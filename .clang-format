@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+#
+# Code style for VDR VAAPI Video Plugin
+
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+
+ColumnLimit: 120
+IndentCaseLabels: true
+IndentWidth: 4

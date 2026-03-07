@@ -1,0 +1,21 @@
+# Doxyfile -- VDR VAAPI Video Plugin
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+
+PROJECT_NAME           = "VDR VAAPI Video Plugin"
+PROJECT_BRIEF          = "Zero-copy VAAPI decode, DRM atomic modesetting, ALSA IEC61937 passthrough"
+OUTPUT_DIRECTORY       = docs
+
+INPUT                  = README.md vaapivideo.cpp src/
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+
+# @R appears in "-r WxH@R" in README.md -- not a Doxygen command
+ALIASES                = "R=R"
+
+GENERATE_LATEX         = NO
+SHOW_INCLUDE_FILES     = NO
