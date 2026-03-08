@@ -87,8 +87,8 @@ extern "C" {
 // === VERSION CHECKS ===
 // ============================================================================
 
-#if APIVERSNUM < 30012
-#error "VDR 2.7.9+ required (APIVERSNUM >= 30012)"
+#if APIVERSNUM < 30011
+#error "VDR 2.7.9+ required (APIVERSNUM >= 30011)"
 #endif
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 3, 100)
