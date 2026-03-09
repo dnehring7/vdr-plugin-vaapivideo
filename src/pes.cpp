@@ -63,6 +63,7 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< First MPEG video stream
 }
 
 /// Per-codec evidence accumulator: each strong NAL type maps to a bit in seenMask.
+namespace {
 struct CodecEvidence {
     uint8_t seenMask{}; ///< Bit flags of distinct strong NAL types seen
     int hits{};         ///< Distinct strong type count (popcount of seenMask)
@@ -76,6 +77,7 @@ struct CodecEvidence {
         lastPos = pos;
     }
 };
+} // namespace
 
 // ============================================================================
 // === CODEC DETECTION ===
@@ -364,7 +366,7 @@ struct CodecEvidence {
     if (pesLen > 0) [[unlikely]] {
         const auto declared = static_cast<size_t>(pesLen);
         // declared counts from byte 6 onward; absolute end = declared + 6.
-        if (declared + 6 > headerSize) [[likely]] {
+        if (declared + 6 > headerSize) {
             payloadLen = std::min(declared + 6 - headerSize, payloadLen);
         } else {
             payloadLen = 0;

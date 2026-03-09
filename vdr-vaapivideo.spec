@@ -8,7 +8,7 @@
 %global __provides_exclude_from ^%{vdr_plugindir}/.*\\.so.*$
 
 Name:           vdr-%{pname}
-Version:        1.0.0
+Version:        1.1.0
 Release:        %autorelease
 Summary:        VAAPI video plugin for VDR
 

@@ -4,9 +4,6 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                ".",
-                "src",
-                "/usr/include/libdrm",
                 "/usr/include/ffmpeg"
             ],
             "defines": [],

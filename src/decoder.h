@@ -68,7 +68,7 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    auto Clear() -> void;      ///< Flush queued packets, codec buffers, and filter graph; reset A/V sync warmup
+    auto Clear() -> void;      ///< Flush queued packets, codec buffers, and filter graph; reset A/V sync
     auto DrainQueue() -> void; ///< Discard all queued packets without touching the codec or filter state
     auto EnqueueData(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parse raw PES payload and push resulting packets onto the decode queue
@@ -177,11 +177,8 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === A/V SYNC ===
     // ========================================================================
-    int64_t prevDelta{}; ///< video_pts - audio_clock on the previous frame, used for discontinuity detection
-    int64_t prevPts{
-        AV_NOPTS_VALUE}; ///< PTS of the previous frame; duplicate PTS identifies the second interlaced field
-    bool syncActive{};   ///< True after the initial warmup phase; enables drop and wait logic
-    int syncDropCount{}; ///< Running count of frames dropped since the last sync was established
+    bool syncCorrectionDone{}; ///< True after first-frame alignment; gates tight vs. relaxed wait threshold
+    cTimeMs nextSyncLog;       ///< Deadline for the next periodic sync status log
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

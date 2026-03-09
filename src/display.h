@@ -22,7 +22,7 @@ struct VaapiFrame;
  * @brief RAII wrapper around a DRM atomic commit request
  *
  * Accumulates object/property/value triples and submits them as a single
- * atomic DRM commit.  Move-only; copying is deleted.
+ * atomic DRM commit. Move-only; copying is deleted.
  */
 class AtomicRequest {
   public:

@@ -58,6 +58,8 @@ extern "C" {
 // === cMenuVaapiStatus ===
 // ============================================================================
 
+namespace {
+
 /// Read-only status page shown when the user picks "VAAPI Video" from VDR's
 /// main menu. All items are rebuilt on demand; the Red key forces a live
 /// refresh.
@@ -93,7 +95,7 @@ class cMenuVaapiStatus : public cOsdMenu {
     auto Refresh() -> void {
         Clear();
 
-        if (device && device->Ready()) [[likely]] {
+        if (device && device->IsReady()) {
             // GetOsdSize() returns the framebuffer dimensions, which match the physical display resolution.
             int width = 0;
             int height = 0;
@@ -126,7 +128,7 @@ class cMenuVaapiStatus : public cOsdMenu {
 // === cMenuSetupVaapi ===
 // ============================================================================
 
-/// VDR setup page for the VAAPI plugin.  Edits are applied to a local copy and
+/// VDR setup page for the VAAPI plugin. Edits are applied to a local copy and
 /// only written back to the global config when the user confirms with Store().
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
@@ -135,6 +137,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         Add(new cMenuEditIntItem(tr("Audio Latency (ms)"), &editConfig.audioLatency, 20, 200));
     }
 
+  protected:
     auto Store() -> void override {
         // Copy the scratch config back to the live global
         vaapiConfig = editConfig;
@@ -152,7 +155,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 // === cVaapiVideoPlugin ===
 // ============================================================================
 
-/// Top-level VDR plugin class.  Responsible for command-line argument parsing,
+/// Top-level VDR plugin class. Responsible for command-line argument parsing,
 /// plugin lifecycle (Initialize / Start / Stop), the setup menu, the SVDRP
 /// interface, and the inter-plugin service API.
 class cVaapiVideoPlugin : public cPlugin {
@@ -388,7 +391,7 @@ auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
 
     if (strcmp(serviceId, "VaapiVideo-IsReady-v1.0") == 0) {
         if (data != nullptr) {
-            *static_cast<bool *>(data) = vaapiDevice && vaapiDevice->Ready();
+            *static_cast<bool *>(data) = vaapiDevice && vaapiDevice->IsReady();
         }
         return true;
     }
@@ -412,7 +415,7 @@ auto cVaapiVideoPlugin::SetupParse(const char *Name, const char *Value) -> bool 
 auto cVaapiVideoPlugin::Start() -> bool {
     isyslog("vaapivideo: starting VAAPI Video Plugin v%s", PLUGIN_VERSION);
 
-    if (!vaapiDevice || !vaapiDevice->Ready()) [[unlikely]] {
+    if (!vaapiDevice || !vaapiDevice->IsReady()) [[unlikely]] {
         esyslog("vaapivideo: device not initialized -- cannot start");
         return false;
     }
@@ -425,12 +428,12 @@ auto cVaapiVideoPlugin::Start() -> bool {
         if (cDevice::SetPrimaryDevice(primaryIndex)) {
             isyslog("vaapivideo: set as primary device %d", primaryIndex);
         } else {
-            // SetPrimaryDevice() can fail if called too early in the VDR startup sequence; MakePrimaryDevice() is
+            // SetPrimaryDevice() can fail if called too early in the VDR startup sequence; SetPrimary() is
             // the direct instance-level fallback.
             esyslog("vaapivideo: SetPrimaryDevice(%d) failed, falling back to "
-                    "MakePrimaryDevice",
+                    "SetPrimary",
                     primaryIndex);
-            vaapiDevice->MakePrimaryDevice(true);
+            vaapiDevice->SetPrimary(true);
         }
     }
 
@@ -498,7 +501,7 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
     }
 
     if (strcasecmp(command, "STAT") == 0) {
-        if (!vaapiDevice || !vaapiDevice->Ready()) [[unlikely]] {
+        if (!vaapiDevice || !vaapiDevice->IsReady()) [[unlikely]] {
             replyCode = 550;
             return "VAAPI device inactive";
         }
@@ -541,5 +544,7 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
 // ============================================================================
 // === VDR plugin factory ===
 // ============================================================================
+
+} // namespace
 
 VDRPLUGINCREATOR(cVaapiVideoPlugin);

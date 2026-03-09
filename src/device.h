@@ -94,9 +94,8 @@ class cVaapiDevice : public cDevice {
     auto operator=(cVaapiDevice &&) noexcept -> cVaapiDevice & = delete;
 
     // ========================================================================
-    // === VDR DEVICE INTERFACE ===
+    // === VDR DEVICE INTERFACE (public in cDevice) ===
     // ========================================================================
-    [[nodiscard]] auto CanReplay() const -> bool override; ///< True when hardware is ready and decoder is open
     auto Clear() -> void override; ///< Flush decoder and audio queues without releasing hardware
     [[nodiscard]] auto DeviceType() const -> cString override; ///< Returns "VAAPI"
     [[nodiscard]] auto Flush(int TimeoutMs = 0)
@@ -110,21 +109,12 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto HasDecoder() const -> bool override; ///< True when a VAAPI codec context is open and ready
     [[nodiscard]] auto HasIBPTrickSpeed()
         -> bool override; ///< Always true: all I/B/P frame types are submitted in trick mode
-    auto MakePrimaryDevice(bool On) -> void override; ///< Install or remove OSD provider when becoming/leaving primary
-    auto Mute() -> void override;                     ///< Drop pending audio frames (hardware mute handled by VDR)
-    auto Play() -> void override;                     ///< Resume normal playback: clear trick speed and unpause
-    [[nodiscard]] auto PlayAudio(const uchar *Data, int Length, uchar Id)
-        -> int override; ///< Demux one audio PES packet and enqueue for decoding
-    [[nodiscard]] auto PlayVideo(const uchar *Data, int Length)
-        -> int override; ///< Demux one video PES packet and enqueue for decoding
+    [[nodiscard]] auto IsReady() -> bool { return Ready(); } ///< Public accessor for protected Ready()
+    auto Mute() -> void override; ///< Drop pending audio frames (hardware mute handled by VDR)
+    auto Play() -> void override; ///< Resume normal playback: clear trick speed and unpause
     [[nodiscard]] auto Poll(cPoller &Poller, int TimeoutMs = 0)
-        -> bool override;                        ///< Return true when at least one queue has space for more data
-    [[nodiscard]] auto Ready() -> bool override; ///< True once Initialize() has completed successfully
-    auto SetAudioTrackDevice(eTrackType Type)
-        -> void override; ///< Reset audio codec detection on user-initiated track switch
-    [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
-        -> bool override;                              ///< Reset state machine and flush on mode transitions
-    auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
+        -> bool override; ///< Return true when at least one queue has space for more data
+    auto SetPrimary(bool On) -> void { MakePrimaryDevice(On); } ///< Public accessor for protected MakePrimaryDevice()
     auto StillPicture(const uchar *Data, int Length)
         -> void override;                                      ///< Decode and hold a single PES frame as a still image
     auto TrickSpeed(int Speed, bool Forward) -> void override; ///< Enter trick-speed mode at the given VDR speed index
@@ -136,6 +126,23 @@ class cVaapiDevice : public cDevice {
     auto Detach() -> void;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume
     [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath)
         -> bool; ///< Open DRM/VAAPI hardware and start decoder, display, and audio threads
+
+  protected:
+    // ========================================================================
+    // === VDR DEVICE OVERRIDES (protected in cDevice) ===
+    // ========================================================================
+    [[nodiscard]] auto CanReplay() const -> bool override; ///< True when hardware is ready and decoder is open
+    auto MakePrimaryDevice(bool On) -> void override; ///< Install or remove OSD provider when becoming/leaving primary
+    [[nodiscard]] auto PlayAudio(const uchar *Data, int Length, uchar Id)
+        -> int override; ///< Demux one audio PES packet and enqueue for decoding
+    [[nodiscard]] auto PlayVideo(const uchar *Data, int Length)
+        -> int override;                         ///< Demux one video PES packet and enqueue for decoding
+    [[nodiscard]] auto Ready() -> bool override; ///< True once Initialize() has completed successfully
+    auto SetAudioTrackDevice(eTrackType Type)
+        -> void override; ///< Reset audio codec detection on user-initiated track switch
+    [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
+        -> bool override;                              ///< Reset state machine and flush on mode transitions
+    auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
 
   private:
     // ========================================================================

@@ -1041,13 +1041,13 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 
             std::vector<uint8_t> eldBuffer(eldSize);
             for (unsigned i = 0; i < eldSize; ++i) {
-                eldBuffer[i] = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
+                eldBuffer.at(i) = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
             }
 
             // Parse CEA-861 Short Audio Descriptors (SADs).
             // ELD byte 20 bits [7:4] = SAD count; each SAD is 3 bytes starting at offset 84.
             // SAD byte 0 bits [6:3] = Audio Format Code (AFC).
-            const unsigned sadCount = (eldBuffer[20] >> 4) & 0x0F;
+            const unsigned sadCount = (eldBuffer.at(20) >> 4) & 0x0F;
             constexpr unsigned kSadOffset = 84; ///< Byte offset of first SAD in the ELD
             constexpr unsigned kSadSize = 3;    ///< Bytes per Short Audio Descriptor
 
@@ -1076,7 +1076,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 
             for (unsigned i = 0; i < sadCount; ++i) {
                 const size_t offset = kSadOffset + (i * kSadSize);
-                const uint8_t formatCode = (eldBuffer[offset] >> 3) & 0x0F;
+                const uint8_t formatCode = (eldBuffer.at(offset) >> 3) & 0x0F;
 
                 switch (formatCode) {
                     case kCeaAc3:
@@ -1095,7 +1095,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                         sinkCaps.truehd = true;
                         break;
                     case kCeaExtended: {
-                        const uint8_t extCode = (eldBuffer[offset + 2] >> 3) & 0x1F;
+                        const uint8_t extCode = (eldBuffer.at(offset + 2) >> 3) & 0x1F;
                         if (extCode == kCeaExtMpegh3d) {
                             sinkCaps.mpegh3d = true;
                         } else if (extCode == kCeaExtAc4) {

@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file decoder.cpp
- * @brief Threaded VAAPI decoder with filter graphs and A/V sync
+ * @brief Threaded VAAPI decoder with filter graph and A/V sync
  *
  * Pipeline:  EnqueueData() -> packet queue -> VAAPI decode -> filter graph -> A/V sync -> display
- * Filters:   [bwdif|deinterlace] -> [hqdn3d|denoise] -> scale (BT.709 NV12) -> [sharpen]  (probed per GPU)
- * Sync:      Audio-clock master, warmup -> discontinuity -> drop/wait/pass policy
+ * Filters:   [bwdif|deinterlace] -> [hqdn3d|denoise] -> scale (BT.709 NV12) -> [sharpen] (probed per GPU)
+ * Sync:      Audio-clock master, threshold submit + first-frame alignment
  */
 
 #include "decoder.h"
@@ -64,11 +64,9 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr size_t DECODER_QUEUE_CAPACITY = 50;                ///< Video packet queue depth (~2 s at 25 fps)
-constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;               ///< Timeout when submitting a frame to the display (ms)
-constexpr int64_t DECODER_SYNC_DISCONT_THRESHOLD = 300 * 90; ///< Reset sync baseline when delta exceeds 300 ms
-constexpr int64_t DECODER_SYNC_DROP_THRESHOLD = 100 * 90;    ///< Drop frame when video is >100 ms behind audio
-constexpr int64_t DECODER_SYNC_MAX_WAIT_MS = 20;             ///< Maximum per-frame wait when video is ahead (ms)
+constexpr size_t DECODER_QUEUE_CAPACITY = 50;              ///< Video packet queue depth (~2 s at 25 fps)
+constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;             ///< Timeout when submitting a frame to the display (ms)
+constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 500 * 90; ///< Re-sync when drift exceeds this (PTS ticks, ~500 ms)
 
 // ============================================================================
 // === STRUCTURES ===
@@ -156,13 +154,10 @@ auto cVaapiDecoder::Clear() -> void {
         av_frame_unref(filteredFrame.get());
     }
 
-    // Reset A/V sync state and re-enter warmup on the next frame. trickSpeed is intentionally preserved -- caller uses
-    // SetTrickSpeed() to change it.
-    syncActive = false;
     lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
-    prevDelta = 0;
-    prevPts = AV_NOPTS_VALUE;
-    syncDropCount = 0;
+
+    syncCorrectionDone = false;
+    nextSyncLog.Set(0);
 }
 
 auto cVaapiDecoder::DrainQueue() -> void {
@@ -493,14 +488,9 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
     // Arm the pacing timer so the first trick frame is displayed immediately.
     nextTrickFrameDue.store(cTimeMs::Now(), std::memory_order_release);
 
-    // Returning to normal play: clear the sync state so the first audio-clock reading after resumption triggers a fresh
-    // warmup and prevents stutter.
     if (speed == 0) {
-        syncActive = false;
         lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
-        prevDelta = 0;
-        prevPts = AV_NOPTS_VALUE;
-        syncDropCount = 0;
+        syncCorrectionDone = false;
     }
 
     trickSpeed.store(speed, std::memory_order_release);
@@ -698,7 +688,8 @@ auto cVaapiDecoder::Action() -> void {
             }
 
             // Stash the source PTS before handing the frame to the filter. The deinterlace filter interpolates PTS for
-            // the second output field which would break A/V sync; we stamp both outputs with the same source PTS.
+            // the second output field which is not suitable for our sync model here, so both outputs keep the source
+            // PTS. Trick mode relies on that too for field-pair detection.
             const int64_t sourcePts = decodedFrame->pts;
 
             if (filterGraph) {
@@ -720,15 +711,14 @@ auto cVaapiDecoder::Action() -> void {
                         break;
                     }
 
-                    // Use the source PTS on every filter output (the filter assigns monotonically increasing pts which
-                    // we do not want for sync).
+                    const bool isTrickMode = trickSpeed.load(std::memory_order_acquire) != 0;
                     filteredFrame->pts = sourcePts;
 
                     if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
                         // In FF/reverse trick mode, rate=field emits two outputs per source frame. The first has a
                         // cross-frame blend ghost; only keep the second.
-                        if (trickSpeed.load(std::memory_order_acquire) != 0 && (isTrickFastForward || isTrickReverse) &&
-                            !outFrames.empty() && outFrames.back()->pts == sourcePts) {
+                        if (isTrickMode && (isTrickFastForward || isTrickReverse) && !outFrames.empty() &&
+                            outFrames.back()->pts == sourcePts) {
                             outFrames.back() = std::move(vaapiFrame);
                         } else {
                             outFrames.push_back(std::move(vaapiFrame));
@@ -1008,20 +998,8 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
-    // A/V sync -- audio clock is master.
-    //
-    // Policies evaluated in order:
-    //   1. Trick mode   -> pace via timer, no audio sync
-    //   2. Freerun      -> no audio processor, no PTS, or clock invalid: submit immediately
-    //   3. Warmup       -> freerun until audio clock appears, then record baseline delta
-    //   4. Same PTS     -> second interlaced field: submit without re-evaluating
-    //   5. Discontinuity -> delta jumped >300 ms from previous: reset baseline
-    //   6. Late (drop)  -> delta < -100 ms: discard frame so decoder catches up
-    //   7. Early (wait) -> delta > ~1 ms: sleep up to 20 ms, re-query clock
-    //   8. On time      -> submit immediately
-    //
-    // delta = video_PTS - audio_clock - latency_offset
-    //   positive = video ahead (wait), negative = video behind (drop)
+    // A/V sync -- audio clock master. delta = vPTS - aClock - latency (positive = early, negative = late).
+    // Trick mode -> pace via timer | Freerun -> submit | Ahead -> wait | In sync -> submit | Late -> drop
 
     if (!frame || !display) [[unlikely]] {
         return false;
@@ -1029,12 +1007,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 
     const int64_t originalPts = frame->pts;
 
-    // --- 1. Trick mode: pacing via nextTrickFrameDue, no A/V sync (audio inactive) ---
+    // --- Trick mode: pace via timer, no A/V sync ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
         const bool newSource = (originalPts != prevTrickPts);
         const int64_t savedPrevPts = prevTrickPts;
 
-        // Reverse: discard out-of-order frames (PTS must decrease monotonically).
+        // Reverse: PTS must decrease monotonically.
         if (isTrickReverse && newSource && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE &&
             originalPts > savedPrevPts) {
             return true;
@@ -1046,7 +1024,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
             lastPts.store(originalPts, std::memory_order_release);
         }
 
-        // Fast mode: wait for pacing timer (slow mode paces via trickHoldMs below).
+        // Fast mode: wait for pacing timer.
         if (newSource && trickMultiplier > 0) {
             const uint64_t due = nextTrickFrameDue.load(std::memory_order_acquire);
             while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
@@ -1069,102 +1047,70 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // --- Normal playback from here ---
-
     if (originalPts != AV_NOPTS_VALUE) {
         lastPts.store(originalPts, std::memory_order_release);
     }
 
-    // --- 2. Freerun: no audio processor or no PTS -- bypass sync entirely ---
+    // --- Freerun: no audio or no PTS ---
     if (!audioProcessor || originalPts == AV_NOPTS_VALUE) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Latency offset: converts user-configurable audioLatency (ms) to 90 kHz ticks. Positive = shift video earlier to
-    // compensate for external audio delay.
     const int64_t latency = static_cast<int64_t>(vaapiConfig.audioLatency) * 90;
+    int64_t clock = audioProcessor->GetClock();
 
-    // --- 3. Warmup: freerun until the audio clock becomes valid, then engage sync ---
-    // After Clear() or startup, syncActive is false. Audio may need time to decode its first packet and fill the ALSA
-    // buffer before GetClock() returns a usable value. Frames are submitted in freerun so the viewer sees immediate
-    // picture.
-    if (!syncActive) {
-        const int64_t clock = audioProcessor->GetClock();
-        if (clock == AV_NOPTS_VALUE) {
-            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    // Hold first frame until audio clock arrives (up to 3 s).
+    if (clock == AV_NOPTS_VALUE && !syncCorrectionDone) {
+        const cTimeMs waitTimeout(3000);
+        while (!stopping.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) == 0 &&
+               !waitTimeout.TimedOut()) {
+            cCondWait::SleepMs(10);
+            clock = audioProcessor->GetClock();
+            if (clock != AV_NOPTS_VALUE) {
+                break;
+            }
         }
-        // Audio clock is now valid -- establish the sync baseline.
-        const int64_t delta = originalPts - clock - latency;
-        syncActive = true;
-        prevDelta = delta;
-        prevPts = originalPts;
-        syncDropCount = 0;
-        dsyslog("vaapivideo/decoder: sync on d=%lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
+    }
+    if (clock == AV_NOPTS_VALUE) {
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
+
+    int64_t delta = originalPts - clock - latency;
+
+    if (nextSyncLog.TimedOut()) {
+        dsyslog("vaapivideo/decoder: sync status d=%lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
                 static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        nextSyncLog.Set(30000);
     }
 
-    // --- Sync-active: compare video PTS against audio clock ---
-
-    // Audio clock lost (ALSA underrun or reconfiguration) -- freerun until it recovers.
-    const int64_t audioClock = audioProcessor->GetClock();
-    if (audioClock == AV_NOPTS_VALUE) {
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
-    }
-
-    int64_t delta = originalPts - audioClock - latency;
-
-    // --- 4. Second interlaced field (same PTS): submit without re-evaluating ---
-    // Interlaced content produces two fields per frame with identical PTS. The first field was already sync-evaluated;
-    // the second passes through.
-    if (originalPts == prevPts) {
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
-    }
-    prevPts = originalPts;
-
-    // --- 5. Discontinuity: large delta jump -- reset baseline ---
-    // A stream-level PTS jump (ad insertion, concatenated recordings) causes a sudden delta shift. If the previous
-    // delta was within range (<300 ms) but the new one deviates by >300 ms, reset rather than entering a prolonged
-    // drop/wait cycle.
-    if (std::abs(prevDelta) < DECODER_SYNC_DISCONT_THRESHOLD &&
-        std::abs(delta - prevDelta) > DECODER_SYNC_DISCONT_THRESHOLD) {
-        dsyslog("vaapivideo/decoder: discont d=%lldms prev=%lldms vPTS=%lld aPTS=%lld drops=%d",
-                static_cast<long long>(delta / 90), static_cast<long long>(prevDelta / 90),
-                static_cast<long long>(originalPts / 90), static_cast<long long>(audioClock / 90), syncDropCount);
-        prevDelta = delta;
-        syncDropCount = 0;
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
-    }
-    prevDelta = delta;
-
-    // --- 6. Late: drop frame to let the decoder catch up ---
-    if (delta < -DECODER_SYNC_DROP_THRESHOLD) {
-        ++syncDropCount;
-        if (syncDropCount == 1 || syncDropCount % 25 == 0) {
-            dsyslog("vaapivideo/decoder: drop d=%lldms vPTS=%lld aPTS=%lld drops=%d",
-                    static_cast<long long>(delta / 90), static_cast<long long>(originalPts / 90),
-                    static_cast<long long>(audioClock / 90), syncDropCount);
+    // Video ahead: first frame waits for any positive delta; steady state waits beyond 500 ms.
+    if (delta > 0 && (!syncCorrectionDone || delta > DECODER_SYNC_DRIFT_THRESHOLD)) {
+        dsyslog("vaapivideo/decoder: sync wait d=%+lldms%s", static_cast<long long>(delta / 90),
+                syncCorrectionDone ? "" : " (initial)");
+        const cTimeMs waitTimeout(3000);
+        while (delta > 0 && !stopping.load(std::memory_order_relaxed) &&
+               trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
+            cCondWait::SleepMs(10);
+            const int64_t updatedClock = audioProcessor->GetClock();
+            if (updatedClock == AV_NOPTS_VALUE) {
+                break;
+            }
+            delta = originalPts - updatedClock - latency;
         }
+    }
+    syncCorrectionDone = true;
+
+    // Within tolerance: submit.
+    if (std::abs(delta) <= DECODER_SYNC_DRIFT_THRESHOLD) {
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
+
+    // Video behind audio: drop.
+    if (delta < 0) {
+        dsyslog("vaapivideo/decoder: sync drop d=%+lldms", static_cast<long long>(delta / 90));
         return true;
     }
 
-    // --- 7. Early: wait in short increments, re-querying the audio clock ---
-    // 90 ticks ~ 1 ms at 90 kHz -- minimum meaningful wait. The loop re-reads the clock after each nap to avoid
-    // overshooting. Total wait is capped at DECODER_SYNC_MAX_WAIT_MS (20 ms) to keep the decode thread responsive.
-    int waited = 0;
-    while (delta > 90 && waited < static_cast<int>(DECODER_SYNC_MAX_WAIT_MS) &&
-           !stopping.load(std::memory_order_relaxed)) {
-        const int ms = std::min(static_cast<int>(delta / 90), static_cast<int>(DECODER_SYNC_MAX_WAIT_MS));
-        cCondWait::SleepMs(ms);
-        waited += ms;
-
-        const int64_t newClock = audioProcessor->GetClock();
-        if (newClock == AV_NOPTS_VALUE) [[unlikely]] {
-            break;
-        }
-        delta = originalPts - newClock - latency;
-    }
-
-    // --- 8. On time: submit ---
+    // Still ahead after wait loop exited early (stopping, trick mode, clock lost, or timeout) -- submit best-effort.
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }

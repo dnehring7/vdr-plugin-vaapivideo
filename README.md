@@ -97,7 +97,7 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
 
 **Fedora / RHEL / openSUSE:**
 
-    sudo dnf install gcc-c++ make git \
+    dnf install gcc-c++ make git \
         vdr-devel \
         libdrm-devel \
         alsa-lib-devel \
@@ -106,7 +106,7 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
 
 **Debian / Ubuntu:**
 
-    sudo apt install g++ make git \
+    apt install g++ make git \
         vdr-dev \
         libdrm-dev \
         libasound2-dev \
@@ -117,10 +117,23 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
         libswresample-dev \
         libva-dev
 
+**Gentoo:**
+
+    echo "media-fonts/corefonts MSttfEULA" >> /etc/portage/package.license
+    emerge -av \
+        sys-devel/gcc \
+        sys-devel/make \
+        dev-vcs/git \
+        media-video/vdr \
+        x11-libs/libdrm \
+        media-libs/alsa-lib \
+        media-video/ffmpeg \
+        media-libs/libva
+
 ### 2. Build and install
 
-    git clone https://github.com/dnehring7/vdr-vaapivideo.git
-    cd vdr-vaapivideo
+    git clone https://github.com/dnehring7/vdr-plugin-vaapivideo.git
+    cd vdr-plugin-vaapivideo
     make
     sudo make install
 
@@ -136,16 +149,44 @@ The user that runs VDR needs access to DRM, video render, and ALSA devices:
 
 A logout or service restart is required for the group change to take effect.
 
-### 4. Verify VAAPI
+### 4. Install the VAAPI driver
 
-Confirm that the VAAPI driver is functional before starting VDR:
+This plugin requires a VAAPI driver with **Video Processing Pipeline (VPP)**
+support. VPP provides hardware scaling, deinterlacing, denoising, and colorspace
+conversion -- the plugin will not start without it.
+
+Install the driver for your GPU:
+
+**Fedora / RHEL / openSUSE:**
+
+    dnf install intel-media-driver          # Intel (Broadwell+)
+    dnf install mesa-va-drivers-freeworld   # AMD (radeonsi)
+
+**Debian / Ubuntu:**
+
+    apt install intel-media-va-driver-non-free   # Intel (Broadwell+)
+    apt install mesa-va-drivers                  # AMD (radeonsi)
+
+**Gentoo:**
+
+    emerge -av media-libs/intel-media-driver                        # Intel (Broadwell+)
+    USE="vaapi" VIDEO_CARDS="radeonsi" emerge -av media-libs/mesa   # AMD (radeonsi)
+
+### 5. Verify VAAPI
+
+Run `vainfo` to confirm the driver is working:
 
     vainfo --display drm --device /dev/dri/renderD128
 
-The output must list at least one decode profile for H.264 or HEVC.
-If `vainfo` fails, install the correct driver package first.
+The output must list at least one decode profile (H.264 or HEVC) and the VPP
+entry point:
 
-### 5. Configure the ALSA audio device
+    VAProfileNone                   : VAEntrypointVideoProc
+
+If this line is missing, VPP is not available and the plugin will not start.
+On Intel, make sure the non-free driver variant is installed (see step 4).
+
+### 6. Configure the ALSA audio device
 
 The plugin defaults to the ALSA `default` device (stereo PCM only).
 For IEC61937 bitstream passthrough (AC-3, DTS, TrueHD, ...) a direct hardware
@@ -171,10 +212,10 @@ If A/V sync is off, adjust the audio latency in the VDR setup menu:
 
     vdr -P 'vaapivideo [-d DEV] [-a DEV] [-r WxH@R]'
 
-| Option   | Default      | Description                                         |
-|----------|--------------|-----------------------------------------------------|
-| `-d DEV` | auto-detect  | DRM device path (`/dev/dri/cardN`)                  |
-| `-a DEV` | `default`    | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
+| Option   | Default      | Description                                            |
+|----------|--------------|--------------------------------------------------------|
+| `-d DEV` | auto-detect  | DRM device path (`/dev/dri/cardN`)                     |
+| `-a DEV` | `default`    | ALSA audio device (use `hw:CARD,DEV` for passthrough)  |
 | `-r WxH@R` | `1920x1080@50` | Output resolution and refresh rate (max 3840×2160) |
 
 The DRM device is auto-detected: `/dev/dri/card0` is tried first; if that is

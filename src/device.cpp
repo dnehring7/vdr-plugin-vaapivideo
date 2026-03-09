@@ -395,7 +395,7 @@ auto cVaapiDevice::Play() -> void {
 
     const AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
 
-    if (currentCodec == AV_CODEC_ID_NONE) [[unlikely]] {
+    if (currentCodec == AV_CODEC_ID_NONE) {
         // Detect live mode (covers pmAudioOnly where no video arrives).
         if (!liveMode) {
             liveMode = Transferring();
@@ -418,7 +418,7 @@ auto cVaapiDevice::Play() -> void {
     } else {
         // Mid-stream codec change with hysteresis (3 consecutive detections)
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
-        if (detectedCodec != AV_CODEC_ID_NONE && detectedCodec != currentCodec) [[unlikely]] {
+        if (detectedCodec != AV_CODEC_ID_NONE && detectedCodec != currentCodec) {
             if (detectedCodec == codecHysteresis) {
                 // Require 3 consecutive detections before committing to a codec switch. A single malformed PES packet
                 // could produce a spurious detection; the hysteresis prevents unnecessary OpenCodec() teardown cycles.
@@ -950,7 +950,7 @@ auto cVaapiDevice::Stop() -> void {
     int numProfiles = 0;
     if (vaQueryConfigProfiles(vaDisplay, profiles.data(), &numProfiles) == VA_STATUS_SUCCESS) {
         for (size_t i = 0; i < static_cast<size_t>(numProfiles); ++i) {
-            switch (profiles[i]) {
+            switch (profiles.at(i)) {
                 case VAProfileMPEG2Simple:
                 case VAProfileMPEG2Main:
                     vaapi.hwMpeg2 = true;
@@ -981,9 +981,9 @@ auto cVaapiDevice::Stop() -> void {
         return false;
     }
 
-    // A 1x1 dummy surface satisfies the vaCreateContext signature requirement.
+    // A small dummy surface satisfies the vaCreateContext signature requirement.
     VASurfaceID surface = VA_INVALID_SURFACE;
-    if (vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, 1, 1, &surface, 1, nullptr, 0) != VA_STATUS_SUCCESS)
+    if (vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, 64, 64, &surface, 1, nullptr, 0) != VA_STATUS_SUCCESS)
         [[unlikely]] {
         vaDestroyConfig(vaDisplay, configId);
         esyslog("vaapivideo/device: VPP probe failed -- vaCreateSurfaces error");
