@@ -90,6 +90,7 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Return true when the trick-mode pacing timer has expired
     [[nodiscard]] auto OpenCodec(AVCodecID codecId)
         -> bool; ///< Open (or reuse) a decoder for the given codec (VAAPI HW if available, else SW fallback)
+    auto NotifyAudioChange() -> void; ///< Reset A/V sync after an audio codec change
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the audio processor used as the A/V sync master clock
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)

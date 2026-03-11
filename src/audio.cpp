@@ -306,6 +306,16 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
         OpenDecoder();
     } else if (oldCodecId != params.codecId) {
         dsyslog("vaapivideo/audio: codec changed, reinitializing decoder");
+
+        // Flush stale PCM so GetClock() does not report an inflated delay from the previous codec's samples.
+        if (alsaHandle) {
+            (void)snd_pcm_drop(alsaHandle);
+            (void)snd_pcm_prepare(alsaHandle);
+        }
+        playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+        pcmQueueEndPts = AV_NOPTS_VALUE;
+        pcmNextPts = AV_NOPTS_VALUE;
+
         CloseDecoder();
         OpenDecoder();
     }

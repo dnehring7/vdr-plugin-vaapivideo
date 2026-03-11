@@ -413,6 +413,10 @@ auto cVaapiDevice::Play() -> void {
         }
 
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
+        // Reset A/V sync -- audio clock is invalid after codec change.
+        if (decoder) {
+            decoder->NotifyAudioChange();
+        }
         isyslog("vaapivideo/device: audio codec %s (%s)", avcodec_get_name(detectedCodec),
                 liveMode ? "live" : "replay");
     } else {
@@ -428,6 +432,9 @@ auto cVaapiDevice::Play() -> void {
 
                     if (audioProcessor->OpenCodec(detectedCodec, 48000, 2)) {
                         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
+                        if (decoder) {
+                            decoder->NotifyAudioChange();
+                        }
                     } else {
                         esyslog("vaapivideo/device: failed to switch to audio codec %s",
                                 avcodec_get_name(detectedCodec));

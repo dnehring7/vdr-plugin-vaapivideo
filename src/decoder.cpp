@@ -430,6 +430,12 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
     return true;
 }
 
+auto cVaapiDecoder::NotifyAudioChange() -> void {
+    dsyslog("vaapivideo/decoder: audio codec changed, resetting A/V sync");
+    syncCorrectionDone = false;
+    nextSyncLog.Set(0);
+}
+
 auto cVaapiDecoder::SetAudioProcessor(cAudioProcessor *audio) -> void { audioProcessor = audio; }
 
 auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
