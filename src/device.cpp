@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // FFmpeg
@@ -38,8 +39,10 @@ extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
+#include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
+#include <libavutil/pixfmt.h>
 }
 #pragma GCC diagnostic pop
 
@@ -138,6 +141,60 @@ DrmDevices::~DrmDevices() noexcept {
 // ============================================================================
 // === VAAPI DEVICE CLASS ===
 // ============================================================================
+
+auto cVaapiDevice::SubmitBlackFrame() -> void {
+    const auto w = static_cast<int>(display->GetOutputWidth());
+    const auto h = static_cast<int>(display->GetOutputHeight());
+
+    // One-shot VAAPI hw_frames_ctx for a single NV12 surface
+    std::unique_ptr<AVBufferRef, FreeAVBufferRef> framesRef{av_hwframe_ctx_alloc(vaapi.hwDeviceRef)};
+    if (!framesRef) [[unlikely]] {
+        esyslog("vaapivideo/device: black frame hw_frames_ctx alloc failed");
+        return;
+    }
+    auto *ctx =
+        reinterpret_cast<AVHWFramesContext *>(framesRef->data); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    ctx->format = AV_PIX_FMT_VAAPI;
+    ctx->sw_format = AV_PIX_FMT_NV12;
+    ctx->width = w;
+    ctx->height = h;
+    ctx->initial_pool_size = 1;
+    if (av_hwframe_ctx_init(framesRef.get()) < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: black frame hw_frames_ctx init failed");
+        return;
+    }
+
+    // Allocate VAAPI surface and software staging frame
+    std::unique_ptr<AVFrame, FreeAVFrame> hwFrame{av_frame_alloc()};
+    std::unique_ptr<AVFrame, FreeAVFrame> swFrame{av_frame_alloc()};
+    if (!hwFrame || !swFrame || av_hwframe_get_buffer(framesRef.get(), hwFrame.get(), 0) < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: black frame surface alloc failed");
+        return;
+    }
+    swFrame->format = AV_PIX_FMT_NV12;
+    swFrame->width = w;
+    swFrame->height = h;
+    if (av_frame_get_buffer(swFrame.get(), 0) < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: black frame sw buffer alloc failed");
+        return;
+    }
+
+    // Fill with limited-range NV12 black (Y=16, UV=128) and upload to VAAPI surface
+    const auto rows = static_cast<size_t>(h);
+    std::memset(swFrame->data[0], 16, static_cast<size_t>(swFrame->linesize[0]) * rows);
+    std::memset(swFrame->data[1], 128, static_cast<size_t>(swFrame->linesize[1]) * (rows / 2));
+    if (av_hwframe_transfer_data(hwFrame.get(), swFrame.get(), 0) < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: black frame upload failed");
+        return;
+    }
+
+    // Wrap in VaapiFrame and submit through the normal display pipeline
+    auto frame = std::make_unique<VaapiFrame>();
+    frame->avFrame = hwFrame.release();
+    frame->vaSurfaceId = static_cast<VASurfaceID>(
+        reinterpret_cast<uintptr_t>(frame->avFrame->data[3])); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    static_cast<void>(display->SubmitFrame(std::move(frame), 100));
+}
 
 cVaapiDevice::cVaapiDevice() {
     isyslog("vaapivideo/device: created");
@@ -637,6 +694,11 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             videoCodecCandidate = AV_CODEC_ID_NONE;
             videoCodecCandidateCount = 0;
             Clear();
+            // Submit a black VAAPI frame so the previous channel's last picture does not stay on screen.
+            // Uses the normal SubmitFrame() path so the display thread and OSD keep running.
+            if (display && vaapi.hwDeviceRef) {
+                SubmitBlackFrame();
+            }
             break;
         case pmAudioVideo:
         case pmAudioOnly:
@@ -822,6 +884,10 @@ auto cVaapiDevice::Detach() -> void {
 
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
+
+    // Show black immediately so the console is covered even if VDR starts on a radio channel.
+    SubmitBlackFrame();
+
     return true;
 }
 

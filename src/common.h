@@ -127,6 +127,11 @@ inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (m
 
 // --- FFmpeg Deleters ---
 
+/// Deleter for AVBufferRef (av_buffer_unref)
+struct FreeAVBufferRef {
+    auto operator()(AVBufferRef *ref) const noexcept -> void { av_buffer_unref(&ref); }
+};
+
 /// Deleter for AVCodecContext (avcodec_free_context)
 struct FreeAVCodecContext {
     auto operator()(AVCodecContext *ctx) const noexcept -> void { avcodec_free_context(&ctx); }

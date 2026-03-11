@@ -152,8 +152,9 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto ProbeVppCapabilities() -> bool; ///< Query VAAPI decode profiles and VPP filter capabilities
     auto ReleaseHardware() -> void;                    ///< Close VAAPI device reference and DRM file descriptor
     [[nodiscard]] auto SelectDrmConnector()
-        -> bool;         ///< Scan connectors, pick a display mode, and store crtcId/connectorId
-    auto Stop() -> void; ///< Shut down decoder, display, and audio in dependency order
+        -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
+    auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order
+    auto SubmitBlackFrame() -> void; ///< Allocate a VAAPI NV12 black surface and submit it through the display pipeline
 
     // ========================================================================
     // === STATE ===
