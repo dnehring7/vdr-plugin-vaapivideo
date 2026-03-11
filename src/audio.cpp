@@ -421,7 +421,7 @@ auto cAudioProcessor::Action() -> void {
 // ============================================================================
 
 [[nodiscard]] auto cAudioProcessor::CanPassthrough(AVCodecID codecId) const -> bool {
-    // AAC and HE-AAC are never passed through -- IEC61937 has no standardized framing for them in broadcast usage.
+    // AAC, HE-AAC, and AAC-LATM are never passed through -- IEC61937 has no standardized framing for them.
     switch (codecId) {
         case AV_CODEC_ID_AC3:
             return sinkCaps.ac3;

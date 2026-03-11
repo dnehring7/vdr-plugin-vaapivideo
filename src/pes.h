@@ -29,7 +29,7 @@ struct PesPacket {
 // ============================================================================
 
 [[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept
-    -> AVCodecID; ///< Identify audio codec from ES bytes (AC-3/E-AC-3/AAC/DTS/MP2)
+    -> AVCodecID; ///< Identify audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2)
 [[nodiscard]] auto DetectVideoCodec(std::span<const uint8_t> data) noexcept
     -> AVCodecID; ///< Identify video codec from ES bytes (HEVC/H.264/MPEG-2)
 [[nodiscard]] auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket; ///< Parse PES packet: extract stream

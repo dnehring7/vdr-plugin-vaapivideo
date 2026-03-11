@@ -105,6 +105,15 @@ struct CodecEvidence {
             }
         }
 
+        // AAC-LATM / LOAS: 11-bit sync 0x2B7 + 13-bit audioMuxLengthBytes (ISO 14496-3, AudioSyncStream).
+        // Require non-zero length to reject false positives from random data (zero-length frames are invalid).
+        if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
+            const auto loasLen = static_cast<uint16_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
+            if (loasLen > 0) {
+                return AV_CODEC_ID_AAC_LATM;
+            }
+        }
+
         // AC-3/E-AC-3 sync 0x0B77; bsid > 10 -> E-AC-3 (ATSC A/52).
         if (sync == 0x0B77) [[unlikely]] {
             if (i + 5 < size && ((AV_RB8(p + i + 5) >> 3) & 0x1F) > 10) [[unlikely]] {
@@ -114,7 +123,7 @@ struct CodecEvidence {
         }
 
         // DTS core sync 0x7FFE8001 (ETSI TS 102 114).
-        if (i + 4 <= size && AV_RB32(p + i) == 0x7FFE8001) [[unlikely]] {
+        if (AV_RB32(p + i) == 0x7FFE8001) [[unlikely]] {
             return AV_CODEC_ID_DTS;
         }
     }
