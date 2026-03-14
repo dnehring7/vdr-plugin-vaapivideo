@@ -44,8 +44,11 @@ extern "C" {
 #include <xf86drmMode.h>
 
 // VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/thread.h>
 #include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // === CONSTANTS ===

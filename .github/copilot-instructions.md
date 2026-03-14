@@ -248,4 +248,4 @@ Forbidden:
 - `std::thread`, `std::mutex` -- use VDR primitives (`cThread`, `cMutex`)
 - `#pragma once` -- use `#ifndef` / `#define` include guards
 - Static mutable state -- use instance members
-- Legacy APIs -- require FFmpeg 7.0+, VDR 2.7.9+
+- Legacy APIs -- require FFmpeg 7.0+, VDR 2.6.0+

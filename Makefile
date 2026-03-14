@@ -72,8 +72,11 @@ CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 #   export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:detect_deadlocks=1:report_thread_leaks=1:history_size=7:symbolize=1"
 #   export LD_PRELOAD="/usr/lib64/libtsan.so.2"
 
-CXXFLAGS += -std=c++20 -pedantic-errors -Wall -Wextra -fPIC
-CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
+# Development Flags (uncomment for development builds)
+#CXXFLAGS += -pedantic-errors -Wall -Wextra
+#CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
+
+CXXFLAGS += -std=c++20 -fPIC
 CXXFLAGS += -DPLUGIN_NAME_I18N='"$(PLUGIN)"'
 CXXFLAGS += -I$(VDRDIR)/include -I.
 CXXFLAGS += $(shell $(PKG_CONFIG) --cflags $(REQUIRED_LIBS))

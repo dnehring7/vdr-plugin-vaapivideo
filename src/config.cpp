@@ -7,7 +7,10 @@
 
 #include "config.h"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 #include <charconv>
 #include <cstdint>

@@ -26,7 +26,10 @@ extern "C" {
 #pragma GCC diagnostic pop
 
 // VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // === CONSTANTS ===

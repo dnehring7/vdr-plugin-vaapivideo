@@ -79,16 +79,19 @@ extern "C" {
 // === VDR HEADERS ===
 // ============================================================================
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/plugin.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // === VERSION CHECKS ===
 // ============================================================================
 
-#if APIVERSNUM < 30011
-#error "VDR 2.7.9+ required (APIVERSNUM >= 30011)"
+#if APIVERSNUM < 20600
+#error "VDR 2.6.0+ required (APIVERSNUM >= 20600)"
 #endif
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 3, 100)
@@ -100,7 +103,7 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.1.0";
+inline constexpr const char *PLUGIN_VERSION = "1.1.1";
 
 // ============================================================================
 // === CONSTANTS ===

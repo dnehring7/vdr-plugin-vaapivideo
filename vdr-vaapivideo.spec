@@ -8,7 +8,7 @@
 %global __provides_exclude_from ^%{vdr_plugindir}/.*\\.so.*$
 
 Name:           vdr-%{pname}
-Version:        1.1.0
+Version:        1.1.1
 Release:        %autorelease
 Summary:        VAAPI video plugin for VDR
 
@@ -26,7 +26,8 @@ BuildRequires:  pkgconfig(libavutil)
 BuildRequires:  pkgconfig(libdrm) >= 2.4.118
 BuildRequires:  pkgconfig(libswresample)
 BuildRequires:  pkgconfig(libva) >= 1.22
-BuildRequires:  vdr-devel >= 2.7.9
+BuildRequires:  pkgconfig(libva-drm)
+BuildRequires:  vdr-devel >= 2.6.0
 Requires:       vdr(abi)%{?_isa} = %{vdr_apiversion}
 
 %description
@@ -42,9 +43,15 @@ is required -- it runs on a bare console, in a systemd service, or headless.
 
 %build
 %make_build
+g++ %{build_cxxflags} -std=c++20 \
+  $(pkg-config --cflags libdrm libva libva-drm) \
+  %{build_ldflags} \
+  -o vaapivideo-probe vaapivideo-probe.cpp \
+  $(pkg-config --libs libdrm libva libva-drm)
 
 %install
 %make_install
+install -Dpm 755 vaapivideo-probe %{buildroot}%{_bindir}/vaapivideo-probe
 install -dm 755 %{buildroot}%{vdr_rundir}/%{pname}
 install -Dpm 644 %{name}.conf \
   %{buildroot}%{_sysconfdir}/sysconfig/vdr-plugins.d/%{pname}.conf
@@ -52,6 +59,7 @@ install -Dpm 644 %{name}.conf \
 %files
 %license LICENSE
 %doc README.md
+%{_bindir}/vaapivideo-probe
 %config(noreplace) %{_sysconfdir}/sysconfig/vdr-plugins.d/%{pname}.conf
 %{vdr_plugindir}/libvdr-%{pname}.so.%{vdr_apiversion}
 %attr(-,%{vdr_user},root) %dir %{vdr_rundir}/%{pname}/

@@ -25,10 +25,12 @@ struct VaapiContext {
     AVBufferRef *hwDeviceRef{};  ///< VAAPI hardware device (owned, freed via av_buffer_unref())
     int drmFd{-1};               ///< DRM file descriptor (borrowed -- owned by cVaapiDevice)
     bool hasDenoise{};           ///< VAProcFilterNoiseReduction supported
+    bool hasHdrToneMapping{};    ///< VPP HDR-to-SDR tone mapping supported (PQ/HDR10)
+    bool hasP010{};              ///< P010 (10-bit YUV420) surface creation supported
     bool hasSharpness{};         ///< VAProcFilterSharpening supported
-    bool hwH264{};               ///< GPU supports VAAPI hardware H.264 decode
-    bool hwHevc{};               ///< GPU supports VAAPI hardware HEVC decode
-    bool hwMpeg2{};              ///< GPU supports VAAPI hardware MPEG-2 decode
+    bool hwH264{};               ///< GPU supports VAAPI hardware H.264 decode (VLD + YUV420)
+    bool hwHevc{};               ///< GPU supports VAAPI hardware HEVC decode (VLD + YUV420)
+    bool hwMpeg2{};              ///< GPU supports VAAPI hardware MPEG-2 decode (VLD + YUV420)
     std::string deinterlaceMode; ///< Best deinterlace mode name (empty = none)
 };
 

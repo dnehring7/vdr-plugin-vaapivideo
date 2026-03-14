@@ -61,16 +61,17 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
                                     DRM Atomic Page-Flip ──▶ Display
 ```
 
-| Source File | Responsibility                                                 |
-|-------------|----------------------------------------------------------------|
-| audio.cpp   | ALSA output, IEC61937 passthrough                              |
-| common.h    | AvErr() helper, RAII deleters, version guards, shared headers  |
-| config.cpp  | Plugin configuration, display parameters, setup storage        |
-| decoder.cpp | VAAPI decode, filter graphs, A/V sync                          |
-| device.cpp  | VDR integration, PES routing, lifecycle                        |
-| display.cpp | DRM atomic modesetting, page flips                             |
-| osd.cpp     | Hardware OSD overlay                                           |
-| pes.cpp     | PES parsing, codec detection                                   |
+| Source File    | Responsibility                                                |
+|----------------|---------------------------------------------------------------|
+| audio.cpp      | ALSA output, IEC61937 passthrough                             |
+| common.h       | AvErr() helper, RAII deleters, version guards, shared headers |
+| config.cpp     | Plugin configuration, display parameters, setup storage       |
+| decoder.cpp    | VAAPI decode, filter graphs, A/V sync                         |
+| device.cpp     | VDR integration, PES routing, lifecycle                       |
+| display.cpp    | DRM atomic modesetting, page flips                            |
+| osd.cpp        | Hardware OSD overlay                                          |
+| pes.cpp        | PES parsing, codec detection                                  |
+| vaapivideo.cpp | Plugin entry point, VDR registration                          |
 
 
 ## Requirements
@@ -78,7 +79,7 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
 | Dependency   | Minimum   | Notes                                                          |
 |--------------|-----------|----------------------------------------------------------------|
 | Linux Kernel | 6.8+      | Atomic async page-flip, universal planes, COLOR_ENCODING/RANGE |
-| VDR          | 2.7.9+    | APIVERSNUM >= 30011                                            |
+| VDR          | 2.6.0+    | APIVERSNUM >= 20600                                            |
 | FFmpeg       | 7.0+      | libavcodec >= 61.3.100, built with VAAPI support               |
 | libdrm       | 2.4.131+  |                                                                |
 
@@ -97,7 +98,7 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
 
 **Fedora / RHEL / openSUSE:**
 
-    dnf install gcc-c++ make git \
+    dnf install gcc-c++ make git pkgconf \
         vdr-devel \
         libdrm-devel \
         alsa-lib-devel \
@@ -106,7 +107,7 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
 
 **Debian / Ubuntu:**
 
-    apt install g++ make git \
+    apt install g++ make git pkgconf \
         vdr-dev \
         libdrm-dev \
         libasound2-dev \
@@ -124,6 +125,7 @@ not implement the Video Processing Pipeline (VPP) required by this plugin.
         sys-devel/gcc \
         sys-devel/make \
         dev-vcs/git \
+        dev-util/pkgconf \
         media-video/vdr \
         x11-libs/libdrm \
         media-libs/alsa-lib \
@@ -164,8 +166,8 @@ Install the driver for your GPU:
 
 **Debian / Ubuntu:**
 
-    apt install intel-media-va-driver-non-free   # Intel (Broadwell+)
-    apt install mesa-va-drivers                  # AMD (radeonsi)
+    apt install intel-media-va-driver                   # Intel (Broadwell+)
+    apt install mesa-va-drivers firmware-amd-graphics   # AMD (radeonsi)
 
 **Gentoo:**
 
@@ -184,7 +186,68 @@ entry point:
     VAProfileNone                   : VAEntrypointVideoProc
 
 If this line is missing, VPP is not available and the plugin will not start.
-On Intel, make sure the non-free driver variant is installed (see step 4).
+Make sure the correct driver for your GPU is installed (see step 4).
+
+#### Detailed capability check with vaapivideo-probe
+
+The repository includes a standalone diagnostic tool `vaapivideo-probe.cpp`
+that probes the exact capabilities the plugin needs: VLD decode profiles,
+P010/NV12 surface support, VPP filters (denoise, sharpen, deinterlace),
+and HDR tone mapping. It is **not** part of the plugin build -- compile and
+run it manually when troubleshooting:
+
+    g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva libva-drm) \
+        -o vaapivideo-probe vaapivideo-probe.cpp
+
+    ./vaapivideo-probe                     # uses /dev/dri/card0
+    ./vaapivideo-probe /dev/dri/card1      # explicit device
+
+The output shows device info, then each capability with a color-coded
+yes/no verdict:
+
+    VAAPI Capability Prober (DVB-S2 / YUV420-NV12)
+    ==============================================
+    DRM device:  /dev/dri/card1
+    Render node: /dev/dri/renderD128
+    VA-API:      1.23
+    Driver:      Intel iHD driver for Intel(R) Gen Graphics - 25.4.6 ()
+
+    --- Hardware Decode (VLD + YUV420) ---
+      MPEG-2 Main                        yes
+      H.264 Main                         yes
+      H.264 High                         yes
+      HEVC Main 10                       yes
+
+    --- Video Processing Pipeline (VPP) ---
+      General (VideoProc)                yes
+      Scaling                            yes
+      P010 (10-bit) surfaces             yes
+      NV12 (8-bit) surfaces              yes
+      10-bit -> 8-bit conversion         yes
+      Noise Reduction (Denoise)          yes
+      Sharpening                         yes
+      Color Balance                      yes
+      Skin Tone Enhancement              yes
+      Total Color Correction             yes
+      HVS Noise Reduction                no
+      HDR Tone Mapping (HDR10)           HDR->HDR, HDR->SDR
+
+    --- DVB-S2 Color Conversion Paths ---
+      BT.601 -> BT.709  (MPEG-2 SD)      yes
+      BT.709 passthrough (H.264 HD)      yes
+      BT.2020 -> BT.709  (HEVC UHD)      yes
+      P010 -> NV12      (10->8 bit)      yes
+      HLG -> SDR   (no TM required)      yes
+      PQ/HDR10 -> SDR    (tone map)      yes
+
+    --- Deinterlacing Algorithms ---
+      Motion Compensated                 yes
+      Motion Adaptive                    yes
+      Weave                              no
+      Bob                                yes
+
+Any line showing **no** indicates a missing driver capability. Compare the
+output against the plugin log (`vdr -l 3`) to identify mismatches.
 
 ### 6. Configure the ALSA audio device
 
@@ -251,11 +314,6 @@ Other plugins can query device state via VDR's service interface:
 
 Passing `data = nullptr` is valid and acts as a capability probe (returns `true`
 for known IDs without writing data).
-
-### Finding devices
-
-    ls -la /dev/dri/card*               # DRM primary nodes
-    aplay -l | grep -E "HDMI|Display"   # ALSA HDMI/DP outputs
 
 
 ## Troubleshooting

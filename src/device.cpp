@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 // C++ Standard Library
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -57,9 +58,12 @@ extern "C" {
 #include <xf86drmMode.h>
 
 // VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/device.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // === HELPER FUNCTIONS ===
@@ -97,6 +101,33 @@ static auto RestoreConsole() -> void {
 
     close(ttyFd);
     dsyslog("vaapivideo/device: console VT%d restored", currentVt);
+}
+
+/// Check whether a profile supports VLD decode with YUV420 output.
+/// Validates both the VLD entrypoint and the VA_RT_FORMAT_YUV420 config attribute.
+[[nodiscard]] static auto HasVldDecode(VADisplay display, VAProfile profile) -> bool {
+    const int maxEp = vaMaxNumEntrypoints(display);
+    if (maxEp <= 0) [[unlikely]] {
+        return false;
+    }
+
+    std::vector<VAEntrypoint> entrypoints(static_cast<size_t>(maxEp));
+    int epCount = 0;
+    if (vaQueryConfigEntrypoints(display, profile, entrypoints.data(), &epCount) != VA_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const auto end = entrypoints.begin() + epCount;
+    if (std::find(entrypoints.begin(), end, VAEntrypointVLD) == end) {
+        return false;
+    }
+
+    VAConfigAttrib attrib{};
+    attrib.type = VAConfigAttribRTFormat;
+    if (vaGetConfigAttributes(display, profile, VAEntrypointVLD, &attrib, 1) != VA_STATUS_SUCCESS) {
+        return false;
+    }
+    return (attrib.value & VA_RT_FORMAT_YUV420) != 0;
 }
 
 // ============================================================================
@@ -687,6 +718,7 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
                 decoder->SetTrickSpeed(0);
+                decoder->RequestCodecReopen();
             }
             prevAudioStreamId.store(0xFF, std::memory_order_relaxed);
             codecHysteresis = AV_CODEC_ID_NONE;
@@ -995,7 +1027,12 @@ auto cVaapiDevice::Stop() -> void {
     // by InitFilterGraph() on every stream change to build a filter chain that only contains supported filters. Returns
     // false when VAEntrypointVideoProc is unavailable (fatal).
     vaapi.hasDenoise = false;
+    vaapi.hasHdrToneMapping = false;
+    vaapi.hasP010 = false;
     vaapi.hasSharpness = false;
+    vaapi.hwH264 = false;
+    vaapi.hwHevc = false;
+    vaapi.hwMpeg2 = false;
     vaapi.deinterlaceMode.clear();
 
     if (!vaapi.hwDeviceRef) [[unlikely]] {
@@ -1016,35 +1053,60 @@ auto cVaapiDevice::Stop() -> void {
     isyslog("vaapivideo/device: VA-API driver -- %s", vendorStr ? vendorStr : "(unknown)");
 
     // --- Probe hardware decode profiles ---
-    // Check which broadcast codecs have VLD (decode) entrypoints on this GPU. OpenCodec() uses these flags to decide
-    // between HW and SW decode paths.
+    // Check which broadcast codecs have VLD (decode) entrypoints with YUV420 output on this GPU. OpenCodec() uses
+    // these flags to decide between HW and SW decode paths. A profile listed without VLD is encode-only.
     const int maxProfiles = vaMaxNumProfiles(vaDisplay);
+    if (maxProfiles <= 0) [[unlikely]] {
+        esyslog("vaapivideo/device: vaMaxNumProfiles failed");
+        return false;
+    }
     std::vector<VAProfile> profiles(static_cast<size_t>(maxProfiles));
     int numProfiles = 0;
     if (vaQueryConfigProfiles(vaDisplay, profiles.data(), &numProfiles) == VA_STATUS_SUCCESS) {
         for (size_t i = 0; i < static_cast<size_t>(numProfiles); ++i) {
-            switch (profiles.at(i)) {
+            const VAProfile profile =
+                profiles[i]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+            switch (profile) {
                 case VAProfileMPEG2Simple:
                 case VAProfileMPEG2Main:
-                    vaapi.hwMpeg2 = true;
+                    if (!vaapi.hwMpeg2 && HasVldDecode(vaDisplay, profile)) {
+                        vaapi.hwMpeg2 = true;
+                    }
                     break;
                 case VAProfileH264ConstrainedBaseline:
                 case VAProfileH264Main:
                 case VAProfileH264High:
-                    vaapi.hwH264 = true;
+                    if (!vaapi.hwH264 && HasVldDecode(vaDisplay, profile)) {
+                        vaapi.hwH264 = true;
+                    }
                     break;
                 case VAProfileHEVCMain:
                 case VAProfileHEVCMain10:
-                    vaapi.hwHevc = true;
+                    if (!vaapi.hwHevc && HasVldDecode(vaDisplay, profile)) {
+                        vaapi.hwHevc = true;
+                    }
                     break;
                 default:
                     break;
             }
+            if (vaapi.hwMpeg2 && vaapi.hwH264 && vaapi.hwHevc) {
+                break;
+            }
         }
     }
 
-    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s", vaapi.hwMpeg2 ? "hw" : "sw",
-            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw");
+    // --- Probe P010 (10-bit) surface support ---
+    // HEVC Main 10 decode produces P010 surfaces. If the driver cannot create them, HW decode of 10-bit content will
+    // fail. The filter graph converts P010 -> NV12 via scale_vaapi, but the input surface must exist first.
+    VASurfaceID p010Surface = VA_INVALID_SURFACE;
+    vaapi.hasP010 =
+        vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420_10, 64, 64, &p010Surface, 1, nullptr, 0) == VA_STATUS_SUCCESS;
+    if (vaapi.hasP010) {
+        vaDestroySurfaces(vaDisplay, &p010Surface, 1);
+    }
+
+    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s p010=%s", vaapi.hwMpeg2 ? "hw" : "sw",
+            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw", vaapi.hasP010 ? "yes" : "no");
 
     // Create a minimal VPP config + context needed for the query API.
     VAConfigID configId = VA_INVALID_ID;
@@ -1064,7 +1126,7 @@ auto cVaapiDevice::Stop() -> void {
     }
 
     VAContextID contextId = VA_INVALID_ID;
-    if (vaCreateContext(vaDisplay, configId, 0, 0, 0, &surface, 1, &contextId) != VA_STATUS_SUCCESS) [[unlikely]] {
+    if (vaCreateContext(vaDisplay, configId, 64, 64, 0, &surface, 1, &contextId) != VA_STATUS_SUCCESS) [[unlikely]] {
         vaDestroySurfaces(vaDisplay, &surface, 1);
         vaDestroyConfig(vaDisplay, configId);
         esyslog("vaapivideo/device: VPP probe failed -- vaCreateContext error");
@@ -1078,11 +1140,32 @@ auto cVaapiDevice::Stop() -> void {
         numFilters = 0;
     }
 
+    bool hasHdrFilter = false;
     for (unsigned int i = 0; i < numFilters; ++i) {
         if (filters[i] == VAProcFilterNoiseReduction) {
             vaapi.hasDenoise = true;
         } else if (filters[i] == VAProcFilterSharpening) {
             vaapi.hasSharpness = true;
+        } else if (filters[i] == VAProcFilterHighDynamicRangeToneMapping) {
+            hasHdrFilter = true;
+        }
+    }
+
+    // --- Query HDR tone mapping capabilities ---
+    // Check for HDR-to-SDR support (PQ/HDR10 content from DVB-S2 UHD broadcasts). The filter graph can insert
+    // tonemap_vaapi when this is available; without it, PQ content produces washed-out SDR output.
+    if (hasHdrFilter) {
+        VAProcFilterCapHighDynamicRange hdrCaps[VAProcHighDynamicRangeMetadataTypeCount];
+        auto hdrCapCount = static_cast<unsigned int>(VAProcHighDynamicRangeMetadataTypeCount);
+        if (vaQueryVideoProcFilterCaps(vaDisplay, contextId, VAProcFilterHighDynamicRangeToneMapping, hdrCaps,
+                                       &hdrCapCount) == VA_STATUS_SUCCESS) {
+            for (unsigned int i = 0; i < hdrCapCount; ++i) {
+                if (hdrCaps[i].metadata_type != VAProcHighDynamicRangeMetadataNone &&
+                    (hdrCaps[i].caps_flag & VA_TONE_MAPPING_HDR_TO_SDR) != 0) {
+                    vaapi.hasHdrToneMapping = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -1121,9 +1204,10 @@ auto cVaapiDevice::Stop() -> void {
     vaDestroySurfaces(vaDisplay, &surface, 1);
     vaDestroyConfig(vaDisplay, configId);
 
-    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s",
+    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s hdr_tonemap=%s",
             vaapi.hasDenoise ? "yes" : "no", vaapi.hasSharpness ? "yes" : "no",
-            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str());
+            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str(),
+            vaapi.hasHdrToneMapping ? "yes" : "no");
     return true;
 }
 

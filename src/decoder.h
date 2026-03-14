@@ -93,6 +93,8 @@ class cVaapiDecoder : public cThread {
     auto NotifyAudioChange() -> void; ///< Reset A/V sync after an audio codec change
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the audio processor used as the A/V sync master clock
+    auto RequestCodecReopen()
+        -> void; ///< Force the next OpenCodec() call to do a full teardown/reopen even for the same codec
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)
         -> void;             ///< Configure trick-play mode; speed 0 returns to normal playback
     auto Shutdown() -> void; ///< Stop the decode thread and release all codec resources
@@ -139,7 +141,9 @@ class cVaapiDecoder : public cThread {
     AVFilterContext *bufferSrcCtx{};  ///< Input node of the VAAPI filter graph (buffer source)
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> codecCtx; ///< Active decoder context (HW or SW)
     AVCodecID currentCodecId{AV_CODEC_ID_NONE};                   ///< Codec ID currently open in codecCtx
+    bool forceCodecReopen{};                                      ///< Force full teardown on next OpenCodec()
     std::unique_ptr<AVFrame, FreeAVFrame> decodedFrame; ///< Reusable staging frame for avcodec_receive_frame() output
+    bool filterHasToneMapping{};                        ///< True if the active filter graph includes PQ tone mapping
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
         filterGraph; ///< VAAPI post-processing filter graph; null until first frame
     std::unique_ptr<AVFrame, FreeAVFrame>
