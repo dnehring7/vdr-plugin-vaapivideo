@@ -81,7 +81,6 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
 | Linux Kernel | 6.8+      | Atomic async page-flip, universal planes, COLOR_ENCODING/RANGE |
 | VDR          | 2.6.0+    | APIVERSNUM >= 20600                                            |
 | FFmpeg       | 7.0+      | libavcodec >= 61.3.100, built with VAAPI support               |
-| libdrm       | 2.4.131+  |                                                                |
 
 **Supported VAAPI drivers:**
 
