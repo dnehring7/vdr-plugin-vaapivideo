@@ -687,10 +687,9 @@ auto cVaapiDecoder::Action() -> void {
 
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
-                isyslog("vaapivideo/decoder: first frame %dx%d %s%s color_trc=%d", decodedFrame->width,
-                        decodedFrame->height, fmtName ? fmtName : "unknown",
-                        (decodedFrame->flags & AV_FRAME_FLAG_INTERLACED) ? " interlaced" : "",
-                        static_cast<int>(codecCtx->color_trc));
+                isyslog("vaapivideo/decoder: first frame %dx%d %s%s", decodedFrame->width, decodedFrame->height,
+                        fmtName ? fmtName : "unknown",
+                        (decodedFrame->flags & AV_FRAME_FLAG_INTERLACED) ? " interlaced" : "");
             }
 
             // DVB MPEG-2 streams often omit the color_description syntax element; force BT.470BG so downstream
@@ -700,18 +699,8 @@ auto cVaapiDecoder::Action() -> void {
             }
 
             // Build the filter graph lazily on the first decoded frame (or after Clear()).
-            // Also rebuild if color transfer characteristics changed (stale metadata on same-codec transitions).
             if (!filterGraph) {
                 (void)InitFilterGraph(decodedFrame.get());
-            } else {
-                const bool framePQ =
-                    decodedFrame->color_trc == AVCOL_TRC_SMPTE2084 || codecCtx->color_trc == AVCOL_TRC_SMPTE2084;
-                if (framePQ != filterHasToneMapping) {
-                    isyslog("vaapivideo/decoder: color transfer changed (%s -> %s), rebuilding filter",
-                            filterHasToneMapping ? "PQ" : "SDR/HLG", framePQ ? "PQ" : "SDR/HLG");
-                    ResetFilterGraph();
-                    (void)InitFilterGraph(decodedFrame.get());
-                }
             }
 
             // Stash the source PTS before handing the frame to the filter. The deinterlace filter interpolates PTS for
@@ -797,14 +786,6 @@ auto cVaapiDecoder::Action() -> void {
     const bool isUhd = (srcWidth > 1920 || srcHeight > 1088);
     const bool isSoftwareDecode = (srcPixFmt != AV_PIX_FMT_VAAPI);
 
-    // Detect PQ (Perceptual Quantizer) HDR10 content. PQ requires tone mapping for correct SDR display; HLG
-    // (AVCOL_TRC_ARIB_STD_B67) is SDR-backwards-compatible and needs no conversion.
-    // Check both the frame and the codec context: VAAPI hardware decoders may not propagate color_trc
-    // to the first output frame even though the SPS/VUI has already been parsed.
-    const bool isPQ = firstFrame->color_trc == AVCOL_TRC_SMPTE2084 || codecCtx->color_trc == AVCOL_TRC_SMPTE2084;
-    const bool needsToneMapping = isPQ && vaapiContext->hasHdrToneMapping;
-    filterHasToneMapping = needsToneMapping;
-
     const uint32_t dstWidth = display->GetOutputWidth();
     const uint32_t dstHeight = display->GetOutputHeight();
 
@@ -859,26 +840,13 @@ auto cVaapiDecoder::Action() -> void {
         }
     }
 
-    // When source resolution matches the target, skip scale_vaapi entirely to save GPU work.
-    const bool needsScale =
-        (static_cast<uint32_t>(srcWidth) != filterWidth || static_cast<uint32_t>(srcHeight) != filterHeight);
-
     // HQ scaling mode is expensive at 4K; skip it for UHD sources to stay within the GPU's real-time budget.
     const char *scaleMode = isUhd ? "" : ":mode=hq";
 
-    // Scale-to-NV12 filter used by non–tone-mapping paths (empty when source matches target resolution).
-    const std::string scaleNv12 =
-        needsScale ? std::format("scale_vaapi=w={}:h={}{}:format=nv12:out_color_matrix=bt709:out_range=tv", filterWidth,
-                                 filterHeight, scaleMode)
-                   : "";
-
-    // Tone-map filter chain for PQ paths. When scaling is needed, scale at 10-bit P010 precision first to reduce GPU
-    // load ~4x for UHD-to-HD; otherwise tone-map the native resolution directly.
-    const std::string scaleP010ToneMap =
-        needsScale ? std::format("scale_vaapi=w={}:h={}{}:format=p010:out_color_matrix=bt709:out_range=tv,"
-                                 "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709",
-                                 filterWidth, filterHeight, scaleMode)
-                   : "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709";
+    // Scale filter: always present -- handles format conversion to NV12 and DAR-fitting geometry.
+    const std::string scaleFilter =
+        std::format("scale_vaapi=w={}:h={}{}:format=nv12:out_color_matrix=bt709:out_range=tv", filterWidth,
+                    filterHeight, scaleMode);
 
     std::string filterChain;
 
@@ -896,13 +864,7 @@ auto cVaapiDecoder::Action() -> void {
             const int hqdn3dStrength = (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) ? 4 : 2;
             filterChain += std::format("hqdn3d={},", hqdn3dStrength);
         }
-        if (needsToneMapping && vaapiContext->hasP010) {
-            filterChain += std::format("format=p010le,hwupload,{}", scaleP010ToneMap);
-        } else if (needsScale) {
-            filterChain += std::format("format=nv12,hwupload,{}", scaleNv12);
-        } else {
-            filterChain += "format=nv12,hwupload";
-        }
+        filterChain += std::format("format=nv12,hwupload,{}", scaleFilter);
     } else {
         // Hardware-decoded: use VAAPI VPP filters before scale.
         if (isInterlaced && !vaapiContext->deinterlaceMode.empty()) {
@@ -911,29 +873,11 @@ auto cVaapiDecoder::Action() -> void {
         if (denoiseLevel > 0 && vaapiContext->hasDenoise) {
             filterChain += std::format("denoise_vaapi=denoise={},", denoiseLevel);
         }
-        if (needsToneMapping) {
-            filterChain += scaleP010ToneMap;
-        } else if (needsScale) {
-            filterChain += scaleNv12;
-        }
-    }
-
-    // Trim trailing comma left by denoise/deinterlace when the scale step was skipped.
-    if (!filterChain.empty() && filterChain.back() == ',') {
-        filterChain.pop_back();
+        filterChain += scaleFilter;
     }
 
     if (sharpnessLevel > 0 && vaapiContext->hasSharpness) {
-        if (!filterChain.empty()) {
-            filterChain += ',';
-        }
-        filterChain += std::format("sharpness_vaapi=sharpness={}", sharpnessLevel);
-    }
-
-    // No filters needed (e.g. native UHD passthrough) -- DecodeOnePacket will pass frames directly.
-    if (filterChain.empty()) {
-        isyslog("vaapivideo/decoder: passthrough (%dx%d, no filtering needed)", srcWidth, srcHeight);
-        return true;
+        filterChain += std::format(",sharpness_vaapi=sharpness={}", sharpnessLevel);
     }
 
     // ---- Create FFmpeg filter graph ----
@@ -1062,8 +1006,8 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    isyslog("vaapivideo/decoder: VAAPI filter initialized (%dx%d -> %ux%u%s%s)", srcWidth, srcHeight, filterWidth,
-            filterHeight, isInterlaced ? ", deinterlaced" : "", needsToneMapping ? ", PQ tone-mapped" : "");
+    isyslog("vaapivideo/decoder: VAAPI filter initialized (%dx%d -> %ux%u%s)", srcWidth, srcHeight, filterWidth,
+            filterHeight, isInterlaced ? ", deinterlaced" : "");
     dsyslog("vaapivideo/decoder: filter chain='%s'", filterChain.c_str());
     return true;
 }
@@ -1072,7 +1016,6 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     bufferSrcCtx = nullptr;
     bufferSinkCtx = nullptr;
     filterGraph.reset();
-    filterHasToneMapping = false;
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {

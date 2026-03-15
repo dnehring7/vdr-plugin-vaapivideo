@@ -23,7 +23,7 @@ BuildRequires:  pkgconfig(libavcodec) >= 61
 BuildRequires:  pkgconfig(libavfilter)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
-BuildRequires:  pkgconfig(libdrm) >= 2.4.118
+BuildRequires:  pkgconfig(libdrm)
 BuildRequires:  pkgconfig(libswresample)
 BuildRequires:  pkgconfig(libva) >= 1.22
 BuildRequires:  pkgconfig(libva-drm)

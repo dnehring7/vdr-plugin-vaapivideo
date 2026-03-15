@@ -1027,8 +1027,6 @@ auto cVaapiDevice::Stop() -> void {
     // by InitFilterGraph() on every stream change to build a filter chain that only contains supported filters. Returns
     // false when VAEntrypointVideoProc is unavailable (fatal).
     vaapi.hasDenoise = false;
-    vaapi.hasHdrToneMapping = false;
-    vaapi.hasP010 = false;
     vaapi.hasSharpness = false;
     vaapi.hwH264 = false;
     vaapi.hwHevc = false;
@@ -1095,18 +1093,8 @@ auto cVaapiDevice::Stop() -> void {
         }
     }
 
-    // --- Probe P010 (10-bit) surface support ---
-    // HEVC Main 10 decode produces P010 surfaces. If the driver cannot create them, HW decode of 10-bit content will
-    // fail. The filter graph converts P010 -> NV12 via scale_vaapi, but the input surface must exist first.
-    VASurfaceID p010Surface = VA_INVALID_SURFACE;
-    vaapi.hasP010 =
-        vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420_10, 64, 64, &p010Surface, 1, nullptr, 0) == VA_STATUS_SUCCESS;
-    if (vaapi.hasP010) {
-        vaDestroySurfaces(vaDisplay, &p010Surface, 1);
-    }
-
-    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s p010=%s", vaapi.hwMpeg2 ? "hw" : "sw",
-            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw", vaapi.hasP010 ? "yes" : "no");
+    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s", vaapi.hwMpeg2 ? "hw" : "sw",
+            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw");
 
     // Create a minimal VPP config + context needed for the query API.
     VAConfigID configId = VA_INVALID_ID;
@@ -1140,32 +1128,11 @@ auto cVaapiDevice::Stop() -> void {
         numFilters = 0;
     }
 
-    bool hasHdrFilter = false;
     for (unsigned int i = 0; i < numFilters; ++i) {
         if (filters[i] == VAProcFilterNoiseReduction) {
             vaapi.hasDenoise = true;
         } else if (filters[i] == VAProcFilterSharpening) {
             vaapi.hasSharpness = true;
-        } else if (filters[i] == VAProcFilterHighDynamicRangeToneMapping) {
-            hasHdrFilter = true;
-        }
-    }
-
-    // --- Query HDR tone mapping capabilities ---
-    // Check for HDR-to-SDR support (PQ/HDR10 content from DVB-S2 UHD broadcasts). The filter graph can insert
-    // tonemap_vaapi when this is available; without it, PQ content produces washed-out SDR output.
-    if (hasHdrFilter) {
-        VAProcFilterCapHighDynamicRange hdrCaps[VAProcHighDynamicRangeMetadataTypeCount];
-        auto hdrCapCount = static_cast<unsigned int>(VAProcHighDynamicRangeMetadataTypeCount);
-        if (vaQueryVideoProcFilterCaps(vaDisplay, contextId, VAProcFilterHighDynamicRangeToneMapping, hdrCaps,
-                                       &hdrCapCount) == VA_STATUS_SUCCESS) {
-            for (unsigned int i = 0; i < hdrCapCount; ++i) {
-                if (hdrCaps[i].metadata_type != VAProcHighDynamicRangeMetadataNone &&
-                    (hdrCaps[i].caps_flag & VA_TONE_MAPPING_HDR_TO_SDR) != 0) {
-                    vaapi.hasHdrToneMapping = true;
-                    break;
-                }
-            }
         }
     }
 
@@ -1204,10 +1171,9 @@ auto cVaapiDevice::Stop() -> void {
     vaDestroySurfaces(vaDisplay, &surface, 1);
     vaDestroyConfig(vaDisplay, configId);
 
-    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s hdr_tonemap=%s",
+    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s",
             vaapi.hasDenoise ? "yes" : "no", vaapi.hasSharpness ? "yes" : "no",
-            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str(),
-            vaapi.hasHdrToneMapping ? "yes" : "no");
+            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str());
     return true;
 }
 
