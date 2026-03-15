@@ -148,9 +148,10 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
-    [[nodiscard]] auto OpenHardware() -> bool;         ///< Open DRM fd, create VAAPI device context, log codec support
-    [[nodiscard]] auto ProbeVppCapabilities() -> bool; ///< Query VAAPI decode profiles and VPP filter capabilities
-    auto ReleaseHardware() -> void;                    ///< Close VAAPI device reference and DRM file descriptor
+    [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI device context, log codec support
+    [[nodiscard]] auto ProbeVppCapabilities(std::string_view renderNode)
+        -> bool;                    ///< Query VAAPI decode profiles and VPP filter capabilities
+    auto ReleaseHardware() -> void; ///< Close VAAPI device reference and DRM file descriptor
     [[nodiscard]] auto SelectDrmConnector()
         -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order

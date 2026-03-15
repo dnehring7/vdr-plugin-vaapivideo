@@ -42,13 +42,13 @@ extern "C" {
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/pixfmt.h>
 }
 #pragma GCC diagnostic pop
 
 // VAAPI
 #include <va/va.h>
+#include <va/va_drm.h>
 #include <va/va_vpp.h>
 
 // DRM
@@ -1011,7 +1011,7 @@ auto cVaapiDevice::Stop() -> void {
     vaapi.hwDeviceRef = hwDevice;
     vaapi.drmFd = drmFd;
 
-    if (!ProbeVppCapabilities()) [[unlikely]] {
+    if (!ProbeVppCapabilities(renderNode)) [[unlikely]] {
         esyslog("vaapivideo/device: VPP unavailable -- GPU is not suitable for this plugin");
         av_buffer_unref(&vaapi.hwDeviceRef);
         close(drmFd);
@@ -1022,10 +1022,9 @@ auto cVaapiDevice::Stop() -> void {
     return true;
 }
 
-[[nodiscard]] auto cVaapiDevice::ProbeVppCapabilities() -> bool {
-    // Query VAAPI Video Processing Pipeline capabilities once at device init. The results are cached in vaapi and used
-    // by InitFilterGraph() on every stream change to build a filter chain that only contains supported filters. Returns
-    // false when VAEntrypointVideoProc is unavailable (fatal).
+[[nodiscard]] auto cVaapiDevice::ProbeVppCapabilities(std::string_view renderNode) -> bool {
+    // Probe decode profiles and VPP filter capabilities. Results cached in vaapi for InitFilterGraph().
+    // Returns false when VAEntrypointVideoProc is missing (fatal -- plugin cannot operate without VPP).
     vaapi.hasDenoise = false;
     vaapi.hasSharpness = false;
     vaapi.hwH264 = false;
@@ -1033,29 +1032,40 @@ auto cVaapiDevice::Stop() -> void {
     vaapi.hwMpeg2 = false;
     vaapi.deinterlaceMode.clear();
 
-    if (!vaapi.hwDeviceRef) [[unlikely]] {
-        esyslog("vaapivideo/device: VPP probe skipped -- no VAAPI device");
+    // Open a temporary VADisplay via vaGetDisplayDRM() instead of reusing FFmpeg's av_hwdevice_ctx.
+    // FFmpeg's VADisplay causes vaCreateContext failures on some Intel iHD driver versions.
+    const std::string renderPath{renderNode};
+    const int renderFd = open(renderPath.c_str(), O_RDWR | O_CLOEXEC);
+    if (renderFd < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: VPP probe failed -- cannot open render node: %s", strerror(errno));
         return false;
     }
 
-    // Extract VADisplay from FFmpeg's hardware device context.
-    const auto *hwDeviceCtx =
-        reinterpret_cast<const AVHWDeviceContext *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            vaapi.hwDeviceRef->data);
-    const auto *vaapiDevCtx = static_cast<const AVVAAPIDeviceContext *>(hwDeviceCtx->hwctx);
-    const VADisplay vaDisplay = vaapiDevCtx->display; // NOLINT(misc-misplaced-const)
+    VADisplay vaDisplay = vaGetDisplayDRM(renderFd);
+    if (!vaDisplay) [[unlikely]] {
+        esyslog("vaapivideo/device: VPP probe failed -- vaGetDisplayDRM error");
+        close(renderFd);
+        return false;
+    }
 
-    // Log the VA-API driver identity so the user can verify which backend is active (e.g. "Mesa Gallium" for AMD
-    // radeonsi).
+    int vaMajor = 0;
+    int vaMinor = 0;
+    if (vaInitialize(vaDisplay, &vaMajor, &vaMinor) != VA_STATUS_SUCCESS) [[unlikely]] {
+        esyslog("vaapivideo/device: VPP probe failed -- vaInitialize error");
+        close(renderFd);
+        return false;
+    }
+
     const char *vendorStr = vaQueryVendorString(vaDisplay);
     isyslog("vaapivideo/device: VA-API driver -- %s", vendorStr ? vendorStr : "(unknown)");
 
-    // --- Probe hardware decode profiles ---
-    // Check which broadcast codecs have VLD (decode) entrypoints with YUV420 output on this GPU. OpenCodec() uses
-    // these flags to decide between HW and SW decode paths. A profile listed without VLD is encode-only.
+    // Probe which broadcast codecs support hardware decode (VLD entrypoint + YUV420 output).
+    // OpenCodec() uses these flags to choose between HW and SW decode paths.
     const int maxProfiles = vaMaxNumProfiles(vaDisplay);
     if (maxProfiles <= 0) [[unlikely]] {
         esyslog("vaapivideo/device: vaMaxNumProfiles failed");
+        vaTerminate(vaDisplay);
+        close(renderFd);
         return false;
     }
     std::vector<VAProfile> profiles(static_cast<size_t>(maxProfiles));
@@ -1096,20 +1106,25 @@ auto cVaapiDevice::Stop() -> void {
     isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s", vaapi.hwMpeg2 ? "hw" : "sw",
             vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw");
 
-    // Create a minimal VPP config + context needed for the query API.
+    // vaQueryVideoProcFilters() requires a live VPP context; create a throwaway config + surface + context.
     VAConfigID configId = VA_INVALID_ID;
     if (vaCreateConfig(vaDisplay, VAProfileNone, VAEntrypointVideoProc, nullptr, 0, &configId) != VA_STATUS_SUCCESS)
         [[unlikely]] {
         esyslog("vaapivideo/device: VAEntrypointVideoProc unavailable -- cannot initialize");
+        vaTerminate(vaDisplay);
+        close(renderFd);
         return false;
     }
 
-    // A small dummy surface satisfies the vaCreateContext signature requirement.
+    // vaCreateContext requires at least one render target surface.
     VASurfaceID surface = VA_INVALID_SURFACE;
+    // Some iHD versions crash vaCreateContext with 0x0 dimensions.
     if (vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, 64, 64, &surface, 1, nullptr, 0) != VA_STATUS_SUCCESS)
         [[unlikely]] {
         vaDestroyConfig(vaDisplay, configId);
         esyslog("vaapivideo/device: VPP probe failed -- vaCreateSurfaces error");
+        vaTerminate(vaDisplay);
+        close(renderFd);
         return false;
     }
 
@@ -1118,10 +1133,11 @@ auto cVaapiDevice::Stop() -> void {
         vaDestroySurfaces(vaDisplay, &surface, 1);
         vaDestroyConfig(vaDisplay, configId);
         esyslog("vaapivideo/device: VPP probe failed -- vaCreateContext error");
+        vaTerminate(vaDisplay);
+        close(renderFd);
         return false;
     }
 
-    // --- Query supported filter types ---
     VAProcFilterType filters[VAProcFilterCount];
     auto numFilters = static_cast<unsigned int>(VAProcFilterCount);
     if (vaQueryVideoProcFilters(vaDisplay, contextId, filters, &numFilters) != VA_STATUS_SUCCESS) {
@@ -1136,40 +1152,37 @@ auto cVaapiDevice::Stop() -> void {
         }
     }
 
-    // --- Query deinterlacing capabilities ---
-    // Walk supported algorithms from best to worst; keep the first (best) match.
+    // Select best deinterlace algorithm. Table is ordered by quality (best first); pick first match.
     VAProcFilterCapDeinterlacing deintCaps[VAProcDeinterlacingCount];
     auto numDeintCaps = static_cast<unsigned int>(VAProcDeinterlacingCount);
     if (vaQueryVideoProcFilterCaps(vaDisplay, contextId, VAProcFilterDeinterlacing, deintCaps, &numDeintCaps) ==
         VA_STATUS_SUCCESS) {
-        // Preference order: motion_compensated > motion_adaptive > weave > bob. Map each type to a priority; higher is
-        // better.
         static constexpr struct {
             VAProcDeinterlacingType type;
-            int priority;
             const char *name;
         } kDeintModes[] = {
-            {.type = VAProcDeinterlacingMotionCompensated, .priority = 4, .name = "motion_compensated"},
-            {.type = VAProcDeinterlacingMotionAdaptive, .priority = 3, .name = "motion_adaptive"},
-            {.type = VAProcDeinterlacingWeave, .priority = 2, .name = "weave"},
-            {.type = VAProcDeinterlacingBob, .priority = 1, .name = "bob"},
+            {.type = VAProcDeinterlacingMotionCompensated, .name = "motion_compensated"},
+            {.type = VAProcDeinterlacingMotionAdaptive, .name = "motion_adaptive"},
+            {.type = VAProcDeinterlacingWeave, .name = "weave"},
+            {.type = VAProcDeinterlacingBob, .name = "bob"},
         };
 
-        int bestPriority = 0;
-        for (unsigned int i = 0; i < numDeintCaps; ++i) {
-            for (const auto &[type, priority, name] : kDeintModes) {
-                if (deintCaps[i].type == type && priority > bestPriority) {
-                    bestPriority = priority;
-                    vaapi.deinterlaceMode = name;
-                }
+        const auto *begin = static_cast<const VAProcFilterCapDeinterlacing *>(deintCaps);
+        const auto *end = begin + numDeintCaps;
+        for (const auto &[type, name] : kDeintModes) {
+            if (std::any_of(begin, end, [type](const auto &c) -> bool { return c.type == type; })) {
+                vaapi.deinterlaceMode = name;
+                break;
             }
         }
     }
 
-    // --- Cleanup temporary VAAPI resources ---
+    // VADisplay has no RAII wrapper -- manual teardown in reverse creation order.
     vaDestroyContext(vaDisplay, contextId);
     vaDestroySurfaces(vaDisplay, &surface, 1);
     vaDestroyConfig(vaDisplay, configId);
+    vaTerminate(vaDisplay);
+    close(renderFd);
 
     isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s",
             vaapi.hasDenoise ? "yes" : "no", vaapi.hasSharpness ? "yes" : "no",

@@ -103,7 +103,7 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.1.1";
+inline constexpr const char *PLUGIN_VERSION = "1.2.0";
 
 // ============================================================================
 // === CONSTANTS ===
