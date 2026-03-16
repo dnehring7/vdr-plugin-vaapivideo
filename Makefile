@@ -41,7 +41,7 @@ APIVERSION = $(call PKGCFG,apiversion)
 # ------------------------------------------------------------
 # Dependencies (pkg-config)
 # ------------------------------------------------------------
-REQUIRED_LIBS = libavfilter libavformat libavcodec libavutil libdrm alsa
+REQUIRED_LIBS = alsa libavcodec libavfilter libavformat libavutil libdrm libva-drm
 
 # Library Validation Function
 define check_lib
