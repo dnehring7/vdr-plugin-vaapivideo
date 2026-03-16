@@ -461,21 +461,6 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
-    // Stream-type detection is deferred to here because cTransferControl -- which determines Transferring() -- may not
-    // exist yet when SetPlayMode() is called.
-    const uchar lastId = prevAudioStreamId.load(std::memory_order_relaxed);
-    if (lastId != Id) [[unlikely]] {
-        if (lastId != 0xFF) {
-            dsyslog("vaapivideo/device: audio stream ID change 0x%02X -> 0x%02X", lastId, Id);
-        }
-        // Different stream ID means a new elementary stream (e.g. after a channel change that races with Transfer Mode
-        // startup). Force full codec re-detection.
-        audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-        codecHysteresis = AV_CODEC_ID_NONE;
-        codecHysteresisCount = 0;
-    }
-    prevAudioStreamId.store(Id, std::memory_order_relaxed);
-
     const auto pes = ParsePes({Data, static_cast<size_t>(Length)});
     if (!pes.isAudio || pes.payloadSize == 0) [[unlikely]] {
         return Length;
@@ -501,6 +486,8 @@ auto cVaapiDevice::Play() -> void {
         }
 
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
+        codecHysteresis = AV_CODEC_ID_NONE;
+        codecHysteresisCount = 0;
         // Reset A/V sync -- audio clock is invalid after codec change.
         if (decoder) {
             decoder->NotifyAudioChange();
@@ -526,7 +513,6 @@ auto cVaapiDevice::Play() -> void {
                     } else {
                         esyslog("vaapivideo/device: failed to switch to audio codec %s",
                                 avcodec_get_name(detectedCodec));
-                        return Length;
                     }
                     codecHysteresis = AV_CODEC_ID_NONE;
                     codecHysteresisCount = 0;
@@ -687,13 +673,18 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
                                    : "unknown",
             static_cast<int>(Type), track ? ", lang=" : "", track ? track->language : "");
 
-    // Resetting to 0xFF forces PlayAudio() to treat the very next packet as a stream-ID change and drop any accumulated
-    // hysteresis state for the previous track.
-    prevAudioStreamId.store(0xFF, std::memory_order_relaxed);
+    // Force codec re-detection -- the new track may use a different codec.
+    audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
 
     // Flush now so the tail of the old track is never rendered during the switch.
     if (audioProcessor) [[likely]] {
         audioProcessor->Clear();
+    }
+
+    // Reset A/V sync so the decoder waits for the new audio clock instead of running freerun
+    // while the transfer thread detects and opens the new codec.
+    if (decoder) [[likely]] {
+        decoder->NotifyAudioChange();
     }
 }
 
@@ -720,7 +711,6 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
                 decoder->SetTrickSpeed(0);
                 decoder->RequestCodecReopen();
             }
-            prevAudioStreamId.store(0xFF, std::memory_order_relaxed);
             codecHysteresis = AV_CODEC_ID_NONE;
             codecHysteresisCount = 0;
             videoCodecCandidate = AV_CODEC_ID_NONE;

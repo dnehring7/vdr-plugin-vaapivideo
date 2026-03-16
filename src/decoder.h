@@ -181,8 +181,10 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === A/V SYNC ===
     // ========================================================================
-    bool syncCorrectionDone{}; ///< True after first-frame alignment; gates tight vs. relaxed wait threshold
-    cTimeMs nextSyncLog;       ///< Deadline for the next periodic sync status log
+    std::atomic<bool> logSyncNow{}; ///< Set by NotifyAudioChange()/Clear() to force an immediate sync status log
+    std::atomic<bool>
+        syncCorrectionDone{}; ///< True after first-frame alignment; gates tight vs. relaxed wait threshold
+    cTimeMs nextSyncLog;      ///< Deadline for the next periodic sync status log (decoder thread only)
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

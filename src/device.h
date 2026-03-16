@@ -177,7 +177,6 @@ class cVaapiDevice : public cDevice {
     int osdHeight{};                                 ///< Cached display height for OSD allocation (pixels)
     int osdWidth{};                                  ///< Cached display width for OSD allocation (pixels)
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
-    std::atomic<uchar> prevAudioStreamId{0xFF};      ///< Stream ID of last audio PES; 0xFF = none seen yet
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     std::atomic<int> trickSpeed;                     ///< Active VDR trick speed index; 0 = normal playback
     VaapiContext vaapi{};                            ///< Shared VAAPI context (hwDeviceRef + drmFd borrow)
