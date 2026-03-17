@@ -780,7 +780,7 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    // Extract source frame properties.
+    // Source frame properties.
     const int srcWidth = firstFrame->width;
     const int srcHeight = firstFrame->height;
     const bool isInterlaced = (firstFrame->flags & AV_FRAME_FLAG_INTERLACED) != 0;
@@ -792,12 +792,9 @@ auto cVaapiDecoder::Action() -> void {
     const uint32_t dstWidth = display->GetOutputWidth();
     const uint32_t dstHeight = display->GetOutputHeight();
 
-    // Compute the Display Aspect Ratio (DAR) of the source from its coded dimensions and Sample Aspect Ratio (SAR): DAR
-    // = (srcWidth x sarNum) : (srcHeight x sarDen). Then fit that DAR into the display bounds to get the final VAAPI
-    // output size. This produces letterbox (bars top/bottom) when video is wider than the display, or pillarbox (bars
-    // left/right) when narrower. The DRM plane presents the output at 1:1 pixel mapping (no hardware scaler). Normalize
-    // SAR: treat 0/0 (unknown) and 0/N as 1:1 square pixels. Both the DAR computation and the buffer source filter args
-    // must use the same values.
+    // Compute DAR = (srcWidth * sarNum) : (srcHeight * sarDen), then fit into the display bounds to get the final
+    // output size (letterbox or pillarbox). DRM presents at 1:1 pixel mapping (no HW scaler). Normalize SAR: treat
+    // 0/0 and 0/N as 1:1 square pixels. Both DAR and the buffer source args must use the same SAR values.
     const int sarNum = firstFrame->sample_aspect_ratio.num > 0 ? firstFrame->sample_aspect_ratio.num : 1;
     const int sarDen = firstFrame->sample_aspect_ratio.den > 0 ? firstFrame->sample_aspect_ratio.den : 1;
 
@@ -807,29 +804,22 @@ auto cVaapiDecoder::Action() -> void {
     uint32_t filterWidth = dstWidth;
     uint32_t filterHeight = dstHeight;
 
-    // Cross-multiply to compare DAR with display aspect without floating point:
-    //   darNum / darDen  vs  dstWidth / dstHeight
-    //   darNum * dstHeight  vs  darDen * dstWidth
+    // Integer cross-multiply: darNum/darDen vs dstWidth/dstHeight (no floating point).
     if (darNum * dstHeight > darDen * static_cast<uint64_t>(dstWidth)) {
-        // Video is wider than display -> letterbox (black bars top/bottom).
+        // Wider -> letterbox.
         filterWidth = dstWidth;
         filterHeight = static_cast<uint32_t>(static_cast<uint64_t>(dstWidth) * darDen / darNum);
     } else if (darNum * dstHeight < darDen * static_cast<uint64_t>(dstWidth)) {
-        // Video is narrower than display -> pillarbox (black bars left/right).
+        // Narrower -> pillarbox.
         filterHeight = dstHeight;
         filterWidth = static_cast<uint32_t>(static_cast<uint64_t>(dstHeight) * darNum / darDen);
     }
-    // else: DAR matches display aspect exactly -- fill the entire screen.
 
-    // Enforce even dimensions (NV12 chroma alignment) and a minimum of 2.
+    // Even dimensions for NV12 chroma alignment, minimum 2.
     filterWidth = std::max(filterWidth & ~1U, 2U);
     filterHeight = std::max(filterHeight & ~1U, 2U);
 
-    // Build the filter chain string (left-to-right). All chains normalize to NV12 with BT.709 color matrix so the
-    // display pipeline sees a consistent format. The graph persists across trick-mode transitions and is rebuilt only
-    // after Clear() or codec change.
-
-    // Select denoise/sharpen levels: UHD = off (GPU-bound at 4K), MPEG-2 SD = heavy, H.264/HEVC HD = moderate.
+    // Denoise/sharpen levels: UHD = off (GPU-bound), MPEG-2 SD = heavy, H.264/HEVC HD = moderate.
     int denoiseLevel = 0;
     int sharpnessLevel = 0;
 
@@ -843,44 +833,57 @@ auto cVaapiDecoder::Action() -> void {
         }
     }
 
-    // HQ scaling mode is expensive at 4K; skip it for UHD sources to stay within the GPU's real-time budget.
-    const char *scaleMode = isUhd ? "" : ":mode=hq";
+    const bool needsResize =
+        (filterWidth != static_cast<uint32_t>(srcWidth) || filterHeight != static_cast<uint32_t>(srcHeight));
 
-    // Scale filter: always present -- handles format conversion to NV12 and DAR-fitting geometry.
-    const std::string scaleFilter =
-        std::format("scale_vaapi=w={}:h={}{}:format=nv12:out_color_matrix=bt709:out_range=tv", filterWidth,
-                    filterHeight, scaleMode);
-
-    std::string filterChain;
+    // Build the filter chain as a list of stages joined by commas. All paths normalize to NV12 BT.709.
+    // SW path:  [bwdif] -> [hqdn3d] -> format=nv12 -> hwupload -> [scale_vaapi] -> [sharpness_vaapi]
+    // HW path:  [deinterlace_vaapi] -> [denoise_vaapi] -> [scale_vaapi] -> [sharpness_vaapi]
+    std::vector<std::string> filters;
 
     if (isSoftwareDecode) {
-        // Software-decoded frames are in system memory; use SW filters (bwdif, hqdn3d) before hwupload for superior
-        // quality, then VAAPI VPP for scale/sharpen.
+        // SW filters before hwupload for superior quality, then VAAPI VPP for scale/sharpen.
         if (isInterlaced) {
-            // bwdif (Bob Weaver Deinterlacing Filter) combines w3fdif + yadif with cubic interpolation -- superior to
-            // VAAPI motion_adaptive on AMD/Mesa.
-            filterChain += "bwdif=mode=send_field:parity=auto:deint=all,";
+            // bwdif: w3fdif + yadif with cubic interpolation; better than VAAPI motion_adaptive on AMD/Mesa.
+            filters.emplace_back("bwdif=mode=send_field:parity=auto:deint=all");
         }
         if (denoiseLevel > 0) {
-            // hqdn3d: high-quality 3D denoise (spatial + temporal). Single param sets luma_spatial; chroma and temporal
-            // strengths auto-derive. SD MPEG-2 broadcast -> 4 (heavier artifacts), HD -> 2 (light).
+            // hqdn3d: spatial + temporal denoise. SD MPEG-2 -> 4 (heavier), HD -> 2 (light).
             const int hqdn3dStrength = (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) ? 4 : 2;
-            filterChain += std::format("hqdn3d={},", hqdn3dStrength);
+            filters.push_back(std::format("hqdn3d={}", hqdn3dStrength));
         }
-        filterChain += std::format("format=nv12,hwupload,{}", scaleFilter);
+        filters.emplace_back("format=nv12");
+        filters.emplace_back("hwupload");
     } else {
-        // Hardware-decoded: use VAAPI VPP filters before scale.
+        // VAAPI VPP filters before scale.
         if (isInterlaced && !vaapiContext->deinterlaceMode.empty()) {
-            filterChain += std::format("deinterlace_vaapi=mode={}:rate=field,", vaapiContext->deinterlaceMode);
+            filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", vaapiContext->deinterlaceMode));
         }
         if (denoiseLevel > 0 && vaapiContext->hasDenoise) {
-            filterChain += std::format("denoise_vaapi=denoise={},", denoiseLevel);
+            filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
         }
-        filterChain += scaleFilter;
+    }
+
+    // scale_vaapi: always present for NV12/BT.709 normalization. Skip resize + HQ mode when src == dst geometry.
+    if (needsResize) {
+        const char *scaleMode = isUhd ? "" : ":mode=hq"; // HQ too expensive at 4K
+        filters.push_back(std::format("scale_vaapi=w={}:h={}{}:format=nv12:out_color_matrix=bt709:out_range=tv",
+                                      filterWidth, filterHeight, scaleMode));
+    } else {
+        filters.emplace_back("scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv");
     }
 
     if (sharpnessLevel > 0 && vaapiContext->hasSharpness) {
-        filterChain += std::format(",sharpness_vaapi=sharpness={}", sharpnessLevel);
+        filters.push_back(std::format("sharpness_vaapi=sharpness={}", sharpnessLevel));
+    }
+
+    // Join stages into a comma-separated filter chain.
+    std::string filterChain;
+    for (size_t i = 0; i < filters.size(); ++i) {
+        if (i > 0) {
+            filterChain += ',';
+        }
+        filterChain += filters[i];
     }
 
     // ---- Create FFmpeg filter graph ----
@@ -891,21 +894,19 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    // framerate.num may be 0 for VBR streams; fall back to 50 fps (European DVB default).
+    // Fall back to 50 fps (DVB default) for VBR streams with unknown framerate.
     const int fpsNum = codecCtx->framerate.num > 0 ? codecCtx->framerate.num : 50;
     const int fpsDen = codecCtx->framerate.den > 0 ? codecCtx->framerate.den : 1;
 
-    // Use numeric pix_fmt value (matches FFmpeg HW filtering examples and avoids name-lookup issues across FFmpeg
-    // versions with hardware pixel format aliases).
+    // Numeric pix_fmt avoids name-lookup issues across FFmpeg versions with HW format aliases.
     const std::string bufferSrcArgs =
         std::format("video_size={}x{}:pix_fmt={}:time_base=1/90000:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
                     srcHeight, static_cast<int>(srcPixFmt), sarNum, sarDen, fpsNum, fpsDen);
 
     dsyslog("vaapivideo/decoder: buffer source args='%s'", bufferSrcArgs.c_str());
 
-    // Allocate the buffer source filter without running its init callback yet. For hardware decode, hw_frames_ctx must
-    // be attached before init runs -- FFmpeg 7.x validates that hardware pixel formats carry a hw_frames_ctx during
-    // init_video() and returns EINVAL if it is missing.
+    // Allocate buffer source without init -- hw_frames_ctx must be attached first (FFmpeg 7.x validates it in
+    // init_video()).
     bufferSrcCtx = avfilter_graph_alloc_filter(filterGraph.get(), avfilter_get_by_name("buffer"), "in");
     if (!bufferSrcCtx) [[unlikely]] {
         esyslog("vaapivideo/decoder: failed to allocate buffer source filter");
@@ -913,9 +914,7 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    // For hardware decode, set hw_frames_ctx before filter init so the buffer source knows the pixel format is backed
-    // by VAAPI surfaces. Software-decoded frames are in system memory; hwupload in the filter chain handles GPU
-    // transfer.
+    // HW decode: attach hw_frames_ctx before init so the buffer source knows the format is VAAPI-backed.
     if (!isSoftwareDecode) {
         AVBufferSrcParameters *hwFramesParams = av_buffersrc_parameters_alloc();
         if (!hwFramesParams) [[unlikely]] {
@@ -937,13 +936,11 @@ auto cVaapiDecoder::Action() -> void {
             ResetFilterGraph();
             return false;
         }
-        // AVBufferSrcParameters is a plain C struct; the FFmpeg API mandates av_free(). Its internal hw_frames_ctx
-        // buffer is now owned by the filter node, not by us.
+        // hw_frames_ctx now owned by the filter node; plain C struct requires av_free().
         av_free(hwFramesParams);
     }
 
-    // Initialize the buffer source -- parses the args string and runs init_video() which validates parameters
-    // (including the hw_frames_ctx set above).
+    // Init buffer source: parses args and validates hw_frames_ctx.
     int ret = avfilter_init_str(bufferSrcCtx, bufferSrcArgs.c_str());
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/decoder: failed to init buffer source '%s': %s", bufferSrcArgs.c_str(), AvErr(ret).data());
@@ -959,10 +956,8 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    // avfilter_graph_parse_ptr() connects the string-described chain between
-    // the two named endpoints. FFmpeg's parameter naming convention:
-    //   3rd param "inputs"  = open graph inputs  -> the sink end   ("out")
-    //   4th param "outputs" = open graph outputs -> the source end ("in")
+    // Wire the filter chain between the buffer source ("in") and buffersink ("out") endpoints.
+    // FFmpeg convention: "inputs" = sink end, "outputs" = source end.
     AVFilterInOut *graphInputs = avfilter_inout_alloc();
     AVFilterInOut *graphOutputs = avfilter_inout_alloc();
     if (!graphInputs || !graphOutputs) [[unlikely]] {
@@ -988,8 +983,7 @@ auto cVaapiDecoder::Action() -> void {
         return false;
     }
 
-    // For software decode, the hwupload filter needs to know which VAAPI device to target. Set hw_device_ctx on all
-    // filter nodes before graph configuration.
+    // SW decode: hwupload needs a target VAAPI device on every filter node.
     if (isSoftwareDecode) {
         for (unsigned int i = 0; i < filterGraph->nb_filters; ++i) {
             filterGraph->filters[i]->hw_device_ctx = av_buffer_ref(vaapiContext->hwDeviceRef);
