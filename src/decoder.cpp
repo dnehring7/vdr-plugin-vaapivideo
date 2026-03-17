@@ -70,6 +70,7 @@ extern "C" {
 constexpr size_t DECODER_QUEUE_CAPACITY = 50;              ///< Video packet queue depth (~2 s at 25 fps)
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;             ///< Timeout when submitting a frame to the display (ms)
 constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 500 * 90; ///< Re-sync when drift exceeds this (PTS ticks, ~500 ms)
+constexpr int DECODER_SYNC_FREERUN_FRAMES = 10; ///< Frames to submit without sync after Clear() (~200 ms at 50 Hz)
 
 // ============================================================================
 // === STRUCTURES ===
@@ -160,6 +161,7 @@ auto cVaapiDecoder::Clear() -> void {
 
     lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 
+    freerunFramesLeft.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
     syncCorrectionDone.store(false, std::memory_order_release);
     logSyncNow.store(true, std::memory_order_relaxed);
 }
@@ -1073,33 +1075,71 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         lastPts.store(originalPts, std::memory_order_release);
     }
 
-    // --- Freerun: no audio or no PTS ---
+    // --- Freerun: no audio processor or no PTS ---
     if (!audioProcessor || originalPts == AV_NOPTS_VALUE) {
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
+
+    // --- Phase 1: initial freerun -- submit immediately to get picture on screen fast ---
+    if (freerunFramesLeft.load(std::memory_order_acquire) > 0) {
+        freerunFramesLeft.fetch_sub(1, std::memory_order_relaxed);
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
     const int64_t latency = static_cast<int64_t>(vaapiConfig.audioLatency) * 90;
     int64_t clock = audioProcessor->GetClock();
-
     const bool synced = syncCorrectionDone.load(std::memory_order_acquire);
 
-    // Hold first frame until audio clock arrives (up to 3 s).
-    if (clock == AV_NOPTS_VALUE && !synced) {
-        const cTimeMs waitTimeout(3000);
-        while (!stopping.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) == 0 &&
-               !waitTimeout.TimedOut()) {
-            cCondWait::SleepMs(10);
-            clock = audioProcessor->GetClock();
-            if (clock != AV_NOPTS_VALUE) {
-                break;
+    // --- Phase 2: one-shot sync -- single blocking wait to align video to audio ---
+    if (!synced) {
+        // Wait for audio clock to become available (up to 3 s).
+        if (clock == AV_NOPTS_VALUE) {
+            const cTimeMs waitTimeout(3000);
+            while (!stopping.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) == 0 &&
+                   !waitTimeout.TimedOut()) {
+                cCondWait::SleepMs(10);
+                clock = audioProcessor->GetClock();
+                if (clock != AV_NOPTS_VALUE) {
+                    break;
+                }
             }
         }
+        if (clock == AV_NOPTS_VALUE) {
+            // Audio still unavailable -- mark synced to avoid blocking on every subsequent frame.
+            syncCorrectionDone.store(true, std::memory_order_release);
+            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        }
+
+        int64_t delta = originalPts - clock - latency;
+        dsyslog("vaapivideo/decoder: one-shot sync d=%+lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
+                static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
+
+        // Video ahead: single blocking wait for audio to catch up.
+        if (delta > 0) {
+            const cTimeMs waitTimeout(static_cast<int>(std::min(delta / 90 + 10, int64_t{3000})));
+            while (delta > 0 && !stopping.load(std::memory_order_relaxed) &&
+                   trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
+                cCondWait::SleepMs(10);
+                clock = audioProcessor->GetClock();
+                if (clock == AV_NOPTS_VALUE) {
+                    break;
+                }
+                delta = originalPts - clock - latency;
+            }
+        }
+
+        dsyslog("vaapivideo/decoder: sync acquired d=%+lldms", static_cast<long long>(delta / 90));
+        syncCorrectionDone.store(true, std::memory_order_release);
+        nextSyncLog.Set(30000);
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
+
+    // --- Phase 3: steady state -- submit immediately, drop only when too far behind ---
     if (clock == AV_NOPTS_VALUE) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    int64_t delta = originalPts - clock - latency;
+    const int64_t delta = originalPts - clock - latency;
 
     if (logSyncNow.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
         dsyslog("vaapivideo/decoder: sync status d=%lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
@@ -1107,33 +1147,9 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         nextSyncLog.Set(30000);
     }
 
-    // Video behind audio beyond threshold: drop to catch up.
     if (delta < -DECODER_SYNC_DRIFT_THRESHOLD) {
-        if (synced) {
-            dsyslog("vaapivideo/decoder: sync drop d=%+lldms", static_cast<long long>(delta / 90));
-        }
+        dsyslog("vaapivideo/decoder: sync drop d=%+lldms", static_cast<long long>(delta / 90));
         return true;
-    }
-
-    // Strict pacing: prevent video from ever running ahead of audio. This forces an immediate shot
-    // to 0 and naturally prevents positive drift without needing a separate steady-state correction.
-    if (delta > 0) {
-        if (!synced) {
-            dsyslog("vaapivideo/decoder: initial shot to 0, sync wait d=%+lldms", static_cast<long long>(delta / 90));
-            syncCorrectionDone.store(true, std::memory_order_release);
-        }
-        const cTimeMs waitTimeout(std::min(static_cast<int>(delta / 90) + 10, 3000));
-        while (delta > 0 && !stopping.load(std::memory_order_relaxed) &&
-               trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
-            cCondWait::SleepMs(2);
-            clock = audioProcessor->GetClock();
-            if (clock == AV_NOPTS_VALUE) {
-                break;
-            }
-            delta = originalPts - clock - latency;
-        }
-    } else if (!synced) {
-        syncCorrectionDone.store(true, std::memory_order_release);
     }
 
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
