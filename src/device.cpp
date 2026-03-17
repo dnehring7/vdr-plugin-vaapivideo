@@ -451,7 +451,7 @@ auto cVaapiDevice::Play() -> void {
     paused.store(false, std::memory_order_relaxed);
 }
 
-[[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar Id) -> int {
+[[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar /*Id*/) -> int {
     if (!Data || Length <= 0 || paused.load(std::memory_order_relaxed) ||
         trickSpeed.load(std::memory_order_relaxed) != 0) [[unlikely]] {
         return Length;

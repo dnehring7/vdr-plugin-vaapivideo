@@ -181,10 +181,10 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === A/V SYNC ===
     // ========================================================================
-    std::atomic<int> freerunFramesLeft{}; ///< Phase-1 counter: frames to submit without sync after Clear()
-    std::atomic<bool> logSyncNow{};       ///< Set by NotifyAudioChange()/Clear() to force an immediate sync status log
-    std::atomic<bool> syncCorrectionDone{}; ///< True after one-shot alignment; gates the drop threshold
-    cTimeMs nextSyncLog;                    ///< Deadline for the next periodic sync status log (decoder thread only)
+    std::atomic<int> freerunFramesLeft;   ///< Phase-1 counter: frames to submit without sync after Clear()
+    std::atomic<bool> logSyncNow;         ///< Set by NotifyAudioChange()/Clear() to force an immediate sync status log
+    std::atomic<bool> syncCorrectionDone; ///< True after one-shot alignment; gates the drop threshold
+    cTimeMs nextSyncLog;                  ///< Deadline for the next periodic sync status log (decoder thread only)
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

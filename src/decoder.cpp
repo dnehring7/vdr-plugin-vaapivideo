@@ -67,9 +67,10 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr size_t DECODER_QUEUE_CAPACITY = 50;              ///< Video packet queue depth (~2 s at 25 fps)
-constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;             ///< Timeout when submitting a frame to the display (ms)
-constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 500 * 90; ///< Re-sync when drift exceeds this (PTS ticks, ~500 ms)
+constexpr size_t DECODER_QUEUE_CAPACITY = 50;               ///< Video packet queue depth (~2 s at 25 fps)
+constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;              ///< Timeout when submitting a frame to the display (ms)
+constexpr int64_t DECODER_SYNC_CATCHUP_THRESHOLD = 30 * 90; ///< Drop sync frames when video still >30 ms behind
+constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 500 * 90;  ///< Re-sync when drift exceeds this (PTS ticks, ~500 ms)
 constexpr int DECODER_SYNC_FREERUN_FRAMES = 10; ///< Frames to submit without sync after Clear() (~200 ms at 50 Hz)
 
 // ============================================================================
@@ -879,11 +880,11 @@ auto cVaapiDecoder::Action() -> void {
 
     // Join stages into a comma-separated filter chain.
     std::string filterChain;
-    for (size_t i = 0; i < filters.size(); ++i) {
-        if (i > 0) {
+    for (const auto &filter : filters) {
+        if (!filterChain.empty()) {
             filterChain += ',';
         }
-        filterChain += filters[i];
+        filterChain += filter;
     }
 
     // ---- Create FFmpeg filter graph ----
@@ -1016,8 +1017,16 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
-    // A/V sync -- audio clock master. delta = vPTS - aClock - latency (positive = early, negative = late).
-    // Trick mode -> pace via timer | Freerun -> submit | Ahead -> wait | In sync -> submit | Late -> drop
+    // A/V sync -- audio clock master.  delta = vPTS - audioClock - latency
+    //   positive delta = video ahead (early)    -> block until audio catches up
+    //   negative delta = video behind (late)    -> drop frame
+    //
+    // Phases:
+    //   1. Trick mode    -- pacing timer, no sync
+    //   2. Freerun       -- no clock or first N frames after Clear()
+    //   3. Steady state  -- submit if |delta| < 500 ms, else trigger re-sync
+    //   4. Sync align    -- one-shot (initial) or drift re-sync (fallthrough from phase 3)
+    //                       wait for clock, wait for delta <= 0, catchup-drop if still behind
 
     if (!frame || !display) [[unlikely]] {
         return false;
@@ -1025,12 +1034,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 
     const int64_t originalPts = frame->pts;
 
-    // --- Trick mode: pace via timer, no A/V sync ---
+    // --- Trick mode: pacing timer, no A/V sync ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
         const bool newSource = (originalPts != prevTrickPts);
         const int64_t savedPrevPts = prevTrickPts;
 
-        // Reverse: PTS must decrease monotonically.
+        // Reverse playback: PTS must decrease monotonically.
         if (isTrickReverse && newSource && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE &&
             originalPts > savedPrevPts) {
             return true;
@@ -1042,7 +1051,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
             lastPts.store(originalPts, std::memory_order_release);
         }
 
-        // Fast mode: wait for pacing timer.
+        // Fast-forward/reverse: block until the pacing timer expires.
         if (newSource && trickMultiplier > 0) {
             const uint64_t due = nextTrickFrameDue.load(std::memory_order_acquire);
             while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
@@ -1051,7 +1060,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
             }
         }
 
-        // Arm pacing timer for the next source frame.
+        // Arm the pacing timer for the next source frame.
         if (newSource) {
             if (trickMultiplier > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
                 const auto ptsDelta = static_cast<uint64_t>(std::abs(originalPts - savedPrevPts));
@@ -1069,12 +1078,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         lastPts.store(originalPts, std::memory_order_release);
     }
 
-    // --- Freerun: no audio processor or no PTS ---
+    // --- Freerun: no audio clock or no PTS available ---
     if (!audioProcessor || originalPts == AV_NOPTS_VALUE) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // --- Phase 1: initial freerun -- submit immediately to get picture on screen fast ---
+    // --- Freerun: first N frames after Clear() -- show picture immediately ---
     if (freerunFramesLeft.load(std::memory_order_acquire) > 0) {
         freerunFramesLeft.fetch_sub(1, std::memory_order_relaxed);
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
@@ -1084,67 +1093,101 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     int64_t clock = audioProcessor->GetClock();
     const bool synced = syncCorrectionDone.load(std::memory_order_acquire);
 
-    // --- Phase 2: one-shot sync -- single blocking wait to align video to audio ---
-    if (!synced) {
-        // Wait for audio clock to become available (up to 3 s).
+    // --- Steady state: submit in-range frames, trigger re-sync on drift ---
+    if (synced) {
         if (clock == AV_NOPTS_VALUE) {
-            const cTimeMs waitTimeout(3000);
-            while (!stopping.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) == 0 &&
-                   !waitTimeout.TimedOut()) {
-                cCondWait::SleepMs(10);
-                clock = audioProcessor->GetClock();
-                if (clock != AV_NOPTS_VALUE) {
-                    break;
-                }
-            }
-        }
-        if (clock == AV_NOPTS_VALUE) {
-            // Audio still unavailable -- mark synced to avoid blocking on every subsequent frame.
-            syncCorrectionDone.store(true, std::memory_order_release);
             return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
         }
 
-        int64_t delta = originalPts - clock - latency;
+        const int64_t delta = originalPts - clock - latency;
+
+        if (logSyncNow.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
+            dsyslog("vaapivideo/decoder: sync status d=%lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
+                    static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
+            nextSyncLog.Set(30000);
+        }
+
+        // Video too far behind: drop frame, trigger re-sync on the next one.
+        if (delta < -DECODER_SYNC_DRIFT_THRESHOLD) {
+            dsyslog("vaapivideo/decoder: sync drop d=%+lldms, triggering re-sync", static_cast<long long>(delta / 90));
+            syncCorrectionDone.store(false, std::memory_order_release);
+            logSyncNow.store(true, std::memory_order_relaxed);
+            return true;
+        }
+
+        // Within tolerance: submit normally.
+        if (delta <= DECODER_SYNC_DRIFT_THRESHOLD) {
+            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        }
+
+        // Video too far ahead (e.g. DVB PTS discontinuity): fall through to sync alignment.
+        dsyslog("vaapivideo/decoder: drift re-sync d=%+lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
+                static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
+    }
+
+    // --- Sync alignment (one-shot after Clear() or drift re-sync from above) ---
+
+    // Step 1: wait up to 3 s for audio clock to become available.
+    if (clock == AV_NOPTS_VALUE) {
+        const cTimeMs waitTimeout(3000);
+        while (clock == AV_NOPTS_VALUE && !stopping.load(std::memory_order_relaxed) &&
+               trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
+            cCondWait::SleepMs(5);
+            clock = audioProcessor->GetClock();
+        }
+    }
+    if (clock == AV_NOPTS_VALUE) {
+        // No clock after 3 s: mark synced to avoid blocking every subsequent frame.
+        syncCorrectionDone.store(true, std::memory_order_release);
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
+
+    int64_t delta = originalPts - clock - latency;
+
+    if (!synced) {
         dsyslog("vaapivideo/decoder: one-shot sync d=%+lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
                 static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
+    }
 
-        // Video ahead: single blocking wait for audio to catch up.
-        if (delta > 0) {
-            const cTimeMs waitTimeout(static_cast<int>(std::min(delta / 90 + 10, int64_t{3000})));
-            while (delta > 0 && !stopping.load(std::memory_order_relaxed) &&
-                   trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
-                cCondWait::SleepMs(10);
-                clock = audioProcessor->GetClock();
-                if (clock == AV_NOPTS_VALUE) {
-                    break;
-                }
+    // Step 2: if video is ahead, block until audio catches up (or timeout).
+    if (delta > 0) {
+        const cTimeMs waitTimeout(static_cast<int>(std::min((delta / 90) + 10, int64_t{3000})));
+        while (delta > 0 && clock != AV_NOPTS_VALUE && !stopping.load(std::memory_order_relaxed) &&
+               trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
+            cCondWait::SleepMs(5);
+            clock = audioProcessor->GetClock();
+            if (clock != AV_NOPTS_VALUE) {
                 delta = originalPts - clock - latency;
             }
         }
-
-        dsyslog("vaapivideo/decoder: sync acquired d=%+lldms", static_cast<long long>(delta / 90));
-        syncCorrectionDone.store(true, std::memory_order_release);
-        nextSyncLog.Set(30000);
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // --- Phase 3: steady state -- submit immediately, drop only when too far behind ---
+    // Step 3: audio clock lost during wait (codec reinit). Submit frame without marking synced;
+    // NotifyAudioChange() already reset syncCorrectionDone -- the next frame retries.
     if (clock == AV_NOPTS_VALUE) {
+        dsyslog("vaapivideo/decoder: %ssync deferred (audio clock lost during wait)", synced ? "drift re-" : "");
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    const int64_t delta = originalPts - clock - latency;
-
-    if (logSyncNow.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-        dsyslog("vaapivideo/decoder: sync status d=%lldms vPTS=%lld aPTS=%lld", static_cast<long long>(delta / 90),
-                static_cast<long long>(originalPts / 90), static_cast<long long>(clock / 90));
-        nextSyncLog.Set(30000);
+    // Step 4: audio codec changed during a drift re-sync wait (NotifyAudioChange() cleared
+    // syncCorrectionDone). Submit this frame, let the next frame do a fresh one-shot.
+    if (synced && !syncCorrectionDone.load(std::memory_order_acquire)) {
+        dsyslog("vaapivideo/decoder: drift re-sync aborted (audio changed during wait) d=%+lldms",
+                static_cast<long long>(delta / 90));
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    if (delta < -DECODER_SYNC_DRIFT_THRESHOLD) {
-        dsyslog("vaapivideo/decoder: sync drop d=%+lldms", static_cast<long long>(delta / 90));
+    // Step 5: video still behind -- drop frame and retry on the next one until delta converges to zero.
+    if (delta < -DECODER_SYNC_CATCHUP_THRESHOLD) {
+        dsyslog("vaapivideo/decoder: %ssync catchup drop d=%+lldms", synced ? "drift re-" : "",
+                static_cast<long long>(delta / 90));
         return true;
     }
 
+    // Step 6: delta within tolerance -- sync acquired.
+    dsyslog("vaapivideo/decoder: %ssync acquired d=%+lldms", synced ? "drift re-" : "",
+            static_cast<long long>(delta / 90));
+    syncCorrectionDone.store(true, std::memory_order_release);
+    nextSyncLog.Set(30000);
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }
