@@ -911,6 +911,9 @@ auto cAudioProcessor::OpenDecoder() -> void {
 
     ctx->request_sample_fmt = AV_SAMPLE_FMT_S16;
     ctx->sample_rate = std::max(streamParams.sampleRate, 0);
+    // Accept unofficial / slightly non-conforming EAC3 / AC3 bitstreams from DVB broadcasts.
+    ctx->err_recognition = AV_EF_CAREFUL;
+    ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
     if (streamParams.channels > 0) {
         av_channel_layout_default(&ctx->ch_layout, streamParams.channels);

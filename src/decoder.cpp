@@ -38,6 +38,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec.h>
 #include <libavcodec/codec_id.h>
+#include <libavcodec/defs.h>
 #include <libavcodec/packet.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
@@ -70,7 +71,7 @@ extern "C" {
 constexpr size_t DECODER_QUEUE_CAPACITY = 50;               ///< Video packet queue depth (~2 s at 25 fps)
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;              ///< Timeout when submitting a frame to the display (ms)
 constexpr int64_t DECODER_SYNC_CATCHUP_THRESHOLD = 30 * 90; ///< Drop sync frames when video still >30 ms behind
-constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 500 * 90;  ///< Re-sync when drift exceeds this (PTS ticks, ~500 ms)
+constexpr int64_t DECODER_SYNC_DRIFT_THRESHOLD = 1500 * 90; ///< Re-sync when drift exceeds this (PTS ticks, ~1500 ms)
 constexpr int DECODER_SYNC_FREERUN_FRAMES = 10; ///< Frames to submit without sync after Clear() (~200 ms at 50 Hz)
 
 // ============================================================================
@@ -409,6 +410,11 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
         return false;
     }
 
+    // DVB stream tolerance: coarse frame-level checks only (no CRC / bitstream-spec abort),
+    // accept slightly non-conforming bitstreams common in HEVC / MPEG-2 broadcasts.
+    decoderCtx->err_recognition = AV_EF_CAREFUL;
+    decoderCtx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+
     if (useHwDecode) {
         // VAAPI hardware decode -- single-threaded; GPU handles its own parallelism.
         decoderCtx->thread_count = 1;
@@ -670,7 +676,16 @@ auto cVaapiDecoder::Action() -> void {
         if (ret == AVERROR(EAGAIN)) {
             // VAAPI decoder is full; drain frames below and retry the send.
         } else {
-            packetSent = true; // success, EOF, or fatal error -- don't retry
+            if (ret < 0 && ret != AVERROR_EOF) [[unlikely]] {
+                // A hard send failure usually means the decoder has entered an error state
+                // (e.g. corrupt NAL on HEVC). Flush and rebuild the filter graph so the next
+                // IDR / I-frame can recover cleanly without leaving stale VAAPI surfaces.
+                dsyslog("vaapivideo/decoder: send_packet failed: %s -- flushing for recovery", AvErr(ret).data());
+                avcodec_flush_buffers(codecCtx.get());
+                ResetFilterGraph();
+                return anyFrameDecoded;
+            }
+            packetSent = true; // success or EOF -- don't retry
         }
 
         // Drain all available decoded frames and push them through the filter graph. We do not flush between trick-mode
@@ -1024,7 +1039,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     // Phases:
     //   1. Trick mode    -- pacing timer, no sync
     //   2. Freerun       -- no clock or first N frames after Clear()
-    //   3. Steady state  -- submit if |delta| < 500 ms, else trigger re-sync
+    //   3. Steady state  -- submit if |delta| < 1500 ms, else trigger re-sync
     //   4. Sync align    -- one-shot (initial) or drift re-sync (fallthrough from phase 3)
     //                       wait for clock, wait for delta <= 0, catchup-drop if still behind
 
@@ -1150,7 +1165,13 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     }
 
     // Step 2: if video is ahead, block until audio catches up (or timeout).
+    // In replay mode the video packet queue may be full, blocking VDR's Poll() loop and
+    // preventing audio delivery. Exit early if the audio clock is not advancing after 100 ms
+    // so that returning here lets the decode thread drain one more packet from the queue,
+    // freeing Poll() to resume audio.
     if (delta > 0) {
+        const int64_t clockAtWaitStart = clock;
+        const cTimeMs frozenCheckTimeout(100);
         const cTimeMs waitTimeout(static_cast<int>(std::min((delta / 90) + 10, int64_t{3000})));
         while (delta > 0 && clock != AV_NOPTS_VALUE && !stopping.load(std::memory_order_relaxed) &&
                trickSpeed.load(std::memory_order_relaxed) == 0 && !waitTimeout.TimedOut()) {
@@ -1158,6 +1179,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
             clock = audioProcessor->GetClock();
             if (clock != AV_NOPTS_VALUE) {
                 delta = originalPts - clock - latency;
+            }
+            // Exit early if clock hasn't advanced by at least 10 ms after 100 ms of waiting.
+            // Less than 10 ms of advance in 100 ms means audio is stalled (ALSA not yet started
+            // or VDR Poll() blocked, preventing audio packet delivery).
+            if (frozenCheckTimeout.TimedOut() && clock != AV_NOPTS_VALUE && clock - clockAtWaitStart < 10 * 90) {
+                break;
             }
         }
     }
@@ -1185,6 +1212,14 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     }
 
     // Step 6: delta within tolerance -- sync acquired.
+    // Guard: if delta still exceeds the drift threshold, acquiring here would immediately
+    // re-trigger drift re-sync on every subsequent frame (oscillation loop). Submit without
+    // marking synced so the video queue can drain and VDR can resume audio delivery.
+    if (delta > DECODER_SYNC_DRIFT_THRESHOLD) {
+        dsyslog("vaapivideo/decoder: %ssync deferred (audio stalled) d=%+lldms", synced ? "drift re-" : "",
+                static_cast<long long>(delta / 90));
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
     dsyslog("vaapivideo/decoder: %ssync acquired d=%+lldms", synced ? "drift re-" : "",
             static_cast<long long>(delta / 90));
     syncCorrectionDone.store(true, std::memory_order_release);
