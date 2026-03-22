@@ -64,7 +64,7 @@ constexpr int AUDIO_DECODER_DRAIN_TIMEOUT_MS =
 constexpr int AUDIO_DECODER_ERROR_LIMIT = 50;  ///< Consecutive decode failures before automatic decoder flush
 constexpr int AUDIO_DECODER_GRACE_PACKETS = 3; ///< Packets silently discarded after decoder (re)init
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between repeated decode-error log messages
-constexpr size_t AUDIO_QUEUE_CAPACITY = 100;      ///< Maximum audio packet queue depth (~2 s at 50 Hz delivery rate)
+constexpr size_t AUDIO_QUEUE_CAPACITY = 500;      ///< Maximum audio packet queue depth (~10 s at 50 Hz delivery rate)
 
 // ============================================================================
 // === AUDIO PROCESSOR CLASS ===
