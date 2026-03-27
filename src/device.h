@@ -69,7 +69,6 @@ class DrmDevices {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    int deviceCount{0};                   ///< Number of DRM devices found by the last Enumerate() call
     std::vector<drmDevicePtr> deviceList; ///< Pointers to enumerated DRM device descriptors (freed in destructor)
 };
 
@@ -173,7 +172,7 @@ class cVaapiDevice : public cDevice {
     int drmFd{-1};                                         ///< Open file descriptor for the DRM primary node
     std::string drmPath;                             ///< Path to the DRM primary device node (e.g. "/dev/dri/card0")
     std::atomic<int> initState;                      ///< Init state machine: 0=uninit, 1=pending, 2=ready
-    bool liveMode{};                                 ///< True in Transfer Mode (live TV); false during replay
+    std::atomic<bool> liveMode;                      ///< True in Transfer Mode (live TV); false during replay
     int osdHeight{};                                 ///< Cached display height for OSD allocation (pixels)
     int osdWidth{};                                  ///< Cached display width for OSD allocation (pixels)
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -191,6 +192,9 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
 
     // Walk the input data, feeding the parser until it is consumed.
     const uint8_t *parseData = data;
+    if (size > static_cast<size_t>(INT_MAX)) [[unlikely]] {
+        return;
+    }
     int parseSize = static_cast<int>(size);
     int64_t currentPts = pts; // PTS is only used on the first av_parser_parse2() call
 
@@ -219,7 +223,9 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
             // In FF and reverse mode only keyframes are useful; skip confirmed non-keyframes (key_frame == 0). Unknown
             // status (-1) passes through because we cannot confirm it is not a keyframe. Slow-forward sends all frames
             // to preserve smooth motion.
-            if (trickSpeed.load(std::memory_order_acquire) != 0 && (isTrickFastForward || isTrickReverse) &&
+            if (trickSpeed.load(std::memory_order_acquire) != 0 &&
+                (isTrickFastForward.load(std::memory_order_relaxed) ||
+                 isTrickReverse.load(std::memory_order_relaxed)) &&
                 parserCtx->key_frame == 0) {
                 continue;
             }
@@ -329,7 +335,7 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
     if (trickSpeed.load(std::memory_order_relaxed) == 0) {
         return true;
     }
-    const uint64_t dueTime = nextTrickFrameDue.load(std::memory_order_acquire);
+    const uint64_t dueTime = nextTrickFrameDue.load(std::memory_order_relaxed);
     return cTimeMs::Now() >= dueTime;
 }
 
@@ -339,6 +345,8 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::OpenCodec(AVCodecID codecId) -> bool {
+    const cMutexLock decodeLock(&codecMutex);
+
     if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
         esyslog("vaapivideo/decoder: not initialized");
         return false;
@@ -488,30 +496,30 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         }
     }
 
-    // Non-atomic state must be written before the trickSpeed release-store so the decode thread reads a consistent set
-    // of flags when it sees the new speed.
-    isTrickFastForward = forward && fast;
-    isTrickReverse = !forward;
-    prevTrickPts = AV_NOPTS_VALUE;
+    // Trick-mode flags must be written before the trickSpeed release-store so the decode thread reads a consistent set
+    // when it observes the new speed via acquire-load.
+    isTrickFastForward.store(forward && fast, std::memory_order_relaxed);
+    isTrickReverse.store(!forward && fast, std::memory_order_relaxed);
+    prevTrickPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 
     // Map VDR speed values to pacing multipliers: 6 -> 2x, 3 -> 4x, 1 -> 8x. Slow mode ignores the multiplier and uses
     // a fixed per-frame hold.
     if (fast && speed > 0) {
         if (speed >= 6) {
-            trickMultiplier = 2;
+            trickMultiplier.store(2, std::memory_order_relaxed);
         } else if (speed >= 3) {
-            trickMultiplier = 4;
+            trickMultiplier.store(4, std::memory_order_relaxed);
         } else {
-            trickMultiplier = 8;
+            trickMultiplier.store(8, std::memory_order_relaxed);
         }
-        trickHoldMs = DECODER_TRICK_HOLD_MS;
+        trickHoldMs.store(DECODER_TRICK_HOLD_MS, std::memory_order_relaxed);
     } else {
-        trickMultiplier = 0;
-        trickHoldMs = static_cast<uint64_t>(speed) * DECODER_TRICK_HOLD_MS;
+        trickMultiplier.store(0, std::memory_order_relaxed);
+        trickHoldMs.store(static_cast<uint64_t>(speed) * DECODER_TRICK_HOLD_MS, std::memory_order_relaxed);
     }
 
     // Arm the pacing timer so the first trick frame is displayed immediately.
-    nextTrickFrameDue.store(cTimeMs::Now(), std::memory_order_release);
+    nextTrickFrameDue.store(cTimeMs::Now(), std::memory_order_relaxed);
 
     if (speed == 0) {
         lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -600,9 +608,9 @@ auto cVaapiDecoder::Action() -> void {
 
                 // Hold codecMutex only while decoding; release it before SyncAndSubmitFrame() so EnqueueData() is not
                 // blocked during display wait.
-                if (!stopping.load(std::memory_order_acquire) && codecCtx) {
+                if (!stopping.load(std::memory_order_acquire)) {
                     const cMutexLock decodeLock(&codecMutex);
-                    if (codecCtx) { // recheck: OpenCodec() may reset it between the two loads
+                    if (codecCtx) {
                         (void)DecodeOnePacket(workPacket, pendingFrames);
                     }
                 }
@@ -648,7 +656,6 @@ auto cVaapiDecoder::Action() -> void {
         static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             vaapiFrame->avFrame->data[3]));
     vaapiFrame->pts = src->pts;
-    vaapiFrame->ownsFrame = true;
 
     return vaapiFrame;
 }
@@ -752,8 +759,10 @@ auto cVaapiDecoder::Action() -> void {
                     if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
                         // In FF/reverse trick mode, rate=field emits two outputs per source frame. The first has a
                         // cross-frame blend ghost; only keep the second.
-                        if (isTrickMode && (isTrickFastForward || isTrickReverse) && !outFrames.empty() &&
-                            outFrames.back()->pts == sourcePts) {
+                        if (isTrickMode &&
+                            (isTrickFastForward.load(std::memory_order_relaxed) ||
+                             isTrickReverse.load(std::memory_order_relaxed)) &&
+                            !outFrames.empty() && outFrames.back()->pts == sourcePts) {
                             outFrames.back() = std::move(vaapiFrame);
                         } else {
                             outFrames.push_back(std::move(vaapiFrame));
@@ -989,6 +998,13 @@ auto cVaapiDecoder::Action() -> void {
     graphInputs->name = av_strdup("out");
     graphInputs->filter_ctx = bufferSinkCtx;
 
+    if (!graphOutputs->name || !graphInputs->name) [[unlikely]] {
+        avfilter_inout_free(&graphInputs);
+        avfilter_inout_free(&graphOutputs);
+        ResetFilterGraph();
+        return false;
+    }
+
     ret = avfilter_graph_parse_ptr(filterGraph.get(), filterChain.c_str(), &graphInputs, &graphOutputs, nullptr);
     avfilter_inout_free(&graphInputs);
     avfilter_inout_free(&graphOutputs);
@@ -1046,24 +1062,25 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 
     // --- Phase 1: trick mode -- pacing timer, no A/V sync ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
-        const bool newSource = (originalPts != prevTrickPts);
-        const int64_t savedPrevPts = prevTrickPts;
+        const int64_t savedPrevPts = prevTrickPts.load(std::memory_order_relaxed);
+        const bool newSource = (originalPts != savedPrevPts);
 
         // Reverse playback: enforce monotonically decreasing PTS.
-        if (isTrickReverse && newSource && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE &&
-            originalPts > savedPrevPts) {
+        if (isTrickReverse.load(std::memory_order_relaxed) && newSource && originalPts != AV_NOPTS_VALUE &&
+            savedPrevPts != AV_NOPTS_VALUE && originalPts > savedPrevPts) {
             return true;
         }
         if (newSource) {
-            prevTrickPts = originalPts;
-        }
-        if (newSource && originalPts != AV_NOPTS_VALUE) {
-            lastPts.store(originalPts, std::memory_order_release);
+            prevTrickPts.store(originalPts, std::memory_order_relaxed);
+            if (originalPts != AV_NOPTS_VALUE) {
+                lastPts.store(originalPts, std::memory_order_release);
+            }
         }
 
         // Block until pacing timer expires.
-        if (newSource && trickMultiplier > 0) {
-            const uint64_t due = nextTrickFrameDue.load(std::memory_order_acquire);
+        const uint64_t localMultiplier = trickMultiplier.load(std::memory_order_relaxed);
+        if (newSource && localMultiplier > 0) {
+            const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
             while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
                    trickSpeed.load(std::memory_order_relaxed) != 0) {
                 cCondWait::SleepMs(10);
@@ -1072,13 +1089,14 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 
         // Arm pacing timer for the next source frame.
         if (newSource) {
-            if (trickMultiplier > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
+            if (localMultiplier > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
                 const auto ptsDelta = static_cast<uint64_t>(std::abs(originalPts - savedPrevPts));
                 const uint64_t holdMs =
-                    std::clamp(ptsDelta / (static_cast<uint64_t>(90) * trickMultiplier), uint64_t{10}, uint64_t{2000});
-                nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_release);
+                    std::clamp(ptsDelta / (static_cast<uint64_t>(90) * localMultiplier), uint64_t{10}, uint64_t{2000});
+                nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
             } else {
-                nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs, std::memory_order_release);
+                nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
             }
         }
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
@@ -1094,7 +1112,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     }
 
     // First frame after Clear(): display immediately for responsive channel switch / seek.
-    if (freerunFramesLeft.load(std::memory_order_acquire) > 0) {
+    if (freerunFramesLeft.load(std::memory_order_relaxed) > 0) {
         freerunFramesLeft.fetch_sub(1, std::memory_order_relaxed);
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
@@ -1120,7 +1138,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         // Drift: video too far behind -- drop and trigger full re-sync.
         if (delta < -DECODER_SYNC_DRIFT_THRESHOLD) {
             dsyslog("vaapivideo/decoder: sync drop d=%+lldms, triggering re-sync", static_cast<long long>(delta / 90));
-            syncCorrectionDone.store(false, std::memory_order_release);
+            syncCorrectionDone.store(false, std::memory_order_relaxed);
             logSyncNow.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -1139,9 +1157,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
                     static_cast<long long>(delta / 90), sleepMs);
             cCondWait::SleepMs(sleepMs);
             clock = audioProcessor->GetClock();
-            if (clock != AV_NOPTS_VALUE) {
-                delta = originalPts - clock - latency;
+            if (clock == AV_NOPTS_VALUE) {
+                // Clock lost during sleep (codec reinit) -- can't assess overshoot; submit and retry.
+                dsyslog("vaapivideo/decoder: natural sync deferred (clock lost during sleep)");
+                return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
             }
+            delta = originalPts - clock - latency;
             // ALSA priming burst may have overshot -- drop if still beyond threshold.
             if (delta < -DECODER_SYNC_NATURAL_THRESHOLD) {
                 dsyslog("vaapivideo/decoder: natural sync drop (post-sleep) d=%+lldms",
@@ -1173,7 +1194,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     }
     if (clock == AV_NOPTS_VALUE) {
         dsyslog("vaapivideo/decoder: sync deferred (no audio clock)");
-        syncCorrectionDone.store(true, std::memory_order_release);
+        syncCorrectionDone.store(true, std::memory_order_relaxed);
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
@@ -1226,7 +1247,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     if (delta < -DECODER_SYNC_NATURAL_THRESHOLD) {
         dsyslog("vaapivideo/decoder: %ssync catchup drop d=%+lldms", synced ? "drift re-" : "",
                 static_cast<long long>(delta / 90));
-        syncCorrectionDone.store(true, std::memory_order_release);
+        syncCorrectionDone.store(true, std::memory_order_relaxed);
         nextSyncLog.Set(30000);
         return true;
     }
@@ -1241,7 +1262,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     // Within ±50 ms: sync acquired.
     dsyslog("vaapivideo/decoder: %ssync acquired d=%+lldms", synced ? "drift re-" : "",
             static_cast<long long>(delta / 90));
-    syncCorrectionDone.store(true, std::memory_order_release);
+    syncCorrectionDone.store(true, std::memory_order_relaxed);
     nextSyncLog.Set(30000);
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }

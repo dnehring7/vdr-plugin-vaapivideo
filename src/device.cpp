@@ -13,12 +13,6 @@
 #include "osd.h"
 #include "pes.h"
 
-// POSIX
-#include <fcntl.h>
-#include <linux/vt.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-
 // C++ Standard Library
 #include <algorithm>
 #include <atomic>
@@ -26,11 +20,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
-#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+// POSIX
+#include <fcntl.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+// DRM/KMS
+#include <libdrm/drm.h>
+#include <libdrm/drm_mode.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 
 // FFmpeg
 #pragma GCC diagnostic push
@@ -50,12 +56,6 @@ extern "C" {
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_vpp.h>
-
-// DRM
-#include <libdrm/drm.h>
-#include <libdrm/drm_mode.h>
-#include <xf86drm.h>
-#include <xf86drmMode.h>
 
 // VDR
 #pragma GCC diagnostic push
@@ -154,20 +154,31 @@ DrmDevices::~DrmDevices() noexcept {
 
 [[nodiscard]] auto DrmDevices::Enumerate() -> bool {
     dsyslog("vaapivideo/device: enumerating DRM devices");
-    deviceList.resize(64); // Hard upper bound; real systems have 1-4 DRM devices at most
-    deviceCount = drmGetDevices2(0, deviceList.data(), static_cast<int>(deviceList.size()));
 
-    if (deviceCount > 0) {
-        deviceList.resize(static_cast<size_t>(deviceCount));
-        dsyslog("vaapivideo/device: found %d DRM device(s)", deviceCount);
+    // Free any devices from a previous Enumerate() call before overwriting the list.
+    if (!deviceList.empty()) {
+        drmFreeDevices(deviceList.data(), static_cast<int>(deviceList.size()));
+        deviceList.clear();
+    }
+
+    deviceList.resize(64); // Hard upper bound; real systems have 1-4 DRM devices at most
+    const int result = drmGetDevices2(0, deviceList.data(), static_cast<int>(deviceList.size()));
+
+    if (result > 0) {
+        deviceList.resize(static_cast<size_t>(result));
+        dsyslog("vaapivideo/device: found %d DRM device(s)", result);
     } else {
-        dsyslog("vaapivideo/device: no DRM devices found");
+        if (result < 0) {
+            esyslog("vaapivideo/device: drmGetDevices2 failed (%s)", strerror(-result));
+        } else {
+            dsyslog("vaapivideo/device: no DRM devices found");
+        }
         deviceList.clear();
     }
     return HasDevices();
 }
 
-[[nodiscard]] auto DrmDevices::HasDevices() const noexcept -> bool { return deviceCount > 0; }
+[[nodiscard]] auto DrmDevices::HasDevices() const noexcept -> bool { return !deviceList.empty(); }
 
 // ============================================================================
 // === VAAPI DEVICE CLASS ===
@@ -244,11 +255,9 @@ cVaapiDevice::~cVaapiDevice() noexcept {
     DetachAllReceivers();
 
     // Detach display from OSD provider before destroying display.
-    if (::osdProvider) {
-        if (auto *vaapiProvider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
-            vaapiProvider->DetachDisplay();
-            dsyslog("vaapivideo/device: OSD provider detached from display");
-        }
+    if (auto *vaapiProvider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+        vaapiProvider->DetachDisplay();
+        dsyslog("vaapivideo/device: OSD provider detached from display");
     }
 
     if (audioProcessor || decoder || display) {
@@ -265,7 +274,7 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiDevice::CanReplay() const -> bool {
-    return (initState.load(std::memory_order_relaxed) == 2) && decoder && decoder->IsReady();
+    return (initState.load(std::memory_order_acquire) == 2) && decoder && decoder->IsReady();
 }
 
 auto cVaapiDevice::Clear() -> void {
@@ -330,42 +339,29 @@ auto cVaapiDevice::Freeze() -> void {
 }
 
 auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> void {
-    // OSD size must match display output (VDR allocates buffers based on this).
-
-    if (!display) [[unlikely]] {
-        // Detached or not yet initialized -- return config defaults without logging. VDR calls this every second; using
-        // esyslog here would flood the log.
-        Width = static_cast<int>(vaapiConfig.display.GetWidth());
-        Height = static_cast<int>(vaapiConfig.display.GetHeight());
-        PixelAspect = static_cast<double>(Width) / Height;
-        return;
-    }
-
-    // Fast path: cached values.
-    if (osdWidth > 0 && osdHeight > 0) [[likely]] {
+    // Fast path: authoritative cached values from display.
+    if (osdWidth > 0 && osdHeight > 0 && display) [[likely]] {
         Width = osdWidth;
         Height = osdHeight;
         PixelAspect = display->GetAspectRatio();
         return;
     }
 
-    // Slow path: populate cache.
-    if (display->IsInitialized()) [[likely]] {
+    // Slow path: populate cache from live display.
+    if (display && display->IsInitialized()) {
         osdWidth = static_cast<int>(display->GetOutputWidth());
         osdHeight = static_cast<int>(display->GetOutputHeight());
         Width = osdWidth;
         Height = osdHeight;
         PixelAspect = display->GetAspectRatio();
         dsyslog("vaapivideo/device: OSD size cached: %dx%d aspect=%.3f", Width, Height, PixelAspect);
-    } else [[unlikely]] {
-        // Fallback to config defaults.
-        osdWidth = static_cast<int>(vaapiConfig.display.GetWidth());
-        osdHeight = static_cast<int>(vaapiConfig.display.GetHeight());
-        Width = osdWidth;
-        Height = osdHeight;
-        PixelAspect = static_cast<double>(vaapiConfig.display.GetWidth()) / vaapiConfig.display.GetHeight();
-        dsyslog("vaapivideo/device: OSD size from config: %dx%d", Width, Height);
+        return;
     }
+
+    // Fallback: config defaults (not cached -- display may initialize later).
+    Width = static_cast<int>(vaapiConfig.display.GetWidth());
+    Height = static_cast<int>(vaapiConfig.display.GetHeight());
+    PixelAspect = static_cast<double>(Width) / Height;
 }
 
 [[nodiscard]] auto cVaapiDevice::GetSTC() -> int64_t {
@@ -374,13 +370,8 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
     if (!decoder) [[unlikely]] {
         return -1;
     }
-
     const int64_t pts = decoder->GetLastPts();
-    if (pts == AV_NOPTS_VALUE) [[unlikely]] {
-        return -1;
-    }
-
-    return pts;
+    return pts != AV_NOPTS_VALUE ? pts : -1;
 }
 
 auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) -> void {
@@ -441,8 +432,7 @@ auto cVaapiDevice::Mute() -> void {
 auto cVaapiDevice::Play() -> void {
     cDevice::Play();
 
-    if (trickSpeed.load(std::memory_order_relaxed) != 0) {
-        trickSpeed.store(0, std::memory_order_release);
+    if (trickSpeed.exchange(0, std::memory_order_release) != 0) {
         if (decoder) [[likely]] {
             decoder->SetTrickSpeed(0);
         }
@@ -467,11 +457,13 @@ auto cVaapiDevice::Play() -> void {
     }
 
     const AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
+    bool isLive = liveMode.load(std::memory_order_relaxed);
 
     if (currentCodec == AV_CODEC_ID_NONE) {
         // Detect live mode (covers pmAudioOnly where no video arrives).
-        if (!liveMode) {
-            liveMode = Transferring();
+        if (!isLive) {
+            isLive = Transferring();
+            liveMode.store(isLive, std::memory_order_relaxed);
         }
 
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
@@ -492,8 +484,7 @@ auto cVaapiDevice::Play() -> void {
         if (decoder) {
             decoder->NotifyAudioChange();
         }
-        isyslog("vaapivideo/device: audio codec %s (%s)", avcodec_get_name(detectedCodec),
-                liveMode ? "live" : "replay");
+        isyslog("vaapivideo/device: audio codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     } else {
         // Mid-stream codec change with hysteresis (3 consecutive detections)
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
@@ -530,7 +521,7 @@ auto cVaapiDevice::Play() -> void {
 
     // Replay flow control (same as PlayVideo()): return 0 so VDR calls Poll() and retries. In live TV mode the queue is
     // always accepted to keep pace with cTransfer.
-    if (!liveMode && audioProcessor->IsQueueFull()) [[unlikely]] {
+    if (!isLive && audioProcessor->IsQueueFull()) [[unlikely]] {
         return 0;
     }
 
@@ -559,13 +550,14 @@ auto cVaapiDevice::Play() -> void {
     }
 
     const AVCodecID currentCodec = videoCodecId.load(std::memory_order_relaxed);
-    AVCodecID detectedCodec = AV_CODEC_ID_NONE;
+    bool isLive = liveMode.load(std::memory_order_relaxed);
 
     if (currentCodec == AV_CODEC_ID_NONE) [[unlikely]] {
         // Detect live vs replay (cTransferControl may not exist at SetPlayMode() time).
-        liveMode = Transferring();
+        isLive = Transferring();
+        liveMode.store(isLive, std::memory_order_relaxed);
 
-        detectedCodec = ::DetectVideoCodec({pes.payload, pes.payloadSize});
+        const AVCodecID detectedCodec = ::DetectVideoCodec({pes.payload, pes.payloadSize});
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
             return Length; // No strong marker found -- wait for next packet
         }
@@ -600,15 +592,14 @@ auto cVaapiDevice::Play() -> void {
         }
 
         videoCodecId.store(detectedCodec, std::memory_order_relaxed);
-        isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec),
-                liveMode ? "live" : "replay");
+        isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     }
     // Mid-stream codec changes (e.g. splice from MPEG-2 to H.264 broadcast) start a new SetPlayMode() cycle. Codec ID
     // is reset in pmNone so re-detection fires.
 
     // Replay flow control: return 0 -> VDR calls Poll() and retries. Live TV: never block (cTransfer has only 100 ms
     // retry budget). Trick mode: single-packet queue (DECODER_TRICK_QUEUE_DEPTH=1).
-    if (!liveMode) [[unlikely]] {
+    if (!isLive) [[unlikely]] {
         const int currentSpeed = trickSpeed.load(std::memory_order_relaxed);
 
         if (currentSpeed != 0) {
@@ -630,7 +621,7 @@ auto cVaapiDevice::Play() -> void {
     }
 
     // Live TV: cTransfer calls PlayVideo/PlayAudio directly and never calls Poll.
-    if (liveMode) {
+    if (liveMode.load(std::memory_order_relaxed)) {
         return true;
     }
 
@@ -702,10 +693,9 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
         case pmNone:
             // Hard reset of all codec state. Doing this here rather than in Clear() allows skip/seek within a
             // recording to reuse the open codec without a teardown cycle.
-            previousVideoCodec = videoCodecId.load(std::memory_order_relaxed);
-            videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+            previousVideoCodec = videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-            liveMode = false;
+            liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
                 decoder->SetTrickSpeed(0);
@@ -759,7 +749,11 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
     // exchange() atomically clears paused so PlayVideo() will accept the packet. Storing the original value lets us
     // restore frozen state after submission.
     const bool wasPaused = paused.exchange(false, std::memory_order_relaxed);
-    PlayVideo(Data, Length);
+    if (PlayVideo(Data, Length) == 0) {
+        // Queue was full despite the preceding Freeze()/DrainQueue(). Retry once after a brief drain window.
+        cCondWait::SleepMs(5);
+        PlayVideo(Data, Length);
+    }
     if (wasPaused) {
         paused.store(true, std::memory_order_relaxed);
     }
@@ -835,6 +829,18 @@ auto cVaapiDevice::Detach() -> void {
     // Force the kernel console to redraw after releasing the DRM device.
     RestoreConsole();
 
+    // Reset all playback and codec state so a subsequent Attach() starts clean. Without this, stale codec IDs from the
+    // previous session would cause PlayVideo/PlayAudio to skip codec detection and feed data to a codec-less decoder.
+    videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    previousVideoCodec = AV_CODEC_ID_NONE;
+    videoCodecCandidate = AV_CODEC_ID_NONE;
+    videoCodecCandidateCount = 0;
+    codecHysteresis = AV_CODEC_ID_NONE;
+    codecHysteresisCount = 0;
+    liveMode.store(false, std::memory_order_relaxed);
+    trickSpeed.store(0, std::memory_order_relaxed);
+    paused.store(false, std::memory_order_relaxed);
     osdWidth = 0;
     osdHeight = 0;
     initState.store(0, std::memory_order_release);
@@ -857,7 +863,7 @@ auto cVaapiDevice::Detach() -> void {
 
     if (!OpenHardware()) [[unlikely]] {
         esyslog("vaapivideo/device: hardware initialization failed");
-        initState.store(0);
+        initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
@@ -867,7 +873,7 @@ auto cVaapiDevice::Detach() -> void {
         esyslog("vaapivideo/device: audio initialization failed");
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0);
+        initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
@@ -878,7 +884,7 @@ auto cVaapiDevice::Detach() -> void {
         audioProcessor->Stop();
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0);
+        initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
@@ -892,7 +898,7 @@ auto cVaapiDevice::Detach() -> void {
         audioProcessor->Stop();
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0);
+        initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
@@ -1182,9 +1188,8 @@ auto cVaapiDevice::Stop() -> void {
 
 auto cVaapiDevice::ReleaseHardware() -> void {
     if (vaapi.hwDeviceRef) {
-        av_buffer_unref(&vaapi.hwDeviceRef);
-        vaapi.hwDeviceRef = nullptr;
-        vaapi.drmFd = -1; // Clear borrowed reference only -- actual fd is closed below.
+        av_buffer_unref(&vaapi.hwDeviceRef); // also sets hwDeviceRef = nullptr
+        vaapi.drmFd = -1;                    // Clear borrowed reference only -- actual fd is closed below.
     }
 
     if (drmFd >= 0) {
@@ -1206,8 +1211,8 @@ auto cVaapiDevice::ReleaseHardware() -> void {
         return false;
     }
 
-    const std::unique_ptr<drmModePlaneRes, FreeDrmPlaneResources> planeRes{drmModeGetPlaneResources(drmFd)};
-    if (!planeRes) [[unlikely]] {
+    // Probe plane resource availability (required for atomic modesetting); result itself is unused.
+    if (!std::unique_ptr<drmModePlaneRes, FreeDrmPlaneResources>{drmModeGetPlaneResources(drmFd)}) [[unlikely]] {
         esyslog("vaapivideo/device: failed to get DRM plane resources (atomic required)");
         return false;
     }

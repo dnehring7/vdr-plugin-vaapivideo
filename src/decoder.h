@@ -168,15 +168,15 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === TRICK MODE ===
     // ========================================================================
-    bool isTrickFastForward{}; ///< True in fast-forward mode (forward=true, fast=true)
-    bool isTrickReverse{};     ///< True in reverse trick mode; enforces monotonically decreasing PTS
+    std::atomic<bool> isTrickFastForward; ///< True in fast-forward mode (forward=true, fast=true)
+    std::atomic<bool> isTrickReverse;     ///< True in fast-reverse trick mode; enforces monotonically decreasing PTS
     std::atomic<uint64_t>
         nextTrickFrameDue; ///< Absolute time (cTimeMs::Now()) when the next trick frame may be submitted
-    int64_t prevTrickPts{
+    std::atomic<int64_t> prevTrickPts{
         AV_NOPTS_VALUE}; ///< PTS of the previous trick-mode source frame, used for field-pair detection
-    uint64_t trickHoldMs{
-        DECODER_TRICK_HOLD_MS}; ///< Per-frame hold duration for slow trick mode (ms), set by SetTrickSpeed()
-    uint64_t trickMultiplier{}; ///< Fast-mode speed multiplier (2 / 4 / 8x); 0 means slow mode
+    std::atomic<uint64_t> trickHoldMs{
+        DECODER_TRICK_HOLD_MS};            ///< Per-frame hold duration for slow trick mode (ms), set by SetTrickSpeed()
+    std::atomic<uint64_t> trickMultiplier; ///< Fast-mode speed multiplier (2 / 4 / 8x); 0 means slow mode
 
     // ========================================================================
     // === A/V SYNC ===
