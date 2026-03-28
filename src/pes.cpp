@@ -53,8 +53,7 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< First MPEG video stream
 // ============================================================================
 
 [[nodiscard]] static inline auto ParseTimestamp(const uint8_t *bytes) noexcept -> int64_t {
-    // Decode 33-bit PTS/DTS from 5 PES header bytes (ISO 13818-1 sec.2.4.3.7). Returns AV_NOPTS_VALUE when any marker
-    // bit is malformed.
+    // Decode 33-bit PTS/DTS from 5 PES header bytes (ISO 13818-1 sec.2.4.3.7).
     if ((AV_RB8(bytes) & AV_RB8(bytes + 2) & AV_RB8(bytes + 4) & 0x01) == 0) [[unlikely]] {
         return AV_NOPTS_VALUE;
     }
@@ -132,12 +131,8 @@ struct CodecEvidence {
 }
 
 [[nodiscard]] auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
-    // Evidence-based video codec detection: scan for Annex-B start codes, accumulate per-codec evidence, require 2+
-    // distinct strong markers.
-    //
-    // HEVC: VPS/SPS/PPS (primary, nuh_layer_id==0) + IDR/CRA (secondary). H.264: SPS + PPS + IDR (nal_ref_idc > 0,
-    // spec-mandated). MPEG-2: sequence_header + extension/GOP (unambiguous: bit 7 set). AUD excluded (no disambiguation
-    // value).
+    // Scan for Annex-B start codes, accumulate per-codec evidence, require 2+ distinct strong markers.
+    // HEVC: VPS/SPS/PPS + IDR/CRA. H.264: SPS + PPS + IDR (nal_ref_idc > 0). MPEG-2: sequence_header + extension/GOP.
     const size_t size = data.size();
     if (size < 6) [[unlikely]] {
         return AV_CODEC_ID_NONE;
@@ -266,8 +261,7 @@ struct CodecEvidence {
     const bool avcOk = std::popcount(avc.seenMask) >= 2;
     const bool mpegOk = ((mpeg2.seenMask & 0x01) != 0) && ((mpeg2.seenMask & 0x06) != 0);
 
-    // MPEG-2 markers (0xB3/0xB5/0xB8) have bit 7 set, making them invalid as H.264/HEVC NAL headers (forbidden_zero_bit
-    // would be 1). When MPEG-2 is confirmed, any H.264/HEVC evidence is from slice-code aliases or stale data.
+    // MPEG-2 markers have bit 7 set (invalid as H.264/HEVC NAL headers); confirmed MPEG-2 invalidates other evidence.
     const bool hevcFinal = hevcOk && !mpegOk;
     const bool avcFinal = avcOk && !mpegOk;
 

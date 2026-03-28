@@ -8,7 +8,7 @@
 %global __provides_exclude_from ^%{vdr_plugindir}/.*\\.so.*$
 
 Name:           vdr-%{pname}
-Version:        1.2.2
+Version:        1.3.0
 Release:        %autorelease
 Summary:        VAAPI video plugin for VDR
 
@@ -32,11 +32,11 @@ Requires:       vdr(abi)%{?_isa} = %{vdr_apiversion}
 
 %description
 Hardware-accelerated video output plugin for VDR using VAAPI decode, DRM
-atomic modesetting, and ALSA audio output.
+atomic modesetting, and ALSA audio.
 
-Unlike older VDR output plugins that rely on X11 or OpenGL, this plugin drives
-the display directly through the kernel DRM/KMS subsystem. No display server
-is required -- it runs on a bare console, in a systemd service, or headless.
+This plugin drives the display directly through the kernel DRM/KMS subsystem --
+no X11, Wayland, or OpenGL required. It runs on a bare console, in a systemd
+service, or headless.
 
 %prep
 %autosetup -n vdr-plugin-%{pname}-%{version}

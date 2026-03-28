@@ -37,8 +37,7 @@
 // === GLOBAL STATE ===
 // ============================================================================
 
-// VDR queries this global to find the active provider; we maintain it manually because VDR's own provider registry uses
-// a different, plugin-incompatible path.
+// VDR's own provider registry is plugin-incompatible; we maintain this global manually.
 cOsdProvider *osdProvider = nullptr;
 
 // ============================================================================
@@ -53,8 +52,7 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
     dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(display_));
 
-    // Only clear the global if it still points to us; another provider may have already replaced it during a rapid
-    // teardown/restart cycle.
+    // Only clear if still pointing to us; another provider may have replaced it during rapid teardown/restart.
     if (::osdProvider == this) {
         ::osdProvider = nullptr;
     }
@@ -99,9 +97,7 @@ auto cVaapiOsdProvider::UntrackOsd(cVaapiOsd *osd) -> void {
 
 auto cVaapiOsdProvider::HideOsd(const uint32_t fbId) -> void {
     if (display_) [[likely]] {
-        // Only clear the OSD plane if the framebuffer being destroyed is the one currently committed. When multiple
-        // OSDs coexist at different levels (e.g. channel display + menu overlay), destroying a non-active OSD must not
-        // hide the active one.
+        // Only clear if this is the active framebuffer; destroying a non-active OSD must not hide the active one.
         display_->ClearOsdIfActive(fbId);
     }
 }
@@ -111,8 +107,7 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
         return;
     }
 
-    // Pass the current framebuffer ID and geometry to the display thread. Left()/Top() come from cOsd base class and
-    // are the screen-space position of the OSD origin, as originally passed to CreateOsd().
+    // Left()/Top() are the screen-space OSD origin from cOsd base class.
     display_->SetOsd({.fbId = osd.GetFramebufferId(),
                       .height = static_cast<uint32_t>(osd.Height()),
                       .width = static_cast<uint32_t>(osd.Width()),
@@ -136,9 +131,7 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
         return nullptr;
     }
 
-    // The framebuffer covers the region from the OSD origin to the screen edge -- exactly the area that
-    // AppendOsdPlane() will scan out. Skin content that extends beyond this (oversized pixmaps, off-screen bitmaps) is
-    // clipped in Flush() before writing to the framebuffer.
+    // Framebuffer spans from OSD origin to screen edge; oversized skin content is clipped in Flush().
     const auto screenWidth = static_cast<int>(display_->GetOutputWidth());
     const auto screenHeight = static_cast<int>(display_->GetOutputHeight());
     const int osdWidth = screenWidth - left;
@@ -167,8 +160,7 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
 
 cVaapiOsd::cVaapiOsd(const int posX, const int posY, const uint lvl, const int fd, const int fbWidth,
                      const int fbHeight, cVaapiOsdProvider *provider)
-    // cOsd base stores position and level; we duplicate width/height ourselves because cOsd does not expose them as
-    // settable fields after construction.
+    // cOsd does not expose width/height as settable fields after construction; we store our own.
     : cOsd(posX, posY, lvl), drmFd_(fd), height_(static_cast<uint32_t>(fbHeight)), provider_(provider),
       width_(static_cast<uint32_t>(fbWidth)) {
     // drmFd_ is borrowed from the display; it must remain valid for the OSD lifetime.
@@ -183,9 +175,7 @@ cVaapiOsd::~cVaapiOsd() noexcept {
     if (provider_ && framebufferId_ != 0) [[likely]] {
         provider_->HideOsd(framebufferId_);
 
-        // Block until the display thread stops scanning out our framebuffer. DestroyDumbBuffer() below frees the GEM
-        // object; doing that while the display is still reading it would cause visible corruption or a kernel page
-        // fault, so this wait is mandatory.
+        // Must wait for the display thread to stop scanning out our framebuffer before freeing the GEM object.
         if (cVaapiDisplay *display = provider_->GetDisplay(); display && display->IsInitialized()) {
             display->AwaitOsdHidden(framebufferId_);
         }
@@ -222,8 +212,7 @@ cVaapiOsd::~cVaapiOsd() noexcept {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiOsd::CanHandleAreas(const tArea *areas, const int numAreas) -> eOsdError {
-    // ProvidesTrueColor() is true, so VDR's pixmap layer handles all color-depth conversion before calling Flush(); any
-    // bit depth is fine.  Just delegate structural checks (overlapping areas, out-of-bounds) to the base class.
+    // TrueColor provider: VDR handles color-depth conversion. Delegate structural checks to base class.
     return cOsd::CanHandleAreas(areas, numAreas);
 }
 
@@ -232,10 +221,7 @@ auto cVaapiOsd::Flush() -> void {
         return;
     }
 
-    // TrueColor path: VDR composites pixmaps into ARGB8888 dirty rectangles. RenderPixmaps() may return multiple
-    // non-overlapping dirty regions from different pixmaps (e.g. background, text, borders). The caller must loop until
-    // it returns nullptr, otherwise parts of the OSD are lost. The entire loop must be protected by LOCK_PIXMAPS (see
-    // vdr/osd.h).
+    // RenderPixmaps() returns ARGB8888 dirty regions; must loop until nullptr under LOCK_PIXMAPS.
     bool rendered = false;
     {
         LOCK_PIXMAPS;
@@ -244,8 +230,7 @@ auto cVaapiOsd::Flush() -> void {
             const uint8_t *src = pm->Data();
             const size_t srcStride = static_cast<size_t>(vp.Width()) * 4;
 
-            // Clip the viewport to the framebuffer boundaries. Skins may produce pixmaps that extend beyond the visible
-            // area (e.g. skinflatplus with oversized OSD settings on a 1080p display).
+            // Clip to framebuffer boundaries (skins may produce oversized pixmaps).
             const int dstX = std::max(vp.X(), 0);
             const int dstY = std::max(vp.Y(), 0);
             const int dstRight = std::min(vp.X() + vp.Width(), static_cast<int>(width_));
@@ -253,8 +238,7 @@ auto cVaapiOsd::Flush() -> void {
 
             if (dstX < dstRight && dstY < dstBottom) [[likely]] {
                 const size_t copyBytes = static_cast<size_t>(dstRight - dstX) * 4;
-                // stride_ (not width_*4) accounts for any DRM alignment padding added by the kernel during dumb
-                // buffer creation.
+                // stride_ accounts for DRM alignment padding (may differ from width_*4).
                 uint8_t *dst = pixels_ + (static_cast<size_t>(dstY) * stride_) + (static_cast<size_t>(dstX) * 4);
                 const uint8_t *srcRow =
                     src + (static_cast<size_t>(dstY - vp.Y()) * srcStride) + (static_cast<size_t>(dstX - vp.X()) * 4);
@@ -269,22 +253,18 @@ auto cVaapiOsd::Flush() -> void {
         }
     }
 
-    // Notify the display thread after releasing LOCK_PIXMAPS -- UpdateOsd() only passes the framebuffer ID and
-    // geometry, it does not touch pixmap data, so holding the global pixmap lock during the cross-thread mutex
-    // acquisition is unnecessary.
+    // Notify display after releasing LOCK_PIXMAPS; UpdateOsd() only passes geometry, not pixmap data.
     if (rendered) {
         provider_->UpdateOsd(*this);
         return;
     }
 
-    // In TrueColor mode RenderPixmaps() composites everything (including bitmap areas) into pixmaps, so reaching here
-    // simply means no dirty content exists this frame -- the indexed-color path is not needed.
+    // TrueColor: no dirty content this frame.
     if (IsTrueColor()) {
         return;
     }
 
-    // Indexed-color path: the skin uses palette-based bitmaps (4/8bpp). Iterate only the dirty rectangle of each bitmap
-    // and convert each pixel through VDR's palette lookup to ARGB8888.
+    // Indexed-color path: convert dirty bitmap regions from palette to ARGB8888.
     bool anyDirty = false;
     for (int i = 0; cBitmap *bitmap = GetBitmap(i); ++i) {
         int x1 = 0;
@@ -295,8 +275,7 @@ auto cVaapiOsd::Flush() -> void {
             continue;
         }
 
-        // Clamp dirty region to framebuffer boundaries (bitmap-local coords). Bitmap origin (X0(), Y0()) is its
-        // position within the OSD coordinate space; pixel (x, y) maps to framebuffer position (X0()+x, Y0()+y).
+        // Clamp dirty region to framebuffer; bitmap pixel (x,y) maps to framebuffer (X0()+x, Y0()+y).
         const int bmpX0 = bitmap->X0();
         const int bmpY0 = bitmap->Y0();
         const int cx1 = std::max(x1, -bmpX0);
@@ -334,8 +313,7 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Step 1: Allocate a dumb (CPU-accessible) GEM buffer in kernel memory. The kernel returns a GEM handle, the actual
-    // row stride, and the total size.
+    // Step 1: Allocate a dumb (CPU-accessible) GEM buffer.
     drm_mode_create_dumb createReq{};
     createReq.width = fbWidth;
     createReq.height = fbHeight;
@@ -350,8 +328,7 @@ auto cVaapiOsd::Flush() -> void {
     stride_ = createReq.pitch; // may be larger than fbWidth*4 due to alignment
     mappedSize_ = createReq.size;
 
-    // Step 2: Register the GEM buffer as a DRM framebuffer so the modesetting API can scan it out via a DRM plane.
-    // Four-plane arrays required by the API; we use only the first plane for the single ARGB8888 buffer.
+    // Step 2: Register as a DRM framebuffer. Only plane 0 used for ARGB8888.
     const uint32_t handles[4] = {gemHandle_, 0, 0, 0};
     const uint32_t pitches[4] = {stride_, 0, 0, 0};
     const uint32_t offsets[4] = {0, 0, 0, 0};
@@ -363,8 +340,7 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Step 3: Obtain a mmap offset from the kernel, then map the buffer into the process address space so we can write
-    // pixels from the CPU side.
+    // Step 3: mmap the buffer for CPU pixel writes.
     drm_mode_map_dumb mapReq{};
     mapReq.handle = gemHandle_;
 
@@ -390,8 +366,7 @@ auto cVaapiOsd::Flush() -> void {
 }
 
 auto cVaapiOsd::DestroyDumbBuffer() -> void {
-    // Teardown must follow the reverse allocation order: unmap CPU memory -> remove DRM framebuffer -> destroy GEM
-    // object. Reversing the order would leave dangling kernel references.
+    // Reverse allocation order: unmap -> remove framebuffer -> destroy GEM handle.
     if (pixels_) [[likely]] {
         munmap(pixels_, mappedSize_);
         pixels_ = nullptr;

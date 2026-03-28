@@ -24,7 +24,7 @@
 // ============================================================================
 
 constexpr int CONFIG_AUDIO_LATENCY_MAX_MS = 200; ///< Upper bound for audio-latency compensation (ms)
-constexpr int CONFIG_AUDIO_LATENCY_MIN_MS = 20;  ///< Lower bound for audio-latency compensation (ms)
+constexpr int CONFIG_AUDIO_LATENCY_MIN_MS = 0;   ///< Lower bound for audio-latency compensation (ms)
 constexpr uint32_t CONFIG_MAX_VIDEO_HEIGHT =
     2160U; ///< Maximum display height accepted by ParseResolution() (4K UHD, px)
 constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width accepted by ParseResolution() (4K UHD, px)
@@ -34,8 +34,6 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
 // ============================================================================
 
 [[nodiscard]] auto DisplayConfig::GetAspectRatio() const noexcept -> double {
-    // Guard against division by zero when outputHeight has been explicitly set to zero (e.g. during teardown or before
-    // a DRM mode has been applied).
     if (outputHeight == 0) [[unlikely]] {
         return DISPLAY_DEFAULT_ASPECT_RATIO;
     }
@@ -48,9 +46,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return false;
     }
 
-    // Expected format: WIDTHxHEIGHT@RATE (e.g. "1920x1080@50"). All three fields are mandatory; we reject anything
-    // that deviates. We locate the two delimiters first so we can pass tight sub-ranges to from_chars() without making
-    // any heap allocations.
+    // Expected format: WIDTHxHEIGHT@RATE (e.g. "1920x1080@50"). All three fields are mandatory.
     const char *widthStart = resolutionStr;
     const char *xPos = std::strchr(widthStart, 'x');
     if (!xPos) [[unlikely]] {
@@ -68,9 +64,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
     const char *rateStart = atPos + 1;
     const char *rateEnd = rateStart + std::strlen(rateStart);
 
-    // from_chars() parses the longest valid integer prefix. We also verify that the returned end pointer sits exactly
-    // on the expected delimiter -- this catches inputs like "1920x1080abc@50" where extra characters follow a field,
-    // which from_chars() itself would accept as a partial success.
+    // Verify end pointer matches delimiter to reject trailing garbage (e.g. "1920abc").
     uint32_t width{};
     auto [ptrW, ecW] = std::from_chars(widthStart, xPos, width);
     if (ecW != std::errc{} || ptrW != xPos) [[unlikely]] {
@@ -108,7 +102,6 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return false;
     }
 
-    // All fields validated -- commit to the struct and log the final state.
     outputWidth = width;
     outputHeight = height;
     refreshRate = rate;
@@ -126,19 +119,16 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
 }
 
 [[nodiscard]] auto VaapiConfig::SetupParse(const char *name, const char *value) -> bool {
-    // VDR may call this with nullptr during internal housekeeping; silently ignore.
     if (!name || !value) [[unlikely]] {
         return false;
     }
 
-    // Key names must exactly match the strings passed to SetupStore() in the plugin class, because VDR round-trips them
-    // verbatim through setup.conf.
+    // Key must match SetupStore() in the plugin class (round-tripped via setup.conf).
     if (std::string_view{name} == "AudioLatency") {
         int parsed{};
         const auto *end = value + std::strlen(value);
         const auto [ptr, ec] = std::from_chars(value, end, parsed);
 
-        // Reject non-numeric values and trailing garbage (e.g. "50ms").
         if (ec != std::errc{} || ptr != end) {
             esyslog("vaapivideo/config: invalid AudioLatency value '%s'", value);
             return false;
@@ -154,13 +144,10 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return true;
     }
 
-    // Unknown key -- returning false tells VDR the key does not belong to this plugin, so it can pass it on to other
-    // plugins or report it as unrecognized.
-    return false;
+    return false; // unknown key
 }
 
 // ----------------------------------------------------------------------------
 
-// Definition of the singleton declared extern in config.h. All other translation units access it via that extern
-// declaration; only this one owns the storage.
+// Singleton storage; declared extern in config.h.
 VaapiConfig vaapiConfig;

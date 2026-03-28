@@ -82,8 +82,7 @@ cAudioProcessor::~cAudioProcessor() noexcept {
 // ============================================================================
 
 auto cAudioProcessor::Clear() -> void {
-    // snd_pcm_drop() discards pending audio immediately (snd_pcm_drain() would block), then snd_pcm_prepare() resets
-    // the ALSA state machine so the device accepts new frames.
+    // snd_pcm_drop() + prepare() discards pending audio and resets the ALSA state machine.
     const cMutexLock lock(mutex.get());
 
     if (alsaHandle) {
@@ -96,8 +95,7 @@ auto cAudioProcessor::Clear() -> void {
     pcmQueueEndPts = AV_NOPTS_VALUE;
     pcmNextPts = AV_NOPTS_VALUE;
 
-    // Bump generation so any in-flight DecodeToPcm() call that already dequeued a stale packet will not write a
-    // stale playbackPts after we release the lock.
+    // Bump generation so in-flight DecodeToPcm() calls discard stale clock writes.
     clearGeneration.fetch_add(1, std::memory_order_release);
 
     while (!packetQueue.empty()) {
@@ -105,9 +103,8 @@ auto cAudioProcessor::Clear() -> void {
         packetQueue.pop();
     }
 
-    // Deferred flush: residual reference frames after seek/skip can cause unexpected channel layout or sample format,
-    // crashing swr_convert(). The actual avcodec_flush_buffers() runs on the Action() thread via needsFlush to avoid
-    // racing with DecodeToPcm().
+    // Deferred flush via needsFlush flag: the actual avcodec_flush_buffers() runs on the Action() thread to avoid
+    // racing with DecodeToPcm(). Residual frames after seek can crash swr_convert() if not flushed.
     if (decoder) {
         needsFlush.store(true, std::memory_order_release);
     }
@@ -121,14 +118,12 @@ auto cAudioProcessor::Clear() -> void {
 }
 
 auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> void {
-    // av_parser_parse2() reassembles the byte stream into complete codec access units. PTS is supplied only on the
-    // first call; the parser tracks timestamps internally after seeing the initial stream boundary.
+    // av_parser_parse2() reassembles into complete access units. PTS is supplied only on the first call.
     if (!data || size == 0) [[unlikely]] {
         return;
     }
 
-    // Lock protects parserCtx and decoder against concurrent Clear()/SetStreamParams(). VDR cMutex is recursive, so
-    // the nested lock in EnqueuePacket() is safe.
+    // Protects parserCtx/decoder against concurrent Clear()/SetStreamParams(). VDR cMutex is recursive.
     const cMutexLock lock(mutex.get());
 
     if (!parserCtx || !decoder) [[unlikely]] {
@@ -167,21 +162,16 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::GetClock() const noexcept -> int64_t {
-    // clock = pcmQueueEndPts - (ALSA ring-buffer delay in 90 kHz ticks)
-    //
-    // pcmQueueEndPts tracks the last sample written to ALSA. snd_pcm_delay() returns frames still buffered in kernel
-    // and hardware. Subtracting that delay yields the PTS currently at the DAC output. Falls back to the cached
-    // playbackPts when the device is closed or no PTS has been anchored.
+    // clock = pcmQueueEndPts - ALSA ring-buffer delay (in 90 kHz ticks).
+    // Falls back to cached playbackPts when the device is closed or no PTS has been anchored.
     const unsigned rate = alsaSampleRate;
 
     if (!alsaHandle || rate == 0) {
         return playbackPts.load(std::memory_order_relaxed);
     }
 
-    // Read delay BEFORE endPts to avoid a cross-thread race with the audio writer. If the audio thread writes samples
-    // between these two reads, delay is stale-low and endPts is current-high, making the clock appear slightly ahead
-    // (decoder waits one extra frame -- harmless). The old order (endPts first) caused the clock to appear to jump
-    // backward by hundreds of milliseconds, triggering massive overshoot in the natural sync sleep path.
+    // Read delay BEFORE endPts: if the audio thread writes between the two reads, the clock appears slightly
+    // ahead (harmless). The reverse order caused backward jumps triggering sync overshoot.
     snd_pcm_sframes_t delayFrames = 0;
     if (snd_pcm_delay(alsaHandle, &delayFrames) != 0 || delayFrames < 0) {
         return playbackPts.load(std::memory_order_relaxed);
@@ -252,8 +242,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
-    // Reconfiguration chain: flush queued packets -> close/reopen ALSA -> reinit decoder/parser. All three steps run
-    // under the mutex so the Action() thread never sees a half-configured state.
+    // Entire reconfiguration runs under the mutex to prevent half-configured state.
     if (params.sampleRate <= 0 || params.channels <= 0) [[unlikely]] {
         esyslog("vaapivideo/audio: invalid stream parameters");
         return;
@@ -264,7 +253,7 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
 
     const cMutexLock lock(mutex.get());
 
-    // Skip reconfiguration when nothing changed to avoid unnecessary ALSA teardowns.
+    // Skip when nothing changed to avoid unnecessary ALSA teardowns.
     if (streamParams.codecId == params.codecId && streamParams.sampleRate == params.sampleRate &&
         streamParams.channels == params.channels) {
         return;
@@ -287,8 +276,7 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
     dsyslog("vaapivideo/audio: codec %s -> %s mode (rate=%u)", avcodec_get_name(params.codecId),
             wantPassthrough ? "passthrough" : "PCM", targetRate);
 
-    // Reopen ALSA only when the hardware format actually changes. For passthrough the IEC958 channel count is always 2,
-    // so a channel-count change in the compressed stream alone does not require a device reopen.
+    // Reopen ALSA only when the hardware format changes. Passthrough always uses 2 IEC958 channels.
     const bool needsReconfig =
         !initialized.load(std::memory_order_relaxed) || alsaPassthroughActive != wantPassthrough ||
         (wantPassthrough ? targetRate != alsaSampleRate
@@ -367,8 +355,7 @@ auto cAudioProcessor::Shutdown() -> void {
 }
 
 auto cAudioProcessor::Stop() -> void {
-    // Orderly teardown: signal the Action() thread via 'stopping', wake condition waits, hard-cancel after timeout,
-    // then release resources. Shutdown() alone would not terminate the Action() thread.
+    // Signal + wake + cancel. Shutdown() alone would not terminate the Action() thread.
     const bool wasStopping = stopping.exchange(true, std::memory_order_release);
     dsyslog("vaapivideo/audio: Stop() (wasStopping=%d)", wasStopping);
 
@@ -405,7 +392,7 @@ auto cAudioProcessor::Action() -> void {
         {
             const cMutexLock lock(mutex.get());
 
-            // 100ms timed wait is a backstop against missed Broadcast() wakeups.
+            // 100ms backstop against missed Broadcast() wakeups.
             while (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
                 packetCondition.TimedWait(*mutex, 100);
             }
@@ -419,22 +406,20 @@ auto cAudioProcessor::Action() -> void {
                 packetQueue.pop();
             }
 
-            // Snapshot under lock: streamParams is written by SetStreamParams() on another thread.
+            // Snapshot under lock; streamParams may be written by another thread.
             passthrough = CanPassthrough(streamParams.codecId);
         }
-        // Lock released here so EnqueuePacket() is not blocked while we do slow I/O.
+        // Lock released; EnqueuePacket() not blocked during slow I/O.
 
         if (!packet || !packet->data || packet->size <= 0) [[unlikely]] {
             continue;
         }
 
-        // WriteToAlsa() manages alsaErrorCount internally (reset on success, increment on failure). DecodeToPcm()
-        // delegates to WritePcmToAlsa() -> WriteToAlsa() for the ALSA path. No additional error tracking needed here.
+        // WriteToAlsa() handles error tracking internally.
         (void)(passthrough ? WriteToAlsa(std::span(packet->data, static_cast<size_t>(packet->size)))
                            : DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), packet->pts));
     }
 
-    // Signal exit before final log -- ensures happens-before ordering with Stop().
     hasExited.store(true, std::memory_order_release);
     isyslog("vaapivideo/audio: processing thread stopped");
 }
@@ -464,8 +449,7 @@ auto cAudioProcessor::Action() -> void {
 }
 
 auto cAudioProcessor::CloseDecoder() -> void {
-    // Wait for any in-flight DecodeToPcm() call to finish (decoderRefCount > 0). Freeing the context while in use
-    // would be use-after-free. The bounded spin completes in microseconds in normal operation.
+    // Wait for in-flight DecodeToPcm() calls to finish before destroying the context.
     for (const cTimeMs start;
          decoderRefCount.load(std::memory_order_acquire) > 0 && start.Elapsed() < AUDIO_DECODER_DRAIN_TIMEOUT_MS;) {
         cCondWait::SleepMs(1);
@@ -497,8 +481,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return streamRate;
     }
 
-    // DD+ (E-AC-3), AC-4, and MPEG-H 3D Audio carry larger frame bursts that require the IEC61937 clock to run at 4x
-    // (192 kHz for a 48 kHz stream). AC-3 and DTS use the standard 1x clock (48 kHz).
+    // DD+/AC-4/MPEG-H require 4x IEC61937 clock (192 kHz for 48 kHz stream); AC-3/DTS use 1x.
     const bool needsQuadRate =
         (codecId == AV_CODEC_ID_EAC3 || codecId == AV_CODEC_ID_AC4 || codecId == AV_CODEC_ID_MPEGH_3D_AUDIO);
     return needsQuadRate ? streamRate * 4 : streamRate;
@@ -553,8 +536,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // 200ms ring buffer with 25ms period. Balances scheduling-jitter resilience against A/V sync latency -- keeps sync
-    // within one video frame at 25 fps.
+    // 200ms buffer / 25ms period: keeps A/V sync within one video frame at 25 fps.
     auto bufferSize = static_cast<snd_pcm_uframes_t>(actualRate / 5);  // 200ms
     auto periodSize = static_cast<snd_pcm_uframes_t>(actualRate / 40); // 25ms
 
@@ -573,8 +555,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // Start playback automatically once the ring buffer is half-full. Pre-fills 100ms before the DAC starts,
-    // preventing an underrun on the first period without adding more than one video frame of startup latency.
+    // Auto-start at half-full (100ms pre-fill) to prevent first-period underrun.
     const snd_pcm_uframes_t startThreshold = bufferSize / 2;
     if (snd_pcm_sw_params_set_start_threshold(handle, swParams, startThreshold) < 0 ||
         snd_pcm_sw_params_set_avail_min(handle, swParams, periodSize) < 0 || snd_pcm_sw_params(handle, swParams) < 0) {
@@ -602,12 +583,10 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // Snapshot generation counter before touching the decoder. If Clear() runs between the dequeue in Action() and
-    // WritePcmToAlsa(), the generation will have advanced and we suppress the stale clock write.
+    // Snapshot generation to detect concurrent Clear() and suppress stale clock writes.
     const uint32_t myGeneration = clearGeneration.load(std::memory_order_acquire);
 
-    // Guard decoder lifetime for the entire function. CloseDecoder() waits for decoderRefCount to reach zero before
-    // destroying the context, preventing use-after-free from concurrent SetStreamParams() calls.
+    // Guard decoder lifetime; CloseDecoder() waits for refcount to drop before destroying the context.
     decoderRefCount.fetch_add(1, std::memory_order_relaxed);
 
     // Re-check: CloseDecoder() may have completed between the null check and the fetch_add above.
@@ -616,8 +595,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // Deferred flush on the Action() thread to avoid racing with avcodec_send_packet/receive_frame. Clear() sets
-    // needsFlush instead of calling avcodec_flush_buffers() directly.
+    // Deferred flush from Clear() -- must run on this thread to avoid racing with avcodec_send_packet.
     if (needsFlush.exchange(false, std::memory_order_acquire)) {
         FlushDecoderState();
     }
@@ -739,8 +717,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
                                        ? static_cast<unsigned>(pcmSize / (outCh * 2U))
                                        : static_cast<unsigned>(frame->nb_samples);
 
-        // Maintain a monotonic 90 kHz PCM timeline based on the parser-provided PTS. FFmpeg's frame->pts uses a
-        // codec-dependent timebase and must not be assumed to be 90 kHz.
+        // Maintain a 90 kHz PCM timeline from parser PTS (FFmpeg frame->pts uses a codec-dependent timebase).
         if (pts != AV_NOPTS_VALUE) {
             if (pcmNextPts == AV_NOPTS_VALUE) {
                 pcmNextPts = pts;
@@ -763,8 +740,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             }
         }
 
-        // If Clear() ran since we dequeued this packet, skip the ALSA write to prevent a stale PTS from poisoning the
-        // audio clock.
+        // Skip ALSA write if Clear() ran since dequeue to prevent stale PTS from poisoning the clock.
         if (clearGeneration.load(std::memory_order_acquire) != myGeneration) [[unlikely]] {
             decoderRefCount.fetch_sub(1, std::memory_order_release);
             return true;
@@ -825,8 +801,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 }
 
 [[nodiscard]] auto cAudioProcessor::OpenAlsaDevice() -> bool {
-    // Passthrough: IEC958_SUBFRAME_LE, always 2 channels (IEC61937 frames the compressed bitstream inside a 2-channel
-    // S/PDIF container). PCM: S16_LE with channels matching the decoded stream. Falls back to PCM if passthrough fails.
+    // Passthrough: IEC958_SUBFRAME_LE 2ch. PCM: S16_LE with decoded channel count. Falls back to PCM on failure.
     if (alsaDeviceName.empty()) {
         esyslog("vaapivideo/audio: empty device name");
         return false;
@@ -885,7 +860,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 }
 
 auto cAudioProcessor::OpenDecoder() -> void {
-    // Wait for any in-flight DecodeToPcm() call (decoderRefCount > 0) before replacing the decoder context.
+    // Wait for in-flight DecodeToPcm() calls before replacing the decoder context.
     for (const cTimeMs start;
          decoderRefCount.load(std::memory_order_acquire) > 0 && start.Elapsed() < AUDIO_DECODER_DRAIN_TIMEOUT_MS;) {
         cCondWait::SleepMs(1);
@@ -960,9 +935,7 @@ auto cAudioProcessor::OpenDecoder() -> void {
 }
 
 auto cAudioProcessor::ProbeSinkCaps() -> void {
-    // The kernel ALSA driver exposes the HDMI ELD (EDID-Like Data) as a PCM control element on the card's control
-    // interface. It mirrors the CEA-861 Short Audio Descriptors (SADs) from the sink's EDID. Falls back to PCM-only
-    // mode when the ELD is unavailable (analogue output, S/PDIF, plug/dmix, ...).
+    // Probe HDMI ELD (EDID-Like Data) for CEA-861 Short Audio Descriptors. Falls back to PCM-only when unavailable.
     if (sinkCapsCached && sinkCapsDevice == alsaDeviceName) {
         return; // Already probed; cached result is still valid
     }
@@ -1006,8 +979,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     snd_pcm_hw_params_t *params = nullptr;
     snd_pcm_hw_params_alloca(&params);
 
-    // Quick format check: if the device does not support IEC958_SUBFRAME_LE at the hardware level there is no point
-    // reading the ELD -- passthrough is impossible anyway.
+    // No point reading ELD if IEC958_SUBFRAME_LE is not supported at the hardware level.
     const bool iec958Supported = snd_pcm_hw_params_any(handle, params) >= 0 &&
                                  snd_pcm_hw_params_test_format(handle, params, SND_PCM_FORMAT_IEC958_SUBFRAME_LE) >= 0;
 
@@ -1018,7 +990,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         return;
     }
 
-    // Open the ALSA control interface (not the PCM device) to read the ELD byte array.
+    // Read ELD via the ALSA control interface (not the PCM device).
     const auto ctlName = std::format("hw:{}", cardId);
 
     snd_ctl_t *ctlRaw = nullptr;
@@ -1165,8 +1137,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         return false;
     }
 
-    // For passthrough, an ALSA "frame" is one IEC958 sub-frame (32 bits), not one audio sample. The relationship to
-    // media time is codec-specific, so the clock is left at AV_NOPTS_VALUE and VDR uses the video clock instead.
+    // Passthrough: ALSA "frame" is an IEC958 sub-frame, not an audio sample; clock stays at AV_NOPTS_VALUE.
     if (alsaPassthroughActive) {
         return true;
     }
@@ -1176,8 +1147,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         return true;
     }
 
-    // Load once, modify locally, store once. Only the Action thread writes; GetClock reads atomically on x86_64
-    // (aligned int64_t loads are indivisible).
+    // Single-writer (Action thread); GetClock() reads atomically.
     int64_t endPts = pcmQueueEndPts;
 
     // PTS jump > 5 s indicates a discontinuity -- re-anchor the timeline.
@@ -1208,10 +1178,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 }
 
 [[nodiscard]] auto cAudioProcessor::WriteToAlsa(std::span<const uint8_t> data) -> bool {
-    // Responsibilities:
-    //  - Software volume scaling (skipped for passthrough -- would corrupt IEC61937 sync words)
-    //  - Frame alignment: trim PCM to frame boundary; zero-pad passthrough
-    //  - Three-tier error recovery: EAGAIN wait -> snd_pcm_recover -> device reopen
+    // Software volume scaling, frame alignment, and three-tier error recovery (EAGAIN -> recover -> reopen).
     if (!alsaHandle || data.empty()) {
         return false;
     }
@@ -1219,8 +1186,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const int currentVolume = volume.load(std::memory_order_relaxed);
     std::vector<uint8_t> scaledBuffer;
 
-    // Scale each S16LE sample by volume/255. Passthrough is untouched -- modifying the compressed bitstream would
-    // corrupt IEC61937 sync words.
+    // Passthrough is untouched -- modifying compressed bitstream would corrupt IEC61937 sync words.
     if (!alsaPassthroughActive && currentVolume != 255) {
         if (currentVolume == 0) {
             scaledBuffer.assign(data.size(), 0); // Muted: replace with silence

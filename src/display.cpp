@@ -109,8 +109,7 @@ auto AtomicRequest::operator=(AtomicRequest &&other) noexcept -> AtomicRequest &
 // ============================================================================
 
 auto AtomicRequest::AddProperty(uint32_t objId, uint32_t propId, uint64_t value) -> void {
-    // propId == 0 means the optional property was not found during discovery; silently skip rather than submitting a
-    // malformed commit.
+    // propId == 0: optional property not found during discovery; skip silently.
     if (!request || propId == 0) {
         return;
     }
@@ -219,8 +218,7 @@ auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
         return;
     }
 
-    // Wait until both the dirty flag is cleared and the overlay is hidden. osdDirty being clear means PresentBuffer()
-    // has committed the hide request; currentOsd.fbId == 0 guarantees the plane is pointing away from our buffer.
+    // Wait until PresentBuffer() has committed the hide (osdDirty cleared) and the plane no longer references fbId.
     const cTimeMs deadline(100);
     while (!deadline.TimedOut()) {
         {
@@ -353,10 +351,8 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
         dsyslog("vaapivideo/display: OSD hide - fbId=%u", currentOsd.fbId);
     }
 
-    // Always store the new overlay and mark dirty so PresentBuffer() re-commits the OSD plane on the next frame.
-    // Skipping identical updates would hide incremental pixel changes written by the OSD into the same dumb buffer
-    // (e.g. background first, then channel logo on a second Flush()) -- the kernel must see each commit to invalidate
-    // FBC/PSR tile caches.
+    // Always mark dirty even for identical geometry: the OSD may have written new pixels into the same dumb buffer,
+    // and the kernel needs a commit to invalidate FBC/PSR tile caches.
     currentOsd = osd;
     osdDirty = true;
 }
@@ -405,11 +401,9 @@ auto cVaapiDisplay::Shutdown() -> void {
 
     // Drain any page-flip events that arrived after the thread exited.
     for (int i = 0; i < MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
-        // intentionally empty -- DrainDrmEvents() does the work.
     }
 
-    // Detach planes and deactivate the CRTC so the kernel/console can take over. Without CRTC deactivation the display
-    // stays in the last programmed mode (black).
+    // Detach planes and deactivate the CRTC so the kernel/console can reclaim the display.
     if (drmFd >= 0) {
         AtomicRequest req;
         if (videoPlaneId != 0) {
@@ -420,8 +414,7 @@ auto cVaapiDisplay::Shutdown() -> void {
             req.AddProperty(osdPlaneId, osdProps.fbId, 0);
             req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
         }
-        // Deactivate the CRTC: clear mode, set ACTIVE=0, disconnect connector. This releases the display output so
-        // another DRM client or the console can reclaim it immediately.
+        // Deactivate the CRTC: clear mode, set ACTIVE=0, disconnect connector.
         if (modesetProps.isValid) {
             req.AddProperty(crtcId, modesetProps.crtcActive, 0);
             req.AddProperty(crtcId, modesetProps.crtcModeId, 0);
@@ -439,16 +432,14 @@ auto cVaapiDisplay::Shutdown() -> void {
 }
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
-    // Relaxed loads are sufficient for these early-exit polls: if we narrowly miss a flag change, we proceed to
-    // bufferMutex which provides its own synchronization.
+    // Relaxed early-exit polls; bufferMutex below provides full synchronization.
     if (!frame || !isReady.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
     const cMutexLock lock(&bufferMutex);
 
-    // There is only one pending-frame slot. Block until the display thread consumes it, unless the caller requested
-    // non-blocking or a timeout.
+    // Single pending-frame slot; block until the display thread consumes the previous frame.
     if (pendingFrame) {
         if (timeoutMs == 0) {
             return false;
@@ -483,10 +474,7 @@ auto cVaapiDisplay::Shutdown() -> void {
 auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
-    // VDR's Running() is not thread-safe; use our own atomic flags.
-    // Relaxed loads are sufficient for polling exit signals -- these flags transition monotonically (or toggle with
-    // explicit mutex hand-off) and no shared data depends on the load ordering here.  Acquire is reserved for the
-    // checks under importMutex that gate VAAPI surface access.
+    // VDR's Running() is not thread-safe; use our own atomic flags (relaxed for polling, acquire under importMutex).
     while (!isStopping.load(std::memory_order_relaxed) && isReady.load(std::memory_order_relaxed)) {
         // Drain all pending DRM events before doing any work.  DrainDrmEvents(0) is non-blocking; the post-drain
         // flag check below catches shutdown immediately after.
@@ -606,7 +594,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(osdPlaneId, osdProps.fbId, osd.fbId);
     req.AddProperty(osdPlaneId, osdProps.srcX, 0);
     req.AddProperty(osdPlaneId, osdProps.srcY, 0);
-    // SRC_* coordinates use 16.16 fixed-point format (same as for the video plane).
+    // SRC_* use 16.16 fixed-point (value = pixels << 16).
     req.AddProperty(osdPlaneId, osdProps.srcW, static_cast<uint64_t>(clippedW) << 16);
     req.AddProperty(osdPlaneId, osdProps.srcH, static_cast<uint64_t>(clippedH) << 16);
     req.AddProperty(osdPlaneId, osdProps.crtcX, static_cast<uint64_t>(osd.x));
@@ -627,9 +615,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true;
     }
 
-    // Page-flip commits are non-blocking with event notifications so the display thread stays responsive.
-    // DRM_MODE_PAGE_FLIP_ASYNC is intentionally not used: it requires linear modifiers (VAAPI surfaces are tiled) and
-    // causes tearing.
+    // Non-blocking page-flip with event notification. ASYNC not used: requires linear modifiers (VAAPI is tiled).
     uint32_t commitFlags = flags;
     if ((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
         commitFlags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
@@ -652,8 +638,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
 [[nodiscard]] auto cVaapiDisplay::ApplyDisplayMode(const drmModeModeInfo &mode) -> bool {
     dsyslog("vaapivideo/display: setting display mode %ux%u@%uHz", mode.hdisplay, mode.vdisplay, mode.vrefresh);
-    // The KMS mode is passed as a property blob (opaque binary struct). Each call creates a fresh blob; the old one
-    // must be destroyed first to avoid leaking kernel resources.
+    // Mode is passed as a property blob; destroy the old one to avoid leaking kernel resources.
     if (modeBlobId != 0) {
         drmModeDestroyPropertyBlob(drmFd, modeBlobId);
         modeBlobId = 0;
@@ -679,9 +664,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::BindDrmPlane(int planeIndex, uint32_t format) -> bool {
-    // Walk all planes in DRM enumeration order, skipping those already assigned or incompatible. planeIndex=0 picks the
-    // first suitable plane; planeIndex=1 the second, etc. The format check uses the IN_FORMATS property blob (not the
-    // legacy format list) so modifier support is correctly verified.
+    // Find the planeIndex'th plane that supports the given format. Uses the IN_FORMATS blob for modifier awareness.
     auto planeRes = std::unique_ptr<drmModePlaneRes, decltype(&drmModeFreePlaneResources)>(
         drmModeGetPlaneResources(drmFd), drmModeFreePlaneResources);
     auto res =
@@ -691,8 +674,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return false;
     }
 
-    // Find CRTC index. The plane's possible_crtcs bitmask uses a bit position, not the CRTC object ID itself, so we
-    // need the index of our CRTC within the global CRTC array.
+    // possible_crtcs is a bitmask by index, not by CRTC object ID.
     int crtcIndex = -1;
     for (int i = 0; i < res->count_crtcs; ++i) {
         if (res->crtcs[i] == crtcId) {
@@ -730,8 +712,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             continue;
         }
 
-        // Walk properties once: collect format support, type value and all atomic property IDs needed for future
-        // commits.
+        // Single pass: collect format support, type, and all atomic property IDs.
         bool hasFormatSupport = false;
         uint32_t planeType = DRM_PLANE_TYPE_OVERLAY;
         DrmPlaneProps tempProps{};
@@ -745,8 +726,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
             const char *name = prop->name;
 
-            // IN_FORMATS blob lists all (format, modifier) pairs the plane supports; parse it to verify our target
-            // format is present.
+            // IN_FORMATS blob: (format, modifier) pairs supported by the plane.
             if (!hasFormatSupport && strcmp(name, "IN_FORMATS") == 0) {
                 const auto blobId = static_cast<uint32_t>(planeProps->prop_values[j]);
                 if (blobId != 0) {
@@ -863,7 +843,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::DrainDrmEvents(int timeoutMs) -> bool {
-    // poll() + drmHandleEvent() are re-entrant here; no mutex needed.
+    // No mutex needed: called only from the display thread.
     pollfd pfd{.fd = drmFd, .events = POLLIN, .revents = 0};
     const int ret = poll(&pfd, 1, timeoutMs);
 
@@ -874,20 +854,18 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
-    // Both capabilities have been mandatory since kernel 4.8/4.2; enabling them is a no-op on modern kernels but
-    // required for the ioctl to work.
+    // Mandatory since kernel 4.8/4.2; the ioctl still requires them to be explicitly enabled.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1);
 
-    // DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP was introduced in kernel 6.8. Probing it acts as a minimum kernel version check
-    // without hard-coding a version number.
+    // Probing this capability (kernel 6.8+) serves as a minimum kernel version check.
     uint64_t asyncCap = 0;
     if (drmGetCap(drmFd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &asyncCap) != 0 || asyncCap == 0) {
         esyslog("vaapivideo/display: kernel 6.8+ required (atomic async page-flip capability missing)");
         return false;
     }
 
-    // CRTC: need ACTIVE and MODE_ID to program a new mode.
+    // Cache CRTC property IDs (ACTIVE, MODE_ID).
     auto crtcProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
         drmModeObjectGetProperties(drmFd, crtcId, DRM_MODE_OBJECT_CRTC), drmModeFreeObjectProperties);
 
@@ -906,7 +884,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         }
     }
 
-    // Connector: need CRTC_ID to attach the connector to our CRTC.
+    // Cache connector CRTC_ID property.
     auto connProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
         drmModeObjectGetProperties(drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR), drmModeFreeObjectProperties);
 
@@ -958,8 +936,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     const auto *desc =
         reinterpret_cast<const AVDRMFrameDescriptor *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             mappedFrame->data[0]);
-    // We only support single-object surfaces (one DMA-BUF fd covering all planes of the NV12 frame via different
-    // offsets within the same buffer).
+    // Only single-object NV12 surfaces supported (one DMA-BUF fd, two planes at different offsets).
     if (!desc || desc->nb_objects == 0 || desc->nb_layers == 0 || desc->nb_objects != 1) [[unlikely]] {
         av_frame_free(&mappedFrame);
         return {};
@@ -1027,8 +1004,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     fb.width = width;
     fb.height = height;
     fb.modifier = modifiers[0];
-    // The AVFrame is moved into the DrmFramebuffer so the VAAPI surface stays alive for as long as the KMS driver needs
-    // the DMA-BUF. VaapiFrame already owns a cloned frame from CreateVaapiFrame(), so no extra copy is needed.
+    // Move AVFrame into the DrmFramebuffer to keep the VAAPI surface alive while KMS scans out the DMA-BUF.
     fb.frame = vaapiFrame->avFrame;
     vaapiFrame->avFrame = nullptr;
     vaapiFrame->ownsFrame = false;
@@ -1041,8 +1017,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] unsigned int seq,
                                     [[maybe_unused]] unsigned int sec, [[maybe_unused]] unsigned int usec, void *data)
     -> void {
-    // Called by drmHandleEvent() from within the display thread's DrainDrmEvents() loop. The 'data' pointer was passed
-    // as the userdata argument to drmModeAtomicCommit(), so we get our display instance back here.
+    // drmHandleEvent() callback; 'data' is the userdata passed to drmModeAtomicCommit().
     auto *display = static_cast<cVaapiDisplay *>(data);
     if (display) {
         display->isFlipPending.store(false, std::memory_order_release);
@@ -1054,18 +1029,15 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         return false;
     }
 
-    // The VAAPI filter graph already scaled the frame to the correct display-fitted dimensions (preserving DAR with
-    // letterbox/pillarbox). The DRM plane presents the frame at 1:1 pixel mapping -- no hardware scaling. Center the
-    // frame on the display; the uncovered area stays black.
+    // Filter graph already scaled to display-fitted dimensions (DAR-preserving letterbox/pillarbox).
+    // Center the frame on screen; DRM presents at 1:1 pixel mapping.
     const uint32_t destX = (fb.width < outputWidth) ? (outputWidth - fb.width) / 2 : 0;
     const uint32_t destY = (fb.height < outputHeight) ? (outputHeight - fb.height) / 2 : 0;
 
     AtomicRequest req;
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
     req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
-    // Tell the display engine this NV12 buffer is BT.709 limited-range. The scale_vaapi filter always outputs BT.709
-    // TV-range NV12 regardless of source format (SD BT.601 is converted). Without these, the driver default may
-    // mismatch, producing washed-out blacks.
+    // Explicitly set BT.709 limited-range to match scale_vaapi output; driver default may mismatch.
     if (videoProps.colorEncodingValid) {
         req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt709);
     }
@@ -1074,7 +1046,6 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     }
     req.AddProperty(videoPlaneId, videoProps.srcX, 0);
     req.AddProperty(videoPlaneId, videoProps.srcY, 0);
-    // SRC_* coordinates use 16.16 fixed-point format (value = pixels << 16).
     req.AddProperty(videoPlaneId, videoProps.srcW, static_cast<uint64_t>(fb.width) << 16);
     req.AddProperty(videoPlaneId, videoProps.srcH, static_cast<uint64_t>(fb.height) << 16);
     req.AddProperty(videoPlaneId, videoProps.crtcX, destX);
@@ -1101,8 +1072,7 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 
     const bool success = AtomicCommit(req, 0);
 
-    // Clear the dirty flag only after a successful commit so that a failed commit retries on the next PresentBuffer()
-    // call.
+    // Clear dirty only on success so a failed commit retries next time.
     if (success && osdCommitted) {
         const cMutexLock lock(&osdMutex);
         osdDirty = false;

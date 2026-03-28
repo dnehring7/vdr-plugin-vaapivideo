@@ -99,7 +99,6 @@ class cMenuVaapiStatus : public cOsdMenu {
         Clear();
 
         if (device && device->IsReady()) {
-            // GetOsdSize() returns the framebuffer dimensions, which match the physical display resolution.
             int width = 0;
             int height = 0;
             double aspect = 1.0;
@@ -112,7 +111,7 @@ class cMenuVaapiStatus : public cOsdMenu {
                 osUnknown, false));
             Add(new cOsdItem("", osUnknown, false));
             Add(new cOsdItem(cString::sprintf("%s: %dx%d", tr("Display Resolution"), width, height), osUnknown, false));
-            // The active DRM mode is not accessible through cDevice; we read the configured rate instead.
+            // Read configured rate; actual DRM mode rate is not exposed through cDevice.
             Add(new cOsdItem(cString::sprintf("%s: %u Hz", tr("Refresh Rate"), vaapiConfig.display.GetRefreshRate()),
                              osUnknown, false));
         } else {
@@ -142,10 +141,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 
   protected:
     auto Store() -> void override {
-        // Copy the scratch config back to the live global
         vaapiConfig = editConfig;
-        // SetupStore() writes the key/value pair to VDR's setup.conf so the setting survives a restart; the key must
-        // match what SetupParse() reads
+        // Key must match what SetupParse() reads from setup.conf.
         SetupStore("AudioLatency", vaapiConfig.audioLatency);
     }
 
@@ -173,21 +170,18 @@ class cVaapiVideoPlugin : public cPlugin {
     // VDR plugin API -- called by VDR in the order described in the file-level comment
     [[nodiscard]] auto CommandLineHelp() -> const char * override;
     [[nodiscard]] auto Description() -> const char * override { return PLUGIN_DESCRIPTION; }
-    auto Housekeeping() -> void override;             ///< Intentionally empty -- no periodic work needed.
-    [[nodiscard]] auto Initialize() -> bool override; ///< Called once after ProcessArgs(); before Start().
-    [[nodiscard]] auto MainMenuAction()
-        -> cOsdObject * override; ///< Opens the status OSD when the user enters the entry.
-    [[nodiscard]] auto MainMenuEntry() -> const char * override; ///< Hidden (nullptr) until the decoder is running.
+    auto Housekeeping() -> void override;
+    [[nodiscard]] auto Initialize() -> bool override;
+    [[nodiscard]] auto MainMenuAction() -> cOsdObject * override;
+    [[nodiscard]] auto MainMenuEntry() -> const char * override;
     [[nodiscard]] auto ProcessArgs(int argc, char *argv[]) -> bool override;
     [[nodiscard]] auto Service(const char *serviceId, void *data = nullptr) -> bool override;
-    [[nodiscard]] auto SetupMenu()
-        -> cMenuSetupPage * override; ///< Returns the plugin's setup page for VDR's setup menu.
-    [[nodiscard]] auto SetupParse(const char *Name, const char *Value) -> bool override; ///< Delegates to VaapiConfig.
+    [[nodiscard]] auto SetupMenu() -> cMenuSetupPage * override;
+    [[nodiscard]] auto SetupParse(const char *Name, const char *Value) -> bool override;
     [[nodiscard]] auto Start() -> bool override;
     auto Stop() -> void override;
     [[nodiscard]] auto SVDRPCommand(const char *command, const char *option, int &replyCode) -> cString override;
-    [[nodiscard]] auto SVDRPHelpPages() -> const char ** override; ///< Null-terminated list; VDR uses it for 'HELP
-                                                                   ///< vaapivideo'.
+    [[nodiscard]] auto SVDRPHelpPages() -> const char ** override;
     [[nodiscard]] auto Version() -> const char * override { return PLUGIN_VERSION; }
 
   private:
@@ -261,8 +255,7 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
 // ============================================================================
 
 auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
-    // VDR calls this before ProcessArgs() to print plugin help alongside its own --help output. The string is built
-    // once and kept alive in static storage for the duration of the process.
+    // Static storage: VDR keeps a pointer to the returned string for the lifetime of the process.
     static const std::string kHelp =
         std::format("  -d DEV, --drm=DEV           Use DRM device DEV "
                     "(default: auto-detect)\n"
@@ -468,8 +461,7 @@ auto cVaapiVideoPlugin::Stop() -> void {
 
 auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const char *option, int &replyCode)
     -> cString {
-    // SVDRP reply codes follow the VDR convention: 900 -- plugin-defined success (analogous to HTTP 200 with custom
-    // data) 550 -- requested action not taken (device not ready / no data available) 500 -- unknown / unhandled command
+    // VDR SVDRP reply codes: 900 = success, 550 = action not taken, 500 = unknown command.
 
     if (strcasecmp(command, "DETA") == 0) {
         if (!vaapiDevice) [[unlikely]] {
@@ -508,7 +500,6 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             return "VAAPI device inactive";
         }
 
-        // Resolution via OSD size -- the framebuffer dimensions match the active DRM mode.
         int width = 0;
         int height = 0;
         double aspect = 1.0;

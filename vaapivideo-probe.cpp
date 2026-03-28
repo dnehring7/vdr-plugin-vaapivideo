@@ -32,15 +32,8 @@
 
 #include <xf86drm.h>
 
-// ============================================================================
-// === CONSTANTS ===
-// ============================================================================
-
+// Minimal surface size for probing driver capabilities without wasting memory.
 constexpr int kProbeSurfaceSize = 64;
-
-// ============================================================================
-// === RAII HELPERS ===
-// ============================================================================
 
 namespace {
 struct DrmDeviceDeleter {
@@ -48,11 +41,7 @@ struct DrmDeviceDeleter {
 };
 } // namespace
 
-// ============================================================================
-// === LOOKUP TABLES ===
-// ============================================================================
-
-/// DVB-S2 decode profiles: MPEG-2 Main (SD), H.264 Main/High (HD), HEVC Main 10 (UHD).
+// DVB-S2 decode profiles: MPEG-2 Main (SD), H.264 Main/High (HD), HEVC Main 10 (UHD).
 static constexpr struct {
     VAProfile profile;
     const char *name;
@@ -63,7 +52,7 @@ static constexpr struct {
     {.profile = VAProfileHEVCMain10, .name = "HEVC Main 10"},
 };
 
-/// VPP filter types (deinterlacing and HDR are probed separately).
+// VPP filter types (deinterlacing and HDR are probed separately).
 static constexpr struct {
     VAProcFilterType type;
     const char *name;
@@ -76,7 +65,6 @@ static constexpr struct {
     {.type = VAProcFilterHVSNoiseReduction, .name = "HVS Noise Reduction"},
 };
 
-/// Tone mapping direction flags.
 static constexpr struct {
     uint16_t flag;
     const char *name;
@@ -86,7 +74,7 @@ static constexpr struct {
     {.flag = VA_TONE_MAPPING_SDR_TO_HDR, .name = "SDR->HDR"},
 };
 
-/// Deinterlacing algorithms, ordered best to worst.
+// Ordered from highest quality (motion compensated) to lowest (bob).
 static constexpr struct {
     VAProcDeinterlacingType type;
     const char *name;
@@ -97,11 +85,6 @@ static constexpr struct {
     {.type = VAProcDeinterlacingBob, .name = "Bob"},
 };
 
-// ============================================================================
-// === HELPERS ===
-// ============================================================================
-
-/// Check whether a profile has the VLD (Variable Length Decoding) entrypoint.
 [[nodiscard]] static auto SupportsVldEntrypoint(VADisplay display, VAProfile profile) -> bool {
     const int maxEntrypoints = vaMaxNumEntrypoints(display);
     if (maxEntrypoints <= 0) {
@@ -114,6 +97,7 @@ static constexpr struct {
         return false;
     }
 
+    // Clamp to buffer capacity to guard against bogus driver-reported counts.
     const auto validCount = (entrypointCount > 0)
                                 ? std::min(static_cast<size_t>(entrypointCount), entrypoints.size())
                                 : size_t{0};
@@ -121,7 +105,6 @@ static constexpr struct {
     return std::ranges::find(valid, VAEntrypointVLD) != valid.end();
 }
 
-/// Check whether a profile+VLD config supports VA_RT_FORMAT_YUV420.
 [[nodiscard]] static auto SupportsYuv420RtFormat(VADisplay display, VAProfile profile) -> bool {
     VAConfigAttrib attrib{};
     attrib.type = VAConfigAttribRTFormat;
@@ -131,7 +114,6 @@ static constexpr struct {
     return (attrib.value & VA_RT_FORMAT_YUV420) != 0;
 }
 
-/// Query the maximum decode resolution for a profile (0x0 if unsupported/unknown).
 [[nodiscard]] static auto QueryMaxDecodeResolution(VADisplay display, VAProfile profile)
     -> std::pair<unsigned int, unsigned int> {
     VAConfigAttrib attribs[2]{};
@@ -145,7 +127,6 @@ static constexpr struct {
     return {w, h};
 }
 
-/// Resolve the render node path (e.g. /dev/dri/renderD128) from an open DRM fd.
 [[nodiscard]] static auto ResolveRenderNode(int drmFd) -> std::string {
     ::drmDevicePtr rawDev = nullptr;
     if (drmGetDevice2(drmFd, 0, &rawDev) != 0 || !rawDev) {
@@ -159,12 +140,10 @@ static constexpr struct {
     return dev->nodes[DRM_NODE_RENDER];
 }
 
-/// Print a labelled yes/no capability line with ANSI color.
 static auto PrintCapability(const char *label, bool supported) -> void {
     std::printf("  %-34s %s\n", label, supported ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
 }
 
-/// Test whether the driver can create a surface with the given RT format.
 [[nodiscard]] static auto CanCreateSurface(VADisplay display, unsigned int rtFormat) -> bool {
     VASurfaceID surface = VA_INVALID_SURFACE;
     if (vaCreateSurfaces(display, rtFormat, kProbeSurfaceSize, kProbeSurfaceSize, &surface, 1, nullptr, 0) !=
@@ -175,12 +154,7 @@ static auto PrintCapability(const char *label, bool supported) -> void {
     return true;
 }
 
-// ============================================================================
-// === PROBE FUNCTIONS ===
-// ============================================================================
-
 namespace {
-/// Decode support results for profiles relevant to DVB-S2 color conversion.
 struct DecodeSupport {
     bool mpeg2 = false;
     bool h264 = false;
@@ -188,7 +162,6 @@ struct DecodeSupport {
 };
 } // namespace
 
-/// Probe and print hardware decode profiles; returns per-codec support flags.
 [[nodiscard]] static auto ProbeDecodeProfiles(VADisplay display) -> DecodeSupport {
     std::printf("\n--- Hardware Decode (VLD + YUV420) ---\n");
 
@@ -203,6 +176,7 @@ struct DecodeSupport {
     std::vector<VAProfile> profileBuf(static_cast<size_t>(maxProfiles));
     int profileCount = 0;
     const bool queryOk = vaQueryConfigProfiles(display, profileBuf.data(), &profileCount) == VA_STATUS_SUCCESS;
+    // Clamp to buffer capacity to guard against bogus driver-reported counts.
     const auto validCount = (queryOk && profileCount > 0)
                                 ? std::min(static_cast<size_t>(profileCount), profileBuf.size())
                                 : size_t{0};
@@ -240,7 +214,6 @@ struct DecodeSupport {
     return result;
 }
 
-/// Probe HDR tone mapping metadata types and direction flags.
 [[nodiscard]] static auto ProbeHdrToneMapping(VADisplay display, VAContextID vppContext,
                                               std::span<const VAProcFilterType> filters) -> bool {
     if (std::ranges::find(filters, VAProcFilterHighDynamicRangeToneMapping) == filters.end()) {
@@ -291,7 +264,6 @@ struct DecodeSupport {
     return hasUsableCaps;
 }
 
-/// Probe and print supported deinterlacing algorithms.
 static auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
     std::printf("\n--- Deinterlacing Algorithms ---\n");
 
@@ -310,8 +282,7 @@ static auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> voi
     }
 }
 
-/// Print DVB-S2 color conversion paths based on discovered capabilities.
-/// Called only when VPP is available — VPP implies colorspace conversion support.
+// Only called when VPP is available -- VPP implies colorspace conversion support.
 static auto PrintColorConversions(bool hasMpeg2, bool hasH264, bool hasHevc, bool hasP010, bool hasNV12,
                                   bool hasHdrToneMapping) -> void {
     std::printf("\n--- DVB-S2 Color Conversion Paths ---\n");
@@ -334,10 +305,6 @@ static auto PrintColorConversions(bool hasMpeg2, bool hasH264, bool hasHevc, boo
     // Requires VPP tone mapping with HDR->SDR support.
     PrintCapability("PQ/HDR10 -> SDR    (tone map)", hasHevc && hasHdrToneMapping);
 }
-
-// ============================================================================
-// === MAIN ===
-// ============================================================================
 
 auto main(int argc, char *argv[]) -> int {
     if (argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0)) {
@@ -397,10 +364,8 @@ auto main(int argc, char *argv[]) -> int {
     const char *vendor = vaQueryVendorString(vaDisplay);
     std::printf("Driver:      %s\n", vendor ? vendor : "(unknown)");
 
-    // --- Decode profiles ---
     const auto decodeSupport = ProbeDecodeProfiles(vaDisplay);
 
-    // --- VPP support ---
     std::printf("\n--- Video Processing Pipeline (VPP) ---\n");
 
     VAConfigID vppConfig = VA_INVALID_ID;
@@ -408,7 +373,7 @@ auto main(int argc, char *argv[]) -> int {
         vaCreateConfig(vaDisplay, VAProfileNone, VAEntrypointVideoProc, nullptr, 0, &vppConfig) == VA_STATUS_SUCCESS;
 
     PrintCapability("General (VideoProc)", vppAvailable);
-    PrintCapability("Scaling", vppAvailable); // Implicit in any VPP pipeline.
+    PrintCapability("Scaling", vppAvailable); // Scaling is implicit in any VPP pipeline.
 
     if (!vppAvailable) {
         std::printf("\n  VPP unavailable -- remaining queries skipped.\n");
@@ -417,7 +382,6 @@ auto main(int argc, char *argv[]) -> int {
         return EXIT_SUCCESS;
     }
 
-    // --- Surface format support ---
     const bool hasP010 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420_10);
     const bool hasNV12 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420);
 
@@ -425,7 +389,7 @@ auto main(int argc, char *argv[]) -> int {
     PrintCapability("NV12 (8-bit) surfaces", hasNV12);
     PrintCapability("10-bit -> 8-bit conversion", hasP010 && hasNV12);
 
-    // --- Create VPP context for filter queries ---
+    // VPP filter queries require a valid context backed by a real surface.
     VASurfaceID probeSurface = VA_INVALID_SURFACE;
     if (const VAStatus st = vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, kProbeSurfaceSize, kProbeSurfaceSize,
                                              &probeSurface, 1, nullptr, 0);
@@ -451,7 +415,6 @@ auto main(int argc, char *argv[]) -> int {
         return EXIT_FAILURE;
     }
 
-    // --- VPP filter types ---
     VAProcFilterType filterBuf[VAProcFilterCount];
     auto filterCount = static_cast<unsigned int>(VAProcFilterCount);
     if (vaQueryVideoProcFilters(vaDisplay, vppContext, filterBuf, &filterCount) != VA_STATUS_SUCCESS) {
@@ -470,7 +433,6 @@ auto main(int argc, char *argv[]) -> int {
                           hasHdrToneMapping);
     ProbeDeinterlacing(vaDisplay, vppContext);
 
-    // --- Cleanup ---
     vaDestroyContext(vaDisplay, vppContext);
     vaDestroySurfaces(vaDisplay, &probeSurface, 1);
     vaDestroyConfig(vaDisplay, vppConfig);
