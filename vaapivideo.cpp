@@ -291,16 +291,15 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
         return false;
     }
 
-    const char *audioName = isempty(*audioDevice) ? "default" : *audioDevice;
-    isyslog("vaapivideo: using audio device: %s", audioName);
+    isyslog("vaapivideo: using audio device: %s", *audioDevice);
 
     // cVaapiDevice self-registers with VDR's internal device list in its constructor. Ownership transfers to VDR
     // immediately; cDevice::Shutdown() (called from main() after all plugin Stop() calls) will delete it. Never delete
     // vaapiDevice here.
-    dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s)", *resolvedDrm, audioName);
+    dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s)", *resolvedDrm, *audioDevice);
     vaapiDevice = new cVaapiDevice();
 
-    if (!vaapiDevice->Initialize(*resolvedDrm, audioName)) {
+    if (!vaapiDevice->Initialize(*resolvedDrm, *audioDevice)) {
         esyslog("vaapivideo: ========================================");
         esyslog("vaapivideo: device initialization FAILED");
         esyslog("vaapivideo: plugin will not be available");
@@ -364,7 +363,7 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
                         vaapiConfig.display.GetHeight(), vaapiConfig.display.GetRefreshRate());
                 break;
             default:
-                esyslog("vaapivideo: unknown command-line option: -%c", opt);
+                esyslog("vaapivideo: unrecognized command-line option (see stderr)");
                 return false;
         }
     }
@@ -400,8 +399,8 @@ auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
     }
 
     if (strcmp(serviceId, "VaapiVideo-DeviceType-v1.0") == 0) {
-        if (data != nullptr && vaapiDevice) {
-            *static_cast<cString *>(data) = vaapiDevice->DeviceType();
+        if (data != nullptr) {
+            *static_cast<cString *>(data) = vaapiDevice ? vaapiDevice->DeviceType() : "N/A";
         }
         return true;
     }
@@ -520,7 +519,7 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
                                 "Type: %s\n"
                                 "Decoder: %s\n"
                                 "Display Resolution: %dx%d\n"
-                                "Refresh Rate: %u Hz\n",
+                                "Refresh Rate: %u Hz",
                                 *vaapiDevice->DeviceType(), vaapiDevice->HasDecoder() ? "Ready" : "Not Ready", width,
                                 height, vaapiConfig.display.GetRefreshRate());
     }
@@ -535,13 +534,12 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
 }
 
 auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
-    // NOLINTNEXTLINE(misc-const-correctness)
-    static const char *kHelpPages[] = {
+    static const char *const kHelpPages[] = {
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.", "CONFIG\n    Display current configuration settings.",
         nullptr};
-    return kHelpPages;
+    return const_cast<const char **>(kHelpPages); // NOLINT(cppcoreguidelines-pro-type-const-cast)
 }
 
 // ============================================================================
