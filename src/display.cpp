@@ -215,7 +215,7 @@ cVaapiDisplay::~cVaapiDisplay() noexcept {
 // ============================================================================
 
 auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
-    if (fbId == 0 || !isReady.load()) {
+    if (fbId == 0 || !isReady.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -325,6 +325,19 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     return isReady.load(std::memory_order_acquire);
 }
 
+auto cVaapiDisplay::ClearOsdIfActive(uint32_t fbId) -> void {
+    if (fbId == 0) {
+        return;
+    }
+
+    const cMutexLock lock(&osdMutex);
+    if (currentOsd.fbId == fbId) {
+        dsyslog("vaapivideo/display: OSD hide (conditional) - fbId=%u", fbId);
+        currentOsd = {};
+        osdDirty = true;
+    }
+}
+
 auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
     const cMutexLock lock(&osdMutex);
 
@@ -426,7 +439,9 @@ auto cVaapiDisplay::Shutdown() -> void {
 }
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
-    if (!frame || !isReady.load(std::memory_order_acquire) || isClearing.load(std::memory_order_acquire)) [[unlikely]] {
+    // Relaxed loads are sufficient for these early-exit polls: if we narrowly miss a flag change, we proceed to
+    // bufferMutex which provides its own synchronization.
+    if (!frame || !isReady.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
@@ -443,16 +458,16 @@ auto cVaapiDisplay::Shutdown() -> void {
         // in TimedWait().
         const int waitMs = (timeoutMs < 0) ? 1000 : timeoutMs;
         const cTimeMs deadline(waitMs);
-        while (pendingFrame && isReady.load() && !deadline.TimedOut()) {
+        while (pendingFrame && isReady.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
             // Break out immediately if a stream switch is in progress to avoid deadlocking: BeginStreamSwitch() drains
             // pendingFrame under bufferMutex, so continuing to wait here would block it.
-            if (isClearing.load(std::memory_order_acquire)) {
+            if (isClearing.load(std::memory_order_relaxed)) {
                 return false;
             }
             frameSlotCond.TimedWait(bufferMutex, 10);
         }
 
-        if (pendingFrame || isClearing.load(std::memory_order_acquire)) [[unlikely]] {
+        if (pendingFrame || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
             return false;
         }
     }
@@ -469,20 +484,21 @@ auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
     // VDR's Running() is not thread-safe; use our own atomic flags.
-    while (!isStopping.load(std::memory_order_acquire) && isReady.load(std::memory_order_acquire)) {
-        // Drain all pending DRM events before doing any work.
-        while (!isStopping.load(std::memory_order_acquire) && isReady.load(std::memory_order_acquire)) {
-            if (!DrainDrmEvents(0)) {
-                break;
-            }
+    // Relaxed loads are sufficient for polling exit signals -- these flags transition monotonically (or toggle with
+    // explicit mutex hand-off) and no shared data depends on the load ordering here.  Acquire is reserved for the
+    // checks under importMutex that gate VAAPI surface access.
+    while (!isStopping.load(std::memory_order_relaxed) && isReady.load(std::memory_order_relaxed)) {
+        // Drain all pending DRM events before doing any work.  DrainDrmEvents(0) is non-blocking; the post-drain
+        // flag check below catches shutdown immediately after.
+        while (DrainDrmEvents(0)) {
         }
 
-        if (isStopping.load(std::memory_order_acquire) || !isReady.load(std::memory_order_acquire)) {
+        if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
             break;
         }
 
         // A flip is outstanding; poll briefly so we stay responsive to shutdown.
-        if (isFlipPending.load(std::memory_order_acquire)) {
+        if (isFlipPending.load(std::memory_order_relaxed)) {
             (void)DrainDrmEvents(5);
             continue;
         }
@@ -536,7 +552,7 @@ auto cVaapiDisplay::Action() -> void {
         // All isClearing checks after this point are outside the lock, so sleep briefly to yield to BeginStreamSwitch()
         // rather than spinning.
         if (skipDueToClearing) {
-            if (isStopping.load(std::memory_order_acquire) || !isReady.load(std::memory_order_acquire)) {
+            if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
                 break;
             }
             cCondWait::SleepMs(5);
@@ -546,7 +562,7 @@ auto cVaapiDisplay::Action() -> void {
         // No new frame arrived this iteration; re-submit the last buffer to keep the CRTC actively scanning. Without
         // this the CRTC could go dark (or display a stale hardware cursor) on drivers that require a flip per refresh
         // cycle. Guard with isClearing to avoid racing with BeginStreamSwitch().
-        if (!frameCommitted && !hadFrame && !isClearing.load(std::memory_order_acquire)) {
+        if (!frameCommitted && !hadFrame && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
@@ -1097,10 +1113,10 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 
 auto cVaapiDisplay::WaitForPageFlip(int timeoutMs) -> void {
     const cTimeMs deadline(timeoutMs);
-    while (isFlipPending.load(std::memory_order_acquire) && !deadline.TimedOut()) {
+    while (isFlipPending.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
         // Abort early on shutdown or stream-switch so callers are not stalled.
-        if (isStopping.load(std::memory_order_acquire) || !isReady.load(std::memory_order_acquire) ||
-            isClearing.load(std::memory_order_acquire)) {
+        if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed) ||
+            isClearing.load(std::memory_order_relaxed)) {
             break;
         }
         (void)DrainDrmEvents(5);

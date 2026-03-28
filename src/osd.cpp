@@ -6,6 +6,7 @@
  */
 
 #include "osd.h"
+#include "display.h"
 
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -76,11 +77,12 @@ auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
 
 [[nodiscard]] auto cVaapiOsdProvider::GetDisplay() const noexcept -> cVaapiDisplay * { return display_; }
 
-auto cVaapiOsdProvider::HideOsd() -> void {
+auto cVaapiOsdProvider::HideOsd(const uint32_t fbId) -> void {
     if (display_) [[likely]] {
-        // An empty OsdInfo struct means "no OSD plane" -- the display thread will remove the overlay on its next atomic
-        // commit.
-        display_->SetOsd({});
+        // Only clear the OSD plane if the framebuffer being destroyed is the one currently committed. When multiple
+        // OSDs coexist at different levels (e.g. channel display + menu overlay), destroying a non-active OSD must not
+        // hide the active one.
+        display_->ClearOsdIfActive(fbId);
     }
 }
 
@@ -153,14 +155,13 @@ cVaapiOsd::cVaapiOsd(const int posX, const int posY, const uint lvl, const int f
 }
 
 cVaapiOsd::~cVaapiOsd() noexcept {
-    if (provider_) [[likely]] {
-        provider_->HideOsd();
+    if (provider_ && framebufferId_ != 0) [[likely]] {
+        provider_->HideOsd(framebufferId_);
 
         // Block until the display thread stops scanning out our framebuffer. DestroyDumbBuffer() below frees the GEM
         // object; doing that while the display is still reading it would cause visible corruption or a kernel page
         // fault, so this wait is mandatory.
-        if (cVaapiDisplay *display = provider_->GetDisplay();
-            display && framebufferId_ != 0 && display->IsInitialized()) {
+        if (cVaapiDisplay *display = provider_->GetDisplay(); display && display->IsInitialized()) {
             display->AwaitOsdHidden(framebufferId_);
         }
     }
@@ -196,14 +197,9 @@ cVaapiOsd::~cVaapiOsd() noexcept {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiOsd::CanHandleAreas(const tArea *areas, const int numAreas) -> eOsdError {
-    // Delegate structural checks (overlapping areas, out-of-bounds) to the base class.
-    if (const eOsdError baseResult = cOsd::CanHandleAreas(areas, numAreas); baseResult != oeOk) {
-        return baseResult;
-    }
-
     // ProvidesTrueColor() is true, so VDR's pixmap layer handles all color-depth conversion before calling Flush(); any
-    // bit depth is fine.
-    return oeOk;
+    // bit depth is fine.  Just delegate structural checks (overlapping areas, out-of-bounds) to the base class.
+    return cOsd::CanHandleAreas(areas, numAreas);
 }
 
 auto cVaapiOsd::Flush() -> void {
@@ -215,9 +211,9 @@ auto cVaapiOsd::Flush() -> void {
     // non-overlapping dirty regions from different pixmaps (e.g. background, text, borders). The caller must loop until
     // it returns nullptr, otherwise parts of the OSD are lost. The entire loop must be protected by LOCK_PIXMAPS (see
     // vdr/osd.h).
+    bool rendered = false;
     {
         LOCK_PIXMAPS;
-        bool rendered = false;
         while (auto *pm = dynamic_cast<cPixmapMemory *>(RenderPixmaps())) {
             const cRect vp = pm->ViewPort();
             const uint8_t *src = pm->Data();
@@ -231,23 +227,29 @@ auto cVaapiOsd::Flush() -> void {
             const int dstBottom = std::min(vp.Y() + vp.Height(), static_cast<int>(height_));
 
             if (dstX < dstRight && dstY < dstBottom) [[likely]] {
-                const auto srcOffX = static_cast<size_t>(dstX - vp.X()) * 4;
                 const size_t copyBytes = static_cast<size_t>(dstRight - dstX) * 4;
+                // stride_ (not width_*4) accounts for any DRM alignment padding added by the kernel during dumb
+                // buffer creation.
+                uint8_t *dst = pixels_ + (static_cast<size_t>(dstY) * stride_) + (static_cast<size_t>(dstX) * 4);
+                const uint8_t *srcRow =
+                    src + (static_cast<size_t>(dstY - vp.Y()) * srcStride) + (static_cast<size_t>(dstX - vp.X()) * 4);
                 for (int y = dstY; y < dstBottom; ++y) {
-                    // stride_ (not width_*4) accounts for any DRM alignment padding added by the kernel during dumb
-                    // buffer creation.
-                    const size_t dstOff = (static_cast<size_t>(y) * stride_) + (static_cast<size_t>(dstX) * 4);
-                    const size_t srcOff = (static_cast<size_t>(y - vp.Y()) * srcStride) + srcOffX;
-                    std::memcpy(pixels_ + dstOff, src + srcOff, copyBytes);
+                    std::memcpy(dst, srcRow, copyBytes);
+                    dst += stride_;
+                    srcRow += srcStride;
                 }
                 rendered = true;
             }
             DestroyPixmap(pm);
         }
-        if (rendered) {
-            provider_->UpdateOsd(*this);
-            return;
-        }
+    }
+
+    // Notify the display thread after releasing LOCK_PIXMAPS -- UpdateOsd() only passes the framebuffer ID and
+    // geometry, it does not touch pixmap data, so holding the global pixmap lock during the cross-thread mutex
+    // acquisition is unnecessary.
+    if (rendered) {
+        provider_->UpdateOsd(*this);
+        return;
     }
 
     // In TrueColor mode RenderPixmaps() composites everything (including bitmap areas) into pixmaps, so reaching here
@@ -365,21 +367,21 @@ auto cVaapiOsd::Flush() -> void {
 auto cVaapiOsd::DestroyDumbBuffer() -> void {
     // Teardown must follow the reverse allocation order: unmap CPU memory -> remove DRM framebuffer -> destroy GEM
     // object. Reversing the order would leave dangling kernel references.
-    if (pixels_ && pixels_ != MAP_FAILED) [[likely]] {
+    if (pixels_) [[likely]] {
         munmap(pixels_, mappedSize_);
         pixels_ = nullptr;
     }
 
-    if (framebufferId_ != 0 && drmFd_ >= 0) [[likely]] {
-        drmModeRmFB(drmFd_, framebufferId_);
-        framebufferId_ = 0;
-    }
-
-    if (gemHandle_ != 0 && drmFd_ >= 0) [[likely]] {
-        drm_mode_destroy_dumb destroyReq{};
-        destroyReq.handle = gemHandle_;
-        // Return value intentionally ignored; nothing useful to do on failure here.
-        (void)drmIoctl(drmFd_, DRM_IOCTL_MODE_DESTROY_DUMB, &destroyReq);
-        gemHandle_ = 0;
+    if (drmFd_ >= 0) [[likely]] {
+        if (framebufferId_ != 0) {
+            drmModeRmFB(drmFd_, framebufferId_);
+            framebufferId_ = 0;
+        }
+        if (gemHandle_ != 0) {
+            drm_mode_destroy_dumb destroyReq{};
+            destroyReq.handle = gemHandle_;
+            (void)drmIoctl(drmFd_, DRM_IOCTL_MODE_DESTROY_DUMB, &destroyReq);
+            gemHandle_ = 0;
+        }
     }
 }

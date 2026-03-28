@@ -22,9 +22,7 @@
 #include "common.h"
 #include "display.h"
 
-class cVaapiDisplay;
 class cVaapiOsd;
-class cVaapiOsdProvider;
 
 // ============================================================================
 // === OSD PROVIDER ===
@@ -70,8 +68,8 @@ class cVaapiOsdProvider : public cOsdProvider {
     // === INTERNAL METHODS ===
     // ========================================================================
     [[nodiscard]] auto GetDisplay() const noexcept -> cVaapiDisplay *; ///< Return the borrowed display pointer
-    auto HideOsd() -> void;                                            ///< Remove the OSD overlay from the display
-    auto UpdateOsd(cVaapiOsd &osd) const -> void;                      ///< Push OSD geometry and framebuffer to display
+    auto HideOsd(uint32_t fbId) -> void; ///< Remove the OSD overlay only if @p fbId is the currently displayed one
+    auto UpdateOsd(cVaapiOsd &osd) const -> void; ///< Push OSD geometry and framebuffer to display
 
     // ========================================================================
     // === STATE ===

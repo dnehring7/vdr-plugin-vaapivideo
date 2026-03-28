@@ -129,7 +129,9 @@ class cVaapiDisplay : public cThread {
                                   const drmModeModeInfo &displayMode)
         -> bool; ///< Set up planes, cache DRM properties, program the initial display mode and start the display thread
     [[nodiscard]] auto IsInitialized() const noexcept
-        -> bool;                                ///< Return true after a successful Initialize() and before Shutdown()
+        -> bool; ///< Return true after a successful Initialize() and before Shutdown()
+    auto ClearOsdIfActive(uint32_t fbId)
+        -> void; ///< Clear the OSD overlay only if the given framebuffer ID is the one currently committed
     auto SetOsd(const OsdOverlay &osd) -> void; ///< Update the OSD overlay geometry; applied on the next frame commit
     auto Shutdown() -> void; ///< Stop the display thread, detach all planes and release all resources
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame,
