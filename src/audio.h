@@ -96,6 +96,7 @@ class cAudioProcessor : public cThread {
         -> void;                 ///< Reconfigures ALSA and the FFmpeg decoder when the codec or sample format changes
     auto Shutdown() -> void;     ///< Closes ALSA and frees codec resources; the processing thread continues running
     auto CloseDecoder() -> void; ///< Waits for in-flight decode calls, then frees the decoder and parser contexts
+    auto FlushDecoderState() -> void; ///< Flushes FFmpeg decoder, resets swr context, clears error/grace counters
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns the ALSA sample rate required for the given codec and passthrough mode
     [[nodiscard]] auto ConfigureAlsaParams(snd_pcm_t *handle, snd_pcm_format_t format, unsigned channels, unsigned rate,
@@ -131,14 +132,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     int consecutiveDecodeErrors{}; ///< Consecutive avcodec_send_packet failures for error recovery
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder{
-        nullptr};                            ///< FFmpeg decoder context; nullptr when closed
-    std::atomic<int> decoderGracePackets{0}; ///< Remaining packets to silently discard after decoder reinit
-    std::atomic<int> decoderRefCount{0};     ///< Count of threads currently inside DecodeToPcm()
-    std::atomic<bool> needsFlush{false};     ///< Signals DecodeToPcm() to flush the decoder on next entry
+        nullptr};                        ///< FFmpeg decoder context; nullptr when closed
+    int decoderGracePackets{0};          ///< Remaining packets to silently discard after decoder reinit
+    std::atomic<int> decoderRefCount{0}; ///< Count of threads currently inside DecodeToPcm()
+    std::atomic<bool> needsFlush{false}; ///< Signals DecodeToPcm() to flush the decoder on next entry
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
-        parserCtx;               ///< FFmpeg bitstream parser for access-unit framing
-    int swrChannels{};           ///< Channel count for which swrCtx was last initialized
-    SwrContext *swrCtx{nullptr}; ///< libswresample context for format/channel conversion to S16LE stereo
+        parserCtx;                                ///< FFmpeg bitstream parser for access-unit framing
+    int swrChannels{};                            ///< Channel count for which swrCtx was last initialized
+    SwrContext *swrCtx{nullptr};                  ///< libswresample context for format/channel conversion to S16LE
     AVSampleFormat swrFormat{AV_SAMPLE_FMT_NONE}; ///< Sample format for which swrCtx was last initialized
 
     // ========================================================================
