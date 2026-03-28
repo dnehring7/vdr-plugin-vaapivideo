@@ -22,6 +22,9 @@
 #include "common.h"
 #include "display.h"
 
+// C++ Standard Library
+#include <vector>
+
 class cVaapiOsd;
 
 // ============================================================================
@@ -50,6 +53,7 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     auto AttachDisplay(cVaapiDisplay *display) noexcept -> void; ///< Reconnect to a (new) display instance
     auto DetachDisplay() noexcept -> void;                       ///< Sever the display reference for safe shutdown
+    auto ReleaseAllOsdResources() -> void; ///< Force-release DRM dumb buffers of all active OSDs (for Detach)
 
   protected:
     // ========================================================================
@@ -72,9 +76,17 @@ class cVaapiOsdProvider : public cOsdProvider {
     auto UpdateOsd(cVaapiOsd &osd) const -> void; ///< Push OSD geometry and framebuffer to display
 
     // ========================================================================
+    // === INTERNAL METHODS ===
+    // ========================================================================
+    auto TrackOsd(cVaapiOsd *osd) -> void;   ///< Register an active OSD for resource tracking
+    auto UntrackOsd(cVaapiOsd *osd) -> void; ///< Unregister an OSD when it is destroyed
+
+    // ========================================================================
     // === STATE ===
     // ========================================================================
-    cVaapiDisplay *display_; ///< Borrowed display reference; nulled by DetachDisplay()
+    std::vector<cVaapiOsd *> activeOsds_; ///< Active OSD instances with allocated DRM resources
+    cVaapiDisplay *display_;              ///< Borrowed display reference; nulled by DetachDisplay()
+    cMutex osdListMutex_;                 ///< Guards activeOsds_ across SVDRP and main threads
 };
 
 // ============================================================================

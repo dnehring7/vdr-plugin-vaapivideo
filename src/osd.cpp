@@ -8,14 +8,15 @@
 #include "osd.h"
 #include "display.h"
 
-#include <sys/mman.h>
-#include <sys/types.h>
-
 // C++ Standard Library
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+
+// POSIX
+#include <sys/mman.h>
+#include <sys/types.h>
 
 // DRM
 #include <libdrm/drm.h>
@@ -73,6 +74,24 @@ auto cVaapiOsdProvider::AttachDisplay(cVaapiDisplay *display) noexcept -> void {
 auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
     dsyslog("vaapivideo/osd: detaching display (was %p)", static_cast<void *>(display_));
     display_ = nullptr;
+}
+
+auto cVaapiOsdProvider::ReleaseAllOsdResources() -> void {
+    const cMutexLock lock(&osdListMutex_);
+    for (auto *osd : activeOsds_) {
+        osd->DestroyDumbBuffer();
+    }
+    dsyslog("vaapivideo/osd: released DRM resources for %zu active OSDs", activeOsds_.size());
+}
+
+auto cVaapiOsdProvider::TrackOsd(cVaapiOsd *osd) -> void {
+    const cMutexLock lock(&osdListMutex_);
+    activeOsds_.push_back(osd);
+}
+
+auto cVaapiOsdProvider::UntrackOsd(cVaapiOsd *osd) -> void {
+    const cMutexLock lock(&osdListMutex_);
+    std::erase(activeOsds_, osd);
 }
 
 [[nodiscard]] auto cVaapiOsdProvider::GetDisplay() const noexcept -> cVaapiDisplay * { return display_; }
@@ -152,9 +171,14 @@ cVaapiOsd::cVaapiOsd(const int posX, const int posY, const uint lvl, const int f
     : cOsd(posX, posY, lvl), drmFd_(fd), height_(static_cast<uint32_t>(fbHeight)), provider_(provider),
       width_(static_cast<uint32_t>(fbWidth)) {
     // drmFd_ is borrowed from the display; it must remain valid for the OSD lifetime.
+    provider_->TrackOsd(this);
 }
 
 cVaapiOsd::~cVaapiOsd() noexcept {
+    if (provider_) {
+        provider_->UntrackOsd(this);
+    }
+
     if (provider_ && framebufferId_ != 0) [[likely]] {
         provider_->HideOsd(framebufferId_);
 

@@ -172,15 +172,23 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // pcmQueueEndPts tracks the last sample written to ALSA. snd_pcm_delay() returns frames still buffered in kernel
     // and hardware. Subtracting that delay yields the PTS currently at the DAC output. Falls back to the cached
     // playbackPts when the device is closed or no PTS has been anchored.
-    const int64_t endPts = pcmQueueEndPts;
     const unsigned rate = alsaSampleRate;
 
-    if (endPts == AV_NOPTS_VALUE || !alsaHandle || rate == 0) {
+    if (!alsaHandle || rate == 0) {
         return playbackPts.load(std::memory_order_relaxed);
     }
 
+    // Read delay BEFORE endPts to avoid a cross-thread race with the audio writer. If the audio thread writes samples
+    // between these two reads, delay is stale-low and endPts is current-high, making the clock appear slightly ahead
+    // (decoder waits one extra frame -- harmless). The old order (endPts first) caused the clock to appear to jump
+    // backward by hundreds of milliseconds, triggering massive overshoot in the natural sync sleep path.
     snd_pcm_sframes_t delayFrames = 0;
     if (snd_pcm_delay(alsaHandle, &delayFrames) != 0 || delayFrames < 0) {
+        return playbackPts.load(std::memory_order_relaxed);
+    }
+
+    const int64_t endPts = pcmQueueEndPts;
+    if (endPts == AV_NOPTS_VALUE) {
         return playbackPts.load(std::memory_order_relaxed);
     }
 

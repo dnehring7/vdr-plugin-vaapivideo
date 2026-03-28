@@ -818,6 +818,15 @@ auto cVaapiDevice::Detach() -> void {
 
     Stop();
 
+    // Force-release DRM dumb buffers (mmap, framebuffers, GEM handles) owned by active OSD instances. VDR's skin system
+    // owns the cVaapiOsd objects and may not destroy them until much later; the mmap'd buffers hold a kernel reference
+    // to the DRM file, preventing the device from being fully released even after close(drmFd). Releasing here -- after
+    // the display thread is stopped (so the OSD plane is detached) but before the fd is closed -- ensures the kernel
+    // can hand the device to another DRM client immediately.
+    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+        provider->ReleaseAllOsdResources();
+    }
+
     // Drop DRM master before closing the fd so the kernel can hand master status to another DRM client (compositor,
     // console, etc.) immediately.
     if (drmFd >= 0) {
