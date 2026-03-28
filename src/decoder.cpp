@@ -499,7 +499,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
     // Trick-mode flags must be written before the trickSpeed release-store so the decode thread reads a consistent set
     // when it observes the new speed via acquire-load.
     isTrickFastForward.store(forward && fast, std::memory_order_relaxed);
-    isTrickReverse.store(!forward && fast, std::memory_order_relaxed);
+    isTrickReverse.store(!forward, std::memory_order_relaxed);
     prevTrickPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 
     // Map VDR speed values to pacing multipliers: 6 -> 2x, 3 -> 4x, 1 -> 8x. Slow mode ignores the multiplier and uses
@@ -1077,9 +1077,10 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
             }
         }
 
-        // Block until pacing timer expires.
+        // Block until pacing timer expires. For fast modes (localMultiplier > 0) the hold is PTS-derived; for slow
+        // modes (localMultiplier == 0) it is the fixed trickHoldMs set by SetTrickSpeed().
         const uint64_t localMultiplier = trickMultiplier.load(std::memory_order_relaxed);
-        if (newSource && localMultiplier > 0) {
+        if (newSource) {
             const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
             while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
                    trickSpeed.load(std::memory_order_relaxed) != 0) {
