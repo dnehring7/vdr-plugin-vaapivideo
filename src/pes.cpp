@@ -9,6 +9,7 @@
 
 // C++ Standard Library
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -69,14 +70,10 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< First MPEG video stream
 namespace {
 struct CodecEvidence {
     uint8_t seenMask{}; ///< Bit flags of distinct strong NAL types seen
-    int hits{};         ///< Distinct strong type count (popcount of seenMask)
     size_t lastPos{};   ///< Buffer offset of most recent evidence
 
     auto Record(uint8_t bit, size_t pos) noexcept -> void {
-        if ((seenMask & bit) == 0) {
-            seenMask |= bit;
-            ++hits;
-        }
+        seenMask |= bit;
         lastPos = pos;
     }
 };
@@ -103,7 +100,7 @@ struct CodecEvidence {
             if ((sync & 0xFFF6) == 0xFFF0) [[unlikely]] {
                 return AV_CODEC_ID_AAC;
             }
-            if ((sync & 0xFFE0) == 0xFFE0) [[likely]] {
+            if ((sync & 0xFFE0) == 0xFFE0 && (sync & 0x06) != 0x00) [[likely]] {
                 return AV_CODEC_ID_MP2;
             }
         }
@@ -176,7 +173,7 @@ struct CodecEvidence {
         size_t scLen = 0;
         if (p[i + 2] == 0x01) {
             scLen = 3;
-        } else if (i + 3 < size && p[i + 2] == 0x00 && p[i + 3] == 0x01) {
+        } else if (p[i + 2] == 0x00 && p[i + 3] == 0x01) {
             scLen = 4;
         }
 
@@ -223,13 +220,9 @@ struct CodecEvidence {
                 const bool layerIdZero = ((b0 & 0x01) == 0) && (((b1 >> 3) & 0x1F) == 0);
                 uint8_t bit = 0;
 
-                if (hevcType == 32 && layerIdZero) {
-                    bit = 0x01; // VPS
-                } else if (hevcType == 33 && layerIdZero) {
-                    bit = 0x02; // SPS
-                } else if (hevcType == 34 && layerIdZero) {
-                    bit = 0x04; // PPS
-                } else if ((hevcType == 19 || hevcType == 20 || hevcType == 21) && layerIdZero) {
+                if (hevcType >= 32 && hevcType <= 34 && layerIdZero) {
+                    bit = static_cast<uint8_t>(1U << (hevcType - 32)); // VPS=0x01, SPS=0x02, PPS=0x04
+                } else if (hevcType >= 19 && hevcType <= 21 && layerIdZero) {
                     // IDR/CRA: secondary, only after param set seen. Require layerIdZero to reject H.264 aliases
                     // (0x27->type19, 0x28->type20).
                     if ((hevc.seenMask & kHevcParamMask) != 0) {
@@ -262,16 +255,15 @@ struct CodecEvidence {
             }
         }
 
-        ++i;
+        i = nalPos;
     }
 
     // HEVC: require VPS (unique to HEVC) or 2+ distinct param set types.
-    const bool hevcHasVps = (hevc.seenMask & 0x01) != 0;
-    const int hevcParamCount =
-        ((hevc.seenMask & 0x01) != 0) + ((hevc.seenMask & 0x02) != 0) + ((hevc.seenMask & 0x04) != 0);
-    const bool hevcOk = (hevc.hits >= 2) && (hevcHasVps || hevcParamCount >= 2);
+    const int hevcHits = std::popcount(hevc.seenMask);
+    const int hevcParams = std::popcount(static_cast<uint8_t>(hevc.seenMask & kHevcParamMask));
+    const bool hevcOk = (hevcHits >= 2) && ((hevc.seenMask & 0x01) != 0 || hevcParams >= 2);
 
-    const bool avcOk = (avc.hits >= 2);
+    const bool avcOk = std::popcount(avc.seenMask) >= 2;
     const bool mpegOk = ((mpeg2.seenMask & 0x01) != 0) && ((mpeg2.seenMask & 0x06) != 0);
 
     // MPEG-2 markers (0xB3/0xB5/0xB8) have bit 7 set, making them invalid as H.264/HEVC NAL headers (forbidden_zero_bit
@@ -288,10 +280,11 @@ struct CodecEvidence {
         if (!ok) {
             return;
         }
-        if (best == AV_CODEC_ID_NONE || ev.hits > bestHits || (ev.hits == bestHits && ev.lastPos > bestPos)) {
+        const int h = std::popcount(ev.seenMask);
+        if (best == AV_CODEC_ID_NONE || h > bestHits || (h == bestHits && ev.lastPos > bestPos)) {
             best = id;
             bestPos = ev.lastPos;
-            bestHits = ev.hits;
+            bestHits = h;
         }
     };
 
@@ -299,17 +292,13 @@ struct CodecEvidence {
     consider(AV_CODEC_ID_H264, avcFinal, avc);
     consider(AV_CODEC_ID_MPEG2VIDEO, mpegOk, mpeg2);
 
-    if (best != AV_CODEC_ID_NONE) {
-        if (best == AV_CODEC_ID_HEVC) {
-            dsyslog("vaapivideo/pes: detected HEVC -- mask=0x%02X hits=%d pos=%zu", hevc.seenMask, hevc.hits,
-                    hevc.lastPos);
-        } else if (best == AV_CODEC_ID_H264) {
-            dsyslog("vaapivideo/pes: detected H.264 -- mask=0x%02X hits=%d pos=%zu", avc.seenMask, avc.hits,
-                    avc.lastPos);
-        } else {
-            dsyslog("vaapivideo/pes: detected MPEG-2 -- mask=0x%02X hits=%d pos=%zu", mpeg2.seenMask, mpeg2.hits,
-                    mpeg2.lastPos);
-        }
+    if (best == AV_CODEC_ID_HEVC) {
+        dsyslog("vaapivideo/pes: detected HEVC -- mask=0x%02X hits=%d pos=%zu", hevc.seenMask, bestHits, hevc.lastPos);
+    } else if (best == AV_CODEC_ID_H264) {
+        dsyslog("vaapivideo/pes: detected H.264 -- mask=0x%02X hits=%d pos=%zu", avc.seenMask, bestHits, avc.lastPos);
+    } else if (best == AV_CODEC_ID_MPEG2VIDEO) {
+        dsyslog("vaapivideo/pes: detected MPEG-2 -- mask=0x%02X hits=%d pos=%zu", mpeg2.seenMask, bestHits,
+                mpeg2.lastPos);
     }
 
     return best;
@@ -375,7 +364,7 @@ struct CodecEvidence {
     size_t payloadLen = size - headerSize;
     const uint16_t pesLen = AV_RB16(p + 4);
 
-    if (pesLen > 0) [[unlikely]] {
+    if (pesLen > 0) {
         const auto declared = static_cast<size_t>(pesLen);
         // declared counts from byte 6 onward; absolute end = declared + 6.
         if (declared + 6 > headerSize) {

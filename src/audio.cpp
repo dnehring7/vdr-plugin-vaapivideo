@@ -1297,10 +1297,10 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         }
 
         // Only count truly unrecoverable errors (not EAGAIN or recovered underruns).
-        alsaErrorCount.fetch_add(1, std::memory_order_relaxed);
+        const int errorCount = alsaErrorCount.fetch_add(1, std::memory_order_relaxed) + 1;
 
         // Tier 3: repeated failures -- close and reopen the PCM device entirely.
-        if (alsaErrorCount.load(std::memory_order_relaxed) >= AUDIO_ALSA_ERROR_LIMIT) {
+        if (errorCount >= AUDIO_ALSA_ERROR_LIMIT) {
             if (lastReopenAttempt.Elapsed() > 1000) {
                 dsyslog("vaapivideo/audio: attempting device reopen");
                 lastReopenAttempt.Set();
