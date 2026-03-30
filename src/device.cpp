@@ -472,10 +472,6 @@ auto cVaapiDevice::Play() -> void {
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
         codecHysteresis = AV_CODEC_ID_NONE;
         codecHysteresisCount = 0;
-        // Reset A/V sync -- audio clock is invalid after codec change.
-        if (decoder) {
-            decoder->NotifyAudioChange();
-        }
         isyslog("vaapivideo/device: audio codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     } else {
         // Mid-stream codec change with hysteresis (3 consecutive detections)
@@ -650,7 +646,10 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             static_cast<int>(Type), track ? ", lang=" : "", track ? track->language : "");
 
     // Force codec re-detection -- the new track may use a different codec.
+    // Also cancel any in-progress hysteresis cycle from the old track.
     audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    codecHysteresis = AV_CODEC_ID_NONE;
+    codecHysteresisCount = 0;
 
     // Flush now so the tail of the old track is never rendered during the switch.
     if (audioProcessor) [[likely]] {

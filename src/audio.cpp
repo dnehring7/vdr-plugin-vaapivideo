@@ -233,7 +233,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
 [[nodiscard]] auto cAudioProcessor::OpenCodec(AVCodecID codecId, int sampleRate, int channels) -> bool {
     if (sampleRate <= 0 || channels <= 0) [[unlikely]] {
-        esyslog("vaapivideo/audio: invalid parameters (rate=%d, ch=%d)", sampleRate, channels);
+        esyslog("vaapivideo/audio: invalid parameters (%dHz %dch)", sampleRate, channels);
         return false;
     }
 
@@ -247,9 +247,6 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
         esyslog("vaapivideo/audio: invalid stream parameters");
         return;
     }
-
-    dsyslog("vaapivideo/audio: stream params - codec=%s, rate=%d, ch=%d", avcodec_get_name(params.codecId),
-            params.sampleRate, params.channels);
 
     const cMutexLock lock(mutex.get());
 
@@ -272,9 +269,6 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
 
     const bool wantPassthrough = CanPassthrough(params.codecId);
     const auto targetRate = ComputeAlsaRate(params.codecId, static_cast<unsigned>(params.sampleRate), wantPassthrough);
-
-    dsyslog("vaapivideo/audio: codec %s -> %s mode (rate=%u)", avcodec_get_name(params.codecId),
-            wantPassthrough ? "passthrough" : "PCM", targetRate);
 
     // Reopen ALSA only when the hardware format changes. Passthrough always uses 2 IEC958 channels.
     const bool needsReconfig =
@@ -303,8 +297,6 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
         // Decoder/parser needed for framing even in IEC61937 passthrough mode.
         OpenDecoder();
     } else if (oldCodecId != params.codecId) {
-        dsyslog("vaapivideo/audio: codec changed, reinitializing decoder");
-
         // Flush stale PCM so GetClock() does not report an inflated delay from the previous codec's samples.
         if (alsaHandle) {
             (void)snd_pcm_drop(alsaHandle);
@@ -785,7 +777,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         if (packetQueue.size() >= AUDIO_QUEUE_CAPACITY) [[unlikely]] {
             // Throttle syslog to once per 500ms during sustained overload.
             if (lastQueueWarn.Elapsed() > 500) {
-                esyslog("vaapivideo/audio: queue full (%zu packets), dropping (codec=%s rate=%d ch=%d passthrough=%s)",
+                esyslog("vaapivideo/audio: queue full (%zu packets), dropping (%s @ %dHz %dch passthrough=%s)",
                         packetQueue.size(), avcodec_get_name(streamParams.codecId), streamParams.sampleRate,
                         streamParams.channels, alsaPassthroughActive ? "yes" : "no");
                 lastQueueWarn.Set();
@@ -930,8 +922,8 @@ auto cAudioProcessor::OpenDecoder() -> void {
     avcodec_flush_buffers(ctx);
     // Grace period: the decoder needs at least one complete access unit before producing output.
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
-    isyslog("vaapivideo/audio: decoder initialized - %s @ %dHz %dch", codec->name, ctx->sample_rate,
-            ctx->ch_layout.nb_channels);
+    isyslog("vaapivideo/audio: opened %s @ %dHz %dch (%s)", codec->name, ctx->sample_rate, ctx->ch_layout.nb_channels,
+            alsaPassthroughActive ? "passthrough" : "PCM");
 }
 
 auto cAudioProcessor::ProbeSinkCaps() -> void {
