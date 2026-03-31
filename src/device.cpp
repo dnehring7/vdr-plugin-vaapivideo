@@ -424,9 +424,11 @@ auto cVaapiDevice::Mute() -> void {
 auto cVaapiDevice::Play() -> void {
     cDevice::Play();
 
+    // Deferred exit: VDR calls Play() both to genuinely leave trick mode and during internal
+    // backward speed transitions.  The decoder auto-exits if TrickSpeed() does not follow.
     if (trickSpeed.exchange(0, std::memory_order_release) != 0) {
         if (decoder) [[likely]] {
-            decoder->SetTrickSpeed(0);
+            decoder->RequestTrickExit();
         }
     }
 

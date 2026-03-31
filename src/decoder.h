@@ -95,6 +95,8 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Attach the audio processor used as the A/V sync master clock
     auto RequestCodecReopen()
         -> void; ///< Force the next OpenCodec() call to do a full teardown/reopen even for the same codec
+    auto RequestTrickExit()
+        -> void; ///< Deferred trick-mode exit from Play(); cleared if TrickSpeed() follows before the next frame
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)
         -> void;             ///< Configure trick-play mode; speed 0 returns to normal playback
     auto Shutdown() -> void; ///< Stop the decode thread and release all codec resources
@@ -168,6 +170,7 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === TRICK MODE ===
     // ========================================================================
+    std::atomic<bool> trickExitPending;   ///< Deferred exit requested by Play(); cleared by SetTrickSpeed()
     std::atomic<bool> isTrickFastForward; ///< True in fast-forward mode (forward=true, fast=true)
     std::atomic<bool> isTrickReverse;     ///< True in fast-reverse trick mode; enforces monotonically decreasing PTS
     std::atomic<uint64_t>

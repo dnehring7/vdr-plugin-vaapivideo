@@ -72,7 +72,7 @@ extern "C" {
 constexpr size_t DECODER_QUEUE_CAPACITY = 500;     ///< Video packet queue depth (~10 s at 50 fps)
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;     ///< Timeout when submitting a frame to the display (ms)
 constexpr int64_t DECODER_SYNC_RESYNC = 1500 * 90; ///< Full Phase-4 re-sync threshold (PTS ticks, ~1500 ms)
-constexpr int64_t DECODER_SYNC_CORRECT = 500 * 90; ///< Phase-3 gentle correction threshold (~500 ms)
+constexpr int64_t DECODER_SYNC_CORRECT = 100 * 90; ///< Phase-3 gentle correction threshold (~100 ms)
 constexpr int64_t DECODER_SYNC_CONVERGE = 50 * 90; ///< Phase-4 convergence band (~50 ms)
 constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;     ///< First frame after Clear() shown immediately for responsiveness
 constexpr int DECODER_SYNC_GRACE_MS = 500;         ///< Suppress Phase-3 corrections while ALSA clock stabilizes
@@ -455,9 +455,14 @@ auto cVaapiDecoder::NotifyAudioChange() -> void {
 
 auto cVaapiDecoder::SetAudioProcessor(cAudioProcessor *audio) -> void { audioProcessor = audio; }
 
+auto cVaapiDecoder::RequestTrickExit() -> void { trickExitPending.store(true, std::memory_order_release); }
+
 auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
     // VDR trick-speed convention:
     //   speed==0: normal play, fast+speed>0: FF/REW (6->2x, 3->4x, 1->8x), !fast+speed>0: slow 1/speed.
+
+    // A new TrickSpeed() call cancels any pending exit from Play().
+    trickExitPending.store(false, std::memory_order_relaxed);
 
     // VDR skips DeviceClear() for FF; flush everything ourselves. Lock ordering: codecMutex -> packetMutex.
     if (fast && speed > 0) {
@@ -1026,45 +1031,57 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 
     // --- Phase 1: trick mode -- pacing timer, no A/V sync ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
-        const int64_t savedPrevPts = prevTrickPts.load(std::memory_order_relaxed);
-        const bool newSource = (originalPts != savedPrevPts);
+        // Deferred exit: Play() was called but TrickSpeed() did not follow -- genuine trick exit.
+        // Reset state and fall through to normal A/V sync.
+        if (trickExitPending.exchange(false, std::memory_order_acquire)) {
+            trickSpeed.store(0, std::memory_order_relaxed);
+            isTrickReverse.store(false, std::memory_order_relaxed);
+            isTrickFastForward.store(false, std::memory_order_relaxed);
+            lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+            freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
+            syncAcquired.store(false, std::memory_order_release);
+            syncLogPending.store(true, std::memory_order_relaxed);
+        } else {
+            const int64_t savedPrevPts = prevTrickPts.load(std::memory_order_relaxed);
+            const bool newSource = (originalPts != savedPrevPts);
 
-        // Reverse playback: enforce monotonically decreasing PTS.
-        if (isTrickReverse.load(std::memory_order_relaxed) && newSource && originalPts != AV_NOPTS_VALUE &&
-            savedPrevPts != AV_NOPTS_VALUE && originalPts > savedPrevPts) {
-            return true;
-        }
-        if (newSource) {
-            prevTrickPts.store(originalPts, std::memory_order_relaxed);
-            if (originalPts != AV_NOPTS_VALUE) {
-                lastPts.store(originalPts, std::memory_order_release);
+            // Reverse playback: enforce monotonically decreasing PTS.
+            if (isTrickReverse.load(std::memory_order_relaxed) && newSource && originalPts != AV_NOPTS_VALUE &&
+                savedPrevPts != AV_NOPTS_VALUE && originalPts > savedPrevPts) {
+                return true;
             }
-        }
+            if (newSource) {
+                prevTrickPts.store(originalPts, std::memory_order_relaxed);
+                if (originalPts != AV_NOPTS_VALUE) {
+                    lastPts.store(originalPts, std::memory_order_release);
+                }
+            }
 
-        // Block until pacing timer expires. For fast modes (localMultiplier > 0) the hold is PTS-derived; for slow
-        // modes (localMultiplier == 0) it is the fixed trickHoldMs set by SetTrickSpeed().
-        const uint64_t localMultiplier = trickMultiplier.load(std::memory_order_relaxed);
-        if (newSource) {
-            const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
-            while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
-                   trickSpeed.load(std::memory_order_relaxed) != 0) {
-                cCondWait::SleepMs(10);
+            // Wait for pacing timer. Fast modes use PTS-derived hold; slow modes use fixed trickHoldMs.
+            const uint64_t localMultiplier = trickMultiplier.load(std::memory_order_relaxed);
+            if (newSource) {
+                const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
+                while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
+                       trickSpeed.load(std::memory_order_relaxed) != 0) {
+                    cCondWait::SleepMs(10);
+                }
             }
-        }
 
-        // Arm pacing timer for the next source frame.
-        if (newSource) {
-            if (localMultiplier > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
-                const auto ptsDelta = static_cast<uint64_t>(std::abs(originalPts - savedPrevPts));
-                const uint64_t holdMs =
-                    std::clamp(ptsDelta / (static_cast<uint64_t>(90) * localMultiplier), uint64_t{10}, uint64_t{2000});
-                nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
-            } else {
-                nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
-                                        std::memory_order_relaxed);
+            // Arm pacing timer for the next source frame.
+            if (newSource) {
+                if (localMultiplier > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
+                    const auto ptsDelta = static_cast<uint64_t>(std::abs(originalPts - savedPrevPts));
+                    const uint64_t holdMs = std::clamp(ptsDelta / (static_cast<uint64_t>(90) * localMultiplier),
+                                                       uint64_t{10}, uint64_t{2000});
+                    nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
+                } else {
+                    nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+                }
             }
+
+            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
         }
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
     if (originalPts != AV_NOPTS_VALUE) {
@@ -1090,8 +1107,8 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     // Phase 3: steady state (synced)
     //
     //   |delta|       zone          action
-    //   ≤ 500 ms      pass-through  page-flip pacing absorbs jitter
-    //   500–1500 ms   correct       drop (behind) or poll-wait (ahead)
+    //   ≤ 100 ms      pass-through  page-flip pacing absorbs jitter
+    //   100–1500 ms   correct       drop (behind) or poll-wait (ahead)
     //   > 1500 ms     re-sync       full Phase-4 alignment from scratch
     //
     // A 500 ms grace period suppresses corrections after Phase-4 sync and
@@ -1126,7 +1143,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
                 return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
             }
 
-            // --- Correct: video behind > 500 ms --- drop to catch up.
+            // --- Correct: video behind > 100 ms --- drop to catch up.
             if (delta < -DECODER_SYNC_CORRECT) {
                 ++correctDrops;
                 return true;
@@ -1140,7 +1157,7 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
                 syncGrace.Set(DECODER_SYNC_GRACE_MS);
             }
 
-            // --- Correct: video ahead > 500 ms --- poll-wait until audio catches up.
+            // --- Correct: video ahead > 100 ms --- poll-wait until audio catches up.
             if (delta > DECODER_SYNC_CORRECT) {
                 const int64_t entryDelta = delta;
                 const cTimeMs pollDeadline(static_cast<int>(std::min(delta / 90 + 100, int64_t{3000})));
