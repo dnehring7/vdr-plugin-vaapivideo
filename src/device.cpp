@@ -458,6 +458,9 @@ auto cVaapiDevice::Play() -> void {
         if (!isLive) {
             isLive = Transferring();
             liveMode.store(isLive, std::memory_order_relaxed);
+            if (decoder) {
+                decoder->SetLiveMode(isLive);
+            }
         }
 
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
@@ -544,6 +547,7 @@ auto cVaapiDevice::Play() -> void {
         // Detect live vs replay (cTransferControl may not exist at SetPlayMode() time).
         isLive = Transferring();
         liveMode.store(isLive, std::memory_order_relaxed);
+        decoder->SetLiveMode(isLive);
 
         const AVCodecID detectedCodec = ::DetectVideoCodec({pes.payload, pes.payloadSize});
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
@@ -685,6 +689,7 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
                 decoder->SetTrickSpeed(0);
+                decoder->SetLiveMode(false);
                 decoder->RequestCodecReopen();
             }
             codecHysteresis = AV_CODEC_ID_NONE;
@@ -692,15 +697,16 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             videoCodecCandidate = AV_CODEC_ID_NONE;
             videoCodecCandidateCount = 0;
             Clear();
-            // Submit a black VAAPI frame so the previous channel's last picture does not stay on screen.
-            // Uses the normal SubmitFrame() path so the display thread and OSD keep running.
-            if (display && vaapi.hwDeviceRef) {
+            break;
+        case pmAudioOnly:
+        case pmAudioOnlyBlack:
+            // Radio channel: clear buffers and show black so the previous channel's last picture disappears.
+            Clear();
+            if (display && vaapi.hwDeviceRef) [[likely]] {
                 SubmitBlackFrame();
             }
             break;
         case pmAudioVideo:
-        case pmAudioOnly:
-        case pmAudioOnlyBlack:
         case pmVideoOnly:
             // Codec state was already reset by the preceding pmNone call. liveMode is determined from the first
             // incoming PES packet via Transferring().

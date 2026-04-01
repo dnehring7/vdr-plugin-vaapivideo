@@ -10,6 +10,8 @@
 
 #include "common.h"
 
+#include <deque>
+
 class cAudioProcessor;
 class cVaapiDisplay;
 struct VaapiContext;
@@ -92,7 +94,8 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Open (or reuse) a decoder for the given codec (VAAPI HW if available, else SW fallback)
     auto NotifyAudioChange() -> void; ///< Reset A/V sync after an audio codec change
     auto SetAudioProcessor(cAudioProcessor *audio)
-        -> void; ///< Attach the audio processor used as the A/V sync master clock
+        -> void;                         ///< Attach the audio processor used as the A/V sync master clock
+    auto SetLiveMode(bool live) -> void; ///< Enable jitter buffering for live TV; disable for replay
     auto RequestCodecReopen()
         -> void; ///< Force the next OpenCodec() call to do a full teardown/reopen even for the same codec
     auto RequestTrickExit()
@@ -164,6 +167,7 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> hasExited;                  ///< Set to true by the decode thread just before it returns
     std::atomic<bool> hasLoggedFirstFrame;        ///< Guards the one-time first-frame info log
     std::atomic<int64_t> lastPts{AV_NOPTS_VALUE}; ///< PTS of the last submitted frame, read by GetLastPts() / GetSTC()
+    std::atomic<bool> liveMode;                   ///< True for live TV (jitter buffer active); false for replay
     std::atomic<bool> ready;                      ///< True once Initialize() has succeeded
     std::atomic<int> trickSpeed;                  ///< Current trick speed: 0 = normal play, >0 = trick mode
 
@@ -191,6 +195,14 @@ class cVaapiDecoder : public cThread {
     int catchupDrops{};               ///< Phase-4 convergence drops, reported in "sync acquired" (decoder thread only)
     int correctDrops{};               ///< Phase-3 correction drops, summarized when run ends (decoder thread only)
     cTimeMs syncGrace;                ///< Suppresses Phase-3 corrections after sync and after each correction
+
+    // ========================================================================
+    // === JITTER BUFFER (live TV only) ===
+    // ========================================================================
+    std::deque<std::unique_ptr<VaapiFrame>> jitterBuf; ///< Decoded frames awaiting display (decoder thread only)
+    bool jitterPrimed{};                               ///< True once jitterBuf has accumulated enough frames
+    int jitterTarget{};            ///< Frame count needed to fill DECODER_JITTER_BUFFER_MS (set by InitFilterGraph)
+    int outputFrameDurationMs{20}; ///< Duration per output frame in ms (e.g. 20 for 50fps, 40 for 25fps)
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H
