@@ -477,7 +477,8 @@ auto cVaapiDevice::Play() -> void {
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
         codecHysteresis = AV_CODEC_ID_NONE;
         codecHysteresisCount = 0;
-        isyslog("vaapivideo/device: audio codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
+        isyslog("vaapivideo/device: audio codec %s (%s, %s)", avcodec_get_name(detectedCodec),
+                isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
     } else {
         // Mid-stream codec change with hysteresis (3 consecutive detections)
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});

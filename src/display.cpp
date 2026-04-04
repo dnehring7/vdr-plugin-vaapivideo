@@ -145,7 +145,6 @@ cVaapiDisplay::DrmFramebuffer::~DrmFramebuffer() noexcept {
         av_frame_free(&frame);
     }
     if (fbId != 0 && drmFd >= 0) {
-        dsyslog("vaapivideo/display: destroy FB %u", fbId);
         drmModeRmFB(drmFd, fbId);
     }
     if (gemHandle != 0 && drmFd >= 0) {
@@ -494,18 +493,14 @@ auto cVaapiDisplay::Action() -> void {
         // importMutex is held across the entire map+commit cycle to prevent BeginStreamSwitch() from tearing down the
         // codec while av_hwframe_map() is still accessing the VAAPI surface.
         bool frameCommitted = false;
-        bool skipDueToClearing = false;
-        bool hadFrame = false;
 
         {
             const cMutexLock importLock(&importMutex);
 
             // Re-check flags under the lock; BeginStreamSwitch() or Shutdown() may have arrived between the flip-wait
             // above and here.
-            if (isClearing.load(std::memory_order_acquire) || isStopping.load(std::memory_order_acquire) ||
-                !isReady.load(std::memory_order_acquire)) {
-                skipDueToClearing = true;
-            } else {
+            if (!isClearing.load(std::memory_order_acquire) && !isStopping.load(std::memory_order_acquire) &&
+                isReady.load(std::memory_order_acquire)) {
                 std::unique_ptr<VaapiFrame> frameToShow;
                 {
                     const cMutexLock lock(&bufferMutex);
@@ -518,7 +513,6 @@ auto cVaapiDisplay::Action() -> void {
                 // BeginStreamSwitch() may have fired between grabbing the frame and reaching this point; discard the
                 // frame in that case so the caller is not blocked waiting for BeginStreamSwitch() to return.
                 if (frameToShow && !isClearing.load(std::memory_order_acquire)) {
-                    hadFrame = true;
                     DrmFramebuffer newFb = MapVaapiFrame(std::move(frameToShow));
 
                     // importMutex must still be held here: av_hwframe_map() keeps a reference into the VAAPI surface,
@@ -526,20 +520,23 @@ auto cVaapiDisplay::Action() -> void {
                     // slowest step in this path.
                     if (newFb.IsValid() && !isClearing.load(std::memory_order_acquire)) {
                         const cMutexLock lock(&bufferMutex);
-                        displayedBuffer = std::move(pendingBuffer);
-                        pendingBuffer = std::move(newFb);
-
-                        if (PresentBuffer(pendingBuffer)) {
+                        if (PresentBuffer(newFb)) {
+                            // Advance the buffer chain only after a successful commit.
+                            // If the commit fails, displayedBuffer must keep holding the currently-scanned
+                            // frame; advancing it to the commit-failed pendingBuffer would destroy the
+                            // scanned FB via drmModeRmFB on the next iteration, causing a black flash.
+                            displayedBuffer = std::move(pendingBuffer);
+                            pendingBuffer = std::move(newFb);
                             frameCommitted = true;
                         }
+                        // On failure: newFb is discarded here (never committed to KMS, safe to remove).
                     }
                 }
             }
         } // importMutex released; BeginStreamSwitch() may now proceed
 
-        // All isClearing checks after this point are outside the lock, so sleep briefly to yield to BeginStreamSwitch()
-        // rather than spinning.
-        if (skipDueToClearing) {
+        // isClearing: yield briefly so BeginStreamSwitch() can acquire importMutex rather than spinning.
+        if (isClearing.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
             if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
                 break;
             }
@@ -550,7 +547,7 @@ auto cVaapiDisplay::Action() -> void {
         // No new frame arrived this iteration; re-submit the last buffer to keep the CRTC actively scanning. Without
         // this the CRTC could go dark (or display a stale hardware cursor) on drivers that require a flip per refresh
         // cycle. Guard with isClearing to avoid racing with BeginStreamSwitch().
-        if (!frameCommitted && !hadFrame && !isClearing.load(std::memory_order_relaxed)) {
+        if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
@@ -1020,6 +1017,7 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // drmHandleEvent() callback; 'data' is the userdata passed to drmModeAtomicCommit().
     auto *display = static_cast<cVaapiDisplay *>(data);
     if (display) {
+        display->lastVSyncTimeMs.store(cTimeMs::Now(), std::memory_order_release);
         display->isFlipPending.store(false, std::memory_order_release);
     }
 }

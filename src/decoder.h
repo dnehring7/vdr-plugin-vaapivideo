@@ -189,11 +189,9 @@ class cVaapiDecoder : public cThread {
     // === A/V SYNC ===
     // ========================================================================
     std::atomic<int> freerunFrames;   ///< Phase-1 counter: frames to submit without sync after Clear()
-    std::atomic<bool> syncLogPending; ///< Triggers "sync start" log on next Phase-4 entry
-    std::atomic<bool> syncAcquired;   ///< True after Phase-4 convergence; gates Phase-3 steady-state
+    std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
     cTimeMs nextSyncLog;              ///< Deadline for the periodic "sync status" log (decoder thread only)
-    int catchupDrops{};               ///< Phase-4 convergence drops, reported in "sync acquired" (decoder thread only)
-    int correctDrops{};               ///< Phase-3 correction drops, summarized when run ends (decoder thread only)
+    int correctDrops{};               ///< Correction drops, summarized when run ends (decoder thread only)
     cTimeMs syncGrace;                ///< Suppresses Phase-3 corrections after sync and after each correction
 
     // ========================================================================
@@ -203,6 +201,8 @@ class cVaapiDecoder : public cThread {
     bool jitterPrimed{};                               ///< True once jitterBuf has accumulated enough frames
     int jitterTarget{};            ///< Frame count needed to fill DECODER_JITTER_BUFFER_MS (set by InitFilterGraph)
     int outputFrameDurationMs{20}; ///< Duration per output frame in ms (e.g. 20 for 50fps, 40 for 25fps)
+    uint64_t jitterDrainTimeMs{0}; ///< Wall-clock timestamp (ms) of the last jitter-buffer drain
+    uint64_t lastSeenVSyncMs{0};   ///< VSync timestamp at last jitter-buffer drain, for VSync-aligned pacing
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

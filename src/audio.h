@@ -13,6 +13,10 @@
 // Platform
 #include <alsa/asoundlib.h>
 
+// FFmpeg (forward declarations for IEC61937 spdif muxer)
+struct AVFormatContext;
+struct AVIOContext;
+
 // ============================================================================
 // === STRUCTURES ===
 // ============================================================================
@@ -73,6 +77,8 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Opens the ALSA device and starts the processing thread; idempotent for the same device
     [[nodiscard]] auto IsInitialized() const noexcept
         -> bool; ///< Returns true if the device is open and the processing thread is running
+    [[nodiscard]] auto IsPassthrough() const noexcept
+        -> bool; ///< Returns true if the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const
         -> bool; ///< Returns true if the packet queue has reached AUDIO_QUEUE_CAPACITY
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
@@ -109,6 +115,11 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto OpenAlsaDevice()
         -> bool; ///< Opens the PCM device with passthrough or PCM parameters; falls back to PCM on failure
     auto OpenDecoder() -> void; ///< Allocates and opens the FFmpeg decoder and parser for the current stream parameters
+    [[nodiscard]] auto OpenSpdifMuxer(AVCodecID codecId, int sampleRate)
+        -> bool; ///< Opens the FFmpeg spdif muxer for IEC61937 burst framing; call when entering passthrough mode
+    auto CloseSpdifMuxer() -> void; ///< Closes the spdif muxer and frees associated resources
+    [[nodiscard]] auto WrapIec61937(const uint8_t *data, int size)
+        -> std::span<const uint8_t>; ///< Wraps a compressed audio frame in an IEC61937 burst via the spdif muxer
     auto ProbeSinkCaps()
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; result is cached per device
     [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames)
@@ -126,6 +137,12 @@ class cAudioProcessor : public cThread {
     snd_pcm_t *alsaHandle{nullptr};     ///< ALSA PCM device handle; nullptr when closed
     bool alsaPassthroughActive{false};  ///< True when the device is open in IEC61937 passthrough mode
     unsigned alsaSampleRate{0};         ///< Hardware sample rate negotiated with ALSA (Hz)
+
+    // ========================================================================
+    // === IEC61937 SPDIF MUXER ===
+    // ========================================================================
+    AVFormatContext *spdifMuxCtx{nullptr}; ///< FFmpeg spdif output context for IEC61937 burst creation
+    std::vector<uint8_t> spdifOutputBuf;   ///< Accumulates IEC61937 burst bytes from the spdif muxer write callback
 
     // ========================================================================
     // === DECODER ===

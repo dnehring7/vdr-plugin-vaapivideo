@@ -37,6 +37,8 @@ extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavcodec/defs.h>
 #include <libavcodec/packet.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
@@ -226,6 +228,8 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     return initialized.load(std::memory_order_relaxed);
 }
 
+[[nodiscard]] auto cAudioProcessor::IsPassthrough() const noexcept -> bool { return alsaPassthroughActive; }
+
 [[nodiscard]] auto cAudioProcessor::IsQueueFull() const -> bool {
     const cMutexLock lock(mutex.get());
     return packetQueue.size() >= AUDIO_QUEUE_CAPACITY;
@@ -270,7 +274,7 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
     const bool wantPassthrough = CanPassthrough(params.codecId);
     const auto targetRate = ComputeAlsaRate(params.codecId, static_cast<unsigned>(params.sampleRate), wantPassthrough);
 
-    // Reopen ALSA only when the hardware format changes. Passthrough always uses 2 IEC958 channels.
+    // Reopen ALSA only when the hardware format changes. Passthrough always uses 2 channels.
     const bool needsReconfig =
         !initialized.load(std::memory_order_relaxed) || alsaPassthroughActive != wantPassthrough ||
         (wantPassthrough ? targetRate != alsaSampleRate
@@ -322,6 +326,7 @@ auto cAudioProcessor::SetVolume(int vol) -> void {
 auto cAudioProcessor::Shutdown() -> void {
     const cMutexLock lock(mutex.get());
 
+    CloseSpdifMuxer();
     CloseDecoder();
 
     while (!packetQueue.empty()) {
@@ -407,9 +412,17 @@ auto cAudioProcessor::Action() -> void {
             continue;
         }
 
-        // WriteToAlsa() handles error tracking internally.
-        (void)(passthrough ? WriteToAlsa(std::span(packet->data, static_cast<size_t>(packet->size)))
-                           : DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), packet->pts));
+        // WritePcmToAlsa() handles error tracking and PTS timeline updates.
+        if (passthrough) {
+            const auto burst = WrapIec61937(packet->data, packet->size);
+            if (!burst.empty()) {
+                const unsigned burstFrames =
+                    (alsaFrameBytes > 0) ? static_cast<unsigned>(burst.size() / alsaFrameBytes) : 0;
+                (void)WritePcmToAlsa(burst, packet->pts, burstFrames);
+            }
+        } else {
+            (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), packet->pts);
+        }
     }
 
     hasExited.store(true, std::memory_order_release);
@@ -565,7 +578,6 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     }
 
     alsaFrameBytes = static_cast<size_t>(frameBytes);
-    alsaPassthroughActive = (format == SND_PCM_FORMAT_IEC958_SUBFRAME_LE);
 
     return true;
 }
@@ -792,8 +804,101 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     return true;
 }
 
+// AVIO write callback for the spdif muxer: appends IEC61937 burst bytes to the output buffer.
+static auto SpdifWriteCallback(void *opaque, const uint8_t *buf, int bufSize) -> int {
+    auto &output = *static_cast<std::vector<uint8_t> *>(opaque);
+    output.insert(output.end(), buf, buf + bufSize);
+    return bufSize;
+}
+
+auto cAudioProcessor::OpenSpdifMuxer(AVCodecID codecId, int sampleRate) -> bool {
+    CloseSpdifMuxer();
+
+    if (avformat_alloc_output_context2(&spdifMuxCtx, nullptr, "spdif", nullptr) < 0 || !spdifMuxCtx) {
+        esyslog("vaapivideo/audio: failed to allocate spdif muxer context");
+        return false;
+    }
+
+    constexpr int kIoBufSize = 32768;
+    auto *ioBuffer = static_cast<uint8_t *>(av_malloc(kIoBufSize));
+    if (!ioBuffer) {
+        avformat_free_context(spdifMuxCtx);
+        spdifMuxCtx = nullptr;
+        return false;
+    }
+
+    spdifMuxCtx->pb =
+        avio_alloc_context(ioBuffer, kIoBufSize, 1, &spdifOutputBuf, nullptr, SpdifWriteCallback, nullptr);
+    if (!spdifMuxCtx->pb) {
+        av_free(ioBuffer);
+        avformat_free_context(spdifMuxCtx);
+        spdifMuxCtx = nullptr;
+        return false;
+    }
+
+    AVStream *const stream = avformat_new_stream(spdifMuxCtx, nullptr); // NOLINT(misc-const-correctness)
+    if (!stream) {
+        CloseSpdifMuxer();
+        return false;
+    }
+
+    stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    stream->codecpar->codec_id = codecId;
+    stream->codecpar->sample_rate = sampleRate;
+    stream->codecpar->ch_layout.nb_channels = 2;
+
+    if (avformat_write_header(spdifMuxCtx, nullptr) < 0) {
+        esyslog("vaapivideo/audio: spdif muxer write_header failed for %s", avcodec_get_name(codecId));
+        CloseSpdifMuxer();
+        return false;
+    }
+
+    dsyslog("vaapivideo/audio: spdif muxer opened for %s @ %dHz", avcodec_get_name(codecId), sampleRate);
+    return true;
+}
+
+auto cAudioProcessor::CloseSpdifMuxer() -> void {
+    if (spdifMuxCtx) {
+        if (spdifMuxCtx->pb) {
+            av_freep(static_cast<void *>(&spdifMuxCtx->pb->buffer));
+            avio_context_free(&spdifMuxCtx->pb);
+        }
+        avformat_free_context(spdifMuxCtx);
+        spdifMuxCtx = nullptr;
+    }
+    spdifOutputBuf.clear();
+}
+
+[[nodiscard]] auto cAudioProcessor::WrapIec61937(const uint8_t *data, int size) -> std::span<const uint8_t> {
+    if (!spdifMuxCtx || !data || size <= 0) {
+        return {};
+    }
+
+    spdifOutputBuf.clear();
+
+    AVPacket *pkt = av_packet_alloc();
+    if (!pkt) {
+        return {};
+    }
+
+    // Wrap without copying: the spdif muxer reads but does not modify the data.
+    pkt->data = const_cast<uint8_t *>(data); // NOLINT(cppcoreguidelines-pro-type-const-cast)
+    pkt->size = size;
+    pkt->stream_index = 0;
+
+    const int ret = av_write_frame(spdifMuxCtx, pkt);
+    av_packet_free(&pkt);
+
+    if (ret < 0) {
+        return {};
+    }
+
+    return {spdifOutputBuf.data(), spdifOutputBuf.size()};
+}
+
 [[nodiscard]] auto cAudioProcessor::OpenAlsaDevice() -> bool {
-    // Passthrough: IEC958_SUBFRAME_LE 2ch. PCM: S16_LE with decoded channel count. Falls back to PCM on failure.
+    // Passthrough: S16_LE 2ch with IEC61937 burst wrapping. PCM: S16_LE with decoded channel count.
+    // Falls back to PCM on failure.
     if (alsaDeviceName.empty()) {
         esyslog("vaapivideo/audio: empty device name");
         return false;
@@ -807,12 +912,16 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
     alsaErrorCount.store(0, std::memory_order_relaxed);
 
+    CloseSpdifMuxer();
+
     const bool wantPassthrough = CanPassthrough(streamParams.codecId);
     const unsigned streamRate = streamParams.sampleRate > 0 ? static_cast<unsigned>(streamParams.sampleRate) : 48000;
     const unsigned alsaRate = ComputeAlsaRate(streamParams.codecId, streamRate, wantPassthrough);
     const unsigned channels =
         (!wantPassthrough && streamParams.channels > 0) ? static_cast<unsigned>(streamParams.channels) : 2;
-    const snd_pcm_format_t format = wantPassthrough ? SND_PCM_FORMAT_IEC958_SUBFRAME_LE : SND_PCM_FORMAT_S16_LE;
+
+    // Passthrough uses S16_LE with IEC61937 burst wrapping (works for both HDMI and S/PDIF).
+    constexpr snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
 
     snd_pcm_t *handle = nullptr;
     if (snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) {
@@ -820,27 +929,45 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    if (ConfigureAlsaParams(handle, format, channels, alsaRate, !wantPassthrough)) {
-        alsaHandle = handle;
-        isyslog("vaapivideo/audio: opened %s @ %uHz on '%s'", alsaPassthroughActive ? "passthrough" : "PCM",
-                alsaSampleRate, alsaDeviceName.c_str());
-        return true;
-    }
-
-    // Passthrough failed -- try PCM fallback.
     if (wantPassthrough) {
-        dsyslog("vaapivideo/audio: passthrough failed, trying PCM fallback");
+        // Passthrough: S16_LE 2ch at the IEC61937 clock rate. The spdif muxer wraps compressed frames into bursts.
+        if (ConfigureAlsaParams(handle, format, 2, alsaRate, false)) {
+            if (OpenSpdifMuxer(streamParams.codecId, streamParams.sampleRate)) {
+                alsaHandle = handle;
+                alsaPassthroughActive = true;
+                isyslog("vaapivideo/audio: opened passthrough @ %uHz on '%s'", alsaSampleRate, alsaDeviceName.c_str());
+                return true;
+            }
+            // Spdif muxer failed; fall through to PCM fallback.
+            dsyslog("vaapivideo/audio: spdif muxer failed, trying PCM fallback");
+        } else {
+            dsyslog("vaapivideo/audio: passthrough hw config failed, trying PCM fallback");
+        }
+
+        // PCM fallback: reopen the device (hw params are consumed by the failed attempt).
         snd_pcm_close(handle);
         handle = nullptr;
 
-        if (snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) >= 0) {
-            const unsigned pcmChannels = streamParams.channels > 0 ? static_cast<unsigned>(streamParams.channels) : 2;
-            if (ConfigureAlsaParams(handle, SND_PCM_FORMAT_S16_LE, pcmChannels, streamRate, true)) {
-                alsaHandle = handle;
-                isyslog("vaapivideo/audio: PCM fallback @ %uHz", alsaSampleRate);
-                OpenDecoder();
-                return true;
-            }
+        if (snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) {
+            esyslog("vaapivideo/audio: snd_pcm_open failed for PCM fallback");
+            return false;
+        }
+
+        const unsigned pcmChannels = streamParams.channels > 0 ? static_cast<unsigned>(streamParams.channels) : 2;
+        if (ConfigureAlsaParams(handle, format, pcmChannels, streamRate, true)) {
+            alsaHandle = handle;
+            alsaPassthroughActive = false;
+            isyslog("vaapivideo/audio: PCM fallback @ %uHz", alsaSampleRate);
+            OpenDecoder();
+            return true;
+        }
+    } else {
+        // Pure PCM path.
+        if (ConfigureAlsaParams(handle, format, channels, alsaRate, true)) {
+            alsaHandle = handle;
+            alsaPassthroughActive = false;
+            isyslog("vaapivideo/audio: opened PCM @ %uHz on '%s'", alsaSampleRate, alsaDeviceName.c_str());
+            return true;
         }
     }
 
@@ -968,21 +1095,11 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const int cardId = snd_pcm_info_get_card(info);
     const int deviceId = static_cast<int>(snd_pcm_info_get_device(info));
 
-    snd_pcm_hw_params_t *params = nullptr;
-    snd_pcm_hw_params_alloca(&params);
-
-    // No point reading ELD if IEC958_SUBFRAME_LE is not supported at the hardware level.
-    const bool iec958Supported = snd_pcm_hw_params_any(handle, params) >= 0 &&
-                                 snd_pcm_hw_params_test_format(handle, params, SND_PCM_FORMAT_IEC958_SUBFRAME_LE) >= 0;
-
     snd_pcm_close(handle);
 
-    if (!iec958Supported) {
-        dsyslog("vaapivideo/audio: IEC958 not supported on hw:%d,%d", cardId, deviceId);
-        return;
-    }
-
     // Read ELD via the ALSA control interface (not the PCM device).
+    // HDMI outputs typically expose only S16_LE (no IEC958_SUBFRAME_LE); passthrough capability is determined
+    // solely from the ELD Short Audio Descriptors, not from the PCM format mask.
     const auto ctlName = std::format("hw:{}", cardId);
 
     snd_ctl_t *ctlRaw = nullptr;
@@ -1021,7 +1138,8 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             }
 
             const unsigned eldSize = snd_ctl_elem_info_get_count(elemInfo);
-            if (eldSize < 21) {
+            constexpr unsigned kEldFixedHeader = 20; ///< Fixed ELD header size (bytes 0-19)
+            if (eldSize < kEldFixedHeader) {
                 dsyslog("vaapivideo/audio: ELD too small (%u bytes) at index %u", eldSize, index);
                 continue;
             }
@@ -1031,12 +1149,15 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                 eldBuffer.at(i) = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
             }
 
-            // Parse CEA-861 Short Audio Descriptors (SADs).
-            // ELD byte 20 bits [7:4] = SAD count; each SAD is 3 bytes starting at offset 84.
-            // SAD byte 0 bits [6:3] = Audio Format Code (AFC).
-            const unsigned sadCount = (eldBuffer.at(20) >> 4) & 0x0F;
-            constexpr unsigned kSadOffset = 84; ///< Byte offset of first SAD in the ELD
-            constexpr unsigned kSadSize = 3;    ///< Bytes per Short Audio Descriptor
+            // ELD layout (see sound/hda/hda_eld.c in the kernel):
+            //   Byte 4 [4:0] = MNL (Monitor Name Length)
+            //   Byte 5 [7:4] = SAD count
+            //   Bytes 20 .. 20+MNL-1 = monitor name
+            //   Bytes 20+MNL .. = Short Audio Descriptors (3 bytes each)
+            const unsigned mnl = eldBuffer.at(4) & 0x1FU;
+            const unsigned sadCount = (eldBuffer.at(5) >> 4) & 0x0FU;
+            const unsigned sadOffset = kEldFixedHeader + mnl;
+            constexpr unsigned kSadSize = 3;
 
             if (sadCount == 0) {
                 dsyslog("vaapivideo/audio: ELD found but no SADs (PCM-only sink)");
@@ -1044,14 +1165,15 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                 break;
             }
 
-            if (kSadOffset + (sadCount * kSadSize) > eldSize) {
-                dsyslog("vaapivideo/audio: truncated ELD (%u SADs need %u bytes, have %u)", sadCount,
-                        kSadOffset + (sadCount * kSadSize), eldSize);
+            if (sadOffset + (sadCount * kSadSize) > eldSize) {
+                dsyslog("vaapivideo/audio: truncated ELD (%u SADs @ offset %u need %u bytes, have %u)", sadCount,
+                        sadOffset, sadOffset + (sadCount * kSadSize), eldSize);
                 continue;
             }
 
-            // Audio Format Codes from CEA-861-D Table 37 / CTA-861-H Table 38. AFC 0x0F is the "Extended" escape;
-            // the actual format is given by the EAFC in SAD byte 2 [7:3].
+            // Audio Format Codes from CEA-861-D Table 37 / CTA-861-H Table 38.
+            // SAD byte 0 bits [6:3] = Audio Format Code (AFC).
+            // AFC 0x0F is the "Extended" escape; the actual format is in SAD byte 2 [7:3] (EAFC).
             constexpr uint8_t kCeaAc3 = 0x02;        ///< Dolby Digital (AC-3)
             constexpr uint8_t kCeaDts = 0x07;        ///< DTS Coherent Acoustics
             constexpr uint8_t kCeaEac3 = 0x0A;       ///< Dolby Digital Plus (E-AC-3)
@@ -1062,7 +1184,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             constexpr uint8_t kCeaExtAc4 = 0x0C;     ///< EAFC: Dolby AC-4
 
             for (unsigned i = 0; i < sadCount; ++i) {
-                const size_t offset = kSadOffset + (i * kSadSize);
+                const size_t offset = sadOffset + (i * kSadSize);
                 const uint8_t formatCode = (eldBuffer.at(offset) >> 3) & 0x0F;
 
                 switch (formatCode) {
@@ -1129,31 +1251,37 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         return false;
     }
 
-    // Passthrough: ALSA "frame" is an IEC958 sub-frame, not an audio sample; clock stays at AV_NOPTS_VALUE.
-    if (alsaPassthroughActive) {
-        return true;
-    }
-
     const unsigned rate = alsaSampleRate;
     if (startPts90k == AV_NOPTS_VALUE || frames == 0U || rate == 0U) {
         return true;
     }
 
     // Single-writer (Action thread); GetClock() reads atomically.
-    int64_t endPts = pcmQueueEndPts;
+    int64_t endPts = 0;
 
-    // PTS jump > 5 s indicates a discontinuity -- re-anchor the timeline.
-    if (endPts != AV_NOPTS_VALUE) {
-        const int64_t diff = (startPts90k > endPts) ? (startPts90k - endPts) : (endPts - startPts90k);
-        if (diff > (5 * 90000)) {
-            endPts = startPts90k;
-        }
+    if (alsaPassthroughActive) {
+        // Passthrough: the IEC61937 burst byte count does NOT equal the codec frame size (the FFmpeg
+        // spdif muxer emits header + compressed data without zero-padding to the full burst period).
+        // Use the packet PTS directly — it carries the correct audio timeline from the stream.
+        endPts = startPts90k;
     } else {
-        endPts = startPts90k; // First write: anchor the PCM timeline
+        // PCM: accumulate endPts from the frames written.
+        endPts = pcmQueueEndPts;
+
+        // PTS jump > 5 s indicates a discontinuity -- re-anchor the timeline.
+        if (endPts != AV_NOPTS_VALUE) {
+            const int64_t diff = (startPts90k > endPts) ? (startPts90k - endPts) : (endPts - startPts90k);
+            if (diff > (5 * 90000)) {
+                endPts = startPts90k;
+            }
+        } else {
+            endPts = startPts90k; // First write: anchor the PCM timeline
+        }
+
+        // Advance end-of-queue PTS by the duration written: frames / sampleRate [s] * 90000 [ticks/s].
+        endPts += static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
     }
 
-    // Advance end-of-queue PTS by the duration written: frames / sampleRate [s] * 90000 [ticks/s].
-    endPts += static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
     pcmQueueEndPts = endPts;
 
     // Compute the playback clock: endPts minus the ALSA ring-buffer delay.

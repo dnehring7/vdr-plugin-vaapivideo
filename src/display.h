@@ -138,6 +138,10 @@ class cVaapiDisplay : public cThread {
                                    int timeoutMs = -1)
         -> bool; ///< Hand a decoded VAAPI frame to the display thread (-1 =
                  ///< wait indefinitely, 0 = non-blocking, >0 = timeout ms)
+    [[nodiscard]] auto GetLastVSyncTimeMs() const noexcept
+        -> uint64_t { ///< Return the wall-clock timestamp (ms) of the most recent page-flip event
+        return lastVSyncTimeMs.load(std::memory_order_relaxed);
+    }
 
   protected:
     // ========================================================================
@@ -284,12 +288,13 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> isFlipPending; ///< Set between an atomic page-flip commit and the corresponding DRM flip event
     std::atomic<bool> isReady;       ///< Set after successful Initialize(); cleared at the start of Shutdown()
     std::atomic<bool> isStopping;    ///< Signals the display thread to exit its run loop
-    uint32_t modeBlobId{};           ///< KMS property blob ID for the current mode (managed lifetime)
-    ModesetProps modesetProps{};     ///< Cached DRM atomic property IDs for the CRTC and connector
-    mutable cMutex osdMutex;         ///< Guards currentOsd and osdDirty across threads
-    bool osdDirty{};                 ///< True from each SetOsd() call until the change is committed by PresentBuffer()
-    uint32_t osdPlaneId{};           ///< DRM plane object ID for the OSD overlay (0 if unavailable)
-    DrmPlaneProps osdProps{};        ///< Cached atomic property IDs for the OSD plane
+    std::atomic<uint64_t> lastVSyncTimeMs{0}; ///< Wall-clock timestamp (ms) of the most recent page-flip event
+    uint32_t modeBlobId{};                    ///< KMS property blob ID for the current mode (managed lifetime)
+    ModesetProps modesetProps{};              ///< Cached DRM atomic property IDs for the CRTC and connector
+    mutable cMutex osdMutex;                  ///< Guards currentOsd and osdDirty across threads
+    bool osdDirty{};          ///< True from each SetOsd() call until the change is committed by PresentBuffer()
+    uint32_t osdPlaneId{};    ///< DRM plane object ID for the OSD overlay (0 if unavailable)
+    DrmPlaneProps osdProps{}; ///< Cached atomic property IDs for the OSD plane
     uint32_t outputHeight{DISPLAY_DEFAULT_HEIGHT}; ///< Active display height in pixels
     uint32_t outputWidth{DISPLAY_DEFAULT_WIDTH};   ///< Active display width in pixels
     DrmFramebuffer pendingBuffer;                  ///< Next framebuffer staged for the upcoming page-flip (back buffer)
