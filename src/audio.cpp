@@ -345,7 +345,7 @@ auto cAudioProcessor::Shutdown() -> void {
     pcmQueueEndPts = AV_NOPTS_VALUE;
     pcmNextPts = AV_NOPTS_VALUE;
     alsaPassthroughActive = false;
-    alsaFrameBytes = 0;
+    alsaFrameBytes.store(0, std::memory_order_release);
     alsaChannels = 0;
     alsaSampleRate = 0;
     initialized.store(false, std::memory_order_release);
@@ -403,8 +403,10 @@ auto cAudioProcessor::Action() -> void {
                 packetQueue.pop();
             }
 
-            // Snapshot under lock; streamParams may be written by another thread.
-            passthrough = CanPassthrough(streamParams.codecId);
+            // Use the actual device state, not sink capability: if passthrough open failed and we
+            // fell back to PCM, alsaPassthroughActive is false even though CanPassthrough() would
+            // still return true (sinkCaps reflect the sink, not the current device mode).
+            passthrough = alsaPassthroughActive;
         }
         // Lock released; EnqueuePacket() not blocked during slow I/O.
 
@@ -416,8 +418,8 @@ auto cAudioProcessor::Action() -> void {
         if (passthrough) {
             const auto burst = WrapIec61937(packet->data, packet->size);
             if (!burst.empty()) {
-                const unsigned burstFrames =
-                    (alsaFrameBytes > 0) ? static_cast<unsigned>(burst.size() / alsaFrameBytes) : 0;
+                const size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
+                const unsigned burstFrames = (bpf > 0) ? static_cast<unsigned>(burst.size() / bpf) : 0;
                 (void)WritePcmToAlsa(burst, packet->pts, burstFrames);
             }
         } else {
@@ -577,7 +579,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    alsaFrameBytes = static_cast<size_t>(frameBytes);
+    alsaFrameBytes.store(static_cast<size_t>(frameBytes), std::memory_order_release);
 
     return true;
 }
@@ -958,7 +960,6 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
             alsaHandle = handle;
             alsaPassthroughActive = false;
             isyslog("vaapivideo/audio: PCM fallback @ %uHz", alsaSampleRate);
-            OpenDecoder();
             return true;
         }
     } else {
@@ -1046,8 +1047,9 @@ auto cAudioProcessor::OpenDecoder() -> void {
         esyslog("vaapivideo/audio: av_parser_init failed");
     }
 
-    avcodec_flush_buffers(ctx);
-    // Grace period: the decoder needs at least one complete access unit before producing output.
+    // Grace period: absorbs any spurious send failures on the very first packet (e.g. AAC warm-up).
+    // Do NOT call avcodec_flush_buffers() here -- that is only for flushing mid-stream state; calling
+    // it on a freshly-opened codec resets internal tables that avcodec_open2() just initialized.
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
     isyslog("vaapivideo/audio: opened %s @ %dHz %dch (%s)", codec->name, ctx->sample_rate, ctx->ch_layout.nb_channels,
             alsaPassthroughActive ? "passthrough" : "PCM");
@@ -1322,16 +1324,15 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                 dst[i] = static_cast<int16_t>((src[i] * currentVolume) / 255);
             }
         }
-        data = scaledBuffer;
+        data = std::move(scaledBuffer);
     }
 
-    size_t bpf = 0;
-    {
-        const cMutexLock lock(mutex.get());
-        bpf = alsaFrameBytes;
-        if (bpf == 0) {
-            return false;
-        }
+    // Read without mutex: alsaFrameBytes is atomic specifically to avoid a deadlock where
+    // SetStreamParams() holds the mutex while waiting for DecodeToPcm() to finish, but
+    // DecodeToPcm() is itself blocked trying to acquire the mutex here.
+    size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
+    if (bpf == 0) {
+        return false;
     }
 
     size_t size = data.size();
@@ -1398,7 +1399,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                     alsaHandle = nullptr;
 
                     if (OpenAlsaDevice()) {
-                        bpf = alsaFrameBytes;
+                        bpf = alsaFrameBytes.load(std::memory_order_relaxed);
                         if (bpf == 0) {
                             esyslog("vaapivideo/audio: invalid frame size after reopen");
                             Shutdown();

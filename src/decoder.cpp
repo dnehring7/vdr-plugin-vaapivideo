@@ -6,7 +6,7 @@
  *
  * Pipeline:  EnqueueData() -> packet queue -> VAAPI decode -> filter graph -> A/V sync -> display
  * Filters:   [bwdif|deinterlace] -> [hqdn3d|denoise] -> scale (BT.709 NV12) -> [sharpen] (probed per GPU)
- * Sync:      Audio-clock master; non-blocking drop/pass, +-100 ms live / +-200 ms replay
+ * Sync:      Audio-clock master; drop/pass/wait: live ±100 ms drop-only; replay ±200 ms drop-behind + wait-ahead
  */
 
 #include "decoder.h"
@@ -1170,15 +1170,14 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
     // A/V sync -- audio clock is master.  delta = vPTS - audioClock - latency
     //
-    //   Live mode (jitter buffer active, +-100 ms):
-    //     |delta| <= 100 ms   pass-through
-    //     delta < -100 ms     video behind  -> drop frame
-    //     delta > +100 ms     video ahead   -> pass (jitter buffer + recovery drain corrects)
+    //   Live (jitter buffer active):
+    //     delta >= -100 ms  pass-through  (jitter-buffer ahead gate + VSync drain handle positive drift)
+    //     delta <  -100 ms  video behind  -> drop frame
     //
-    //   Replay (non-blocking, +-200 ms):
-    //     |delta| <= 200 ms   pass-through (SubmitFrame VSync pacing)
-    //     delta < -200 ms     video behind  -> drop frame
-    //     delta > +200 ms     video ahead   -> pass (VSync pacing; resolves when audio starts)
+    //   Replay:
+    //     -200 ms <= delta <= +200 ms  pass-through  (VSync pacing)
+    //     delta <  -200 ms             video behind  -> drop frame
+    //     delta >  +200 ms             video ahead   -> wait for audio, then submit frame
 
     if (!frame || !display) [[unlikely]] {
         return false;
@@ -1254,67 +1253,27 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     }
 
     // audioLatency compensates for external delays (AV receiver, etc.).
-    // videoPipelineDelay accounts for the internal display path: after SubmitFrame() the frame still
-    // has to be picked up by the display thread, mapped via MapVaapiFrame(), committed with
-    // drmModeAtomicCommit(), and scanned out at the next vblank — roughly one frame period end-to-end.
+    // videoPipelineDelay accounts for the display path: after SubmitFrame() the frame is committed via
+    // drmModeAtomicCommit() and scanned out at the next vblank — roughly one frame period end-to-end.
     const int64_t videoPipelineDelay = static_cast<int64_t>(outputFrameDurationMs) * 90;
     const int64_t latency = (static_cast<int64_t>(vaapiConfig.audioLatency) * 90) + videoPipelineDelay;
     const int64_t clock = audioProcessor->GetClock();
 
-    // --- Live mode: lightweight sync; jitter buffer + VSync drain handle pacing ---
-    // Never blocks the decode thread.  Drop-if-behind corrects negative drift; positive drift is
-    // absorbed by the jitter buffer and corrected via recovery drain.  Phase 4 convergence is
-    // unnecessary because jitter-buffer priming already aligns PTS to the audio clock.
-    if (liveMode.load(std::memory_order_relaxed)) {
-        // No clock (e.g. audio passthrough): jitter buffer paces output; no sync possible.
-        if (clock == AV_NOPTS_VALUE) {
-            if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-                dsyslog("vaapivideo/decoder: sync freerun (no audio clock) buf=%zu", jitterBuf.size());
-                nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
-            }
-            return submit();
-        }
+    // --- Phase 3: A/V sync (live and replay share the same structure) ---
+    // Live:   100 ms drop threshold; non-blocking; ahead correction is the jitter-buffer drain in Action().
+    // Replay: 200 ms drop threshold.
+    //   Behind: drop frames to catch up.
+    //   Ahead:  wait for the audio clock to reach the frame's PTS, then submit.  This handles the
+    //           common case where the DVB encoder muxed video PTS ahead of audio PTS by a fixed offset
+    //           (up to several seconds).  The decode thread holds here; safe in replay because the
+    //           file-reader pre-fills packet queues deep enough that audio never starves during the wait.
+    const bool isLive = liveMode.load(std::memory_order_relaxed);
+    const int64_t threshold = isLive ? DECODER_SYNC_CORRECT_LIVE : DECODER_SYNC_CORRECT_REPLAY;
 
-        const int64_t delta = originalPts - clock - latency;
-
-        if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-            dsyslog("vaapivideo/decoder: sync status d=%+lldms buf=%zu", static_cast<long long>(delta / 90),
-                    jitterBuf.size());
-            nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
-        }
-
-        // Grace period: suppress corrections while ALSA clock stabilizes.
-        if (!syncGrace.TimedOut()) {
-            return submit();
-        }
-
-        // Behind > 100 ms: drop to catch up.
-        if (delta < -DECODER_SYNC_CORRECT_LIVE) {
-            ++correctDrops;
-            return true;
-        }
-
-        // Log when a drop run ends.
-        if (correctDrops > 0) {
-            dsyslog("vaapivideo/decoder: sync corrected %d dropped d=%+lldms", correctDrops,
-                    static_cast<long long>(delta / 90));
-            correctDrops = 0;
-            syncGrace.Set(DECODER_SYNC_GRACE_MS);
-        }
-
-        return submit();
-    }
-
-    // --- Replay: non-blocking sync (same principle as live mode) ---
-    // SubmitFrame() blocks at VSync rate — that provides the pacing. No poll-waits: they block the
-    // decode thread, which fills the video packet queue, which blocks the dvbplayer (single-threaded),
-    // which starves the audio pipeline and makes the audio clock stall.
-    //
-    // Behind > 200 ms: drop to catch up.
-    // Ahead: submit; SubmitFrame paces at VSync rate. Initial ahead offset resolves when audio starts.
+    // No clock: audio pipeline not yet started (applies equally to PCM and passthrough before first write).
     if (clock == AV_NOPTS_VALUE) {
         if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-            dsyslog("vaapivideo/decoder: sync freerun (no audio clock)");
+            dsyslog("vaapivideo/decoder: sync freerun (no audio clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
         }
         return submit();
@@ -1323,27 +1282,47 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     const int64_t delta = originalPts - clock - latency;
 
     if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-        dsyslog("vaapivideo/decoder: sync status d=%+lldms", static_cast<long long>(delta / 90));
+        dsyslog("vaapivideo/decoder: sync status d=%+lldms buf=%zu", static_cast<long long>(delta / 90),
+                jitterBuf.size());
         nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
     }
 
-    // Grace period: suppress corrections while ALSA clock stabilizes.
+    // Grace period: suppress corrections while the ALSA clock stabilizes.
     if (!syncGrace.TimedOut()) {
         return submit();
     }
 
-    // Behind > 200 ms: drop to catch up.
-    if (delta < -DECODER_SYNC_CORRECT_REPLAY) {
+    // Behind threshold: drop to catch up.
+    if (delta < -threshold) {
         ++correctDrops;
         return true;
     }
 
-    // Log when a drop run ends.
+    // Log when a drop run ends and arm a grace period to avoid immediate re-correction.
     if (correctDrops > 0) {
         dsyslog("vaapivideo/decoder: sync corrected %d dropped d=%+lldms", correctDrops,
                 static_cast<long long>(delta / 90));
         correctDrops = 0;
         syncGrace.Set(DECODER_SYNC_GRACE_MS);
+    }
+
+    // Replay ahead correction: video PTS leads audio clock (common DVB stream PTS offset).
+    // Wait until the audio clock reaches this frame's PTS before submitting.
+    // Live ahead correction is handled by the jitter-buffer ahead gate in Action().
+    if (!isLive && delta > threshold) {
+        dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio", static_cast<long long>(delta / 90));
+        // Cap at 5 s; add one grace interval so the loop exits cleanly after the clock crosses zero.
+        const int64_t maxWaitMs = std::min<int64_t>((delta / 90) + DECODER_SYNC_GRACE_MS, 5000LL);
+        const cTimeMs deadline(static_cast<int>(maxWaitMs));
+        while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
+            const int64_t freshClock = audioProcessor->GetClock();
+            if (freshClock == AV_NOPTS_VALUE || (originalPts - freshClock - latency) <= 0) {
+                break;
+            }
+            cCondWait::SleepMs(10);
+        }
+        syncGrace.Set(DECODER_SYNC_GRACE_MS);
+        syncLogPending.store(true, std::memory_order_relaxed);
     }
 
     return submit();

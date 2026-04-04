@@ -130,13 +130,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === ALSA DEVICE ===
     // ========================================================================
-    unsigned alsaChannels{0};           ///< Configured hardware channel count
-    std::string alsaDeviceName;         ///< ALSA PCM device name (e.g. "plughw:0,3")
-    std::atomic<int> alsaErrorCount{0}; ///< Consecutive ALSA write failures since the last successful write
-    size_t alsaFrameBytes{0};           ///< Bytes per interleaved audio frame (channels x sample_size)
-    snd_pcm_t *alsaHandle{nullptr};     ///< ALSA PCM device handle; nullptr when closed
-    bool alsaPassthroughActive{false};  ///< True when the device is open in IEC61937 passthrough mode
-    unsigned alsaSampleRate{0};         ///< Hardware sample rate negotiated with ALSA (Hz)
+    unsigned alsaChannels{0};              ///< Configured hardware channel count
+    std::string alsaDeviceName;            ///< ALSA PCM device name (e.g. "plughw:0,3")
+    std::atomic<int> alsaErrorCount{0};    ///< Consecutive ALSA write failures since the last successful write
+    std::atomic<size_t> alsaFrameBytes{0}; ///< Bytes per interleaved audio frame (channels x sample_size); atomic so
+                                           ///<   WriteToAlsa() can read it without holding the mutex
+    snd_pcm_t *alsaHandle{nullptr};        ///< ALSA PCM device handle; nullptr when closed
+    bool alsaPassthroughActive{false};     ///< True when the device is open in IEC61937 passthrough mode
+    unsigned alsaSampleRate{0};            ///< Hardware sample rate negotiated with ALSA (Hz)
 
     // ========================================================================
     // === IEC61937 SPDIF MUXER ===
