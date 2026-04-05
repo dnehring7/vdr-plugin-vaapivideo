@@ -732,13 +732,16 @@ auto cVaapiDecoder::Action() -> void {
                                 // Fast-skip frames far behind the audio clock at CPU speed.
                                 // VSync-paced drain is too slow when the deficit is large (e.g. initial
                                 // tune where audio starts seconds before video is ready).
-                                while (jitterBuf.size() > 1) {
-                                    const int64_t delta = jitterBuf.front()->pts - clock - lat;
-                                    if (delta < -DECODER_SYNC_THRESHOLD) {
+                                // Once triggered at -threshold, drain until delta reaches zero so the
+                                // burst fully closes the gap rather than stopping at the boundary.
+                                if (jitterBuf.size() > 1 &&
+                                    jitterBuf.front()->pts - clock - lat < -DECODER_SYNC_THRESHOLD) {
+                                    while (jitterBuf.size() > 1) {
+                                        const int64_t delta = jitterBuf.front()->pts - clock - lat;
+                                        if (delta >= 0)
+                                            break;
                                         jitterBuf.pop_front();
                                         ++correctDrops;
-                                    } else {
-                                        break;
                                     }
                                 }
 

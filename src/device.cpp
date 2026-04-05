@@ -512,6 +512,15 @@ auto cVaapiDevice::Play() -> void {
         }
     }
 
+    // Radio detection: audio is playing but no video codec opened within 1 second.
+    if (radioBlackPending && radioBlackTimer.TimedOut()) [[unlikely]] {
+        radioBlackPending = false;
+        if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && display && vaapi.hwDeviceRef) {
+            isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
+            SubmitBlackFrame();
+        }
+    }
+
     // Replay: return 0 for backpressure via Poll(). Live TV: always accept to keep pace with cTransfer.
     if (!isLive && audioProcessor->IsQueueFull()) [[unlikely]] {
         return 0;
@@ -535,6 +544,8 @@ auto cVaapiDevice::Play() -> void {
     if (!decoder || !decoder->IsReady()) [[unlikely]] {
         return Length;
     }
+
+    radioBlackPending = false;
 
     const auto pes = ParsePes({Data, static_cast<size_t>(Length)});
     if (!pes.isVideo || pes.payloadSize == 0) [[unlikely]] {
@@ -684,6 +695,7 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
         case pmNone:
             // Hard reset of all codec state. Doing this here rather than in Clear() allows skip/seek within a
             // recording to reuse the open codec without a teardown cycle.
+            radioBlackPending = false;
             previousVideoCodec = videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
@@ -702,6 +714,7 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
         case pmAudioOnly:
         case pmAudioOnlyBlack:
             // Radio channel: clear buffers and show black so the previous channel's last picture disappears.
+            radioBlackPending = false;
             Clear();
             if (display && vaapi.hwDeviceRef) [[likely]] {
                 SubmitBlackFrame();
@@ -712,6 +725,9 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             // Codec state was already reset by the preceding pmNone call. liveMode is determined from the first
             // incoming PES packet via Transferring().
             Clear();
+            // Arm radio detection: if no video codec opens within 3 s, show a black frame.
+            radioBlackTimer.Set(3000);
+            radioBlackPending = true;
             break;
         default:
             break;
@@ -1206,7 +1222,7 @@ auto cVaapiDevice::ReleaseHardware() -> void {
     for (int i = 0; i < resources->count_connectors; ++i) {
         std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
             drmModeGetConnector(drmFd, resources->connectors[i])};
-        if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) [[unlikely]] {
+        if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) [[likely]] {
             continue;
         }
 

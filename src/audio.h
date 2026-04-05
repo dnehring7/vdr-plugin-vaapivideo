@@ -170,9 +170,9 @@ class cAudioProcessor : public cThread {
     // === PCM CLOCK ===
     // ========================================================================
     std::atomic<uint32_t> clearGeneration{0}; ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
-    int64_t pcmNextPts{AV_NOPTS_VALUE}; ///< Expected 90 kHz PTS of the next PCM write; used for discontinuity detection
-    int64_t pcmQueueEndPts{AV_NOPTS_VALUE}; ///< 90 kHz PTS of the last sample written into the ALSA ring buffer
-    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< Cached 90 kHz audio playback clock updated after each write
+    int64_t pcmNextPts{AV_NOPTS_VALUE};       ///< DVB-anchored 90 kHz PTS for the next ALSA write (PCM & passthrough)
+    int64_t pcmQueueEndPts{AV_NOPTS_VALUE};   ///< 90 kHz PTS of the last sample written into the ALSA ring buffer
+    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< Cached DAC-output PTS (endPts minus ALSA delay at write time)
 
     // ========================================================================
     // === SINK CAPABILITIES ===

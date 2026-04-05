@@ -164,7 +164,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::GetClock() const noexcept -> int64_t {
-    // clock = pcmQueueEndPts - ALSA ring-buffer delay (in 90 kHz ticks).
+    // PTS of the sample at the DAC output: pcmQueueEndPts minus ALSA ring-buffer delay.
     // Falls back to cached playbackPts when the device is closed or no PTS has been anchored.
     const unsigned rate = alsaSampleRate;
 
@@ -405,15 +405,34 @@ auto cAudioProcessor::Action() -> void {
             passthrough = alsaPassthroughActive;
         }
 
+        // Re-anchor audio clock from DVB stream PTS on every packet (shared by PCM and passthrough).
+        const int64_t pts = packet->pts;
+        if (pts != AV_NOPTS_VALUE) {
+            if (pcmNextPts != AV_NOPTS_VALUE) {
+                const int64_t diff = (pts > pcmNextPts) ? (pts - pcmNextPts) : (pcmNextPts - pts);
+                if (diff > (5 * 90000)) {
+                    // Discontinuity (channel change, stream reset): flush queued audio.
+                    const cMutexLock lock(mutex.get());
+                    if (alsaHandle) {
+                        (void)snd_pcm_drop(alsaHandle);
+                        (void)snd_pcm_prepare(alsaHandle);
+                    }
+                    pcmQueueEndPts = AV_NOPTS_VALUE;
+                    playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+                }
+            }
+            pcmNextPts = pts;
+        }
+
         if (passthrough) {
             const auto burst = WrapIec61937(packet->data, packet->size);
             if (!burst.empty()) {
                 const size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
                 const unsigned burstFrames = (bpf > 0) ? static_cast<unsigned>(burst.size() / bpf) : 0;
-                (void)WritePcmToAlsa(burst, packet->pts, burstFrames);
+                (void)WritePcmToAlsa(burst, pcmNextPts, burstFrames);
             }
         } else {
-            (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), packet->pts);
+            (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), pts);
         }
     }
 
@@ -713,29 +732,6 @@ auto cAudioProcessor::FlushDecoderState() -> void {
                                        ? static_cast<unsigned>(pcmSize / (outCh * 2U))
                                        : static_cast<unsigned>(frame->nb_samples);
 
-        // Maintain a 90 kHz PCM timeline from parser PTS (FFmpeg frame->pts uses a codec-dependent timebase).
-        if (pts != AV_NOPTS_VALUE) {
-            if (pcmNextPts == AV_NOPTS_VALUE) {
-                pcmNextPts = pts;
-            } else {
-                const int64_t diff = (pts > pcmNextPts) ? (pts - pcmNextPts) : (pcmNextPts - pts);
-                if (diff > (5 * 90000)) {
-                    // Discontinuity (channel change, stream reset): flush queued audio and re-anchor.
-                    {
-                        const cMutexLock lock(mutex.get());
-                        if (alsaHandle) {
-                            (void)snd_pcm_drop(alsaHandle);
-                            (void)snd_pcm_prepare(alsaHandle);
-                        }
-                    }
-
-                    pcmQueueEndPts = AV_NOPTS_VALUE;
-                    playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
-                    pcmNextPts = pts;
-                }
-            }
-        }
-
         // Skip ALSA write if Clear() ran since dequeue to prevent stale PTS from poisoning the clock.
         if (clearGeneration.load(std::memory_order_acquire) != myGeneration) [[unlikely]] {
             decoderRefCount.fetch_sub(1, std::memory_order_release);
@@ -751,8 +747,8 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             return false;
         }
 
-        // Advance PCM timeline by the duration queued, using the ALSA sample rate for delay conversion.
-        if (!alsaPassthroughActive && startPts90k != AV_NOPTS_VALUE && alsaSampleRate > 0U) {
+        // Advance pcmNextPts for multi-frame decode (next avcodec_receive_frame iteration).
+        if (startPts90k != AV_NOPTS_VALUE && alsaSampleRate > 0U) {
             const auto added90k = static_cast<int64_t>((static_cast<uint64_t>(framesOut) * 90000ULL) /
                                                        static_cast<uint64_t>(alsaSampleRate));
             pcmNextPts = startPts90k + added90k;
@@ -970,18 +966,7 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
 }
 
 auto cAudioProcessor::OpenDecoder() -> void {
-    // Wait for in-flight DecodeToPcm() calls before replacing the decoder context.
-    for (const cTimeMs start;
-         decoderRefCount.load(std::memory_order_acquire) > 0 && start.Elapsed() < AUDIO_DECODER_DRAIN_TIMEOUT_MS;) {
-        cCondWait::SleepMs(1);
-    }
-
-    decoder.reset();
-    if (swrCtx) {
-        swr_free(&swrCtx);
-    }
-    swrChannels = 0;
-    swrFormat = AV_SAMPLE_FMT_NONE;
+    CloseDecoder();
 
     if (streamParams.codecId == AV_CODEC_ID_NONE) {
         return;
@@ -1248,35 +1233,12 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         return true;
     }
 
-    // Single-writer (Action thread); GetClock() reads atomically.
-    int64_t endPts = 0;
-
-    if (alsaPassthroughActive) {
-        // Passthrough: the IEC61937 burst byte count does NOT equal the codec frame size (the FFmpeg
-        // spdif muxer emits header + compressed data without zero-padding to the full burst period).
-        // Use the packet PTS directly — it carries the correct audio timeline from the stream.
-        endPts = startPts90k;
-    } else {
-        // PCM: accumulate endPts from the frames written.
-        endPts = pcmQueueEndPts;
-
-        // PTS jump > 5 s indicates a discontinuity -- re-anchor the timeline.
-        if (endPts != AV_NOPTS_VALUE) {
-            const int64_t diff = (startPts90k > endPts) ? (startPts90k - endPts) : (endPts - startPts90k);
-            if (diff > (5 * 90000)) {
-                endPts = startPts90k;
-            }
-        } else {
-            endPts = startPts90k; // First write: anchor the PCM timeline
-        }
-
-        // Advance end-of-queue PTS by the duration written: frames / sampleRate [s] * 90000 [ticks/s].
-        endPts += static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
-    }
+    // endPts = DVB-anchored start PTS + written duration (same formula for PCM and passthrough).
+    const int64_t endPts = startPts90k + static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
 
     pcmQueueEndPts = endPts;
 
-    // Compute the playback clock: endPts minus the ALSA ring-buffer delay.
+    // Cache the playback clock (endPts minus ALSA ring-buffer delay) for GetClock() fallback.
     snd_pcm_sframes_t delayFrames = 0;
     if (alsaHandle && snd_pcm_delay(alsaHandle, &delayFrames) == 0) {
         delayFrames = std::max<snd_pcm_sframes_t>(delayFrames, 0);

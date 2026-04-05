@@ -177,6 +177,8 @@ class cVaapiDevice : public cDevice {
     int osdWidth{};                                  ///< Cached display width for OSD allocation (pixels)
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
+    bool radioBlackPending{false};                   ///< True while waiting to detect radio-only channel
+    cTimeMs radioBlackTimer;                         ///< 1-second timeout for radio channel black frame
     std::atomic<int> trickSpeed;                     ///< Active VDR trick speed index; 0 = normal playback
     VaapiContext vaapi{};                            ///< Shared VAAPI context (hwDeviceRef + drmFd borrow)
     AVCodecID videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate video codec pending confirmation
