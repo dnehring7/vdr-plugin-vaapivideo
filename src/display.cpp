@@ -473,32 +473,30 @@ auto cVaapiDisplay::Shutdown() -> void {
 auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
-    // VDR's Running() is not thread-safe; use our own atomic flags (relaxed for polling, acquire under importMutex).
     while (!isStopping.load(std::memory_order_relaxed) && isReady.load(std::memory_order_relaxed)) {
-        // Drain all pending DRM events before doing any work.  DrainDrmEvents(0) is non-blocking; the post-drain
-        // flag check below catches shutdown immediately after.
+        // Drain pending DRM events (non-blocking).
         while (DrainDrmEvents(0)) {
         }
 
-        if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        // A flip is outstanding; poll briefly so we stay responsive to shutdown.
+        // Wait for outstanding page-flip before submitting new work.
         if (isFlipPending.load(std::memory_order_relaxed)) {
             (void)DrainDrmEvents(5);
             continue;
         }
 
-        // importMutex is held across the entire map+commit cycle to prevent BeginStreamSwitch() from tearing down the
-        // codec while av_hwframe_map() is still accessing the VAAPI surface.
-        bool frameCommitted = false;
+        // Yield during stream switch so BeginStreamSwitch() can acquire importMutex.
+        if (isClearing.load(std::memory_order_relaxed)) {
+            cCondWait::SleepMs(5);
+            continue;
+        }
 
+        // Hold importMutex across the map+commit cycle to prevent BeginStreamSwitch() from tearing down the codec
+        // while av_hwframe_map() accesses the VAAPI surface.
+        bool frameCommitted = false;
         {
             const cMutexLock importLock(&importMutex);
 
-            // Re-check flags under the lock; BeginStreamSwitch() or Shutdown() may have arrived between the flip-wait
-            // above and here.
+            // Re-check flags under the lock; state may have changed since the checks above.
             if (!isClearing.load(std::memory_order_acquire) && !isStopping.load(std::memory_order_acquire) &&
                 isReady.load(std::memory_order_acquire)) {
                 std::unique_ptr<VaapiFrame> frameToShow;
@@ -510,52 +508,37 @@ auto cVaapiDisplay::Action() -> void {
                     }
                 }
 
-                // BeginStreamSwitch() may have fired between grabbing the frame and reaching this point; discard the
-                // frame in that case so the caller is not blocked waiting for BeginStreamSwitch() to return.
                 if (frameToShow && !isClearing.load(std::memory_order_acquire)) {
                     DrmFramebuffer newFb = MapVaapiFrame(std::move(frameToShow));
 
-                    // importMutex must still be held here: av_hwframe_map() keeps a reference into the VAAPI surface,
-                    // which must outlive the DRM commit. Check isClearing once more because MapVaapiFrame() is the
-                    // slowest step in this path.
+                    // Check isClearing again; MapVaapiFrame() is the slowest step.
                     if (newFb.IsValid() && !isClearing.load(std::memory_order_acquire)) {
                         const cMutexLock lock(&bufferMutex);
                         if (PresentBuffer(newFb)) {
-                            // Advance the buffer chain only after a successful commit.
-                            // If the commit fails, displayedBuffer must keep holding the currently-scanned
-                            // frame; advancing it to the commit-failed pendingBuffer would destroy the
-                            // scanned FB via drmModeRmFB on the next iteration, causing a black flash.
+                            // Advance buffer chain only on success; a failed commit must not destroy the
+                            // currently-scanned FB via drmModeRmFB.
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
                             frameCommitted = true;
                         }
-                        // On failure: newFb is discarded here (never committed to KMS, safe to remove).
                     }
                 }
             }
-        } // importMutex released; BeginStreamSwitch() may now proceed
-
-        // isClearing: yield briefly so BeginStreamSwitch() can acquire importMutex rather than spinning.
-        if (isClearing.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
-            if (isStopping.load(std::memory_order_relaxed) || !isReady.load(std::memory_order_relaxed)) {
-                break;
-            }
-            cCondWait::SleepMs(5);
-            continue;
         }
 
-        // No new frame arrived this iteration; re-submit the last buffer to keep the CRTC actively scanning. Without
-        // this the CRTC could go dark (or display a stale hardware cursor) on drivers that require a flip per refresh
-        // cycle. Guard with isClearing to avoid racing with BeginStreamSwitch().
+        // Re-submit the last buffer to maintain the flip cadence and commit any pending OSD changes that would
+        // otherwise stall until the next video frame.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
+            } else {
+                // No buffer available yet; avoid busy-spinning.
+                cCondWait::SleepMs(5);
             }
         }
     }
 
-    // Store before the final log so Shutdown()'s spin sees it immediately.
     hasThreadExited.store(true, std::memory_order_release);
 }
 

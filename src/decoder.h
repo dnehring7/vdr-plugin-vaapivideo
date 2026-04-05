@@ -135,9 +135,9 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === REFERENCES ===
     // ========================================================================
-    cAudioProcessor *audioProcessor{}; ///< Audio processor providing the master clock for A/V sync
-    cVaapiDisplay *display;            ///< Display that receives completed VaapiFrames
-    VaapiContext *vaapiContext;        ///< Shared VAAPI hardware device context
+    std::atomic<cAudioProcessor *> audioProcessor{nullptr}; ///< Audio processor providing the master clock for A/V sync
+    cVaapiDisplay *display;                                 ///< Display that receives completed VaapiFrames
+    VaapiContext *vaapiContext;                             ///< Shared VAAPI hardware device context
 
     // ========================================================================
     // === FFMPEG STATE ===
@@ -188,7 +188,9 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === A/V SYNC ===
     // ========================================================================
-    std::atomic<int> freerunFrames;   ///< Phase-1 counter: frames to submit without sync after Clear()
+    std::atomic<int> freerunFrames; ///< Frames to submit without sync after Clear() (written by main thread)
+    std::atomic<bool> jitterFlushPending{
+        false};                       ///< Set by Clear(); decode thread applies jitter reset on next delivery cycle
     std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
     cTimeMs nextSyncLog;              ///< Deadline for the periodic "sync status" log (decoder thread only)
     int correctDrops{};               ///< Correction drops, summarized when run ends (decoder thread only)

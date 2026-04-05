@@ -398,23 +398,13 @@ auto cAudioProcessor::Action() -> void {
                 break;
             }
 
-            if (!packetQueue.empty()) {
-                packet.reset(packetQueue.front());
-                packetQueue.pop();
-            }
+            packet.reset(packetQueue.front());
+            packetQueue.pop();
 
-            // Use the actual device state, not sink capability: if passthrough open failed and we
-            // fell back to PCM, alsaPassthroughActive is false even though CanPassthrough() would
-            // still return true (sinkCaps reflect the sink, not the current device mode).
+            // Reflects actual device mode, not sink capability (passthrough open may have fallen back to PCM).
             passthrough = alsaPassthroughActive;
         }
-        // Lock released; EnqueuePacket() not blocked during slow I/O.
 
-        if (!packet || !packet->data || packet->size <= 0) [[unlikely]] {
-            continue;
-        }
-
-        // WritePcmToAlsa() handles error tracking and PTS timeline updates.
         if (passthrough) {
             const auto burst = WrapIec61937(packet->data, packet->size);
             if (!burst.empty()) {
