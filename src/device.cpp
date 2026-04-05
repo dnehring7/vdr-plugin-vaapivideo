@@ -904,9 +904,6 @@ auto cVaapiDevice::Detach() -> void {
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
-    // Show black immediately so the console is covered even if VDR starts on a radio channel.
-    SubmitBlackFrame();
-
     return true;
 }
 

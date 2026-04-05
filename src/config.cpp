@@ -115,7 +115,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
-    return std::format("Audio Latency: {}ms", audioLatency);
+    return std::format("Audio Latency: {}ms", audioLatency.load(std::memory_order_relaxed));
 }
 
 [[nodiscard]] auto VaapiConfig::SetupParse(const char *name, const char *value) -> bool {
@@ -139,8 +139,9 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
             return false;
         }
 
-        dsyslog("vaapivideo/config: audio latency updated from %d to %d ms", audioLatency, parsed);
-        audioLatency = parsed;
+        dsyslog("vaapivideo/config: audio latency updated from %d to %d ms",
+                audioLatency.load(std::memory_order_relaxed), parsed);
+        audioLatency.store(parsed, std::memory_order_relaxed);
         return true;
     }
 

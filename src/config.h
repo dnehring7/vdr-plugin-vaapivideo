@@ -8,6 +8,7 @@
 #ifndef VDR_VAAPIVIDEO_CONFIG_H
 #define VDR_VAAPIVIDEO_CONFIG_H
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -65,9 +66,9 @@ struct VaapiConfig {
     // ========================================================================
     // === DATA MEMBERS ===
     // ========================================================================
-    int audioLatency{0};   ///< Extra A/V synchronization offset (ms); positive shifts video earlier to compensate for
-                           ///< external audio delay
-    DisplayConfig display; ///< Desired display output parameters
+    std::atomic<int> audioLatency{0}; ///< Extra A/V synchronization offset (ms); positive shifts video earlier to
+                                      ///< compensate for external audio delay (read by decode thread)
+    DisplayConfig display;            ///< Desired display output parameters
 
     // ========================================================================
     // === METHODS ===

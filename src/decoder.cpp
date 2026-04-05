@@ -677,9 +677,7 @@ auto cVaapiDecoder::Action() -> void {
                     if (auto *const ap = audioProcessor.load(std::memory_order_acquire)) {
                         const int64_t clock = ap->GetClock();
                         if (clock != AV_NOPTS_VALUE) {
-                            // Same latency as SyncAndSubmitFrame: audioLatency + one frame pipeline delay.
-                            const int64_t lat = (static_cast<int64_t>(vaapiConfig.audioLatency) * 90) +
-                                                (static_cast<int64_t>(outputFrameDurationMs) * 90);
+                            const int64_t lat = SyncLatency90k();
                             while (jitterBuf.size() > 1) {
                                 const int64_t pts = jitterBuf.front()->pts;
                                 if (pts != AV_NOPTS_VALUE && (pts - clock - lat) < 0) {
@@ -724,20 +722,33 @@ auto cVaapiDecoder::Action() -> void {
                         lastSeenVSyncMs = vsyncTs;
                         jitterDrainTimeMs = now;
 
-                        // Ahead gate: if the front frame's PTS is ahead of the audio clock,
-                        // skip this drain cycle.  The display re-submits the previous frame; audio
-                        // catches up by one frame period per skipped VSync.  This corrects the initial
-                        // priming offset (audio clock not yet established) and positive PCR/ALSA drift.
-                        // Uses half a frame period as dead zone to avoid stutter from clock jitter.
+                        // Read the audio clock once for both fast-skip and ahead gate decisions.
                         if (auto *const ap = audioProcessor.load(std::memory_order_acquire);
                             ap && jitterBuf.front()->pts != AV_NOPTS_VALUE) {
-                            const int64_t aheadClock = ap->GetClock();
-                            if (aheadClock != AV_NOPTS_VALUE) {
-                                const int64_t lat = (static_cast<int64_t>(vaapiConfig.audioLatency) * 90) +
-                                                    (static_cast<int64_t>(outputFrameDurationMs) * 90);
-                                const int64_t delta = jitterBuf.front()->pts - aheadClock - lat;
+                            const int64_t clock = ap->GetClock();
+                            if (clock != AV_NOPTS_VALUE) {
+                                const int64_t lat = SyncLatency90k();
+
+                                // Fast-skip frames far behind the audio clock at CPU speed.
+                                // VSync-paced drain is too slow when the deficit is large (e.g. initial
+                                // tune where audio starts seconds before video is ready).
+                                while (jitterBuf.size() > 1) {
+                                    const int64_t delta = jitterBuf.front()->pts - clock - lat;
+                                    if (delta < -DECODER_SYNC_THRESHOLD) {
+                                        jitterBuf.pop_front();
+                                        ++correctDrops;
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                // Ahead gate: if the front frame is ahead of the audio clock, skip this
+                                // drain cycle.  The display re-submits the previous buffer; audio catches
+                                // up by one frame period per skipped VSync.  Half a frame period dead zone
+                                // avoids stutter from clock jitter.
+                                const int64_t frontDelta = jitterBuf.front()->pts - clock - lat;
                                 const int64_t deadZone = static_cast<int64_t>(outputFrameDurationMs) * 90 / 2;
-                                if (delta > deadZone) {
+                                if (frontDelta > deadZone) {
                                     continue; // Skip drain; let audio catch up
                                 }
                             }
@@ -851,63 +862,65 @@ auto cVaapiDecoder::Action() -> void {
             }
 
             // Build the filter graph lazily on the first decoded frame (or after Clear()).
-            if (!filterGraph) {
-                (void)InitFilterGraph(decodedFrame.get());
-            }
-
+            // vaDriverMutex serializes all VA driver calls (filter graph + surface sync) between
+            // the decode and display threads; concurrent VA operations on the same VADisplay are not thread-safe.
             const int64_t sourcePts = decodedFrame->pts;
+            {
+                const cMutexLock vaLock(&display->vaDriverMutex);
 
-            if (filterGraph) {
-                if (av_buffersrc_add_frame_flags(bufferSrcCtx, decodedFrame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
-                    [[unlikely]] {
-                    // Unexpected rejection -- rebuild the graph on the next frame.
-                    ResetFilterGraph();
-                    continue;
+                if (!filterGraph) {
+                    (void)InitFilterGraph(decodedFrame.get());
                 }
 
-                // With rate=field deinterlacing each source frame produces two outputs.
-                // Assign monotonically increasing PTS: first field keeps the source PTS,
-                // second field advances by one field period so A/V sync sees a smooth timeline.
-                int fieldIndex = 0;
-                while (true) {
-                    av_frame_unref(filteredFrame.get());
-                    const int filterRet = av_buffersink_get_frame(bufferSinkCtx, filteredFrame.get());
-                    if (filterRet == AVERROR(EAGAIN) || filterRet == AVERROR_EOF) {
-                        break;
-                    }
-                    if (filterRet < 0) [[unlikely]] {
-                        break;
+                if (filterGraph) {
+                    if (av_buffersrc_add_frame_flags(bufferSrcCtx, decodedFrame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
+                        [[unlikely]] {
+                        ResetFilterGraph();
+                        continue;
                     }
 
-                    const bool isTrickMode = trickSpeed.load(std::memory_order_acquire) != 0;
-                    // fieldIndex==0: first field uses the original frame PTS.
-                    // fieldIndex==1: second field advances by one field duration (outputFrameDurationMs * 90 ticks).
-                    filteredFrame->pts =
-                        (sourcePts != AV_NOPTS_VALUE && fieldIndex > 0)
-                            ? sourcePts + (static_cast<int64_t>(outputFrameDurationMs) * 90 * fieldIndex)
-                            : sourcePts;
-                    ++fieldIndex;
-
-                    if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
-                        // In FF/reverse trick mode, rate=field emits two outputs per source frame. The first has a
-                        // cross-frame blend ghost; only keep the second.
-                        if (isTrickMode &&
-                            (isTrickFastForward.load(std::memory_order_relaxed) ||
-                             isTrickReverse.load(std::memory_order_relaxed)) &&
-                            !outFrames.empty() && outFrames.back()->pts == sourcePts) {
-                            outFrames.back() = std::move(vaapiFrame);
-                        } else {
-                            outFrames.push_back(std::move(vaapiFrame));
+                    while (true) {
+                        av_frame_unref(filteredFrame.get());
+                        const int filterRet = av_buffersink_get_frame(bufferSinkCtx, filteredFrame.get());
+                        if (filterRet == AVERROR(EAGAIN) || filterRet == AVERROR_EOF) {
+                            break;
                         }
+                        if (filterRet < 0) [[unlikely]] {
+                            break;
+                        }
+
+                        if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
+                            outFrames.push_back(std::move(vaapiFrame));
+                            anyFrameDecoded = true;
+                        }
+                    }
+                } else {
+                    // Filter graph is not available; pass the raw VAAPI frame directly.
+                    if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
+                        outFrames.push_back(std::move(vaapiFrame));
                         anyFrameDecoded = true;
                     }
                 }
-            } else {
-                // Filter graph is not available; pass the raw VAAPI frame directly.
-                if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
-                    outFrames.push_back(std::move(vaapiFrame));
-                    anyFrameDecoded = true;
-                }
+            }
+
+            // PTS assignment and trick-mode filtering happen outside the VA driver lock.
+            // With rate=field deinterlacing each source frame produces two outputs.
+            // Assign monotonically increasing PTS: first field keeps the source PTS,
+            // second field advances by one field period so A/V sync sees a smooth timeline.
+            for (size_t i = 0; i < outFrames.size(); ++i) {
+                outFrames[i]->pts =
+                    (sourcePts != AV_NOPTS_VALUE && i > 0)
+                        ? sourcePts + (static_cast<int64_t>(outputFrameDurationMs) * 90 * static_cast<int64_t>(i))
+                        : sourcePts;
+            }
+
+            // In FF/reverse trick mode, rate=field emits two outputs per source frame. The first has a
+            // cross-frame blend ghost; only keep the second.
+            if (trickSpeed.load(std::memory_order_relaxed) != 0 &&
+                (isTrickFastForward.load(std::memory_order_relaxed) ||
+                 isTrickReverse.load(std::memory_order_relaxed)) &&
+                outFrames.size() > 1 && outFrames.front()->pts == sourcePts) {
+                outFrames.erase(outFrames.begin());
             }
         }
 
@@ -1179,135 +1192,168 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
     filterGraph.reset();
 }
 
+[[nodiscard]] auto cVaapiDecoder::SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
+    const int64_t pts = frame->pts;
+    const int64_t prevPts = prevTrickPts.load(std::memory_order_relaxed);
+
+    // Reverse: enforce monotonically decreasing PTS.
+    if (isTrickReverse.load(std::memory_order_relaxed) && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE &&
+        pts > prevPts) {
+        return true; // drop out-of-order frame
+    }
+
+    // Deinterlaced field pairs share the same source PTS; only pace and re-arm on new source frames.
+    if (pts != prevPts) {
+        prevTrickPts.store(pts, std::memory_order_relaxed);
+        if (pts != AV_NOPTS_VALUE) {
+            lastPts.store(pts, std::memory_order_release);
+        }
+
+        // Wait for pacing timer, then arm the next one.
+        const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
+        while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
+               trickSpeed.load(std::memory_order_relaxed) != 0) {
+            cCondWait::SleepMs(10);
+        }
+
+        // Fast: PTS-derived hold; slow: fixed trickHoldMs.
+        const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
+        if (mult > 0 && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
+            const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
+            const uint64_t holdMs = std::clamp(ptsDelta / (uint64_t{90} * mult), uint64_t{10}, uint64_t{2000});
+            nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
+        } else {
+            nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
+        }
+    }
+
+    return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+}
+
+auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta) -> void {
+    dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio", static_cast<long long>(delta / 90));
+
+    // Cap at 5 s to avoid indefinite blocking on broken streams.
+    const int64_t maxWaitMs = std::min<int64_t>(delta / 90 + DECODER_SYNC_GRACE_MS, 5000LL);
+    const cTimeMs deadline(static_cast<int>(maxWaitMs));
+
+    while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
+        // Clear() sets freerunFrames to signal that a seek or channel switch happened;
+        // the frame we're waiting to submit is now stale — stop blocking immediately.
+        if (freerunFrames.load(std::memory_order_relaxed) > 0) {
+            break;
+        }
+        const int64_t freshClock = ap->GetClock();
+        if (freshClock == AV_NOPTS_VALUE || (pts - freshClock - latency) <= 0) {
+            break;
+        }
+        cCondWait::SleepMs(10);
+    }
+
+    syncGrace.Set(DECODER_SYNC_GRACE_MS);
+    syncLogPending.store(true, std::memory_order_relaxed);
+}
+
+[[nodiscard]] auto cVaapiDecoder::SyncLatency90k() const noexcept -> int64_t {
+    // audioLatency compensates for external delays (AV receiver, etc.).
+    // videoPipelineDelay accounts for the display path: after SubmitFrame() the frame is committed via
+    // drmModeAtomicCommit() and scanned out at the next vblank — roughly one frame period end-to-end.
+    return (static_cast<int64_t>(vaapiConfig.audioLatency.load(std::memory_order_relaxed)) +
+            static_cast<int64_t>(outputFrameDurationMs)) *
+           90;
+}
+
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
+    // -----------------------------------------------------------------------
     // A/V sync -- audio clock is master.  delta = vPTS - audioClock - latency
     //
+    //   Trick mode:
+    //     Pacing timer only; no A/V sync.
+    //
     //   Live (jitter buffer active):
-    //     delta >= -threshold  pass-through  (jitter-buffer ahead gate + VSync drain handle positive drift)
-    //     delta <  -threshold  video behind  -> drop frame
+    //     delta >= -threshold  submit  (jitter-buffer ahead gate handles positive drift)
+    //     delta <  -threshold  drop    (video behind audio)
     //
     //   Replay:
-    //     |delta| <= threshold  pass-through  (VSync pacing)
-    //     delta  <  -threshold  video behind  -> drop frame
-    //     delta  >  +threshold  video ahead   -> wait for audio, then submit frame
+    //     |delta| <= threshold  submit  (VSync pacing)
+    //     delta  <  -threshold  drop    (video behind audio)
+    //     delta  >  +threshold  wait    (video ahead; hold until audio catches up)
+    //
+    // Called exclusively from the decode thread (Action).
+    // -----------------------------------------------------------------------
 
     if (!frame || !display) [[unlikely]] {
         return false;
     }
 
-    const auto submit = [&]() -> bool { return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS); };
-    const int64_t originalPts = frame->pts;
+    const int64_t pts = frame->pts;
 
-    // --- Phase 1: trick mode (pacing timer, no A/V sync) ---
+    // --- Trick mode: pacing timer, no A/V sync ---
+
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
-        // Deferred exit: Play() was called but TrickSpeed() did not follow.
         if (trickExitPending.exchange(false, std::memory_order_acquire)) {
+            // Play() was called but TrickSpeed() did not follow -- leave trick mode.
             trickSpeed.store(0, std::memory_order_relaxed);
             isTrickReverse.store(false, std::memory_order_relaxed);
             isTrickFastForward.store(false, std::memory_order_relaxed);
-            lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
             freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
-
             syncLogPending.store(true, std::memory_order_relaxed);
-            // Fall through to normal A/V sync.
+            // Fall through to normal A/V sync below.
         } else {
-            const int64_t savedPrevPts = prevTrickPts.load(std::memory_order_relaxed);
-            const bool newSource = (originalPts != savedPrevPts);
-
-            // Reverse: enforce monotonically decreasing PTS.
-            if (isTrickReverse.load(std::memory_order_relaxed) && newSource && originalPts != AV_NOPTS_VALUE &&
-                savedPrevPts != AV_NOPTS_VALUE && originalPts > savedPrevPts) {
-                return true;
-            }
-
-            if (newSource) {
-                prevTrickPts.store(originalPts, std::memory_order_relaxed);
-                if (originalPts != AV_NOPTS_VALUE) {
-                    lastPts.store(originalPts, std::memory_order_release);
-                }
-
-                // Wait for pacing timer, then arm the next one.
-                const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
-                while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
-                       trickSpeed.load(std::memory_order_relaxed) != 0) {
-                    cCondWait::SleepMs(10);
-                }
-
-                // Fast: PTS-derived hold; slow: fixed trickHoldMs.
-                const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
-                if (mult > 0 && originalPts != AV_NOPTS_VALUE && savedPrevPts != AV_NOPTS_VALUE) {
-                    const auto ptsDelta = static_cast<uint64_t>(std::abs(originalPts - savedPrevPts));
-                    const uint64_t holdMs = std::clamp(ptsDelta / (uint64_t{90} * mult), uint64_t{10}, uint64_t{2000});
-                    nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
-                } else {
-                    nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
-                                            std::memory_order_relaxed);
-                }
-            }
-
-            return submit();
+            return SubmitTrickFrame(std::move(frame));
         }
     }
 
-    if (originalPts != AV_NOPTS_VALUE) {
-        lastPts.store(originalPts, std::memory_order_release);
+    if (pts != AV_NOPTS_VALUE) {
+        lastPts.store(pts, std::memory_order_release);
     }
 
-    // --- Phase 2: freerun (no audio clock or no PTS) ---
+    // --- Freerun: no audio processor, no PTS, or first frame after Clear() ---
+
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
-    if (!ap || originalPts == AV_NOPTS_VALUE) {
-        return submit();
+    if (!ap || pts == AV_NOPTS_VALUE) {
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // First frame after Clear(): submit immediately for responsive channel switch.
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
-        return submit();
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // audioLatency compensates for external delays (AV receiver, etc.).
-    // videoPipelineDelay accounts for the display path: after SubmitFrame() the frame is committed via
-    // drmModeAtomicCommit() and scanned out at the next vblank — roughly one frame period end-to-end.
-    const int64_t videoPipelineDelay = static_cast<int64_t>(outputFrameDurationMs) * 90;
-    const int64_t latency = (static_cast<int64_t>(vaapiConfig.audioLatency) * 90) + videoPipelineDelay;
+    // --- A/V sync ---
+
+    const int64_t latency = SyncLatency90k();
     const int64_t clock = ap->GetClock();
 
-    // --- Phase 3: A/V sync (live and replay, unified DECODER_SYNC_THRESHOLD) ---
-    // Live:   drop-only; ahead correction is the jitter-buffer drain in Action().
-    // Replay: drop when behind; wait for the audio clock before submitting when ahead.  This handles
-    //         the common case where the DVB encoder muxed video PTS ahead of audio PTS by a fixed
-    //         offset (up to several seconds).  The decode thread holds here; safe in replay because
-    //         the file-reader pre-fills packet queues deep enough that audio never starves.
-    // No clock: audio pipeline not yet started (applies equally to PCM and passthrough before first write).
+    // Audio pipeline not yet started (PCM and passthrough before first write).
     if (clock == AV_NOPTS_VALUE) {
         if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-            dsyslog("vaapivideo/decoder: sync freerun (no audio clock) buf=%zu", jitterBuf.size());
+            dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
         }
-        return submit();
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    const int64_t delta = originalPts - clock - latency;
+    const int64_t delta = pts - clock - latency;
 
     if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-        dsyslog("vaapivideo/decoder: sync status d=%+lldms buf=%zu", static_cast<long long>(delta / 90),
-                jitterBuf.size());
+        dsyslog("vaapivideo/decoder: sync d=%+lldms buf=%zu", static_cast<long long>(delta / 90), jitterBuf.size());
         nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
     }
 
     // Grace period: suppress corrections while the ALSA clock stabilizes.
     if (!syncGrace.TimedOut()) {
-        return submit();
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Behind threshold: drop to catch up.
-    constexpr int64_t threshold = DECODER_SYNC_THRESHOLD;
-    if (delta < -threshold) {
+    // Behind: drop frame to catch up.
+    if (delta < -DECODER_SYNC_THRESHOLD) {
         ++correctDrops;
-        return true;
+        return true; // frame dropped
     }
 
-    // Log when a drop run ends and arm a grace period to avoid immediate re-correction.
+    // Transition out of a drop run: log summary and arm grace period.
     if (correctDrops > 0) {
         dsyslog("vaapivideo/decoder: sync corrected %d dropped d=%+lldms", correctDrops,
                 static_cast<long long>(delta / 90));
@@ -1315,24 +1361,13 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
         syncGrace.Set(DECODER_SYNC_GRACE_MS);
     }
 
-    // Replay ahead correction: video PTS leads audio clock (common DVB stream PTS offset).
-    // Wait until the audio clock reaches this frame's PTS before submitting.
+    // Ahead (replay only): hold the decode thread until audio catches up.
     // Live ahead correction is handled by the jitter-buffer ahead gate in Action().
-    if (!liveMode.load(std::memory_order_relaxed) && delta > threshold) {
-        dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio", static_cast<long long>(delta / 90));
-        // Cap at 5 s; add one grace interval so the loop exits cleanly after the clock crosses zero.
-        const int64_t maxWaitMs = std::min<int64_t>((delta / 90) + DECODER_SYNC_GRACE_MS, 5000LL);
-        const cTimeMs deadline(static_cast<int>(maxWaitMs));
-        while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
-            const int64_t freshClock = ap->GetClock();
-            if (freshClock == AV_NOPTS_VALUE || (originalPts - freshClock - latency) <= 0) {
-                break;
-            }
-            cCondWait::SleepMs(10);
-        }
-        syncGrace.Set(DECODER_SYNC_GRACE_MS);
-        syncLogPending.store(true, std::memory_order_relaxed);
+    // Safe to block in replay: the file-reader pre-fills packet queues deep enough
+    // that audio never starves.
+    if (!liveMode.load(std::memory_order_relaxed) && delta > DECODER_SYNC_THRESHOLD) {
+        WaitForAudioCatchUp(ap, pts, latency, delta);
     }
 
-    return submit();
+    return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }

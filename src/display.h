@@ -283,7 +283,13 @@ class cVaapiDisplay : public cThread {
     cCondVar frameSlotCond;            ///< Signalled when pendingFrame is consumed and the slot becomes free
     std::atomic<bool> hasThreadExited; ///< Set by the display thread just before it returns (happens-before Shutdown())
     AVBufferRef *hwDeviceRef{};        ///< VAAPI hardware device context reference (owned)
-    mutable cMutex importMutex;      ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()
+    mutable cMutex importMutex; ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()
+
+  public:
+    mutable cMutex vaDriverMutex; ///< Serializes VA driver calls between display thread (vaSyncSurface in
+                                  ///< MapVaapiFrame) and decode thread (VPP filter graph); the iHD VEBOX path
+                                  ///< is not thread-safe when another thread calls vaSyncSurface concurrently.
+  private:
     std::atomic<bool> isClearing;    ///< Set during a stream switch to block new frame imports
     std::atomic<bool> isFlipPending; ///< Set between an atomic page-flip commit and the corresponding DRM flip event
     std::atomic<bool> isReady;       ///< Set after successful Initialize(); cleared at the start of Shutdown()

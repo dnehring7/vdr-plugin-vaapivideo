@@ -122,8 +122,14 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame)
         -> bool; ///< Build VPP filter graph: HW path or SW (bwdif/hqdn3d -> hwupload) + scale/sharpen
     auto ResetFilterGraph() -> void; ///< Null filter pointers and destroy the graph (idempotent)
+    [[nodiscard]] auto SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame)
+        -> bool; ///< Trick-mode pacing: enforce timing, reverse-PTS filtering, then submit
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Apply A/V sync policy (wait / drop / pass) and forward the frame to the display
+    [[nodiscard]] auto SyncLatency90k() const noexcept
+        -> int64_t; ///< Combined A/V sync latency: audioLatency + one-frame pipeline delay (90 kHz ticks)
+    auto WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta)
+        -> void; ///< Block decode thread until audio clock reaches video PTS (replay ahead correction)
 
     // ========================================================================
     // === SYNCHRONIZATION ===

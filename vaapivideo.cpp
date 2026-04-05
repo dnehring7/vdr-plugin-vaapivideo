@@ -134,21 +134,19 @@ class cMenuVaapiStatus : public cOsdMenu {
 /// only written back to the global config when the user confirms with Store().
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
-    cMenuSetupVaapi() : editConfig(vaapiConfig) {
+    cMenuSetupVaapi() : editLatency(vaapiConfig.audioLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
-        Add(new cMenuEditIntItem(tr("Audio Latency (ms)"), &editConfig.audioLatency, 20, 200));
+        Add(new cMenuEditIntItem(tr("Audio Latency (ms)"), &editLatency, 0, 200));
     }
 
   protected:
     auto Store() -> void override {
-        vaapiConfig = editConfig;
-        // Key must match what SetupParse() reads from setup.conf.
-        SetupStore("AudioLatency", vaapiConfig.audioLatency);
+        vaapiConfig.audioLatency.store(editLatency, std::memory_order_relaxed);
+        SetupStore("AudioLatency", editLatency);
     }
 
   private:
-    VaapiConfig editConfig; ///< Scratch copy; prevents live config changes
-                            ///< while the user is still editing.
+    int editLatency; ///< Scratch copy; prevents live config changes while the user is still editing.
 };
 
 // ============================================================================

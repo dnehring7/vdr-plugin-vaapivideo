@@ -902,7 +902,13 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     mappedFrame->format = AV_PIX_FMT_DRM_PRIME;
     // AV_HWFRAME_MAP_READ -- we need read access to the surface data. AV_HWFRAME_MAP_DIRECT -- request a zero-copy map
     // (the DRM fd points directly into the VA surface, no intermediate copy).
-    const int ret = av_hwframe_map(mappedFrame, srcFrame, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+    // vaDriverMutex serializes this vaSyncSurface call against the decode thread's VPP filter graph execution;
+    // the iHD driver's VEBOX path crashes when both run concurrently on the same VADisplay.
+    int ret;
+    {
+        const cMutexLock vaLock(&vaDriverMutex);
+        ret = av_hwframe_map(mappedFrame, srcFrame, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+    }
     if (ret < 0) [[unlikely]] {
         // EIO is normal when av_hwframe_map() is called while the codec is being destroyed; the surface is already gone
         // from the VA driver.
