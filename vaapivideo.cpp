@@ -30,6 +30,7 @@
 
 // C++ Standard Library
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <format>
 #include <string>

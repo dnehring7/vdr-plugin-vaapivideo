@@ -142,6 +142,10 @@ class cVaapiDisplay : public cThread {
         -> uint64_t { ///< Return the wall-clock timestamp (ms) of the most recent page-flip event
         return lastVSyncTimeMs.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] auto GetVaDriverMutex() noexcept
+        -> cMutex & { ///< Return the VA driver mutex for cross-thread serialization (decoder ↔ display)
+        return vaDriverMutex;
+    }
 
   protected:
     // ========================================================================
@@ -285,11 +289,8 @@ class cVaapiDisplay : public cThread {
     AVBufferRef *hwDeviceRef{};        ///< VAAPI hardware device context reference (owned)
     mutable cMutex importMutex; ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()
 
-  public:
-    mutable cMutex vaDriverMutex; ///< Serializes VA driver calls between display thread (vaSyncSurface in
-                                  ///< MapVaapiFrame) and decode thread (VPP filter graph); the iHD VEBOX path
-                                  ///< is not thread-safe when another thread calls vaSyncSurface concurrently.
-  private:
+    mutable cMutex vaDriverMutex;    ///< Serializes VA driver calls between display (MapVaapiFrame) and decode thread
+                                     ///< (VPP filter graph); the iHD VEBOX path is not thread-safe concurrently.
     std::atomic<bool> isClearing;    ///< Set during a stream switch to block new frame imports
     std::atomic<bool> isFlipPending; ///< Set between an atomic page-flip commit and the corresponding DRM flip event
     std::atomic<bool> isReady;       ///< Set after successful Initialize(); cleared at the start of Shutdown()

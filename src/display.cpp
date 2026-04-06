@@ -904,7 +904,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // (the DRM fd points directly into the VA surface, no intermediate copy).
     // vaDriverMutex serializes this vaSyncSurface call against the decode thread's VPP filter graph execution;
     // the iHD driver's VEBOX path crashes when both run concurrently on the same VADisplay.
-    int ret;
+    int ret = 0;
     {
         const cMutexLock vaLock(&vaDriverMutex);
         ret = av_hwframe_map(mappedFrame, srcFrame, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);

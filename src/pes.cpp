@@ -104,12 +104,15 @@ struct CodecEvidence {
             }
         }
 
-        // AAC-LATM / LOAS: 11-bit sync 0x2B7 + 13-bit audioMuxLengthBytes (ISO 14496-3, AudioSyncStream).
-        // Require non-zero length to reject false positives from random data (zero-length frames are invalid).
+        // AAC-LATM / LOAS: 11-bit sync 0x2B7 + 13-bit audioMuxLengthBytes (ISO 14496-3).
+        // Require a second sync at the next frame boundary to reject false positives from random data.
         if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
-            const auto loasLen = static_cast<uint16_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
-            if (loasLen > 0) {
-                return AV_CODEC_ID_AAC_LATM;
+            const auto frameLen = static_cast<uint16_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
+            if (frameLen >= 2) {
+                const size_t next = i + 3 + frameLen;
+                if (next + 2 <= size && (AV_RB16(p + next) & 0xFFE0) == 0x56E0) {
+                    return AV_CODEC_ID_AAC_LATM;
+                }
             }
         }
 
@@ -184,23 +187,18 @@ struct CodecEvidence {
 
         const uint8_t b0 = p[nalPos];
 
-        // MPEG-2: sequence_header(0xB3)=0x01, extension(0xB5)=0x02, GOP(0xB8)=0x04.
-        {
-            uint8_t bit = 0;
+        // MPEG-2 start codes have bit 7 set (forbidden in H.264/HEVC NAL headers) — evidence is definitive.
+        // sequence_header(0xB3)=0x01, extension(0xB5)=0x02, GOP(0xB8)=0x04.
+        if (b0 == 0xB3 || b0 == 0xB5 || b0 == 0xB8) {
+            uint8_t bit = 0x04;
             if (b0 == 0xB3) {
                 bit = 0x01;
             } else if (b0 == 0xB5) {
                 bit = 0x02;
-            } else if (b0 == 0xB8) {
-                bit = 0x04;
             }
-            if (bit != 0) {
-                mpeg2.Record(bit, i);
-                // Early exit: MPEG-2 markers have bit 7 set (invalid as H.264/HEVC NAL headers). Once sequence_header +
-                // extension/GOP found, the result is definitive -- no need to scan further.
-                if ((mpeg2.seenMask & 0x01) != 0 && (mpeg2.seenMask & 0x06) != 0) [[unlikely]] {
-                    break;
-                }
+            mpeg2.Record(bit, i);
+            if ((mpeg2.seenMask & 0x01) != 0 && (mpeg2.seenMask & 0x06) != 0) [[unlikely]] {
+                break; // sequence_header + extension/GOP → definitive MPEG-2
             }
         }
 
@@ -261,7 +259,7 @@ struct CodecEvidence {
     const bool avcOk = std::popcount(avc.seenMask) >= 2;
     const bool mpegOk = ((mpeg2.seenMask & 0x01) != 0) && ((mpeg2.seenMask & 0x06) != 0);
 
-    // MPEG-2 markers have bit 7 set (invalid as H.264/HEVC NAL headers); confirmed MPEG-2 invalidates other evidence.
+    // Confirmed MPEG-2 invalidates H.264/HEVC evidence (start codes alias as NAL headers).
     const bool hevcFinal = hevcOk && !mpegOk;
     const bool avcFinal = avcOk && !mpegOk;
 

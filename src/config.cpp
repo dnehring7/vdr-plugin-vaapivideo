@@ -12,6 +12,7 @@
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstring>

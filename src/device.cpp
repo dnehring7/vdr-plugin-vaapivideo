@@ -295,7 +295,7 @@ auto cVaapiDevice::Clear() -> void {
         audioProcessor->Clear();
     }
 
-    // Audio tracking preserved -- reset in SetPlayMode(pmNone) and SetAudioTrackDevice().
+    // audioCodecId preserved across Clear(); reset in SetPlayMode(pmNone) and SetAudioTrackDevice().
 }
 
 [[nodiscard]] auto cVaapiDevice::DeviceType() const -> cString { return "VAAPI"; }
@@ -425,7 +425,7 @@ auto cVaapiDevice::Play() -> void {
     cDevice::Play();
 
     // Deferred exit: VDR calls Play() both to genuinely leave trick mode and during internal
-    // backward speed transitions.  The decoder auto-exits if TrickSpeed() does not follow.
+    // backward speed transitions. The decoder auto-exits if TrickSpeed() does not follow.
     if (trickSpeed.exchange(0, std::memory_order_release) != 0) {
         if (decoder) [[likely]] {
             decoder->RequestTrickExit();
@@ -450,6 +450,8 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
+    // Codec detection runs once per cycle: audioCodecId is reset to NONE by SetPlayMode(pmNone)
+    // or SetAudioTrackDevice(). Mid-stream codec changes arrive via PMT -> SetAudioTrackDevice().
     const AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
     bool isLive = liveMode.load(std::memory_order_relaxed);
 
@@ -465,54 +467,20 @@ auto cVaapiDevice::Play() -> void {
 
         const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
-            return Length; // Not enough data yet
+            return Length;
         }
 
-        // Open codec with default parameters (48kHz stereo)
         if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
             return Length;
         }
 
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
-        codecHysteresis = AV_CODEC_ID_NONE;
-        codecHysteresisCount = 0;
         isyslog("vaapivideo/device: audio codec %s (%s, %s)", avcodec_get_name(detectedCodec),
                 isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
-    } else {
-        // Mid-stream codec change with hysteresis (3 consecutive detections)
-        const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
-        if (detectedCodec != AV_CODEC_ID_NONE && detectedCodec != currentCodec) {
-            if (detectedCodec == codecHysteresis) {
-                // 3 consecutive detections prevents spurious switches from malformed PES packets.
-                if (++codecHysteresisCount >= 3) {
-                    isyslog("vaapivideo/device: audio codec change %s -> %s", avcodec_get_name(currentCodec),
-                            avcodec_get_name(detectedCodec));
-
-                    if (audioProcessor->OpenCodec(detectedCodec, 48000, 2)) {
-                        audioCodecId.store(detectedCodec, std::memory_order_relaxed);
-                        if (decoder) {
-                            decoder->NotifyAudioChange();
-                        }
-                    } else {
-                        esyslog("vaapivideo/device: failed to switch to audio codec %s",
-                                avcodec_get_name(detectedCodec));
-                    }
-                    codecHysteresis = AV_CODEC_ID_NONE;
-                    codecHysteresisCount = 0;
-                }
-            } else {
-                codecHysteresis = detectedCodec;
-                codecHysteresisCount = 1;
-            }
-        } else if (detectedCodec == currentCodec && codecHysteresisCount > 0) {
-            // Confirmed back to original codec -- cancel the pending switch.
-            codecHysteresis = AV_CODEC_ID_NONE;
-            codecHysteresisCount = 0;
-        }
     }
 
-    // Radio detection: audio is playing but no video codec opened within 1 second.
+    // Radio detection: audio playing but no video codec opened within the timeout.
     if (radioBlackPending && radioBlackTimer.TimedOut()) [[unlikely]] {
         radioBlackPending = false;
         if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && display && vaapi.hwDeviceRef) {
@@ -595,8 +563,7 @@ auto cVaapiDevice::Play() -> void {
         videoCodecId.store(detectedCodec, std::memory_order_relaxed);
         isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     }
-    // Mid-stream codec changes (e.g. splice from MPEG-2 to H.264 broadcast) start a new SetPlayMode() cycle. Codec ID
-    // is reset in pmNone so re-detection fires.
+    // Mid-stream video codec changes trigger a SetPlayMode(pmNone) cycle; videoCodecId resets there.
 
     // Replay backpressure via Poll(). Live TV: never block. Trick: single-packet queue.
     if (!isLive) [[unlikely]] {
@@ -654,8 +621,6 @@ auto cVaapiDevice::Play() -> void {
 [[nodiscard]] auto cVaapiDevice::Ready() -> bool { return initState.load(std::memory_order_acquire) == 2; }
 
 auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
-    // User switched audio track; reset codec state so PlayAudio() re-detects the codec.
-
     const tTrackId *track = GetTrack(Type);
     dsyslog("vaapivideo/device: SetAudioTrackDevice(%s %d%s%s)",
             IS_AUDIO_TRACK(Type)   ? "audio"
@@ -663,19 +628,13 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
                                    : "unknown",
             static_cast<int>(Type), track ? ", lang=" : "", track ? track->language : "");
 
-    // Force codec re-detection -- the new track may use a different codec.
-    // Also cancel any in-progress hysteresis cycle from the old track.
+    // Reset codec so PlayAudio() re-detects on the next PES packet.
     audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    codecHysteresis = AV_CODEC_ID_NONE;
-    codecHysteresisCount = 0;
 
-    // Flush now so the tail of the old track is never rendered during the switch.
+    // Flush old track's tail and reset A/V sync for the new audio clock.
     if (audioProcessor) [[likely]] {
         audioProcessor->Clear();
     }
-
-    // Reset A/V sync so the decoder waits for the new audio clock instead of running freerun
-    // while the transfer thread detects and opens the new codec.
     if (decoder) [[likely]] {
         decoder->NotifyAudioChange();
     }
@@ -705,8 +664,6 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
                 decoder->SetLiveMode(false);
                 decoder->RequestCodecReopen();
             }
-            codecHysteresis = AV_CODEC_ID_NONE;
-            codecHysteresisCount = 0;
             videoCodecCandidate = AV_CODEC_ID_NONE;
             videoCodecCandidateCount = 0;
             Clear();
@@ -748,9 +705,8 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
 
     dsyslog("vaapivideo/device: StillPicture(%d bytes)", Length);
 
-    // Input: TS (0x47) or PES (0x00). Base class converts TS -> PES.
+    // TS input (0x47): delegate to base class which converts TS -> PES and calls us back.
     if (Data[0] == 0x47) {
-        dsyslog("vaapivideo/device: StillPicture received TS packet, waiting for PES");
         cDevice::StillPicture(Data, Length);
         return;
     }
@@ -844,8 +800,6 @@ auto cVaapiDevice::Detach() -> void {
     previousVideoCodec = AV_CODEC_ID_NONE;
     videoCodecCandidate = AV_CODEC_ID_NONE;
     videoCodecCandidateCount = 0;
-    codecHysteresis = AV_CODEC_ID_NONE;
-    codecHysteresisCount = 0;
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
     paused.store(false, std::memory_order_relaxed);

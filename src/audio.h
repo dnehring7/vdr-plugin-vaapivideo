@@ -122,6 +122,8 @@ class cAudioProcessor : public cThread {
         -> std::span<const uint8_t>; ///< Wraps a compressed audio frame in an IEC61937 burst via the spdif muxer
     auto ProbeSinkCaps()
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; result is cached per device
+    auto SetIec958NonAudio(bool enable)
+        -> void; ///< Sets or clears the IEC958 non-audio bit on the HDMI mixer control for passthrough mode
     [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames)
         -> bool; ///< Writes PCM to ALSA and advances the 90 kHz playback clock by the number of written frames
     [[nodiscard]] auto WriteToAlsa(std::span<const uint8_t> data)
@@ -130,12 +132,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === ALSA DEVICE ===
     // ========================================================================
+    int alsaCardId{-1};                    ///< ALSA card number resolved from device name (cached by ProbeSinkCaps)
     unsigned alsaChannels{0};              ///< Configured hardware channel count
     std::string alsaDeviceName;            ///< ALSA PCM device name (e.g. "plughw:0,3")
     std::atomic<int> alsaErrorCount{0};    ///< Consecutive ALSA write failures since the last successful write
     std::atomic<size_t> alsaFrameBytes{0}; ///< Bytes per interleaved audio frame (channels x sample_size); atomic so
                                            ///<   WriteToAlsa() can read it without holding the mutex
     snd_pcm_t *alsaHandle{nullptr};        ///< ALSA PCM device handle; nullptr when closed
+    unsigned alsaIec958CtlIndex{0};        ///< IEC958 Playback Default control index for this HDMI port
     bool alsaPassthroughActive{false};     ///< True when the device is open in IEC61937 passthrough mode
     unsigned alsaSampleRate{0};            ///< Hardware sample rate negotiated with ALSA (Hz)
 
@@ -172,7 +176,7 @@ class cAudioProcessor : public cThread {
     std::atomic<uint32_t> clearGeneration{0}; ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
     int64_t pcmNextPts{AV_NOPTS_VALUE};       ///< DVB-anchored 90 kHz PTS for the next ALSA write (PCM & passthrough)
     int64_t pcmQueueEndPts{AV_NOPTS_VALUE};   ///< 90 kHz PTS of the last sample written into the ALSA ring buffer
-    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< Cached DAC-output PTS (endPts minus ALSA delay at write time)
+    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< DAC-output PTS (endPts minus ALSA delay) at each write
 
     // ========================================================================
     // === SINK CAPABILITIES ===

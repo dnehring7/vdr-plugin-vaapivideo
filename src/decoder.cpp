@@ -710,7 +710,7 @@ auto cVaapiDecoder::Action() -> void {
                 // that value against lastSeenVSyncMs tells us when a new VSync has arrived without
                 // any polling overhead.  A wall-clock fallback fires after outputFrameDurationMs+5 ms
                 // to handle the brief window before the first flip or if the display thread is busy.
-                // This couples the drain cadence directly to hardware refresh, eliminating the ±10 ms
+                // This couples the drain cadence directly to hardware refresh, eliminating the +/-10 ms
                 // phase drift that a free-running wall-clock timer accumulates against the scanout.
                 if (jitterPrimed && !jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
                     const uint64_t now = cTimeMs::Now();
@@ -738,8 +738,9 @@ auto cVaapiDecoder::Action() -> void {
                                     jitterBuf.front()->pts - clock - lat < -DECODER_SYNC_THRESHOLD) {
                                     while (jitterBuf.size() > 1) {
                                         const int64_t delta = jitterBuf.front()->pts - clock - lat;
-                                        if (delta >= 0)
+                                        if (delta >= 0) {
                                             break;
+                                        }
                                         jitterBuf.pop_front();
                                         ++correctDrops;
                                     }
@@ -869,7 +870,7 @@ auto cVaapiDecoder::Action() -> void {
             // the decode and display threads; concurrent VA operations on the same VADisplay are not thread-safe.
             const int64_t sourcePts = decodedFrame->pts;
             {
-                const cMutexLock vaLock(&display->vaDriverMutex);
+                const cMutexLock vaLock(&display->GetVaDriverMutex());
 
                 if (!filterGraph) {
                     (void)InitFilterGraph(decodedFrame.get());
@@ -911,7 +912,7 @@ auto cVaapiDecoder::Action() -> void {
             // Assign monotonically increasing PTS: first field keeps the source PTS,
             // second field advances by one field period so A/V sync sees a smooth timeline.
             for (size_t i = 0; i < outFrames.size(); ++i) {
-                outFrames[i]->pts =
+                outFrames.at(i)->pts =
                     (sourcePts != AV_NOPTS_VALUE && i > 0)
                         ? sourcePts + (static_cast<int64_t>(outputFrameDurationMs) * 90 * static_cast<int64_t>(i))
                         : sourcePts;
@@ -1238,12 +1239,12 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio", static_cast<long long>(delta / 90));
 
     // Cap at 5 s to avoid indefinite blocking on broken streams.
-    const int64_t maxWaitMs = std::min<int64_t>(delta / 90 + DECODER_SYNC_GRACE_MS, 5000LL);
+    const int64_t maxWaitMs = std::min<int64_t>((delta / 90) + DECODER_SYNC_GRACE_MS, 5000LL);
     const cTimeMs deadline(static_cast<int>(maxWaitMs));
 
     while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
         // Clear() sets freerunFrames to signal that a seek or channel switch happened;
-        // the frame we're waiting to submit is now stale — stop blocking immediately.
+        // the frame we're waiting to submit is now stale - stop blocking immediately.
         if (freerunFrames.load(std::memory_order_relaxed) > 0) {
             break;
         }
@@ -1261,7 +1262,7 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
 [[nodiscard]] auto cVaapiDecoder::SyncLatency90k() const noexcept -> int64_t {
     // audioLatency compensates for external delays (AV receiver, etc.).
     // videoPipelineDelay accounts for the display path: after SubmitFrame() the frame is committed via
-    // drmModeAtomicCommit() and scanned out at the next vblank — roughly one frame period end-to-end.
+    // drmModeAtomicCommit() and scanned out at the next vblank - roughly one frame period end-to-end.
     return (static_cast<int64_t>(vaapiConfig.audioLatency.load(std::memory_order_relaxed)) +
             static_cast<int64_t>(outputFrameDurationMs)) *
            90;

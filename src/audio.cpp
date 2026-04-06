@@ -164,28 +164,11 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::GetClock() const noexcept -> int64_t {
-    // PTS of the sample at the DAC output: pcmQueueEndPts minus ALSA ring-buffer delay.
-    // Falls back to cached playbackPts when the device is closed or no PTS has been anchored.
-    const unsigned rate = alsaSampleRate;
-
-    if (!alsaHandle || rate == 0) {
-        return playbackPts.load(std::memory_order_relaxed);
-    }
-
-    // Read delay BEFORE endPts: if the audio thread writes between the two reads, the clock appears slightly
-    // ahead (harmless). The reverse order caused backward jumps triggering sync overshoot.
-    snd_pcm_sframes_t delayFrames = 0;
-    if (snd_pcm_delay(alsaHandle, &delayFrames) != 0 || delayFrames < 0) {
-        return playbackPts.load(std::memory_order_relaxed);
-    }
-
-    const int64_t endPts = pcmQueueEndPts;
-    if (endPts == AV_NOPTS_VALUE) {
-        return playbackPts.load(std::memory_order_relaxed);
-    }
-
-    const auto delay90k = static_cast<int64_t>((static_cast<uint64_t>(delayFrames) * 90000ULL) / rate);
-    return endPts - delay90k;
+    // Returns the PTS of the audio sample currently at the DAC output.
+    // Updated by WritePcmToAlsa() on every audio write (~24 ms for MP2) as:
+    //   playbackPts = endPts - snd_pcm_delay_90k
+    // endPts tracks the DVB stream PTS; snd_pcm_delay provides the ALSA buffer depth.
+    return playbackPts.load(std::memory_order_acquire);
 }
 
 [[nodiscard]] auto cAudioProcessor::Initialize(std::string_view alsaDevice) -> bool {
@@ -884,6 +867,42 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
     return {spdifOutputBuf.data(), spdifOutputBuf.size()};
 }
 
+auto cAudioProcessor::SetIec958NonAudio(bool enable) -> void {
+    if (alsaCardId < 0) {
+        return;
+    }
+
+    const auto ctlName = std::format("hw:{}", alsaCardId);
+    snd_ctl_t *ctl = nullptr;
+    if (snd_ctl_open(&ctl, ctlName.c_str(), 0) < 0) {
+        return;
+    }
+
+    snd_ctl_elem_id_t *id = nullptr;
+    snd_ctl_elem_id_alloca(&id);
+    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_PCM);
+    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
+    snd_ctl_elem_id_set_index(id, alsaIec958CtlIndex);
+
+    snd_ctl_elem_value_t *val = nullptr;
+    snd_ctl_elem_value_alloca(&val);
+    snd_ctl_elem_value_set_id(val, id);
+
+    if (snd_ctl_elem_read(ctl, val) == 0) {
+        auto aes0 = snd_ctl_elem_value_get_byte(val, 0);
+        const unsigned char newAes0 =
+            enable ? static_cast<unsigned char>(aes0 | 0x02U) : static_cast<unsigned char>(aes0 & ~0x02U);
+        if (newAes0 != aes0) {
+            snd_ctl_elem_value_set_byte(val, 0, newAes0);
+            snd_ctl_elem_write(ctl, val);
+            dsyslog("vaapivideo/audio: IEC958 AES0 0x%02x -> 0x%02x (%s)", aes0, newAes0,
+                    enable ? "non-audio" : "audio");
+        }
+    }
+
+    snd_ctl_close(ctl);
+}
+
 [[nodiscard]] auto cAudioProcessor::OpenAlsaDevice() -> bool {
     // Passthrough: S16_LE 2ch with IEC61937 burst wrapping. PCM: S16_LE with decoded channel count.
     // Falls back to PCM on failure.
@@ -918,6 +937,9 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
     }
 
     if (wantPassthrough) {
+        // Set non-audio flag before hw_params so the HDMI transmitter enables HBR mode for 192 kHz+ rates.
+        SetIec958NonAudio(true);
+
         // Passthrough: S16_LE 2ch at the IEC61937 clock rate. The spdif muxer wraps compressed frames into bursts.
         if (ConfigureAlsaParams(handle, format, 2, alsaRate, false)) {
             if (OpenSpdifMuxer(streamParams.codecId, streamParams.sampleRate)) {
@@ -932,7 +954,8 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
             dsyslog("vaapivideo/audio: passthrough hw config failed, trying PCM fallback");
         }
 
-        // PCM fallback: reopen the device (hw params are consumed by the failed attempt).
+        // PCM fallback: clear non-audio flag and reopen the device (hw params are consumed by the failed attempt).
+        SetIec958NonAudio(false);
         snd_pcm_close(handle);
         handle = nullptr;
 
@@ -949,7 +972,8 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
             return true;
         }
     } else {
-        // Pure PCM path.
+        // Pure PCM path: ensure non-audio flag is cleared from any previous passthrough session.
+        SetIec958NonAudio(false);
         if (ConfigureAlsaParams(handle, format, channels, alsaRate, true)) {
             alsaHandle = handle;
             alsaPassthroughActive = false;
@@ -1071,6 +1095,8 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 
     const int cardId = snd_pcm_info_get_card(info);
     const int deviceId = static_cast<int>(snd_pcm_info_get_device(info));
+
+    alsaCardId = cardId;
 
     snd_pcm_close(handle);
 
@@ -1200,6 +1226,26 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         if (!foundValidEld) {
             dsyslog("vaapivideo/audio: no valid ELD found across all indices");
         }
+
+        // Discover the IEC958 Playback Default control index for this HDMI port.
+        // The HDA driver exposes one element per HDMI output at sequential indices.
+        snd_ctl_elem_id_t *iecId = nullptr;
+        snd_ctl_elem_id_alloca(&iecId);
+        snd_ctl_elem_id_set_interface(iecId, SND_CTL_ELEM_IFACE_PCM);
+        snd_ctl_elem_id_set_name(iecId, "IEC958 Playback Default");
+
+        snd_ctl_elem_value_t *iecVal = nullptr;
+        snd_ctl_elem_value_alloca(&iecVal);
+
+        for (unsigned idx = 0; idx < 16; ++idx) {
+            snd_ctl_elem_id_set_index(iecId, idx);
+            snd_ctl_elem_value_set_id(iecVal, iecId);
+            if (snd_ctl_elem_read(ctl.get(), iecVal) == 0) {
+                alsaIec958CtlIndex = idx;
+                dsyslog("vaapivideo/audio: IEC958 Playback Default found at index %u", idx);
+                break;
+            }
+        }
     }
 
     constexpr std::array<std::pair<bool HdmiSinkCaps::*, std::string_view>, 7> kFormats{
@@ -1238,14 +1284,15 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 
     pcmQueueEndPts = endPts;
 
-    // Cache the playback clock (endPts minus ALSA ring-buffer delay) for GetClock() fallback.
+    // Snapshot the DAC-output PTS: endPts (DVB-anchored) minus the current ALSA ring-buffer delay.
+    // Updated on every write (~24 ms); GetClock() returns this value directly.
     snd_pcm_sframes_t delayFrames = 0;
     if (alsaHandle && snd_pcm_delay(alsaHandle, &delayFrames) == 0) {
         delayFrames = std::max<snd_pcm_sframes_t>(delayFrames, 0);
         const auto delay90k = static_cast<int64_t>((static_cast<uint64_t>(delayFrames) * 90000ULL) / rate);
-        playbackPts.store(endPts - delay90k, std::memory_order_relaxed);
+        playbackPts.store(endPts - delay90k, std::memory_order_release);
     } else {
-        playbackPts.store(endPts, std::memory_order_relaxed);
+        playbackPts.store(endPts, std::memory_order_release);
     }
 
     return true;

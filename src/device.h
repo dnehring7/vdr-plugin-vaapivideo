@@ -138,7 +138,7 @@ class cVaapiDevice : public cDevice {
         -> int override;                         ///< Demux one video PES packet and enqueue for decoding
     [[nodiscard]] auto Ready() -> bool override; ///< True once Initialize() has completed successfully
     auto SetAudioTrackDevice(eTrackType Type)
-        -> void override; ///< Reset audio codec detection on user-initiated track switch
+        -> void override; ///< Reset audio codec state and flush on track switch (user or PMT)
     [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
         -> bool override;                              ///< Reset state machine and flush on mode transitions
     auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
@@ -163,8 +163,6 @@ class cVaapiDevice : public cDevice {
     std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE}; ///< Codec active for the current audio stream
     std::string audioDevice;                               ///< ALSA device name (e.g. "default", "hw:0,3")
     std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
-    AVCodecID codecHysteresis{AV_CODEC_ID_NONE};           ///< Candidate codec pending hysteresis confirmation
-    int codecHysteresisCount{};                            ///< Consecutive detections of the candidate codec
     uint32_t connectorId{};                                ///< DRM connector ID chosen by SelectDrmConnector()
     uint32_t crtcId{};                                     ///< DRM CRTC ID associated with the selected connector
     std::unique_ptr<cVaapiDecoder> decoder;                ///< Threaded VAAPI packet decoder
@@ -178,7 +176,7 @@ class cVaapiDevice : public cDevice {
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     bool radioBlackPending{false};                   ///< True while waiting to detect radio-only channel
-    cTimeMs radioBlackTimer;                         ///< 1-second timeout for radio channel black frame
+    cTimeMs radioBlackTimer;                         ///< Timeout for radio-mode detection (no video -> black frame)
     std::atomic<int> trickSpeed;                     ///< Active VDR trick speed index; 0 = normal playback
     VaapiContext vaapi{};                            ///< Shared VAAPI context (hwDeviceRef + drmFd borrow)
     AVCodecID videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate video codec pending confirmation
