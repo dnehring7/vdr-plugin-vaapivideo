@@ -200,7 +200,19 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
     cTimeMs nextSyncLog;              ///< Deadline for the periodic "sync status" log (decoder thread only)
     int correctDrops{};               ///< Correction drops, summarized when run ends (decoder thread only)
-    cTimeMs syncGrace;                ///< Suppresses Phase-3 corrections after sync and after each correction
+    int64_t driftIntegral90k{};       ///< Accumulated drift error (I-term); learns the steady-state HW drift
+                                      ///<   rate.  Preserved across channel switches and re-primes for instant
+                                      ///<   relock.  Only reset after hard-drop transients where the anti-windup
+                                      ///<   value ≠ true drift.  ~5 s cold-start convergence at 50 fps
+    int64_t smoothedDelta90k{};       ///< EMA-smoothed A/V sync delta in 90 kHz ticks (decoder thread only)
+    bool smoothedDeltaValid{false};   ///< True after first delta measurement
+    cTimeMs syncGrace;                ///< Suppresses hard corrections while the ALSA clock stabilizes
+
+    // ========================================================================
+    // === DRAIN TRACKING (decoder thread only, live TV) ===
+    // ========================================================================
+    double drainFps{};    ///< Measured drain fps from jitter buffer
+    int drainMissCount{}; ///< Drain stalls since last sync log: gap > 2× frame duration
 
     // ========================================================================
     // === JITTER BUFFER (live TV only) ===
@@ -209,8 +221,6 @@ class cVaapiDecoder : public cThread {
     bool jitterPrimed{};                               ///< True once jitterBuf has accumulated enough frames
     int jitterTarget{};            ///< Frame count needed to fill DECODER_JITTER_BUFFER_MS (set by InitFilterGraph)
     int outputFrameDurationMs{20}; ///< Duration per output frame in ms (e.g. 20 for 50fps, 40 for 25fps)
-    uint64_t jitterDrainTimeMs{0}; ///< Wall-clock timestamp (ms) of the last jitter-buffer drain
-    uint64_t lastSeenVSyncMs{0};   ///< VSync timestamp at last jitter-buffer drain, for VSync-aligned pacing
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

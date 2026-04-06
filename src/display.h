@@ -143,7 +143,7 @@ class cVaapiDisplay : public cThread {
         return lastVSyncTimeMs.load(std::memory_order_relaxed);
     }
     [[nodiscard]] auto GetVaDriverMutex() noexcept
-        -> cMutex & { ///< Return the VA driver mutex for cross-thread serialization (decoder ↔ display)
+        -> cMutex & { ///< Return the VA driver mutex for cross-thread serialization (decoder <-> display)
         return vaDriverMutex;
     }
 

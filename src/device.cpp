@@ -874,6 +874,10 @@ auto cVaapiDevice::Detach() -> void {
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
+    // Show a black frame immediately so the display doesn't show stale framebuffer
+    // content before the first channel is tuned.
+    SubmitBlackFrame();
+
     return true;
 }
 

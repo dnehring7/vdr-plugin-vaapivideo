@@ -73,6 +73,9 @@ class cAudioProcessor : public cThread {
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding
     [[nodiscard]] auto GetClock() const noexcept
         -> int64_t; ///< Returns the PTS of the sample at the DAC output in 90 kHz ticks, or AV_NOPTS_VALUE
+    auto SetDriftCompensation(int comp) noexcept -> void {
+        driftCompensation.store(comp, std::memory_order_relaxed);
+    } ///< Drift correction: samples per 10000
     [[nodiscard]] auto Initialize(std::string_view alsaDevice)
         -> bool; ///< Opens the ALSA device and starts the processing thread; idempotent for the same device
     [[nodiscard]] auto IsInitialized() const noexcept
@@ -81,6 +84,11 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Returns true if the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const
         -> bool; ///< Returns true if the packet queue has reached AUDIO_QUEUE_CAPACITY
+    [[nodiscard]] auto GetQueueSize() const
+        -> size_t; ///< Returns the current number of packets in the audio decode queue
+    [[nodiscard]] auto GetPacketDurationMs() const
+        -> int; ///< Returns the duration of one audio packet in ms (codec-dependent, 0 if unknown)
+    auto DropPackets(int count) -> int; ///< Discard up to count oldest packets; returns the number actually dropped
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper: configures codec, sample rate, and channel count in one call
     auto SetVolume(int vol) -> void; ///< Sets PCM playback volume in the range 0 (mute) to 255 (full scale)
@@ -176,6 +184,9 @@ class cAudioProcessor : public cThread {
     std::atomic<uint32_t> clearGeneration{0}; ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
     int64_t pcmNextPts{AV_NOPTS_VALUE};       ///< DVB-anchored 90 kHz PTS for the next ALSA write (PCM & passthrough)
     int64_t pcmQueueEndPts{AV_NOPTS_VALUE};   ///< 90 kHz PTS of the last sample written into the ALSA ring buffer
+    std::atomic<int> driftCompensation{0};    ///< Drift correction: samples to add per 10000 output samples;
+                                              ///<   positive slows audio (video behind), negative speeds it up;
+                                              ///<   written by decoder thread, read by audio thread
     std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< DAC-output PTS (endPts minus ALSA delay) at each write
 
     // ========================================================================

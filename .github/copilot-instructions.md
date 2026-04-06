@@ -1,225 +1,49 @@
-# VDR VAAPI Video Plugin -- Coding Guidelines
+# Coding Rules
 
-## Architecture
+See README.md for architecture, source layout, build instructions, and requirements.
+See `src/common.h` for RAII deleters (`FreeAVFrame`, `FreeAVPacket`, …) and `AvErr()`.
 
-```
-VDR --PES--> cVaapiDevice --> [Decoder, Audio, Display] --> Hardware (zero-copy VAAPI -> DRM)
-```
+## Build & Lint
 
-| File | Role |
-|------|------|
-| `common.h` | `AvErr()` helper, RAII deleters, version guards, shared headers |
-| `config.cpp` | Plugin configuration, display parameters, setup storage |
-| `decoder.cpp` | VAAPI decode, filter graphs, A/V sync |
-| `device.cpp` | VDR integration, PES routing, lifecycle |
-| `display.cpp` | DRM atomic modesetting, page flips |
-| `audio.cpp` | ALSA output, IEC61937 passthrough |
-| `osd.cpp` | Hardware OSD overlay |
-| `pes.cpp` | PES parsing, codec detection |
-
-## Code Style
-
-### Signatures
-
-Trailing return types on **all** functions (including `-> void`, deleted operators).
-`[[nodiscard]]` on every value-returning function.
-`noexcept` on destructors, move operations, and trivial `const` getters.
-
-```cpp
-[[nodiscard]] auto Initialize(std::string_view device) const -> bool;
-auto Clear() -> void;
-auto operator=(const T&) -> T& = delete;
-auto operator=(T&&) noexcept -> T&;
-~Component() noexcept;
-[[nodiscard]] auto GetValue() const noexcept -> int;
+```sh
+make                # build plugin
+make lint           # clang-tidy (requires bear + clang-tidy; generates compile_commands.json)
+make indent         # clang-format all sources
 ```
 
-### Expressions
+## Hard Rules
 
-- `auto` when the type is evident from the initializer.
-- `std::format` for string construction (never `snprintf` for `std::string`).
-- `std::span` for buffer parameters (never raw pointer + size).
-- `std::memcpy` / `std::memset` (always `std::`-qualified).
-- Brace initialization for members; designated initializers for structs.
-- Structured bindings for multi-value returns: `const auto [ptr, ec] = std::from_chars(...)`.
+- **Trailing return types** on every function, including `-> void` and deleted operators.
+- **`[[nodiscard]]`** on every value-returning function.
+- **`noexcept`** on destructors, move operations, trivial `const` getters.
+- **`#ifndef`/`#define`/`#endif`** include guards — never `#pragma once`.
+- **`std::format`** for strings — never `snprintf` into `std::string`.
+- **`std::span`** for buffers — never raw pointer + size.
+- **`std::`-qualified** C functions (`std::memcpy`, `std::memset`).
+- **RAII** for all resources — no naked `new`/`delete`, no manual `av_*_free`.
+- **Check every C API return value.**
+- **No exceptions** — VDR is exception-free.
+- **No `std::thread`/`std::mutex`** — use VDR primitives (`cThread`, `cMutex`, `cMutexLock`, `cCondVar`, `cCondWait::SleepMs()`, `cTimeMs`).
+- **`NOLINT`** only at C API boundaries; always name the check.
 
-```cpp
-const auto width = static_cast<uint32_t>(rawWidth);
-auto name = std::format("hw:{}", cardId);
-auto ParsePes(std::span<const uint8_t> data) -> PesPacket;
-StreamParams params{.codecId = AV_CODEC_ID_H264, .sampleRate = 48000};
-```
+## Non-Obvious Conventions
 
-### Control Flow
+- **Constants:** `inline constexpr` + UPPERCASE in headers; plain `constexpr` in `.cpp`.
+- **File scope:** `static` for free functions; anonymous namespace for types.
+- **Logging:** `"vaapivideo/<basename>: <msg>"` — never in hot paths (decode/render loops).
+- **Errors:** FFmpeg → `AvErr(ret).data()`; DRM/VAAPI → `%m` or `strerror(errno)`.
+- **Members:** inline Doxygen `///<` after the member, brace-init, alphabetical within groups.
+- **Section headers:** full-width `// === LABEL ===` ruler (see existing files).
+- **Control flow:** `[[unlikely]]` on error paths, `[[likely]]` on hot paths, early returns.
 
-- `[[unlikely]]` on error paths; `[[likely]]` on hot paths.
-- Early returns to avoid deep nesting.
+## Thread-Safety Pitfall
 
-```cpp
-if (!ptr) [[unlikely]] { return false; }
-if (hasData) [[likely]] { process(); }
-```
+VDR's `Running()` is **not** thread-safe. Use `std::atomic<bool> stopping` / `hasExited` with `memory_order_acquire`/`release`. See existing `Shutdown()` patterns in the codebase.
 
-## File Organization
+## Lifecycle
 
-### Include Guards
+Each component provides three methods — match existing patterns exactly:
 
-`#ifndef` / `#define` / `#endif` (never `#pragma once`):
-
-```cpp
-#ifndef VDR_VAAPIVIDEO_MODULE_H
-#define VDR_VAAPIVIDEO_MODULE_H
-// ...
-#endif // VDR_VAAPIVIDEO_MODULE_H
-```
-
-### Section Headers
-
-Full-width ruler with centered label:
-
-```cpp
-// ============================================================================
-// === CONSTANTS ===
-// ============================================================================
-```
-
-### Declarations
-
-- `inline constexpr` in headers; plain `constexpr` in `.cpp` files. UPPERCASE names:
-
-```cpp
-// header
-inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (ms)
-// cpp
-constexpr size_t DECODER_QUEUE_CAPACITY = 500;   ///< Video packet queue depth
-```
-
-- `static` for file-local free functions; anonymous namespace for file-local types:
-
-```cpp
-[[nodiscard]] static auto Helper(int x) -> int;
-namespace { struct Internal { ... }; } // namespace
-```
-
-### Documentation
-
-Inline Doxygen after the member. Alphabetical within logical groups.
-
-```cpp
-AVFrame* frame{};             ///< Brief description
-int64_t pts{AV_NOPTS_VALUE};  ///< Presentation timestamp (90 kHz)
-```
-
-## Logging
-
-Format: `"vaapivideo/<component>: <message>"` where `<component>` is the source file basename.
-Never log in hot paths (decode/render loops) -- errors and initialization only.
-
-```cpp
-isyslog("vaapivideo/decoder: initialized");              // Info
-dsyslog("vaapivideo/decoder: packet queue size=%zu", n); // Debug
-esyslog("vaapivideo/decoder: failed: %s", msg);          // Error
-```
-
-## Resource Management
-
-### VDR Lifecycle
-
-```cpp
-auto Clear() -> void;     ///< Reset buffers, keep resources
-auto Shutdown() -> void;  ///< Release all resources, log stats
-~Component() noexcept;    ///< Call Shutdown() if not already done
-```
-
-### RAII Deleters (common.h)
-
-All FFmpeg/DRM resources wrapped in `std::unique_ptr` with custom deleters.
-Drain queues via RAII -- never manual `av_packet_free`:
-
-```cpp
-std::unique_ptr<AVFrame, FreeAVFrame> frame{av_frame_alloc()};
-std::unique_ptr<AVPacket, FreeAVPacket> pkt{av_packet_alloc()};
-std::unique_ptr<AVCodecContext, FreeAVCodecContext> ctx{avcodec_alloc_context3(codec)};
-
-while (!packetQueue.empty()) {
-    const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
-    packetQueue.pop();
-}
-```
-
-## Concurrency
-
-### VDR Primitives Only
-
-Never use `std::thread`, `std::mutex`, etc.
-
-| Primitive | Usage |
-|-----------|-------|
-| `cThread` | Inherit, override `Action()` |
-| `cMutex` / `cMutexLock` | Always declare lock as `const` |
-| `cCondVar` | Condition variable, paired with `cMutex` |
-| `cCondWait::SleepMs()` | Timed sleep utility |
-| `cTimeMs` | Deadline timer, always `const` |
-
-### Thread Safety
-
-VDR's `Running()` is NOT thread-safe -- use atomic flags instead:
-
-```cpp
-std::atomic<bool> stopping{};   ///< Thread stop request
-std::atomic<bool> hasExited{};  ///< Thread exit confirmation
-```
-
-Action() loop:
-
-```cpp
-while (!stopping.load(std::memory_order_acquire)) { /* work */ }
-hasExited.store(true, std::memory_order_release);  // BEFORE final log
-```
-
-Shutdown() pattern:
-
-```cpp
-auto Shutdown() -> void {
-    if (stopping.exchange(true, std::memory_order_acq_rel)) return;
-    condition.Broadcast();
-    if (!hasExited.load(std::memory_order_acquire)) Cancel(3);
-    const cTimeMs timeout(SHUTDOWN_TIMEOUT_MS);
-    while (!hasExited.load(std::memory_order_acquire) && !timeout.TimedOut()) {
-        condition.Broadcast();
-        cCondWait::SleepMs(10);
-    }
-}
-```
-
-## Error Handling
-
-FFmpeg errors use `AvErr()` from `common.h`. DRM/VAAPI errors use `strerror(errno)` or `%m`:
-
-```cpp
-if (const int ret = avcodec_send_packet(ctx, pkt); ret < 0) {
-    esyslog("vaapivideo/decoder: send_packet failed: %s", AvErr(ret).data());
-    return false;
-}
-if (drmModeAddFB2(fd, w, h, fmt, handles, pitches, offsets, &fbId, 0) != 0) {
-    esyslog("vaapivideo/display: AddFB2 failed: %m");
-    return false;
-}
-```
-
-## Suppression Policy
-
-`NOLINT` only at C API boundaries (FFmpeg, VAAPI, DRM, ALSA). Always specify the check name:
-
-```cpp
-reinterpret_cast<const AVDRMFrameDescriptor*>(...) // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-uint8_t* outPtr = buf.data();                      // NOLINT(misc-const-correctness)
-```
-
-Prefer `std::memcpy` over `reinterpret_cast` when possible.
-
-## Rules
-
-**Required:** `[[nodiscard]]` on all value-returning functions -- trailing return types on all functions -- `const` correctness on functions, parameters, and locks -- RAII for all resources (no naked `new`/`delete`) -- check all C API return values -- `std::`-qualified C functions.
-
-**Forbidden:** exceptions (VDR is exception-free) -- `std::thread`/`std::mutex` (use VDR primitives) -- `#pragma once` -- static mutable state -- legacy APIs (require FFmpeg 7.0+, VDR 2.6.0+).
+- `Clear()` — reset buffers, keep allocated resources.
+- `Shutdown()` — release everything, log stats, idempotent via `stopping.exchange(true)`.
+- `~Destructor() noexcept` — calls `Shutdown()` if not already done.

@@ -213,6 +213,48 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
 [[nodiscard]] auto cAudioProcessor::IsPassthrough() const noexcept -> bool { return alsaPassthroughActive; }
 
+[[nodiscard]] auto cAudioProcessor::GetQueueSize() const -> size_t {
+    const cMutexLock lock(mutex.get());
+    return packetQueue.size();
+}
+
+auto cAudioProcessor::DropPackets(int count) -> int {
+    const cMutexLock lock(mutex.get());
+    int dropped = 0;
+    while (dropped < count && !packetQueue.empty()) {
+        const std::unique_ptr<AVPacket, FreeAVPacket> pkt{packetQueue.front()};
+        packetQueue.pop();
+        ++dropped;
+    }
+    return dropped;
+}
+
+[[nodiscard]] auto cAudioProcessor::GetPacketDurationMs() const -> int {
+    const cMutexLock lock(mutex.get());
+    const int rate = streamParams.sampleRate > 0 ? streamParams.sampleRate : 48000;
+    int samplesPerFrame = 0;
+    switch (streamParams.codecId) {
+        case AV_CODEC_ID_MP2:
+        case AV_CODEC_ID_MP3:
+            samplesPerFrame = 1152;
+            break;
+        case AV_CODEC_ID_AC3:
+        case AV_CODEC_ID_EAC3:
+            samplesPerFrame = 1536;
+            break;
+        case AV_CODEC_ID_AAC:
+        case AV_CODEC_ID_AAC_LATM:
+            samplesPerFrame = 1024;
+            break;
+        case AV_CODEC_ID_DTS:
+            samplesPerFrame = 512;
+            break;
+        default:
+            return 0;
+    }
+    return (samplesPerFrame * 1000) / rate;
+}
+
 [[nodiscard]] auto cAudioProcessor::IsQueueFull() const -> bool {
     const cMutexLock lock(mutex.get());
     return packetQueue.size() >= AUDIO_QUEUE_CAPACITY;
@@ -646,55 +688,67 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
         const unsigned outCh = alsaChannels > 0 ? alsaChannels : 2;
 
-        // Re-create swrCtx if format/channels change (e.g. after decoder flush on seek).
-        if (frame->format != AV_SAMPLE_FMT_S16) {
-            const auto frameFmt = static_cast<AVSampleFormat>(frame->format);
-            const int frameCh = frame->ch_layout.nb_channels;
+        // (Re-)create swrCtx when format/channels change.  Always create one -- even for S16 input
+        // (identity conversion) -- so swr_set_compensation() can micro-adjust the playback rate to
+        // compensate for DAC-vs-DVB-PCR clock drift.
+        const auto frameFmt = static_cast<AVSampleFormat>(frame->format);
+        const int frameCh = frame->ch_layout.nb_channels;
 
-            if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels)) {
-                dsyslog("vaapivideo/audio: frame format changed (%s %dch -> %s %dch), recreating swresample",
-                        av_get_sample_fmt_name(swrFormat), swrChannels, av_get_sample_fmt_name(frameFmt), frameCh);
-                swr_free(&swrCtx);
-            }
+        if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels)) {
+            swr_free(&swrCtx);
+        }
 
-            if (!swrCtx) {
-                AVChannelLayout outLayout{};
-                av_channel_layout_default(&outLayout, static_cast<int>(outCh));
+        if (!swrCtx) {
+            AVChannelLayout outLayout{};
+            av_channel_layout_default(&outLayout, static_cast<int>(outCh));
 
-                const int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, frame->sample_rate,
-                                                    &frame->ch_layout, frameFmt, frame->sample_rate, 0, nullptr);
+            const int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, frame->sample_rate,
+                                                &frame->ch_layout, frameFmt, frame->sample_rate, 0, nullptr);
 
-                if (ret < 0 || !swrCtx || swr_init(swrCtx) < 0) {
-                    esyslog("vaapivideo/audio: swr_alloc_set_opts2 failed for %s %dch -> S16 %uch conversion",
-                            av_get_sample_fmt_name(frameFmt), frameCh, outCh);
-                    if (swrCtx) {
-                        swr_free(&swrCtx);
-                    }
-                    swrChannels = 0;
-                    swrFormat = AV_SAMPLE_FMT_NONE;
-                    decoderRefCount.fetch_sub(1, std::memory_order_release);
-                    return false;
-                }
-
-                swrFormat = frameFmt;
-                swrChannels = frameCh;
-                dsyslog("vaapivideo/audio: initialized swresample for %s %dch -> S16 %uch conversion",
+            if (ret < 0 || !swrCtx || swr_init(swrCtx) < 0) {
+                esyslog("vaapivideo/audio: swr_alloc_set_opts2 failed for %s %dch -> S16 %uch",
                         av_get_sample_fmt_name(frameFmt), frameCh, outCh);
+                if (swrCtx) {
+                    swr_free(&swrCtx);
+                }
+                swrChannels = 0;
+                swrFormat = AV_SAMPLE_FMT_NONE;
+                decoderRefCount.fetch_sub(1, std::memory_order_release);
+                return false;
             }
+
+            swrFormat = frameFmt;
+            swrChannels = frameCh;
+            dsyslog("vaapivideo/audio: initialized swresample for %s %dch -> S16 %uch",
+                    av_get_sample_fmt_name(frameFmt), frameCh, outCh);
+        }
+
+        // Apply drift compensation: slightly speed up or slow down audio to track DVB PCR.
+        // driftCompensation is in samples per 10000 output samples (set by the decoder's sync loop).
+        // Calculate over one full second (sample_rate) rather than per-frame to prevent integer
+        // truncation of tiny adjustments (e.g. 50 ppm -> comp=5 -> 5*1152/10000=0 with per-frame math,
+        // but 5*48000/10000=24 with per-second math).  swresample applies the ratio continuously.
+        const int comp = driftCompensation.load(std::memory_order_relaxed);
+        if (comp != 0) {
+            const int compSamples = (comp * frame->sample_rate) / 10000;
+            swr_set_compensation(swrCtx, compSamples, frame->sample_rate);
         }
 
         const uint8_t *pcmData = nullptr;
         size_t pcmSize = 0;
         std::vector<uint8_t> convertedBuffer;
 
-        if (frame->format != AV_SAMPLE_FMT_S16 && swrCtx) {
-            const int outSamples = frame->nb_samples;
-            const size_t bufferSize = static_cast<size_t>(outSamples) * outCh * 2;
+        {
+            // Use FFmpeg's estimate + padding: swresample's internal fractional buffering can
+            // occasionally emit more samples than the number fed in.
+            const int estimatedOut = swr_get_out_samples(swrCtx, frame->nb_samples);
+            const int maxOutSamples = std::max(estimatedOut, frame->nb_samples) + 128;
+            const size_t bufferSize = static_cast<size_t>(maxOutSamples) * outCh * 2;
             convertedBuffer.resize(bufferSize);
 
             uint8_t *outPtr = convertedBuffer.data(); // NOLINT(misc-const-correctness)
             const int converted =
-                swr_convert(swrCtx, &outPtr, outSamples,
+                swr_convert(swrCtx, &outPtr, maxOutSamples,
                             const_cast<const uint8_t **>(frame->data), // NOLINT(cppcoreguidelines-pro-type-const-cast)
                             frame->nb_samples);
 
@@ -706,14 +760,15 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
             pcmSize = static_cast<size_t>(converted) * outCh * 2;
             pcmData = convertedBuffer.data();
-        } else {
-            pcmSize = static_cast<size_t>(frame->nb_samples) * static_cast<size_t>(frame->ch_layout.nb_channels) * 2;
-            pcmData = frame->data[0];
         }
 
-        const unsigned framesOut = (frame->format != AV_SAMPLE_FMT_S16 && swrCtx)
-                                       ? static_cast<unsigned>(pcmSize / (outCh * 2U))
-                                       : static_cast<unsigned>(frame->nb_samples);
+        // PTS tracking uses the ORIGINAL (pre-compensation) frame count so that endPts and
+        // pcmNextPts advance on the DVB timeline.  The compensated buffer (which may contain a
+        // few extra or fewer samples) is written to ALSA in full.  This creates an intentional
+        // mismatch: endPts advances at DVB rate while the ALSA buffer depth reflects the actual
+        // (compensated) sample count.  GetClock() = endPts - delay then naturally shifts,
+        // which is exactly the drift correction effect we need.
+        const auto originalFrames = static_cast<unsigned>(frame->nb_samples);
 
         // Skip ALSA write if Clear() ran since dequeue to prevent stale PTS from poisoning the clock.
         if (clearGeneration.load(std::memory_order_acquire) != myGeneration) [[unlikely]] {
@@ -722,7 +777,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         }
 
         const int64_t startPts90k = pcmNextPts;
-        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, framesOut);
+        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, originalFrames);
         av_frame_unref(frame.get());
 
         if (!writeOk) {
@@ -732,7 +787,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
         // Advance pcmNextPts for multi-frame decode (next avcodec_receive_frame iteration).
         if (startPts90k != AV_NOPTS_VALUE && alsaSampleRate > 0U) {
-            const auto added90k = static_cast<int64_t>((static_cast<uint64_t>(framesOut) * 90000ULL) /
+            const auto added90k = static_cast<int64_t>((static_cast<uint64_t>(originalFrames) * 90000ULL) /
                                                        static_cast<uint64_t>(alsaSampleRate));
             pcmNextPts = startPts90k + added90k;
         }

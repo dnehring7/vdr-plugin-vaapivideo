@@ -187,7 +187,7 @@ struct CodecEvidence {
 
         const uint8_t b0 = p[nalPos];
 
-        // MPEG-2 start codes have bit 7 set (forbidden in H.264/HEVC NAL headers) — evidence is definitive.
+        // MPEG-2 start codes have bit 7 set (forbidden in H.264/HEVC NAL headers) -- evidence is definitive.
         // sequence_header(0xB3)=0x01, extension(0xB5)=0x02, GOP(0xB8)=0x04.
         if (b0 == 0xB3 || b0 == 0xB5 || b0 == 0xB8) {
             uint8_t bit = 0x04;
@@ -198,7 +198,7 @@ struct CodecEvidence {
             }
             mpeg2.Record(bit, i);
             if ((mpeg2.seenMask & 0x01) != 0 && (mpeg2.seenMask & 0x06) != 0) [[unlikely]] {
-                break; // sequence_header + extension/GOP → definitive MPEG-2
+                break; // sequence_header + extension/GOP -> definitive MPEG-2
             }
         }
 

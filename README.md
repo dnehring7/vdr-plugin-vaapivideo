@@ -1,21 +1,15 @@
 # VDR VAAPI Video Plugin
 
 Hardware-accelerated video output for [VDR](https://www.tvdr.de/) using VAAPI
-decode, DRM atomic modesetting, and ALSA audio.
+decode, DRM atomic modesetting, and ALSA audio -- no X11, Wayland, or OpenGL
+required. Runs on a bare console, in a systemd service, or headless.
 
-This plugin drives the display directly through the kernel DRM/KMS subsystem --
-no X11, Wayland, or OpenGL required. It runs on a bare console, in a systemd
-service, or headless.
-
-The video path from decoder to screen is zero-copy: VAAPI surfaces are exported
-as DRM PRIME buffers and scanned out by the kernel without touching system
-memory. Audio passthrough formats (AC-3, DTS, TrueHD, ...) are detected
-automatically from the HDMI sink's EDID -- no manual codec selection is needed.
-
-GPU capabilities (decode profiles, VPP filters) are probed once at startup.
-The VAAPI Video Processing Pipeline (VPP) **must** be available -- the plugin
-will not start without it. Codecs lacking hardware decode support
-(e.g. MPEG-2 on AMD) fall back to FFmpeg software decoding transparently.
+The video path is zero-copy: VAAPI surfaces are exported as DRM PRIME buffers
+and scanned out without touching system memory. Audio passthrough formats are
+detected automatically from the HDMI sink's EDID. Codecs lacking hardware
+decode support (e.g. MPEG-2 on AMD) fall back to FFmpeg software decoding
+transparently. The VAAPI Video Processing Pipeline (VPP) **must** be
+available -- the plugin will not start without it.
 
 
 ## Features
@@ -205,13 +199,10 @@ Look for the VPP entry point in the output:
 If this line is missing, the plugin will not start. Verify the correct driver
 is installed (step 4) and that the user has access to the render node (step 3).
 
-#### vaapivideo-probe (detailed capability check)
+#### vaapivideo-probe
 
-The repository includes a standalone diagnostic tool that probes the exact
-capabilities the plugin needs: VLD decode profiles, P010/NV12 surface support,
-VPP filters (denoise, sharpen, deinterlace), and HDR tone mapping.
-
-It is **not** part of the plugin build -- compile and run it manually:
+Standalone diagnostic tool (not part of the plugin build) that probes decode
+profiles, VPP filters, surface formats, and HDR tone mapping:
 
     g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva libva-drm) \
         -o vaapivideo-probe vaapivideo-probe.cpp
@@ -219,76 +210,16 @@ It is **not** part of the plugin build -- compile and run it manually:
     ./vaapivideo-probe                     # uses /dev/dri/card0
     ./vaapivideo-probe /dev/dri/card1      # explicit device
 
-<details>
-<summary>Example output (Intel iHD)</summary>
-
-    VAAPI Capability Prober (DVB-S2 / YUV420-NV12)
-    ==============================================
-    DRM device:  /dev/dri/card1
-    Render node: /dev/dri/renderD128
-    VA-API:      1.23
-    Driver:      Intel iHD driver for Intel(R) Gen Graphics - 25.4.6 ()
-
-    --- Hardware Decode (VLD + YUV420) ---
-      MPEG-2 Main                        yes
-                                         (max 2048x2048)
-      H.264 Main                         yes
-                                         (max 4096x4096)
-      H.264 High                         yes
-                                         (max 4096x4096)
-      HEVC Main 10                       yes
-                                         (max 8192x8192)
-
-    --- Video Processing Pipeline (VPP) ---
-      General (VideoProc)                yes
-      Scaling                            yes
-      P010 (10-bit) surfaces             yes
-      NV12 (8-bit) surfaces              yes
-      10-bit -> 8-bit conversion         yes
-      Noise Reduction (Denoise)          yes
-      Sharpening                         yes
-      Color Balance                      yes
-      Skin Tone Enhancement              yes
-      Total Color Correction             yes
-      HVS Noise Reduction                no
-      HDR Tone Mapping (HDR10)           HDR->HDR, HDR->SDR
-
-    --- DVB-S2 Color Conversion Paths ---
-      BT.601 -> BT.709  (MPEG-2 SD)      yes
-      BT.709 passthrough (H.264 HD)      yes
-      BT.2020 -> BT.709  (HEVC UHD)      yes
-      P010 -> NV12      (10->8 bit)      yes
-      HLG -> SDR   (no TM required)      yes
-      PQ/HDR10 -> SDR    (tone map)      yes
-
-    --- Deinterlacing Algorithms ---
-      Motion Compensated                 yes
-      Motion Adaptive                    yes
-      Weave                              no
-      Bob                                yes
-
-</details>
-
-Any line showing **no** indicates a missing driver capability. Compare the
-output against the plugin log (`vdr -l 3`) to identify mismatches.
+Any line showing **no** indicates a missing driver capability. Compare against
+the plugin log (`vdr -l 3`) to identify mismatches.
 
 ### 6. Configure the ALSA audio device
 
-The plugin defaults to the ALSA `default` device (stereo PCM).
-For IEC61937 bitstream passthrough (AC-3, DTS, TrueHD, ...) a direct hardware
-device node is required. Passthrough formats are detected automatically from
-the sink's EDID.
-
-Find the card and device numbers for your HDMI output:
+Defaults to ALSA `default` (stereo PCM). For IEC61937 passthrough use a direct
+hardware device -- passthrough formats are detected from the sink's EDID:
 
     aplay -l | grep -E "HDMI|DisplayPort"
-
-Pass the result to VDR:
-
     vdr -P 'vaapivideo -a hw:0,3'
-
-If A/V sync is off, adjust the audio latency in the VDR setup menu
-(`Setup -> Plugins -> vaapivideo -> Audio Latency`).
 
 
 ## Configuration
@@ -303,8 +234,7 @@ If A/V sync is off, adjust the audio latency in the VDR setup menu
 | `-a DEV`    | `default`      | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
 | `-r WxH@R`  | `1920x1080@50` | Output resolution and refresh rate (max 3840x2160)    |
 
-DRM auto-detection tries `/dev/dri/card0` first, then enumerates all DRM
-devices via libdrm. Use `-d` explicitly when multiple GPUs are present.
+Use `-d` explicitly when multiple GPUs are present.
 
 ### VDR setup menu
 
@@ -323,12 +253,12 @@ devices via libdrm. Use `-d` explicitly when multiple GPUs are present.
 | `PLUG vaapivideo DETA`   | Detach from DRM/VAAPI hardware (release for other use) |
 | `PLUG vaapivideo ATTA`   | Re-attach to DRM/VAAPI hardware and restart pipeline   |
 
-The DETA/ATTA pair is useful for handing the display to another application
-(e.g. Kodi) and reclaiming it later without restarting VDR.
+DETA/ATTA hands the display to another application and reclaims it without
+restarting VDR.
 
 ### Inter-plugin service API
 
-Other plugins can query device state via VDR's `cPlugin::Service()` interface:
+Query device state via VDR's `cPlugin::Service()` interface:
 
 | Service ID                   | Data type  | Description                               |
 |------------------------------|------------|-------------------------------------------|
@@ -336,7 +266,7 @@ Other plugins can query device state via VDR's `cPlugin::Service()` interface:
 | `VaapiVideo-IsReady-v1.0`    | `bool*`    | `true` if the device is fully initialized |
 | `VaapiVideo-DeviceType-v1.0` | `cString*` | Human-readable device type string         |
 
-Passing `data = nullptr` acts as a capability probe (`true` for known IDs).
+`data = nullptr` acts as a capability probe (`true` for known IDs).
 
 
 ## Troubleshooting
@@ -371,22 +301,8 @@ Passing `data = nullptr` acts as a capability probe (`true` for known IDs).
 
 ### Debug builds
 
-Uncomment the matching pair of sanitizer lines in the Makefile:
-
-**AddressSanitizer + UndefinedBehaviorSanitizer:**
-
-    CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto -fsanitize=address,undefined
-    LDFLAGS += -fsanitize=address,undefined
-
-    export ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:symbolize=1
-    export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
-
-**ThreadSanitizer** (mutually exclusive with ASan):
-
-    CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto -fsanitize=thread
-    LDFLAGS += -fsanitize=thread
-
-    export TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1:history_size=7
+Uncomment the matching sanitizer lines in the Makefile (ASan+UBSan **or**
+TSan -- mutually exclusive). See the Makefile comments for runtime env vars.
 
 ### Verbose logging
 
