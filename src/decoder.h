@@ -128,6 +128,13 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Apply A/V sync policy (wait / drop / pass) and forward the frame to the display
     [[nodiscard]] auto SyncLatency90k() const noexcept
         -> int64_t; ///< Combined A/V sync latency: audioLatency + one-frame pipeline delay (90 kHz ticks)
+    auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
+        -> void; ///< Update the EMA-smoothed A/V delta; reseeds on the first sample after a reset
+    auto LogSyncStats(int64_t rawDelta90k, const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
+    auto RunJitterPrimeSync(cAudioProcessor *ap)
+        -> void; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0
+    auto SkipStaleJitterFrames(cAudioProcessor *ap)
+        -> void; ///< Pop jitter-buffer frames whose PTS is past the hard-late threshold (transient catch-up)
     auto WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta)
         -> void; ///< Block decode thread until audio clock reaches video PTS (replay ahead correction)
 
@@ -200,19 +207,10 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
     cTimeMs nextSyncLog;              ///< Deadline for the periodic "sync status" log (decoder thread only)
     int correctDrops{};               ///< Correction drops, summarized when run ends (decoder thread only)
-    int64_t driftIntegral90k{};       ///< Accumulated drift error (I-term); learns the steady-state HW drift
-                                      ///<   rate.  Preserved across channel switches and re-primes for instant
-                                      ///<   relock.  Only reset after hard-drop transients where the anti-windup
-                                      ///<   value ≠ true drift.  ~5 s cold-start convergence at 50 fps
+    int drainMissCount{};             ///< Drain stalls since last sync log: gap > 2x frame duration
     int64_t smoothedDelta90k{};       ///< EMA-smoothed A/V sync delta in 90 kHz ticks (decoder thread only)
     bool smoothedDeltaValid{false};   ///< True after first delta measurement
-    cTimeMs syncGrace;                ///< Suppresses hard corrections while the ALSA clock stabilizes
-
-    // ========================================================================
-    // === DRAIN TRACKING (decoder thread only, live TV) ===
-    // ========================================================================
-    double drainFps{};    ///< Measured drain fps from jitter buffer
-    int drainMissCount{}; ///< Drain stalls since last sync log: gap > 2× frame duration
+    cTimeMs syncGrace;                ///< Suppresses corrections while the EMA reseeds after a correction
 
     // ========================================================================
     // === JITTER BUFFER (live TV only) ===

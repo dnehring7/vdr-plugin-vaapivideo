@@ -69,14 +69,31 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr size_t DECODER_QUEUE_CAPACITY = 500;       ///< Video packet queue depth (~10 s at 50 fps)
-constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;       ///< Timeout when submitting a frame to the display (ms)
-constexpr int64_t DECODER_SYNC_THRESHOLD = 200 * 90; ///< A/V sync threshold in 90 kHz ticks (~200 ms):
-                                                     ///<   drop when behind, wait-before-submit when ahead (replay)
-constexpr int DECODER_SYNC_GRACE_MS = 500;           ///< Grace period after sync correction (ms)
-constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;       ///< Frames submitted immediately after Clear() without sync
-constexpr int DECODER_JITTER_BUFFER_MS = 500;        ///< Jitter buffer target depth (ms)
-constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 3ß000;  ///< Interval between periodic A/V sync log lines (ms)
+constexpr size_t DECODER_QUEUE_CAPACITY = 500;            ///< Video packet queue depth (~10 s at 50 fps)
+constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;            ///< Timeout when submitting a frame to the display (ms)
+constexpr int64_t DECODER_SYNC_HARD_THRESHOLD = 200 * 90; ///< Raw-delta safety net (~200 ms): drop when behind,
+                                                          ///<   block until catch-up when ahead (replay only).
+                                                          ///<   Used for transients (channel switch, network gap).
+constexpr int64_t DECODER_SYNC_TARGET_BAND = 15 * 90;     ///< Steady-state EMA dead band (+/-15 ms).  When the EMA
+                                                          ///<   exceeds the band on the AHEAD side, the decode thread
+                                                          ///<   sleeps the excess so the audio clock can catch up.
+                                                          ///<   15 ms sits clear of the EMA noise floor (~5-10 ms at
+                                                          ///<   5 s time constant) and well inside the imperceptible
+                                                          ///<   lip-sync window (~+/-40 ms).  No corrective action is
+                                                          ///<   taken on the BEHIND side -- the audio clock derives
+                                                          ///<   from the source PTS via endPts-snd_pcm_delay, so it
+                                                          ///<   cannot drift permanently faster than the DVB stream;
+                                                          ///<   any sustained negative delta is a transient handled
+                                                          ///<   by HARD_THRESHOLD below.
+constexpr int DECODER_SYNC_MAX_WAIT_MS = 80;              ///< Cap on a single sleep (ms).  Limits the slow-down on a
+                                                          ///<   large calibration shift to ~5x normal frame time.
+constexpr int DECODER_SYNC_GRACE_MS = 1000;               ///< Grace period after a sync correction or state change
+                                                          ///<   (prime-sync, hard transient, soft wait): suppresses
+                                                          ///<   further corrections while the EMA reseeds.
+constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;            ///< Frames submitted immediately after Clear() without sync
+constexpr int DECODER_JITTER_BUFFER_MS = 500;             ///< Jitter buffer target depth (ms)
+constexpr int DECODER_SYNC_EMA_SAMPLES = 250;             ///< EMA divisor (alpha = 1/N).  ~5 s time constant @ 50 fps
+constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 30000;       ///< Interval between periodic A/V sync log lines (ms)
 
 // ============================================================================
 // === STRUCTURES ===
@@ -170,7 +187,6 @@ auto cVaapiDecoder::Clear() -> void {
 
     freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
     smoothedDeltaValid = false;
-    // driftIntegral90k intentionally NOT reset: it represents hardware drift, not channel state.
 
     syncLogPending.store(true, std::memory_order_relaxed);
 }
@@ -579,28 +595,20 @@ auto cVaapiDecoder::Action() -> void {
     }
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
-    bool primeSyncPending{false};             // one-shot settle requested at jitter-buffer prime
-    uint64_t drainFrameCount{0};              // frames drained since last fps reset
-    uint64_t drainFpsStartMs{cTimeMs::Now()}; // timestamp of last fps calculation reset
-    uint64_t lastDrainMs{0};                  // timestamp of most recent drain for gap detection
+    bool primeSyncPending{false}; // one-shot settle requested at jitter-buffer prime
+    uint64_t lastDrainMs{0};      // wall-clock timestamp of the previous drain, for miss detection
 
     while (!stopping.load(std::memory_order_acquire)) {
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
 
         // --- Dequeue: timed wait avoids busy-looping when no packets are pending ---
         //
-        // When the jitter buffer is primed and has frames to drain, use a short
-        // timeout (15 ms) so the loop iterates well before the next VSync.  The
-        // Phase-2 ahead gate (audio-clock PTS check) decides whether to actually
-        // drain a frame, and SubmitFrame's single-slot backpressure throttles us
-        // if the display thread hasn't consumed the previous frame yet.  This
-        // makes the effective drain cadence track VSync rather than an imprecise
-        // wall-clock timer: the decoder delivers early, the display thread
-        // presents at exactly the VSync rate.
-        //
-        // Without this, TimedWait(20 ms) stacks on top of any SubmitFrame
-        // blocking, degrading 50 fps rate=field content to ~33 fps and causing
-        // the jitter buffer to grow.
+        // When the jitter buffer has frames to drain, use a slightly shorter
+        // wait (18 ms) than one frame period: the loop iterates often enough
+        // that SubmitFrame's single-slot backpressure -- not the wall-clock
+        // timer -- paces drain to the display VSync.  Stacking TimedWait(20)
+        // on top of any SubmitFrame blocking would degrade 50 fps rate=field
+        // content to ~33 fps and grow the jitter buffer unbounded.
         {
             const cMutexLock lock(&packetMutex);
             if (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
@@ -662,7 +670,7 @@ auto cVaapiDecoder::Action() -> void {
 
             // Clear() / channel switch / seek: flush stale frames, show the first
             // decoded frame immediately (freerun), then re-prime the jitter buffer.
-            // SyncAndSubmitFrame() consumes freerunFrames via its Phase-2 path.
+            // SyncAndSubmitFrame() consumes the freerunFrames counter.
             if (freerunFrames.load(std::memory_order_relaxed) > 0) {
                 jitterBuf.clear();
                 jitterPrimed = false;
@@ -694,11 +702,7 @@ auto cVaapiDecoder::Action() -> void {
                     smoothedDeltaValid = false;
                     syncGrace.Set(DECODER_SYNC_GRACE_MS);
                     nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
-                    // Reset drain tracking for this channel.
-                    drainFrameCount = 0;
-                    drainFpsStartMs = cTimeMs::Now();
                     lastDrainMs = 0;
-                    drainFps = 0;
                     drainMissCount = 0;
                     dsyslog("vaapivideo/decoder: jitter buffer primed (buf=%zu target=%d)", jitterBuf.size(),
                             jitterTarget);
@@ -710,185 +714,27 @@ auto cVaapiDecoder::Action() -> void {
                     jitterPrimed = false;
                 }
 
-                // Two-phase drain: fast-skip then single VSync-paced frame.
-                //
-                // Phase 1 skips frames hopelessly behind audio at CPU speed (no
-                // SubmitFrame).  Phase 2 drains at most one frame per iteration
-                // with an ahead gate for one-shot startup sync.
-                //
-                // A while-SubmitFrame loop would cascade: SubmitFrame blocks to
-                // VSync (~20 ms), advancing the audio clock just enough for the
-                // NEXT frame to appear "due", draining the entire buffer in one
-                // pass.  Single drain avoids this; the main loop naturally
-                // iterates at the output frame rate (TimedWait fires at
-                // outputFrameDurationMs), so one drain per iteration matches the
-                // display refresh.  Rate=field 25→50 fps is paced by extra
-                // TimedWait timeout iterations between source packets.
+                // Drain one frame per loop iteration.  SubmitFrame's single-slot
+                // backpressure paces this to the display VSync (rate=field 25->50
+                // is sustained because TimedWait above fires between source packets).
+                // No buffer regulation: audio and video share the source clock, so
+                // the jitter level tracks the audio queue -- any sustained growth is
+                // an audio-path issue, not ours.
                 if (jitterPrimed && !jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
-                    if (auto *const ap = audioProcessor.load(std::memory_order_acquire); ap) {
-                        // Prime-time one-shot sync: align video front to the audio clock
-                        // before the first drain so the PI controller starts from delta ≈ 0.
-                        //
-                        //  initDelta < 0  video is BEHIND audio: fast-drop stale jitter frames
-                        //                 until the front PTS meets the clock.
-                        //
-                        //  initDelta > 0  video is AHEAD of audio: block until the audio clock
-                        //                 advances to meet the video front PTS.
-                        //
-                        // EMA is reset so the P-term starts fresh.  The I-term (learned HW
-                        // drift rate) is preserved across channel switches for instant relock.
-                        if (primeSyncPending && !jitterBuf.empty()) {
+                    auto *const ap = audioProcessor.load(std::memory_order_acquire);
+                    if (ap) {
+                        if (primeSyncPending) {
                             primeSyncPending = false;
-                            const int64_t fpts0 = jitterBuf.front()->pts;
-                            const int64_t clock0 = ap->GetClock();
-                            if (fpts0 != AV_NOPTS_VALUE && clock0 != AV_NOPTS_VALUE) {
-                                const int64_t primeLatency = SyncLatency90k();
-                                const int64_t initDelta = fpts0 - clock0 - primeLatency;
-                                if (initDelta < 0) {
-                                    // Video is behind: drop frames until front ≥ audio clock.
-                                    // Allow draining the entire buffer: when the deficit exceeds
-                                    // one buffer's worth, all frames are stale.  The buffer then
-                                    // empties, underrun triggers re-prime, and the cycle repeats
-                                    // at CPU speed until the deficit fits within one buffer.
-                                    int primeDrops = 0;
-                                    while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
-                                        if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
-                                            break;
-                                        }
-                                        const int64_t clk = ap->GetClock();
-                                        if (clk == AV_NOPTS_VALUE || jitterBuf.front()->pts >= clk + primeLatency) {
-                                            break;
-                                        }
-                                        jitterBuf.pop_front();
-                                        ++primeDrops;
-                                    }
-                                    dsyslog("vaapivideo/decoder: prime-sync dropped %d frames (initDelta=%+lldms)",
-                                            primeDrops, static_cast<long long>(initDelta / 90));
-                                } else if (initDelta > 0) {
-                                    // Video is ahead: wait for the audio clock to catch up.
-                                    dsyslog("vaapivideo/decoder: prime-sync ahead d=%+lldms -- waiting for audio",
-                                            static_cast<long long>(initDelta / 90));
-                                    while (!stopping.load(std::memory_order_relaxed)) {
-                                        const int64_t clk = ap->GetClock();
-                                        if (clk == AV_NOPTS_VALUE || clk >= fpts0 - primeLatency) {
-                                            break;
-                                        }
-                                        cCondWait::SleepMs(10);
-                                    }
-                                    // Correct clock overshoot: the audio clock is updated in
-                                    // ~24 ms steps so it can jump past the target.  Drop any
-                                    // jitter frames that are now behind the audio position.
-                                    int postDrops = 0;
-                                    while (jitterBuf.size() > 1 && !stopping.load(std::memory_order_relaxed)) {
-                                        if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
-                                            break;
-                                        }
-                                        const int64_t clk = ap->GetClock();
-                                        if (clk == AV_NOPTS_VALUE || jitterBuf.front()->pts - clk - primeLatency >= 0) {
-                                            break;
-                                        }
-                                        jitterBuf.pop_front();
-                                        ++postDrops;
-                                    }
-                                    if (postDrops > 0) {
-                                        dsyslog("vaapivideo/decoder: prime-sync overshoot correction: "
-                                                "dropped %d frames",
-                                                postDrops);
-                                    }
-                                }
-                                // Reset EMA so P-term starts fresh; keep I-term (HW drift).
-                                smoothedDeltaValid = false;
-                                syncGrace.Set(DECODER_SYNC_GRACE_MS);
-                                nextSyncLog.Set(0); // log immediately to confirm
-                            }
+                            RunJitterPrimeSync(ap);
                         }
-
-                        // Phase 1: Fast-skip frames hopelessly behind audio at CPU speed.
-                        while (jitterBuf.size() > 1 && !stopping.load(std::memory_order_relaxed)) {
-                            if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
-                                break;
-                            }
-                            const int64_t clock = ap->GetClock();
-                            if (clock == AV_NOPTS_VALUE) {
-                                break;
-                            }
-                            const int64_t frontDelta = jitterBuf.front()->pts - clock - SyncLatency90k();
-                            if (frontDelta >= -DECODER_SYNC_THRESHOLD) {
-                                break;
-                            }
-                            jitterBuf.pop_front();
-                            ++correctDrops;
+                        SkipStaleJitterFrames(ap);
+                    }
+                    if (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
+                        const uint64_t nowMs = cTimeMs::Now();
+                        if (lastDrainMs > 0 && static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs * 2) {
+                            ++drainMissCount;
                         }
-
-                        // Buffer regulation: cap jitter buffer to prevent unbounded
-                        // growth.  Drop from the BACK (newest/furthest-in-future) to
-                        // keep the front aligned with the audio clock. Dropping from
-                        // the front would jump the front PTS far ahead of audio,
-                        // stalling drain and causing a runaway feedback loop.
-                        constexpr int JITTER_MAX_FACTOR = 3;
-                        const int maxJitter = jitterTarget * JITTER_MAX_FACTOR;
-                        if (static_cast<int>(jitterBuf.size()) > maxJitter) {
-                            int bufDrops = 0;
-                            while (static_cast<int>(jitterBuf.size()) > jitterTarget * 2 && jitterBuf.size() > 1) {
-                                jitterBuf.pop_back();
-                                ++bufDrops;
-                            }
-                            if (bufDrops > 0) {
-                                dsyslog("vaapivideo/decoder: buffer regulation: dropped %d "
-                                        "(buf=%zu target=%d)",
-                                        bufDrops, jitterBuf.size(), jitterTarget);
-                                smoothedDeltaValid = false;
-                                syncGrace.Set(DECODER_SYNC_GRACE_MS);
-                                nextSyncLog.Set(0);
-                            }
-                        }
-
-                        // Audio overflow safety net: one-shot flush when the audio
-                        // queue grows beyond the emergency threshold.  With buffer
-                        // regulation the PI delta stays accurate and comp converges
-                        // to the true drift, so this should rarely fire.
-                        constexpr int AQ_EMERGENCY = 50;
-                        constexpr int AQ_TARGET = 10;
-                        if (static_cast<int>(ap->GetQueueSize()) >= AQ_EMERGENCY && syncGrace.TimedOut()) {
-                            const int excess = static_cast<int>(ap->GetQueueSize()) - AQ_TARGET;
-                            if (excess > 0) {
-                                const int aDropped = ap->DropPackets(excess);
-                                dsyslog("vaapivideo/decoder: audio overflow: "
-                                        "dropped %d packets (aq=%zu)",
-                                        aDropped, ap->GetQueueSize());
-                            }
-                        }
-
-                        // Phase 2: Drain a single frame.
-                        // VSync backpressure from SubmitFrame's single-slot naturally
-                        // limits drain to the display refresh rate.  Prime-sync handles
-                        // initial alignment; the PI controller handles steady-state.
-                        // No ahead gate: it was starving drain rate (fps < source rate)
-                        // and causing buffer growth that triggered regulation, whose
-                        // front-drops then jumped the PTS far ahead of audio, blocking
-                        // all further drains in a runaway feedback loop.
-                        if (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
-                            ++drainFrameCount;
-                            const uint64_t nowMs = cTimeMs::Now();
-                            if (lastDrainMs > 0) {
-                                const auto gap = static_cast<int>(nowMs - lastDrainMs);
-                                if (gap > outputFrameDurationMs * 2) {
-                                    ++drainMissCount;
-                                }
-                            }
-                            lastDrainMs = nowMs;
-                            const uint64_t elapsed = nowMs - drainFpsStartMs;
-                            if (elapsed >= 2000) {
-                                drainFps = static_cast<double>(drainFrameCount * 1000) / static_cast<double>(elapsed);
-                                drainFrameCount = 0;
-                                drainFpsStartMs = nowMs;
-                            }
-                            auto drainFrame = std::move(jitterBuf.front());
-                            jitterBuf.pop_front();
-                            (void)SyncAndSubmitFrame(std::move(drainFrame));
-                        }
-                    } else {
-                        // No audio processor: drain one frame (freerun).
+                        lastDrainMs = nowMs;
                         auto drainFrame = std::move(jitterBuf.front());
                         jitterBuf.pop_front();
                         (void)SyncAndSubmitFrame(std::move(drainFrame));
@@ -1376,6 +1222,7 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
         cCondWait::SleepMs(10);
     }
 
+    smoothedDeltaValid = false;
     syncGrace.Set(DECODER_SYNC_GRACE_MS);
     syncLogPending.store(true, std::memory_order_relaxed);
 }
@@ -1389,21 +1236,150 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
            90;
 }
 
+auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
+    // EMA, alpha = 1/N (~N frames time constant).  Long enough to suppress ALSA
+    // clock-period aliasing (~30 ms steps), short enough to converge within 1 s.
+    if (!smoothedDeltaValid) {
+        smoothedDelta90k = rawDelta90k;
+        smoothedDeltaValid = true;
+        return;
+    }
+    smoothedDelta90k += (rawDelta90k - smoothedDelta90k) / DECODER_SYNC_EMA_SAMPLES;
+}
+
+auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, const cAudioProcessor *ap) -> void {
+    if (!(syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut())) {
+        return;
+    }
+    dsyslog("vaapivideo/decoder: sync d=%+lldms avg=%+lld.%01lldms buf=%zu aq=%zu miss=%d",
+            static_cast<long long>(rawDelta90k / 90), static_cast<long long>(smoothedDelta90k / 90),
+            std::abs(static_cast<long long>((smoothedDelta90k * 10 / 90) % 10)), jitterBuf.size(), ap->GetQueueSize(),
+            drainMissCount);
+    drainMissCount = 0;
+    nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
+}
+
+auto cVaapiDecoder::RunJitterPrimeSync(cAudioProcessor *ap) -> void {
+    // One-shot pre-drain alignment: bring the front of the jitter buffer to delta ~= 0
+    // before we start submitting frames, so the EMA starts from a clean state.
+    //   initDelta < 0  video is BEHIND audio: drop stale frames until front >= clock
+    //                  (if the deficit exceeds one buffer's worth, the buffer empties,
+    //                   underrun re-prime triggers, and the cycle repeats until aligned)
+    //   initDelta > 0  video is AHEAD: block until the audio clock catches up, then drop
+    //                  any frames the ~24 ms ALSA clock step overshot past
+    if (jitterBuf.empty()) {
+        return;
+    }
+    const int64_t fpts0 = jitterBuf.front()->pts;
+    const int64_t clock0 = ap->GetClock();
+    if (fpts0 == AV_NOPTS_VALUE || clock0 == AV_NOPTS_VALUE) {
+        return;
+    }
+    const int64_t latency = SyncLatency90k();
+    const int64_t initDelta = fpts0 - clock0 - latency;
+
+    if (initDelta < 0) {
+        int drops = 0;
+        while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
+            if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
+                break;
+            }
+            const int64_t clk = ap->GetClock();
+            if (clk == AV_NOPTS_VALUE || jitterBuf.front()->pts >= clk + latency) {
+                break;
+            }
+            jitterBuf.pop_front();
+            ++drops;
+        }
+        dsyslog("vaapivideo/decoder: prime-sync dropped %d frames (initDelta=%+lldms)", drops,
+                static_cast<long long>(initDelta / 90));
+    } else if (initDelta > 0) {
+        dsyslog("vaapivideo/decoder: prime-sync ahead d=%+lldms -- waiting for audio",
+                static_cast<long long>(initDelta / 90));
+        while (!stopping.load(std::memory_order_relaxed)) {
+            const int64_t clk = ap->GetClock();
+            if (clk == AV_NOPTS_VALUE || clk >= fpts0 - latency) {
+                break;
+            }
+            cCondWait::SleepMs(10);
+        }
+        int drops = 0;
+        while (jitterBuf.size() > 1 && !stopping.load(std::memory_order_relaxed)) {
+            if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
+                break;
+            }
+            const int64_t clk = ap->GetClock();
+            if (clk == AV_NOPTS_VALUE || jitterBuf.front()->pts - clk - latency >= 0) {
+                break;
+            }
+            jitterBuf.pop_front();
+            ++drops;
+        }
+        if (drops > 0) {
+            dsyslog("vaapivideo/decoder: prime-sync overshoot correction: dropped %d frames", drops);
+        }
+    }
+
+    smoothedDeltaValid = false;
+    syncGrace.Set(DECODER_SYNC_GRACE_MS);
+    nextSyncLog.Set(0);
+}
+
+auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
+    // Transient catch-up: drop jitter-buffer frames whose PTS is more than HARD_THRESHOLD
+    // (~200 ms) behind the audio clock at CPU speed.  Per-iteration draining via
+    // SyncAndSubmitFrame can only drop one such frame per loop turn, which is too slow
+    // to recover from a multi-frame stale burst (e.g. after a network gap).
+    while (jitterBuf.size() > 1 && !stopping.load(std::memory_order_relaxed)) {
+        if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
+            break;
+        }
+        const int64_t clock = ap->GetClock();
+        if (clock == AV_NOPTS_VALUE) {
+            break;
+        }
+        const int64_t frontDelta = jitterBuf.front()->pts - clock - SyncLatency90k();
+        if (frontDelta >= -DECODER_SYNC_HARD_THRESHOLD) {
+            break;
+        }
+        jitterBuf.pop_front();
+        ++correctDrops;
+    }
+}
+
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
     // -----------------------------------------------------------------------
     // A/V sync -- audio clock is master.  delta = vPTS - audioClock - latency
     //
-    //   Trick mode:
-    //     Pacing timer only; no A/V sync.
+    // Audio plays at the native rate; no resampler compensation.  Decisions use
+    // the EMA-smoothed delta, never the raw value: GetClock() is piecewise-
+    // constant between ALSA writes (~24-32 ms), so the raw delta carries +/-50 ms
+    // aliasing noise that is not real drift.
     //
-    //   Live (jitter buffer active):
-    //     delta >= -threshold  submit  (PI controller handles positive drift)
-    //     delta <  -threshold  drop    (video behind audio)
+    // Convergence strategy: drive the smoothed delta to a small dead band around
+    // zero by *scaled* corrections (sleep the excess) rather than threshold-edge
+    // corrections (sleep one frame).  A threshold-edge controller parks at the
+    // threshold; a scaled controller parks at the band.
     //
-    //   Replay:
-    //     |delta| <= threshold  submit  (VSync pacing)
-    //     delta  <  -threshold  drop    (video behind audio)
-    //     delta  >  +threshold  wait    (video ahead; hold until audio catches up)
+    //   Trick mode / freerun / no-clock / no-PTS: submit immediately (unchanged).
+    //   Grace after correction:                    submit (let the EMA settle).
+    //
+    //   Hard transient safety nets (raw delta, large excursion):
+    //     delta < -HARD              drop  (channel switch / network gap)
+    //     delta > +HARD (replay)     block until audio catches up
+    //
+    //   Steady state (smoothed EMA delta):
+    //     smoothed > +TARGET_BAND    sleep (smoothed - 0) capped at MAX_WAIT,
+    //                                then submit.  The wait pauses video for
+    //                                the excess so the audio clock catches up;
+    //                                source frames pile up in the jitter buffer
+    //                                naturally (~4 frames for an 80 ms shift).
+    //
+    //   No correction is applied on the behind side.  The audio clock derives
+    //   from the source PTS (endPts - ALSA delay), so it cannot run permanently
+    //   faster than the DVB stream -- any sustained negative delta is a real
+    //   transient that the HARD safety net handles.  Soft drops on the behind
+    //   side would only fire on EMA noise and would inject visible artifacts.
     //
     // Called exclusively from the decode thread (Action).
     // -----------------------------------------------------------------------
@@ -1415,7 +1391,6 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     const int64_t pts = frame->pts;
 
     // --- Trick mode: pacing timer, no A/V sync ---
-
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
         if (trickExitPending.exchange(false, std::memory_order_acquire)) {
             // Play() was called but TrickSpeed() did not follow -- leave trick mode.
@@ -1435,23 +1410,18 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     }
 
     // --- Freerun: no audio processor, no PTS, or first frame after Clear() ---
-
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
     if (!ap || pts == AV_NOPTS_VALUE) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
-
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // --- A/V sync ---
-
+    // --- Audio pipeline not yet running (no PCM written yet) ---
     const int64_t latency = SyncLatency90k();
     const int64_t clock = ap->GetClock();
-
-    // Audio pipeline not yet started (PCM and passthrough before first write).
     if (clock == AV_NOPTS_VALUE) {
         if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
             dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
@@ -1460,94 +1430,46 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    const int64_t delta = pts - clock - latency;
+    // --- Measure and smooth ---
+    const int64_t rawDelta = pts - clock - latency;
+    UpdateSmoothedDelta(rawDelta);
+    LogSyncStats(rawDelta, ap);
 
-    // --- Drift tracking (EMA, ~2 s time constant at 50 fps) ---
-    if (!smoothedDeltaValid) {
-        smoothedDelta90k = delta;
-        smoothedDeltaValid = true;
-    } else {
-        smoothedDelta90k += (delta - smoothedDelta90k) / 100; // alpha ~= 0.01
-    }
-
-    // --- PI drift compensation for PCM audio ---
-    //
-    // Published to the audio processor which applies swr_set_compensation() to micro-adjust
-    // the resampler output rate.  Units: samples per 10000 output samples.
-    //
-    // P-term (smoothedDelta90k/90): drives the current A/V offset toward zero.
-    //   Fast response (~10 s), but drops to zero when avg=0, letting drift resume.
-    //
-    // I-term (driftIntegral90k): accumulates the error to learn the steady-state
-    //   hardware drift rate.  When P has driven avg to 0, the I-term alone sustains the
-    //   exact compensation needed to keep it there.  Accumulates raw smoothedDelta90k to
-    //   avoid integer truncation (small deltas like 7200 / 10000 = 0 in integer math).
-    //   The /I_DIVISOR is applied only on the output.  Time constant ~5 s at 50 fps.
-    //   Clamped to prevent integral windup on transients.
-    //
-    // Together they form a PI controller: P handles convergence, I handles steady-state.
-    //
-    // Integral clamp: DVB source clocks can drift up to ~2% from HDMI/ALSA sinks;
-    // ±200 in comp units (2%) covers pathological SAT>IP setups.
-    constexpr int I_DIVISOR = 250;                             // I-term output divisor; ~5 s time constant at 50 fps
-    constexpr int64_t INTEGRAL_CLAMP = 200LL * 90 * I_DIVISOR; // ±200 comp equivalent
-    const int64_t newIntegral = std::clamp(driftIntegral90k + smoothedDelta90k, -INTEGRAL_CLAMP, INTEGRAL_CLAMP);
-    const int rawComp = static_cast<int>(-(smoothedDelta90k + newIntegral / I_DIVISOR) / 90);
-    // Anti-windup: accumulate the integral only when the output is not saturated.
-    // When saturated, back-calculate the integral to the value that produces exactly
-    // the clamped output.  Pure freeze (the previous approach) pins the integral at a
-    // deep value from transients that takes minutes to unwind, holding comp at ±200
-    // indefinitely and overflowing the audio queue.
-    if (rawComp > -200 && rawComp < 200) {
-        driftIntegral90k = newIntegral;
-    } else {
-        const auto clampedComp = static_cast<int64_t>(std::clamp(rawComp, -200, 200));
-        driftIntegral90k =
-            std::clamp((-clampedComp * 90 - smoothedDelta90k) * I_DIVISOR, -INTEGRAL_CLAMP, INTEGRAL_CLAMP);
-    }
-    const int comp = std::clamp(rawComp, -200, 200);
-    ap->SetDriftCompensation(comp);
-
-    if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
-        dsyslog("vaapivideo/decoder: sync d=%+lldms avg=%+lld.%01lldms comp=%d i=%+lld.%01lldms "
-                "buf=%zu aq=%zu fps=%.1f miss=%d",
-                static_cast<long long>(delta / 90), static_cast<long long>(smoothedDelta90k / 90),
-                std::abs(static_cast<long long>((smoothedDelta90k * 10 / 90) % 10)), comp,
-                static_cast<long long>(driftIntegral90k / I_DIVISOR / 90),
-                std::abs(static_cast<long long>((driftIntegral90k / I_DIVISOR * 10 / 90) % 10)), jitterBuf.size(),
-                ap->GetQueueSize(), drainFps, drainMissCount);
-        drainMissCount = 0;
-        nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
-    }
-
-    // Grace period: suppress corrections while the ALSA clock stabilizes.
+    // Grace: suppress all corrections while the EMA reseeds after a prior correction.
     if (!syncGrace.TimedOut()) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Hard drop: frame far behind audio (safety net for transients/channel switch).
-    if (delta < -DECODER_SYNC_THRESHOLD) {
+    // --- Hard transient drop: frame far behind audio (channel switch / gap) ---
+    if (rawDelta < -DECODER_SYNC_HARD_THRESHOLD) [[unlikely]] {
         ++correctDrops;
-        return true; // frame dropped
+        smoothedDeltaValid = false;
+        syncGrace.Set(DECODER_SYNC_GRACE_MS);
+        return true;
     }
-
-    // After a hard-drop run: reset the EMA to the current (post-correction) delta so the
-    // smoothed value doesn't carry a stale deficit that would trigger endless soft drops.
     if (correctDrops > 0) {
         dsyslog("vaapivideo/decoder: sync corrected %d dropped d=%+lldms", correctDrops,
-                static_cast<long long>(delta / 90));
+                static_cast<long long>(rawDelta / 90));
         correctDrops = 0;
-        smoothedDelta90k = delta; // re-seed EMA from post-correction position
-        driftIntegral90k = 0;     // reset: anti-windup value from transient ≠ drift
-        syncGrace.Set(DECODER_SYNC_GRACE_MS);
     }
 
-    // Ahead (replay only): hold the decode thread until audio catches up.
-    // Live ahead correction is handled by the jitter-buffer ahead gate in Action().
-    // Safe to block in replay: the file-reader pre-fills packet queues deep enough
-    // that audio never starves.
-    if (!liveMode.load(std::memory_order_relaxed) && delta > DECODER_SYNC_THRESHOLD) {
-        WaitForAudioCatchUp(ap, pts, latency, delta);
+    // --- Hard transient hold (replay only): video far ahead, e.g. post-seek ---
+    if (!liveMode.load(std::memory_order_relaxed) && rawDelta > DECODER_SYNC_HARD_THRESHOLD) [[unlikely]] {
+        WaitForAudioCatchUp(ap, pts, latency, rawDelta);
+        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    }
+
+    // --- Soft wait: video sustainably ahead -- sleep the excess to converge to 0 ---
+    // The wait length is the smoothed delta itself (cap at MAX_WAIT_MS), driving
+    // the smoothed value to ~0 in a single shot.  Reseed the EMA so the next
+    // sample re-anchors instantly (the 5 s EMA otherwise has too much inertia
+    // to recognize the post-wait state) and arm grace as a belt-and-braces.
+    if (smoothedDelta90k > DECODER_SYNC_TARGET_BAND) {
+        const auto excessMs = static_cast<int>(smoothedDelta90k / 90);
+        const int waitMs = std::min(excessMs, DECODER_SYNC_MAX_WAIT_MS);
+        cCondWait::SleepMs(waitMs);
+        smoothedDeltaValid = false;
+        syncGrace.Set(DECODER_SYNC_GRACE_MS);
     }
 
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);

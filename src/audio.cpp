@@ -165,9 +165,10 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
 [[nodiscard]] auto cAudioProcessor::GetClock() const noexcept -> int64_t {
     // Returns the PTS of the audio sample currently at the DAC output.
-    // Updated by WritePcmToAlsa() on every audio write (~24 ms for MP2) as:
+    // Updated by WritePcmToAlsa() on every audio write (one ALSA period, ~24-32 ms) as:
     //   playbackPts = endPts - snd_pcm_delay_90k
     // endPts tracks the DVB stream PTS; snd_pcm_delay provides the ALSA buffer depth.
+    // The value is piecewise-constant between writes (no interpolation).
     return playbackPts.load(std::memory_order_acquire);
 }
 
@@ -688,9 +689,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
         const unsigned outCh = alsaChannels > 0 ? alsaChannels : 2;
 
-        // (Re-)create swrCtx when format/channels change.  Always create one -- even for S16 input
-        // (identity conversion) -- so swr_set_compensation() can micro-adjust the playback rate to
-        // compensate for DAC-vs-DVB-PCR clock drift.
+        // (Re-)create swrCtx when format/channels change.
         const auto frameFmt = static_cast<AVSampleFormat>(frame->format);
         const int frameCh = frame->ch_layout.nb_channels;
 
@@ -723,17 +722,6 @@ auto cAudioProcessor::FlushDecoderState() -> void {
                     av_get_sample_fmt_name(frameFmt), frameCh, outCh);
         }
 
-        // Apply drift compensation: slightly speed up or slow down audio to track DVB PCR.
-        // driftCompensation is in samples per 10000 output samples (set by the decoder's sync loop).
-        // Calculate over one full second (sample_rate) rather than per-frame to prevent integer
-        // truncation of tiny adjustments (e.g. 50 ppm -> comp=5 -> 5*1152/10000=0 with per-frame math,
-        // but 5*48000/10000=24 with per-second math).  swresample applies the ratio continuously.
-        const int comp = driftCompensation.load(std::memory_order_relaxed);
-        if (comp != 0) {
-            const int compSamples = (comp * frame->sample_rate) / 10000;
-            swr_set_compensation(swrCtx, compSamples, frame->sample_rate);
-        }
-
         const uint8_t *pcmData = nullptr;
         size_t pcmSize = 0;
         std::vector<uint8_t> convertedBuffer;
@@ -762,13 +750,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             pcmData = convertedBuffer.data();
         }
 
-        // PTS tracking uses the ORIGINAL (pre-compensation) frame count so that endPts and
-        // pcmNextPts advance on the DVB timeline.  The compensated buffer (which may contain a
-        // few extra or fewer samples) is written to ALSA in full.  This creates an intentional
-        // mismatch: endPts advances at DVB rate while the ALSA buffer depth reflects the actual
-        // (compensated) sample count.  GetClock() = endPts - delay then naturally shifts,
-        // which is exactly the drift correction effect we need.
-        const auto originalFrames = static_cast<unsigned>(frame->nb_samples);
+        const auto sampleCount = static_cast<unsigned>(frame->nb_samples);
 
         // Skip ALSA write if Clear() ran since dequeue to prevent stale PTS from poisoning the clock.
         if (clearGeneration.load(std::memory_order_acquire) != myGeneration) [[unlikely]] {
@@ -777,7 +759,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         }
 
         const int64_t startPts90k = pcmNextPts;
-        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, originalFrames);
+        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, sampleCount);
         av_frame_unref(frame.get());
 
         if (!writeOk) {
@@ -787,8 +769,8 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
         // Advance pcmNextPts for multi-frame decode (next avcodec_receive_frame iteration).
         if (startPts90k != AV_NOPTS_VALUE && alsaSampleRate > 0U) {
-            const auto added90k = static_cast<int64_t>((static_cast<uint64_t>(originalFrames) * 90000ULL) /
-                                                       static_cast<uint64_t>(alsaSampleRate));
+            const auto added90k =
+                static_cast<int64_t>((static_cast<uint64_t>(sampleCount) * 90000ULL) / alsaSampleRate);
             pcmNextPts = startPts90k + added90k;
         }
     }

@@ -73,9 +73,6 @@ class cAudioProcessor : public cThread {
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding
     [[nodiscard]] auto GetClock() const noexcept
         -> int64_t; ///< Returns the PTS of the sample at the DAC output in 90 kHz ticks, or AV_NOPTS_VALUE
-    auto SetDriftCompensation(int comp) noexcept -> void {
-        driftCompensation.store(comp, std::memory_order_relaxed);
-    } ///< Drift correction: samples per 10000
     [[nodiscard]] auto Initialize(std::string_view alsaDevice)
         -> bool; ///< Opens the ALSA device and starts the processing thread; idempotent for the same device
     [[nodiscard]] auto IsInitialized() const noexcept
@@ -181,12 +178,9 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PCM CLOCK ===
     // ========================================================================
-    std::atomic<uint32_t> clearGeneration{0}; ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
-    int64_t pcmNextPts{AV_NOPTS_VALUE};       ///< DVB-anchored 90 kHz PTS for the next ALSA write (PCM & passthrough)
-    int64_t pcmQueueEndPts{AV_NOPTS_VALUE};   ///< 90 kHz PTS of the last sample written into the ALSA ring buffer
-    std::atomic<int> driftCompensation{0};    ///< Drift correction: samples to add per 10000 output samples;
-                                              ///<   positive slows audio (video behind), negative speeds it up;
-                                              ///<   written by decoder thread, read by audio thread
+    std::atomic<uint32_t> clearGeneration{0};         ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
+    int64_t pcmNextPts{AV_NOPTS_VALUE};               ///< DVB-anchored 90 kHz PTS for the next ALSA write
+    int64_t pcmQueueEndPts{AV_NOPTS_VALUE};           ///< 90 kHz PTS of the last sample written into the ALSA ring
     std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< DAC-output PTS (endPts minus ALSA delay) at each write
 
     // ========================================================================
