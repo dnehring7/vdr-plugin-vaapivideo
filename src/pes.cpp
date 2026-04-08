@@ -54,6 +54,7 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< First MPEG video stream
 
 [[nodiscard]] static inline auto ParseTimestamp(const uint8_t *bytes) noexcept -> int64_t {
     // Decode 33-bit PTS/DTS from 5 PES header bytes (ISO 13818-1 sec.2.4.3.7).
+    // Each of the 3 timestamp fragments ends with a marker bit that must be 1; reject corrupt timestamps early.
     if ((AV_RB8(bytes) & AV_RB8(bytes + 2) & AV_RB8(bytes + 4) & 0x01) == 0) [[unlikely]] {
         return AV_NOPTS_VALUE;
     }
@@ -83,7 +84,7 @@ struct CodecEvidence {
 // ============================================================================
 
 [[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
-    // Scan ES buffer for audio sync words, return first matching codec.
+    // Single-pass scan for audio sync words; first match wins (codecs have unambiguous sync patterns).
     if (data.size() < 4) [[unlikely]] {
         return AV_CODEC_ID_NONE;
     }
@@ -94,7 +95,8 @@ struct CodecEvidence {
     for (size_t i = 0; i + 4 <= size; ++i) {
         const uint16_t sync = AV_RB16(p + i);
 
-        // AAC ADTS (0xFFF, layer=00) tested before MP2 (0xFFE) -- stricter mask.
+        // AAC ADTS must be tested before MP2: both share 0xFFE prefix, but ADTS has layer=00 (0xFFF6==0xFFF0)
+        // which MP2's looser 0xFFE0 mask would also match.
         if ((sync & 0xFF00) == 0xFF00) [[unlikely]] {
             if ((sync & 0xFFF6) == 0xFFF0) [[unlikely]] {
                 return AV_CODEC_ID_AAC;
@@ -104,8 +106,9 @@ struct CodecEvidence {
             }
         }
 
-        // AAC-LATM / LOAS: 11-bit sync 0x2B7 + 13-bit audioMuxLengthBytes (ISO 14496-3).
-        // Require a second sync at the next frame boundary to reject false positives from random data.
+        // AAC-LATM / LOAS (ISO 14496-3): 11-bit sync 0x2B7 in upper bits of 0x56E0 mask.
+        // Unlike other codecs, LATM's short sync triggers false positives; require a second sync at the
+        // predicted next frame boundary (current + 3 header bytes + audioMuxLengthBytes).
         if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
             const auto frameLen = static_cast<uint16_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
             if (frameLen >= 2) {
@@ -134,8 +137,10 @@ struct CodecEvidence {
 }
 
 [[nodiscard]] auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
-    // Scan for Annex-B start codes, accumulate per-codec evidence, require 2+ distinct strong markers.
-    // HEVC: VPS/SPS/PPS + IDR/CRA. H.264: SPS + PPS + IDR (nal_ref_idc > 0). MPEG-2: sequence_header + extension/GOP.
+    // Multi-codec scan: accumulate per-codec evidence from Annex-B NAL units until one codec reaches threshold.
+    // Thresholds: HEVC: VPS (unique) or 2+ param sets. H.264: 2+ of SPS/PPS/IDR. MPEG-2: sequence_header + ext/GOP.
+    // Key challenge: MPEG-2 start codes (0xB3/0xB5/0xB8) alias as valid H.264/HEVC NAL headers; confirmed
+    // MPEG-2 therefore invalidates H.264/HEVC evidence.
     const size_t size = data.size();
     if (size < 6) [[unlikely]] {
         return AV_CODEC_ID_NONE;
@@ -187,8 +192,9 @@ struct CodecEvidence {
 
         const uint8_t b0 = p[nalPos];
 
-        // MPEG-2 start codes have bit 7 set (forbidden in H.264/HEVC NAL headers) -- evidence is definitive.
-        // sequence_header(0xB3)=0x01, extension(0xB5)=0x02, GOP(0xB8)=0x04.
+        // MPEG-2 start codes 0xB3/0xB5/0xB8 are unambiguous: b0 >= 0x80 means forbidden_zero_bit==1 which is
+        // illegal for both H.264 and HEVC, so these cannot be NAL headers from either codec.
+        // Evidence bits: sequence_header(0xB3)=0x01, extension(0xB5)=0x02, GOP(0xB8)=0x04.
         if (b0 == 0xB3 || b0 == 0xB5 || b0 == 0xB8) {
             uint8_t bit = 0x04;
             if (b0 == 0xB3) {
@@ -202,8 +208,9 @@ struct CodecEvidence {
             }
         }
 
-        // HEVC: forbidden_zero_bit(1) nal_unit_type(6) nuh_layer_id_msb(1) | [byte1]. Require nuh_layer_id==0 for param
-        // sets (rejects H.264 slice aliases like 0x41->VPS(32), 0x42->SPS(33), 0x44->PPS(34)).
+        // HEVC NAL header: forbidden_zero_bit(1) nal_unit_type(6) nuh_layer_id_msb(1) | [byte1].
+        // Require nuh_layer_id==0 for VPS/SPS/PPS: rejects H.264 slice NALs that alias as HEVC param sets
+        // (e.g. H.264 nal_unit_type=1 with nal_ref_idc=2 -> byte 0x41 -> HEVC type 32 = VPS).
         if (nalPos + 1 < size && (b0 & 0x80) == 0) {
             const uint8_t b1 = p[nalPos + 1];
             const uint8_t temporalIdPlus1 = b1 & 0x07;
@@ -216,8 +223,8 @@ struct CodecEvidence {
                 if (hevcType >= 32 && hevcType <= 34 && layerIdZero) {
                     bit = static_cast<uint8_t>(1U << (hevcType - 32)); // VPS=0x01, SPS=0x02, PPS=0x04
                 } else if (hevcType >= 19 && hevcType <= 21 && layerIdZero) {
-                    // IDR/CRA: secondary, only after param set seen. Require layerIdZero to reject H.264 aliases
-                    // (0x27->type19, 0x28->type20).
+                    // IDR_W_RADL(19)/IDR_N_LP(20)/CRA(21): only count after a param set is seen to avoid
+                    // premature confirmation from H.264 aliases (H.264 0x27->type 19, 0x28->type 20).
                     if ((hevc.seenMask & kHevcParamMask) != 0) {
                         bit = 0x08;
                     }
@@ -229,8 +236,9 @@ struct CodecEvidence {
             }
         }
 
-        // H.264: forbidden_zero_bit(1) nal_ref_idc(2) nal_unit_type(5). Require nal_ref_idc > 0 for SPS/PPS/IDR (spec
-        // sec.7.4.1 mandates this; eliminates MPEG-2 slice codes 0x01-0x1F which have nal_ref_idc==0).
+        // H.264 NAL header: forbidden_zero_bit(1) nal_ref_idc(2) nal_unit_type(5).
+        // nal_ref_idc > 0 is mandatory for SPS(7)/PPS(8)/IDR(5) per H.264 sec.7.4.1 and conveniently
+        // eliminates MPEG-2 start codes 0x01-0x1F which would decode as nal_ref_idc==0.
         if ((b0 & 0x80) == 0 && (b0 & 0x60) != 0) {
             const uint8_t avcType = b0 & 0x1F;
             uint8_t bit = 0;
@@ -259,7 +267,8 @@ struct CodecEvidence {
     const bool avcOk = std::popcount(avc.seenMask) >= 2;
     const bool mpegOk = ((mpeg2.seenMask & 0x01) != 0) && ((mpeg2.seenMask & 0x06) != 0);
 
-    // Confirmed MPEG-2 invalidates H.264/HEVC evidence (start codes alias as NAL headers).
+    // MPEG-2 confirmation voids H.264/HEVC: its start codes (0xB3/0xB5/0xB8) are valid NAL byte patterns
+    // that inflate H.264/HEVC evidence counts with phantom hits.
     const bool hevcFinal = hevcOk && !mpegOk;
     const bool avcFinal = avcOk && !mpegOk;
 
@@ -352,13 +361,15 @@ struct CodecEvidence {
         }
     }
 
-    // PES_packet_length (bytes 4-5): 0 = unspecified (common for video).
+    // PES_packet_length (bytes 4-5): 0 means unbounded (ISO 13818-1 permits this only for video streams
+    // carried in Transport Stream packets; VDR always passes complete PES packets, so 0 is safe to treat as "use all
+    // remaining data").
     size_t payloadLen = size - headerSize;
     const uint16_t pesLen = AV_RB16(p + 4);
 
     if (pesLen > 0) {
         const auto declared = static_cast<size_t>(pesLen);
-        // declared counts from byte 6 onward; absolute end = declared + 6.
+        // PES_packet_length counts from byte 6 (after start_code_prefix + stream_id + length field itself).
         if (declared + 6 > headerSize) {
             payloadLen = std::min(declared + 6 - headerSize, payloadLen);
         } else {

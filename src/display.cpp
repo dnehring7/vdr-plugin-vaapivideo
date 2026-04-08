@@ -54,8 +54,8 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< Maximum wait for a DRM page-flip event (ms)
-constexpr int MAX_DRAIN_ITERATIONS = 10;         ///< Maximum DRM event drain passes during shutdown
+constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblank periods at 50 Hz; enough for one retry
+constexpr int MAX_DRAIN_ITERATIONS = 10;         ///< Cap on post-shutdown DRM event drain passes
 
 // ============================================================================
 // === HELPER FUNCTIONS ===
@@ -138,9 +138,10 @@ cVaapiDisplay::DrmFramebuffer::DrmFramebuffer(DrmFramebuffer &&other) noexcept
 
 cVaapiDisplay::DrmFramebuffer::~DrmFramebuffer() noexcept {
     // Release in reverse-acquisition order:
-    // 1. AVFrame -- drops the libva surface reference (and closes the DMA-BUF fd).
-    // 2. KMS FB -- the KMS driver stops scanning out and drops its DMA-BUF reference.
-    // 3. GEM handle -- the imported buffer object is finally freed by the DRM driver.
+    // 1. AVFrame -> drops the libva surface reference (closes the DMA-BUF fd).
+    // 2. KMS FB -> the CRTC stops scanning out and drops its DMA-BUF reference.
+    // 3. GEM handle -> the imported buffer object is freed by the DRM driver.
+    // Any other order may cause a use-after-free in the kernel (KMS still scanning a freed surface).
     if (frame) {
         av_frame_free(&frame);
     }
@@ -185,8 +186,7 @@ auto cVaapiDisplay::DrmFramebuffer::operator=(DrmFramebuffer &&other) noexcept -
 // ============================================================================
 
 cVaapiDisplay::cVaapiDisplay()
-    // Register only the page-flip handler; vblank and sequence events are not used, so those slots are left null to
-    // avoid spurious callbacks.
+    // Only the page_flip_handler is needed; vblank/sequence callbacks left null to avoid spurious calls.
     : eventContext{.version = DRM_EVENT_CONTEXT_VERSION,
                    .vblank_handler = nullptr,
                    .page_flip_handler = OnPageFlipEvent,
@@ -197,8 +197,7 @@ cVaapiDisplay::cVaapiDisplay()
 
 cVaapiDisplay::~cVaapiDisplay() noexcept {
     dsyslog("vaapivideo/display: destroying (isReady=%d)", isReady.load(std::memory_order_relaxed));
-    // Shutdown() must run before the mode blob is destroyed: the display thread may still be committing frames that
-    // reference modesetProps.
+    // Shutdown() must complete before the mode blob is destroyed: the display thread's commits reference modesetProps.
     Shutdown();
 
     if (hwDeviceRef) {
@@ -350,8 +349,8 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
         dsyslog("vaapivideo/display: OSD hide - fbId=%u", currentOsd.fbId);
     }
 
-    // Always mark dirty even for identical geometry: the OSD may have written new pixels into the same dumb buffer,
-    // and the kernel needs a commit to invalidate FBC/PSR tile caches.
+    // Always mark dirty even for identical geometry: the OSD may have redrawn pixels into the same dumb buffer,
+    // and the kernel needs a commit to invalidate FBC (Framebuffer Compression) and PSR tile caches.
     currentOsd = osd;
     osdDirty = true;
 }
@@ -365,13 +364,13 @@ auto cVaapiDisplay::Shutdown() -> void {
         return;
     }
 
-    // isClearing must be set before isStopping: it prevents new frame imports while isStopping tells the run loop to
-    // exit.
+    // isClearing must be set before isStopping: it prevents new frame imports while isStopping tells the run loop
+    // to exit. Reversing the order allows a race where a frame import starts between isStopping and isClearing.
     isClearing.store(true, std::memory_order_release);
     isStopping.store(true, std::memory_order_release);
 
-    // Force-clear isFlipPending in case the CRTC has been disabled and the page-flip event will never arrive, which
-    // would stall the thread.
+    // Force-clear isFlipPending: if the CRTC was disabled externally or the display disconnected, the
+    // page-flip event will never arrive, permanently stalling the thread.
     isFlipPending.store(false, std::memory_order_release);
 
     frameSlotCond.Broadcast();
@@ -444,8 +443,7 @@ auto cVaapiDisplay::Shutdown() -> void {
             return false;
         }
 
-        // Clamp "infinite" to 1 second chunks so we still check isClearing regularly instead of sleeping indefinitely
-        // in TimedWait().
+        // Clamp "infinite" wait to 1 s chunks so isClearing checks don't sleep past a stream switch.
         const int waitMs = (timeoutMs < 0) ? 1000 : timeoutMs;
         const cTimeMs deadline(waitMs);
         while (pendingFrame && isReady.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
@@ -526,8 +524,8 @@ auto cVaapiDisplay::Action() -> void {
             }
         }
 
-        // Re-submit the last buffer to maintain the flip cadence and commit any pending OSD changes that would
-        // otherwise stall until the next video frame.
+        // Re-submit the last buffer when no new frame arrived: maintains the page-flip cadence (vsync pacing)
+        // and commits any pending OSD geometry changes that would otherwise stall until the next video frame.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
@@ -561,8 +559,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return;
     }
 
-    // Clip the OSD rectangle to the screen boundary. This is mandatory: the KMS driver rejects any atomic commit where
-    // the destination rectangle (CRTC_X + CRTC_W) exceeds the CRTC dimensions.
+    // KMS rejects commits where CRTC_X + CRTC_W exceeds CRTC dimensions; clip proactively.
     const auto clippedW = std::min(osd.width, outputWidth - static_cast<uint32_t>(osd.x));
     const auto clippedH = std::min(osd.height, outputHeight - static_cast<uint32_t>(osd.y));
 
@@ -574,7 +571,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(osdPlaneId, osdProps.fbId, osd.fbId);
     req.AddProperty(osdPlaneId, osdProps.srcX, 0);
     req.AddProperty(osdPlaneId, osdProps.srcY, 0);
-    // SRC_* use 16.16 fixed-point (value = pixels << 16).
+    // SRC_* properties use 16.16 fixed-point (value = pixels << 16).
     req.AddProperty(osdPlaneId, osdProps.srcW, static_cast<uint64_t>(clippedW) << 16);
     req.AddProperty(osdPlaneId, osdProps.srcH, static_cast<uint64_t>(clippedH) << 16);
     req.AddProperty(osdPlaneId, osdProps.crtcX, static_cast<uint64_t>(osd.x));
@@ -582,12 +579,12 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(osdPlaneId, osdProps.crtcW, clippedW);
     req.AddProperty(osdPlaneId, osdProps.crtcH, clippedH);
 
-    // VDR's tColor is straight (non-pre-multiplied) ARGB, so request "Coverage" blending (value 1) rather than
-    // "Pre-multiplied".
+    // VDR's tColor is straight (non-premultiplied) ARGB; request "Coverage" blending (enum value 1)
+    // rather than "Pre-multiplied" (0) to avoid incorrect alpha compositing.
     if (osdProps.pixelBlendMode != 0) {
         req.AddProperty(osdPlaneId, osdProps.pixelBlendMode, 1);
     }
-    // zpos is intentionally omitted: it is immutable on Intel i915 overlay planes.
+    // zpos is intentionally omitted: it is immutable on Intel i915 overlay planes (set by the driver at bind time).
 }
 
 [[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool {
@@ -595,7 +592,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true;
     }
 
-    // Non-blocking page-flip with event notification. ASYNC not used: requires linear modifiers (VAAPI is tiled).
+    // Non-blocking page-flip with event notification.
+    // DRM_MODE_ATOMIC_ASYNC is not used: it requires linear (untiled) modifiers, but VAAPI surfaces are tiled.
     uint32_t commitFlags = flags;
     if ((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
         commitFlags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
@@ -609,7 +607,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true;
     }
 
-    // EBUSY means the CRTC is still processing the previous flip; the caller will retry on the next iteration.
+    // EBUSY: the CRTC is still processing the previous flip; the caller retries next iteration.
     if (errno != EBUSY) {
         esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", strerror(errno), commitFlags);
     }
@@ -618,7 +616,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
 [[nodiscard]] auto cVaapiDisplay::ApplyDisplayMode(const drmModeModeInfo &mode) -> bool {
     dsyslog("vaapivideo/display: setting display mode %ux%u@%uHz", mode.hdisplay, mode.vdisplay, mode.vrefresh);
-    // Mode is passed as a property blob; destroy the old one to avoid leaking kernel resources.
+    // Mode is passed as a KMS property blob; destroy the old one to avoid leaking kernel-side resources.
     if (modeBlobId != 0) {
         drmModeDestroyPropertyBlob(drmFd, modeBlobId);
         modeBlobId = 0;
@@ -644,7 +642,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::BindDrmPlane(int planeIndex, uint32_t format) -> bool {
-    // Find the planeIndex'th plane that supports the given format. Uses the IN_FORMATS blob for modifier awareness.
+    // Find the planeIndex'th plane supporting the given fourcc format. Uses the IN_FORMATS blob
+    // which includes modifier info (tiling layout) -- necessary for VAAPI's tiled NV12 surfaces.
     auto planeRes = std::unique_ptr<drmModePlaneRes, decltype(&drmModeFreePlaneResources)>(
         drmModeGetPlaneResources(drmFd), drmModeFreePlaneResources);
     auto res =
@@ -654,7 +653,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return false;
     }
 
-    // possible_crtcs is a bitmask by index, not by CRTC object ID.
+    // possible_crtcs is a bitmask indexed by CRTC position in the resources array, not by CRTC object ID.
     int crtcIndex = -1;
     for (int i = 0; i < res->count_crtcs; ++i) {
         if (res->crtcs[i] == crtcId) {
@@ -823,7 +822,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::DrainDrmEvents(int timeoutMs) -> bool {
-    // No mutex needed: called only from the display thread.
+    // Thread-safety: called only from the display thread (single consumer).
     pollfd pfd{.fd = drmFd, .events = POLLIN, .revents = 0};
     const int ret = poll(&pfd, 1, timeoutMs);
 
@@ -834,11 +833,12 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
-    // Mandatory since kernel 4.8/4.2; the ioctl still requires them to be explicitly enabled.
+    // Universal planes (kernel 4.2+) and atomic modesetting (4.8+) must be opted into per-client.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1);
 
-    // Probing this capability (kernel 6.8+) serves as a minimum kernel version check.
+    // DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP (kernel 6.8+) doubles as our minimum kernel version check;
+    // we don't use async flips but need the atomic infrastructure that came with it.
     uint64_t asyncCap = 0;
     if (drmGetCap(drmFd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &asyncCap) != 0 || asyncCap == 0) {
         esyslog("vaapivideo/display: kernel 6.8+ required (atomic async page-flip capability missing)");
@@ -900,18 +900,17 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     }
 
     mappedFrame->format = AV_PIX_FMT_DRM_PRIME;
-    // AV_HWFRAME_MAP_READ -- we need read access to the surface data. AV_HWFRAME_MAP_DIRECT -- request a zero-copy map
-    // (the DRM fd points directly into the VA surface, no intermediate copy).
-    // vaDriverMutex serializes this vaSyncSurface call against the decode thread's VPP filter graph execution;
-    // the iHD driver's VEBOX path crashes when both run concurrently on the same VADisplay.
+    // AV_HWFRAME_MAP_READ: read access to the surface data required for KMS scanout.
+    // AV_HWFRAME_MAP_DIRECT: zero-copy map -- the DRM PRIME fd points directly into the VA surface.
+    // vaDriverMutex: the iHD driver's VEBOX path is not thread-safe when VPP filter graph execution
+    // runs concurrently on the same VADisplay from the decode thread.
     int ret = 0;
     {
         const cMutexLock vaLock(&vaDriverMutex);
         ret = av_hwframe_map(mappedFrame, srcFrame, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
     }
     if (ret < 0) [[unlikely]] {
-        // EIO is normal when av_hwframe_map() is called while the codec is being destroyed; the surface is already gone
-        // from the VA driver.
+        // AVERROR(EIO) is expected when the codec is being destroyed -- the VA surface is already gone.
         if (ret != AVERROR(EIO) && !isClearing.load(std::memory_order_relaxed)) {
             dsyslog("vaapivideo/display: av_hwframe_map failed: %s", AvErr(ret).data());
         }
@@ -922,7 +921,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     const auto *desc =
         reinterpret_cast<const AVDRMFrameDescriptor *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             mappedFrame->data[0]);
-    // Only single-object NV12 surfaces supported (one DMA-BUF fd, two planes at different offsets).
+    // Single-object NV12: one DMA-BUF fd backing two planes (Y + interleaved UV) at different offsets.
     if (!desc || desc->nb_objects == 0 || desc->nb_layers == 0 || desc->nb_objects != 1) [[unlikely]] {
         av_frame_free(&mappedFrame);
         return {};
@@ -990,7 +989,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     fb.width = width;
     fb.height = height;
     fb.modifier = modifiers[0];
-    // Move AVFrame into the DrmFramebuffer to keep the VAAPI surface alive while KMS scans out the DMA-BUF.
+    // Transfer the AVFrame into DrmFramebuffer to keep the VAAPI surface reference alive while
+    // KMS scans out the DMA-BUF. Without this, the VA driver may recycle the surface.
     fb.frame = vaapiFrame->avFrame;
     vaapiFrame->avFrame = nullptr;
     vaapiFrame->ownsFrame = false;
@@ -1016,15 +1016,16 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         return false;
     }
 
-    // Filter graph already scaled to display-fitted dimensions (DAR-preserving letterbox/pillarbox).
-    // Center the frame on screen; DRM presents at 1:1 pixel mapping.
+    // Center the frame on screen (letterbox/pillarbox). The filter graph already scaled to display-fitted
+    // dimensions preserving DAR; DRM scans out at 1:1 pixel mapping (no hardware scaler).
     const uint32_t destX = (fb.width < outputWidth) ? (outputWidth - fb.width) / 2 : 0;
     const uint32_t destY = (fb.height < outputHeight) ? (outputHeight - fb.height) / 2 : 0;
 
     AtomicRequest req;
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
     req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
-    // Explicitly set BT.709 limited-range to match scale_vaapi output; driver default may mismatch.
+    // BT.709 limited-range must be set explicitly: some drivers default to full-range or BT.601,
+    // which would cause washed-out colors or green tint on NV12 surfaces from the scale_vaapi filter.
     if (videoProps.colorEncodingValid) {
         req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt709);
     }
@@ -1040,8 +1041,8 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     req.AddProperty(videoPlaneId, videoProps.crtcW, fb.width);
     req.AddProperty(videoPlaneId, videoProps.crtcH, fb.height);
 
-    // Bundle any pending OSD change into the same atomic commit as the video flip so both planes switch on the exact
-    // same vblank.
+    // Bundle any pending OSD change atomically with the video flip so both planes switch
+    // on the exact same vblank -- prevents OSD flicker or tearing across plane boundaries.
     bool osdCommitted = false;
     {
         const cMutexLock lock(&osdMutex);

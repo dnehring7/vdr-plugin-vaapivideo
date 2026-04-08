@@ -83,9 +83,6 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Returns true if the packet queue has reached AUDIO_QUEUE_CAPACITY
     [[nodiscard]] auto GetQueueSize() const
         -> size_t; ///< Returns the current number of packets in the audio decode queue
-    [[nodiscard]] auto GetPacketDurationMs() const
-        -> int; ///< Returns the duration of one audio packet in ms (codec-dependent, 0 if unknown)
-    auto DropPackets(int count) -> int; ///< Discard up to count oldest packets; returns the number actually dropped
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper: configures codec, sample rate, and channel count in one call
     auto SetVolume(int vol) -> void; ///< Sets PCM playback volume in the range 0 (mute) to 255 (full scale)

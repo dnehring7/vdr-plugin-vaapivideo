@@ -7,11 +7,7 @@
 
 #include "config.h"
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wvariadic-macros"
-#include <vdr/tools.h>
-#pragma GCC diagnostic pop
-
+// C++ Standard Library
 #include <atomic>
 #include <charconv>
 #include <cstdint>
@@ -19,6 +15,12 @@
 #include <format>
 #include <string>
 #include <system_error>
+
+// VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/tools.h>
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // === CONSTANTS ===
@@ -124,7 +126,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return false;
     }
 
-    // Key must match SetupStore() in the plugin class (round-tripped via setup.conf).
+    // Key must match the string passed to SetupStore() in vaapivideo.cpp; VDR persists these in setup.conf.
     if (std::string_view{name} == "AudioLatency") {
         int parsed{};
         const auto *end = value + std::strlen(value);
@@ -146,10 +148,10 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return true;
     }
 
-    return false; // unknown key
+    return false; // Unknown key: VDR will offer it to other plugins.
 }
 
 // ----------------------------------------------------------------------------
 
-// Singleton storage; declared extern in config.h.
+// Singleton; written once during plugin init, then effectively read-only. Declared extern in config.h.
 VaapiConfig vaapiConfig;

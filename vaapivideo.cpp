@@ -50,82 +50,12 @@ extern "C" {
 #include <vdr/channels.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
-#include <vdr/keys.h>
 #include <vdr/menuitems.h>
-#include <vdr/osdbase.h>
 #include <vdr/plugin.h>
-#include <vdr/skins.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
-// ============================================================================
-// === cMenuVaapiStatus ===
-// ============================================================================
-
 namespace {
-
-/// Read-only status page shown when the user picks "VAAPI Video" from VDR's
-/// main menu. All items are rebuilt on demand; the Red key forces a live
-/// refresh.
-class cMenuVaapiStatus : public cOsdMenu {
-  public:
-    explicit cMenuVaapiStatus(cVaapiDevice *dev) : cOsdMenu(tr("VAAPI Video Status")), device(dev) {
-        SetMenuCategory(mcPlugin);
-        Refresh();
-    }
-
-    auto ProcessKey(eKeys key) -> eOSState override {
-        // Let the base class handle navigation first (scrolling, focus, etc.). osUnknown means the base class did not
-        // consume the key, so we handle it.
-        const eOSState baseResult = cOsdMenu::ProcessKey(key);
-        if (baseResult == osUnknown) {
-            switch (key) {
-                case kOk:
-                case kBack:
-                    return osEnd; // closes the OSD and returns to the caller
-                case kRed:
-                    Refresh();         // re-query the device and repaint
-                    return osContinue; // stay in this menu
-                default:
-                    break;
-            }
-        }
-        return baseResult;
-    }
-
-  private:
-    /// Rebuilds all menu items from the current device state and redraws the
-    /// OSD.
-    auto Refresh() -> void {
-        Clear();
-
-        if (device && device->IsReady()) {
-            int width = 0;
-            int height = 0;
-            double aspect = 1.0;
-            device->GetOsdSize(width, height, aspect);
-
-            Add(new cOsdItem(cString::sprintf("%s: %s", tr("Status"), tr("Active")), osUnknown, false));
-            Add(new cOsdItem(cString::sprintf("%s: %s", tr("Device"), *device->DeviceType()), osUnknown, false));
-            Add(new cOsdItem(
-                cString::sprintf("%s: %s", tr("Decoder"), device->HasDecoder() ? tr("Ready") : tr("Not Ready")),
-                osUnknown, false));
-            Add(new cOsdItem("", osUnknown, false));
-            Add(new cOsdItem(cString::sprintf("%s: %dx%d", tr("Display Resolution"), width, height), osUnknown, false));
-            // Read configured rate; actual DRM mode rate is not exposed through cDevice.
-            Add(new cOsdItem(cString::sprintf("%s: %u Hz", tr("Refresh Rate"), vaapiConfig.display.GetRefreshRate()),
-                             osUnknown, false));
-        } else {
-            Add(new cOsdItem(cString::sprintf("%s: %s", tr("Status"), tr("Inactive")), osUnknown, false));
-        }
-        Add(new cOsdItem("", osUnknown, false));
-        Add(new cOsdItem(tr("Red: Refresh | OK/Back: Close"), osUnknown, false));
-        Display();
-    }
-
-    cVaapiDevice *device; ///< Non-owning; the device is owned and destroyed by
-                          ///< VDR's cDevice registry.
-};
 
 // ============================================================================
 // === cMenuSetupVaapi ===
@@ -171,8 +101,6 @@ class cVaapiVideoPlugin : public cPlugin {
     [[nodiscard]] auto Description() -> const char * override { return PLUGIN_DESCRIPTION; }
     auto Housekeeping() -> void override;
     [[nodiscard]] auto Initialize() -> bool override;
-    [[nodiscard]] auto MainMenuAction() -> cOsdObject * override;
-    [[nodiscard]] auto MainMenuEntry() -> const char * override;
     [[nodiscard]] auto ProcessArgs(int argc, char *argv[]) -> bool override;
     [[nodiscard]] auto Service(const char *serviceId, void *data = nullptr) -> bool override;
     [[nodiscard]] auto SetupMenu() -> cMenuSetupPage * override;
@@ -219,8 +147,8 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
         return drmPath;
     }
 
-    // No device specified on the command line -- probe in order of likelihood. /dev/dri/card0 covers the vast majority
-    // of single-GPU setups; only fall back to full libdrm enumeration when that node is absent or inaccessible.
+    // No device specified -- try /dev/dri/card0 first (covers the vast majority of single-GPU setups),
+    // then fall back to full libdrm enumeration when that node is absent or inaccessible.
     if (access("/dev/dri/card0", R_OK | W_OK) == 0) {
         isyslog("vaapivideo: auto-detected /dev/dri/card0 (primary GPU)");
         return "/dev/dri/card0";
@@ -254,7 +182,7 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
 // ============================================================================
 
 auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
-    // Static storage: VDR keeps a pointer to the returned string for the lifetime of the process.
+    // Static storage: VDR keeps a pointer to the returned string for the process lifetime.
     static const std::string kHelp =
         std::format("  -d DEV, --drm=DEV           Use DRM device DEV "
                     "(default: auto-detect)\n"
@@ -269,14 +197,12 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
 auto cVaapiVideoPlugin::Housekeeping() -> void {}
 
 auto cVaapiVideoPlugin::Initialize() -> bool {
-    // PPS/SPS parse errors during initial stream acquisition are normal and fill the log with noise; only fatal FFmpeg
-    // errors are worth surfacing.
+    // FFmpeg's PPS/SPS parse errors during initial stream acquisition flood the log; only fatal errors matter here.
     av_log_set_level(AV_LOG_FATAL);
 
-    // Device creation must happen in Initialize(), not Start(), because VDR's startup sequence is: all Initialize() ->
-    // set primary device -> all Start(). Skin plugins (e.g. skinflatplus) call cOsdProvider::SupportsTrueColor() in
-    // their Start(). The OSD provider is created when VDR calls MakePrimaryDevice() on this device. If the device
-    // doesn't exist until Start(), VDR cannot set it as primary before skins start, causing "no OSD provider" errors.
+    // Device must be created in Initialize(), not Start(): VDR's startup is all Initialize() -> set primary device ->
+    // all Start(). Skin plugins call cOsdProvider::SupportsTrueColor() in their Start(), which requires our OSD
+    // provider (installed via MakePrimaryDevice()). Deferring to Start() would miss the primary device window.
 
     const cString resolvedDrm = ResolveDrmDevice();
     if (isempty(*resolvedDrm)) {
@@ -285,9 +211,8 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
     isyslog("vaapivideo: using audio device: %s", *audioDevice);
 
-    // cVaapiDevice self-registers with VDR's internal device list in its constructor. Ownership transfers to VDR
-    // immediately; cDevice::Shutdown() (called from main() after all plugin Stop() calls) will delete it. Never delete
-    // vaapiDevice here.
+    // cVaapiDevice self-registers with VDR's device list in its cDevice constructor; ownership transfers to VDR
+    // immediately and cDevice::Shutdown() (called from main()) will delete it. Never delete vaapiDevice manually.
     dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s)", *resolvedDrm, *audioDevice);
     vaapiDevice = new cVaapiDevice();
 
@@ -306,13 +231,6 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
     return true;
 }
 
-auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * { return new cMenuVaapiStatus(vaapiDevice); }
-
-auto cVaapiVideoPlugin::MainMenuEntry() -> const char * {
-    // Hide the entry until the decoder is up; returning nullptr removes it from VDR's main menu
-    return (vaapiDevice && vaapiDevice->HasDecoder()) ? tr("VAAPI Video") : nullptr;
-}
-
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
     // NOLINTNEXTLINE(misc-include-cleaner)
     static constexpr std::array<option, 4> kLongOptions = {
@@ -321,7 +239,7 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
          {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
-    optind = 1; // reset global getopt state; VDR may call ProcessArgs() more than once // NOLINT(misc-include-cleaner)
+    optind = 1; // Reset global getopt state; VDR may call ProcessArgs() more than once. // NOLINT(misc-include-cleaner)
     int opt{};
     // NOLINTNEXTLINE(misc-include-cleaner)
     while ((opt = getopt_long(argc, argv, "d:a:r:", kLongOptions.data(), nullptr)) != -1) {
@@ -364,13 +282,12 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
 
 // Inter-plugin service API.
 //
-// Supported service IDs and their `data` contract:
-//   "VaapiVideo-Available-v1.0"  -- data: bool*    -- set to true if a hardware decoder is ready
-//   "VaapiVideo-IsReady-v1.0"    -- data: bool*    -- set to true if the device is fully initialized
-//   "VaapiVideo-DeviceType-v1.0" -- data: cString* -- filled with the human-readable device type
+// Service IDs and data contracts:
+//   "VaapiVideo-Available-v1.0"  -- bool*    -- true if hardware decoder is ready
+//   "VaapiVideo-IsReady-v1.0"    -- bool*    -- true if device is fully initialized
+//   "VaapiVideo-DeviceType-v1.0" -- cString* -- human-readable device type string
 //
-// Passing data == nullptr is valid and acts as a pure capability probe ("does this ID exist?"). Returns true for known
-// IDs (whether or not data was written), false for unknown ones.
+// data==nullptr is a pure capability probe ("does this service exist?").
 auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
     if (serviceId == nullptr) {
         return false;
@@ -414,16 +331,15 @@ auto cVaapiVideoPlugin::Start() -> bool {
         return false;
     }
 
-    // By this point VDR has already processed setup.conf and called MakePrimaryDevice() on whichever device matched the
-    // stored primary device number. If our device was selected, the OSD provider is already installed. The code below
-    // is a safety net for first-run or misconfigured setups where VDR did not pick our device.
+    // By this point VDR has processed setup.conf and called MakePrimaryDevice() on the stored primary device.
+    // The fallback below handles first-run or misconfigured setups where VDR did not select our device.
     if (!vaapiDevice->IsPrimaryDevice()) {
         const int primaryIndex = vaapiDevice->DeviceNumber() + 1;
         if (cDevice::SetPrimaryDevice(primaryIndex)) {
             isyslog("vaapivideo: set as primary device %d", primaryIndex);
         } else {
-            // SetPrimaryDevice() can fail if called too early in the VDR startup sequence; SetPrimary() is
-            // the direct instance-level fallback.
+            // SetPrimaryDevice() can fail if called too early in VDR's startup; SetPrimary() is the
+            // direct instance-level fallback that bypasses the global device-index lookup.
             esyslog("vaapivideo: SetPrimaryDevice(%d) failed, falling back to "
                     "SetPrimary",
                     primaryIndex);
@@ -441,18 +357,17 @@ auto cVaapiVideoPlugin::Start() -> bool {
 }
 
 auto cVaapiVideoPlugin::Stop() -> void {
-    // Do not delete vaapiDevice here. VDR's device registry owns the object; cDevice::Shutdown() (called from main()
-    // after all plugin Stop() invocations) will destroy it. Deleting it here would cause a double-free when VDR later
-    // iterates its internal device list.
+    // Do not delete vaapiDevice: VDR's device registry owns it; cDevice::Shutdown() (called from main() after all
+    // Stop() invocations) destroys it. Deleting here would cause a double-free.
 
     if (vaapiDevice) {
-        // The OSD provider holds a raw pointer to the DRM display. Detaching it before VDR tears down the device
-        // prevents a dangling-pointer dereference during shutdown.
+        // The OSD provider holds a raw pointer to cVaapiDisplay. Detach it before VDR tears down cVaapiDevice
+        // to prevent a dangling-pointer dereference when the display destructor runs.
         if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
             provider->DetachDisplay();
             dsyslog("vaapivideo: OSD provider detached from display");
         }
-        vaapiDevice = nullptr; // give up our non-owning pointer; VDR destroys the object
+        vaapiDevice = nullptr; // Relinquish non-owning pointer; VDR destroys the object via cDevice::Shutdown().
     }
 
     isyslog("vaapivideo: plugin stopped");
@@ -460,7 +375,7 @@ auto cVaapiVideoPlugin::Stop() -> void {
 
 auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const char *option, int &replyCode)
     -> cString {
-    // VDR SVDRP reply codes: 900 = success, 550 = action not taken, 500 = unknown command.
+    // VDR SVDRP reply codes: 900=success, 550=action not taken, 500=unknown command.
 
     if (strcasecmp(command, "DETA") == 0) {
         if (!vaapiDevice) [[unlikely]] {
@@ -481,8 +396,8 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "VAAPI device attach failed - check logs for details";
         }
-        // Force VDR to restart the current channel's transfer so data flows through the freshly initialized
-        // decoder/display pipeline again.
+        // Force VDR to restart the current channel's transfer so data flows through the freshly
+        // re-initialized decoder/display pipeline.
         {
             LOCK_CHANNELS_READ;
             if (const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel())) {

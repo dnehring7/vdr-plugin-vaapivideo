@@ -37,7 +37,8 @@
 // === GLOBAL STATE ===
 // ============================================================================
 
-// VDR's own provider registry is plugin-incompatible; we maintain this global manually.
+// VDR's cOsdProvider::Install() is singleton-only and unsuitable for multi-plugin coexistence;
+// we track the active provider manually so device.cpp can manage attach/detach across stream switches.
 cOsdProvider *osdProvider = nullptr;
 
 // ============================================================================
@@ -52,7 +53,7 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
     dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(display_));
 
-    // Only clear if still pointing to us; another provider may have replaced it during rapid teardown/restart.
+    // Guard against rapid teardown/restart: another provider instance may have already replaced us.
     if (::osdProvider == this) {
         ::osdProvider = nullptr;
     }
@@ -107,7 +108,6 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
         return;
     }
 
-    // Left()/Top() are the screen-space OSD origin from cOsd base class.
     display_->SetOsd({.fbId = osd.GetFramebufferId(),
                       .height = static_cast<uint32_t>(osd.Height()),
                       .width = static_cast<uint32_t>(osd.Width()),
@@ -131,7 +131,8 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
         return nullptr;
     }
 
-    // Framebuffer spans from OSD origin to screen edge; oversized skin content is clipped in Flush().
+    // Framebuffer spans from OSD origin to screen edge; oversized skin content is clipped scanline-by-scanline
+    // in Flush() to avoid out-of-bounds writes into the mmap'd dumb buffer.
     const auto screenWidth = static_cast<int>(display_->GetOutputWidth());
     const auto screenHeight = static_cast<int>(display_->GetOutputHeight());
     const int osdWidth = screenWidth - left;
@@ -175,7 +176,8 @@ cVaapiOsd::~cVaapiOsd() noexcept {
     if (provider_ && framebufferId_ != 0) [[likely]] {
         provider_->HideOsd(framebufferId_);
 
-        // Must wait for the display thread to stop scanning out our framebuffer before freeing the GEM object.
+        // Wait for the display thread to finish scanning out this framebuffer; freeing the GEM object
+        // while KMS still references it causes a kernel use-after-free.
         if (cVaapiDisplay *display = provider_->GetDisplay(); display && display->IsInitialized()) {
             display->AwaitOsdHidden(framebufferId_);
         }
@@ -221,7 +223,8 @@ auto cVaapiOsd::Flush() -> void {
         return;
     }
 
-    // RenderPixmaps() returns ARGB8888 dirty regions; must loop until nullptr under LOCK_PIXMAPS.
+    // RenderPixmaps() returns one dirty ARGB8888 region per call; loop until nullptr.
+    // LOCK_PIXMAPS must be held across the entire sequence -- VDR's cPixmap is not thread-safe.
     bool rendered = false;
     {
         LOCK_PIXMAPS;
@@ -238,7 +241,7 @@ auto cVaapiOsd::Flush() -> void {
 
             if (dstX < dstRight && dstY < dstBottom) [[likely]] {
                 const size_t copyBytes = static_cast<size_t>(dstRight - dstX) * 4;
-                // stride_ accounts for DRM alignment padding (may differ from width_*4).
+                // stride_ may exceed width_*4 due to DRM pitch alignment requirements.
                 uint8_t *dst = pixels_ + (static_cast<size_t>(dstY) * stride_) + (static_cast<size_t>(dstX) * 4);
                 const uint8_t *srcRow =
                     src + (static_cast<size_t>(dstY - vp.Y()) * srcStride) + (static_cast<size_t>(dstX - vp.X()) * 4);
@@ -253,18 +256,19 @@ auto cVaapiOsd::Flush() -> void {
         }
     }
 
-    // Notify display after releasing LOCK_PIXMAPS; UpdateOsd() only passes geometry, not pixmap data.
+    // Notify display after releasing LOCK_PIXMAPS to avoid holding VDR's global lock during an atomic commit.
+    // UpdateOsd() passes only geometry; the display reads pixel data directly from the mmap'd dumb buffer.
     if (rendered) {
         provider_->UpdateOsd(*this);
         return;
     }
 
-    // TrueColor: no dirty content this frame.
     if (IsTrueColor()) {
         return;
     }
 
-    // Indexed-color path: convert dirty bitmap regions from palette to ARGB8888.
+    // Indexed-color fallback: convert dirty bitmap regions from VDR palette to ARGB8888 pixel-by-pixel.
+    // Only reached by legacy 4/8bpp skins; TrueColor skins use the RenderPixmaps() path above.
     bool anyDirty = false;
     for (int i = 0; cBitmap *bitmap = GetBitmap(i); ++i) {
         int x1 = 0;
@@ -313,7 +317,7 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Step 1: Allocate a dumb (CPU-accessible) GEM buffer.
+    // Allocate a dumb (CPU-accessible) GEM buffer -- the only buffer type guaranteed by all DRM drivers.
     drm_mode_create_dumb createReq{};
     createReq.width = fbWidth;
     createReq.height = fbHeight;
@@ -325,10 +329,10 @@ auto cVaapiOsd::Flush() -> void {
     }
 
     gemHandle_ = createReq.handle;
-    stride_ = createReq.pitch; // may be larger than fbWidth*4 due to alignment
+    stride_ = createReq.pitch; // may exceed fbWidth*4 due to GPU-specific pitch alignment
     mappedSize_ = createReq.size;
 
-    // Step 2: Register as a DRM framebuffer. Only plane 0 used for ARGB8888.
+    // Register as a KMS framebuffer. ARGB8888 is single-plane (index 0 only).
     const uint32_t handles[4] = {gemHandle_, 0, 0, 0};
     const uint32_t pitches[4] = {stride_, 0, 0, 0};
     const uint32_t offsets[4] = {0, 0, 0, 0};
@@ -340,7 +344,7 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Step 3: mmap the buffer for CPU pixel writes.
+    // mmap for direct CPU pixel writes; PROT_READ is needed for potential read-back by FBC/PSR.
     drm_mode_map_dumb mapReq{};
     mapReq.handle = gemHandle_;
 
@@ -366,7 +370,8 @@ auto cVaapiOsd::Flush() -> void {
 }
 
 auto cVaapiOsd::DestroyDumbBuffer() -> void {
-    // Reverse allocation order: unmap -> remove framebuffer -> destroy GEM handle.
+    // Reverse allocation order: unmap -> remove FB -> destroy GEM handle.
+    // FB must be removed before closing the GEM handle: the kernel asserts no active FB references remain.
     if (pixels_) [[likely]] {
         munmap(pixels_, mappedSize_);
         pixels_ = nullptr;

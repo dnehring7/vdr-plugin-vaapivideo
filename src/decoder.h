@@ -129,7 +129,8 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto SyncLatency90k() const noexcept
         -> int64_t; ///< Combined A/V sync latency: audioLatency + one-frame pipeline delay (90 kHz ticks)
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
-        -> void; ///< Update the EMA-smoothed A/V delta; reseeds on the first sample after a reset
+        -> void; ///< Update the EMA-smoothed A/V delta; warms up from N samples after a reset
+    auto ResetSmoothedDelta() noexcept -> void; ///< Invalidate EMA and clear warmup accumulator
     auto LogSyncStats(int64_t rawDelta90k, const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
     auto RunJitterPrimeSync(cAudioProcessor *ap)
         -> void; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0
@@ -206,11 +207,15 @@ class cVaapiDecoder : public cThread {
         false};                       ///< Set by Clear(); decode thread applies jitter reset on next delivery cycle
     std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
     cTimeMs nextSyncLog;              ///< Deadline for the periodic "sync status" log (decoder thread only)
-    int correctDrops{};               ///< Correction drops, summarized when run ends (decoder thread only)
     int drainMissCount{};             ///< Drain stalls since last sync log: gap > 2x frame duration
+    int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log (decoder thread only)
+    int syncSkipSinceLog{};           ///< Frames whose render was delayed (video ahead) since last sync log
+    int pendingDrops{};               ///< Remaining frames to drop in the current soft-correction burst
+    int warmupSampleCount{};          ///< Samples accumulated during EMA warmup phase (post-reset)
+    int64_t warmupSampleSum90k{};     ///< Sum of warmup-phase samples in 90 kHz ticks
     int64_t smoothedDelta90k{};       ///< EMA-smoothed A/V sync delta in 90 kHz ticks (decoder thread only)
-    bool smoothedDeltaValid{false};   ///< True after first delta measurement
-    cTimeMs syncGrace;                ///< Suppresses corrections while the EMA reseeds after a correction
+    bool smoothedDeltaValid{false};   ///< True once the EMA has been seeded (warmup complete)
+    cTimeMs syncCooldown;             ///< Rate-limit timer between soft corrections
 
     // ========================================================================
     // === JITTER BUFFER (live TV only) ===
