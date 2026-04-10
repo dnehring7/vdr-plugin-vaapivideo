@@ -2,7 +2,20 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file device.cpp
- * @brief VDR device integration, PES routing, and lifecycle
+ * @brief cDevice subclass: PES routing, codec detection, audio-track plumbing, lifecycle.
+ *
+ * Threading model:
+ *   - Main VDR thread: Clear/SetPlayMode/TrickSpeed/Freeze, audio-track hooks, OSD queries.
+ *   - Receiver / dvbplayer thread: PlayVideo / PlayAudio / Poll / Flush.
+ *   - Decoder/audio/display threads: owned by their subsystems.
+ *
+ * Subsystem lifetime is bound to a tri-state initState (0=none, 1=in-progress, 2=ready)
+ * managed via CAS in Initialize() / Stop() / Detach(). The decoder Action thread holds raw
+ * pointers to display + audioProcessor, so Stop() MUST tear them down in the order
+ * decoder -> display -> audioProcessor (see Stop() comment).
+ *
+ * The Detach() path also has a non-obvious upstream-shutdown ordering hazard with
+ * cTransferControl that the destructor doesn't share -- documented inline.
  */
 
 #include "device.h"
@@ -61,6 +74,7 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/device.h>
+#include <vdr/player.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
@@ -69,9 +83,10 @@ extern "C" {
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
-/// Force a VT round-trip to restore the Linux console after releasing DRM master. fbcon does not
-/// reclaim the display when other processes (e.g. systemd-logind) keep the DRM device open; the
-/// VT_ACTIVATE bounce forces a CRTC reprogram that hands the framebuffer back to the console.
+/// VT bounce after dropping DRM master. fbcon does not auto-reclaim the display when another
+/// DRM client (typically systemd-logind) still holds the device open, so we VT_ACTIVATE to a
+/// different VT and back -- the kernel reprograms the CRTC on each switch and the second
+/// switch hands the framebuffer back to the console.
 static auto RestoreConsole() -> void {
     const int ttyFd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if (ttyFd < 0) {
@@ -87,7 +102,8 @@ static auto RestoreConsole() -> void {
 
     const auto currentVt = static_cast<int>(vtState.v_active);
 
-    // Switching to the already-active VT is a kernel no-op; bounce via a different VT to force a CRTC reprogram.
+    // VT_ACTIVATE to the current VT is a no-op in the kernel; pick any other VT to force a
+    // real switch (and therefore a CRTC reprogram).
     const int tempVt = (currentVt == 1) ? 2 : 1;
 
     if (ioctl(ttyFd, VT_ACTIVATE, tempVt) == 0) {
@@ -101,7 +117,9 @@ static auto RestoreConsole() -> void {
     dsyslog("vaapivideo/device: console VT%d restored", currentVt);
 }
 
-/// Check whether a profile supports VLD decode with YUV420 output.
+/// True iff the driver advertises VLD bitstream decode + YUV420 surface output for this
+/// profile. Both are required for our pipeline; HW-accel pickers in OpenCodec() use the
+/// per-profile flags this populates.
 [[nodiscard]] static auto HasVldDecode(VADisplay display, VAProfile profile) -> bool {
     const int maxEp = vaMaxNumEntrypoints(display);
     if (maxEp <= 0) [[unlikely]] {
@@ -152,13 +170,13 @@ DrmDevices::~DrmDevices() noexcept {
 [[nodiscard]] auto DrmDevices::Enumerate() -> bool {
     dsyslog("vaapivideo/device: enumerating DRM devices");
 
-    // Free any previous enumeration results.
+    // Re-enumeration: free the previous batch (drmFreeDevices walks libdrm's per-entry refs).
     if (!deviceList.empty()) {
         drmFreeDevices(deviceList.data(), static_cast<int>(deviceList.size()));
         deviceList.clear();
     }
 
-    deviceList.resize(64); // DRM hard limit is much lower; real systems have 1-4 devices
+    deviceList.resize(64); // Generous overprovision: real systems have 1-4 DRM nodes.
     const int result = drmGetDevices2(0, deviceList.data(), static_cast<int>(deviceList.size()));
 
     if (result > 0) {
@@ -182,10 +200,13 @@ DrmDevices::~DrmDevices() noexcept {
 // ============================================================================
 
 auto cVaapiDevice::SubmitBlackFrame() -> void {
+    // Used to clear the previous channel's residual picture on radio channels and on
+    // hardware (re)init -- the DRM scanout buffer would otherwise hold whatever was last
+    // displayed. Allocates its own one-shot hw_frames_ctx so it does not depend on the
+    // decoder pipeline being up.
     const auto w = static_cast<int>(display->GetOutputWidth());
     const auto h = static_cast<int>(display->GetOutputHeight());
 
-    // One-shot VAAPI hw_frames_ctx for a single NV12 surface
     std::unique_ptr<AVBufferRef, FreeAVBufferRef> framesRef{av_hwframe_ctx_alloc(vaapi.hwDeviceRef)};
     if (!framesRef) [[unlikely]] {
         esyslog("vaapivideo/device: black frame hw_frames_ctx alloc failed");
@@ -203,7 +224,7 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
         return;
     }
 
-    // Allocate VAAPI surface and software staging frame
+    // SW staging frame -> uploaded to a single VAAPI surface via av_hwframe_transfer_data.
     std::unique_ptr<AVFrame, FreeAVFrame> hwFrame{av_frame_alloc()};
     std::unique_ptr<AVFrame, FreeAVFrame> swFrame{av_frame_alloc()};
     if (!hwFrame || !swFrame || av_hwframe_get_buffer(framesRef.get(), hwFrame.get(), 0) < 0) [[unlikely]] {
@@ -218,7 +239,8 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
         return;
     }
 
-    // NV12 limited-range black: Y=16 (not 0), UV=128 (neutral chroma).
+    // BT.709 TV-range "black": Y=16, UV=128. Y=0 would clip below black on TV-range
+    // sinks and the rest of the pipeline (scale_vaapi out_range=tv) is TV-range too.
     const auto rows = static_cast<size_t>(h);
     std::memset(swFrame->data[0], 16, static_cast<size_t>(swFrame->linesize[0]) * rows);
     std::memset(swFrame->data[1], 128, static_cast<size_t>(swFrame->linesize[1]) * (rows / 2));
@@ -227,10 +249,11 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
         return;
     }
 
-    // Wrap in VaapiFrame and submit through the normal display pipeline
+    // Wrap and submit through the normal display path so the modeset / DRM plane state
+    // matches a regular frame (no separate "blank" code path to maintain).
     auto frame = std::make_unique<VaapiFrame>();
     frame->avFrame = hwFrame.release();
-    // FFmpeg VAAPI convention: data[3] is a VASurfaceID cast to a pointer (not a real allocation).
+    // FFmpeg VAAPI ABI: data[3] holds the VASurfaceID directly, cast through uintptr_t.
     frame->vaSurfaceId = static_cast<VASurfaceID>(
         reinterpret_cast<uintptr_t>(frame->avFrame->data[3])); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
     static_cast<void>(display->SubmitFrame(std::move(frame), 100));
@@ -245,14 +268,16 @@ cVaapiDevice::cVaapiDevice() {
 cVaapiDevice::~cVaapiDevice() noexcept {
     dsyslog("vaapivideo/device: destroying (isPrimary=%d)", IsPrimaryDevice());
 
-    // Remove as primary device to prevent VDR calling into us.
+    // Demote ourselves first so VDR cannot route any further calls (PlayVideo / OSD lookups
+    // / etc.) into a half-destroyed device.
     if (IsPrimaryDevice()) {
         cDevice::MakePrimaryDevice(false);
     }
 
     DetachAllReceivers();
 
-    // Detach display from OSD provider before destroying display.
+    // Sever the OSD provider's display pointer before display is destroyed -- the OSD
+    // provider outlives this device (VDR owns its lifecycle via cOsdProvider::Shutdown).
     if (auto *vaapiProvider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
         vaapiProvider->DetachDisplay();
         dsyslog("vaapivideo/device: OSD provider detached from display");
@@ -278,10 +303,23 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 auto cVaapiDevice::Clear() -> void {
     cDevice::Clear();
 
-    // trickSpeed intentionally not reset -- Clear() is a buffer flush, not a mode change.
+    // trickSpeed is intentionally NOT reset: Clear() is a buffer flush, not a mode change.
+    // VDR also calls Clear() at the start of trick play and resetting the speed here would
+    // bounce us out of the mode the user just selected.
 
-    // Hold display import lock across decoder flush to prevent the display thread from
-    // re-presenting a stale surface that the decoder is about to invalidate.
+    // Force audio codec re-detection. This is the *only* place that catches the replay
+    // audio-track-switch path: SVDRP "audi N" -> cDevice::SetCurrentAudioTrack -> player path
+    // -> cDvbPlayer::SetAudioTrack -> Goto(Current) -> Empty() -> DeviceClear() -> here.
+    // VDR routes around our SetAudioTrackDevice() override when a player is attached, so
+    // without this reset audioCodecId stays pinned to the old codec and the still-open old
+    // decoder is fed the new track's bitstream -- audio dies silently until the next channel
+    // switch. Re-detection is cheap: SetStreamParams() early-returns on matching codec/rate.
+    // Concurrency: Clear() runs on the main thread (or cDvbPlayer's mutex via Goto/Empty),
+    // so PlayAudio() cannot race this reset.
+    ResetAudioCodecState();
+
+    // Bracket the decoder flush in a stream-switch window so the display thread cannot
+    // re-present a surface that the decoder is about to invalidate.
     if (display) [[likely]] {
         display->BeginStreamSwitch();
     }
@@ -302,13 +340,18 @@ auto cVaapiDevice::Clear() -> void {
 [[nodiscard]] auto cVaapiDevice::DeviceType() const -> cString { return "VAAPI"; }
 
 [[nodiscard]] auto cVaapiDevice::Flush(int TimeoutMs) -> bool {
+    // VDR contract: return true once queued data has reached the output. We currently
+    // only wait on the decoder packet queue, NOT on the audio queue. Audio is paced by
+    // its own thread + ALSA backpressure and a stuck audio queue would never block VDR's
+    // channel-switch flow in observed behavior. If a future regression shows lingering
+    // audio across channel switches when Flush returns true, also waiting on
+    // audioProcessor->GetQueueSize()==0 here is the place to add it.
     dsyslog("vaapivideo/device: Flush(%d)", TimeoutMs);
 
     if (!decoder) {
         return true;
     }
 
-    // Wait for decoder queue to drain.
     const cTimeMs timeout(TimeoutMs);
     while (!decoder->IsQueueEmpty() && !timeout.TimedOut()) {
         cCondWait::SleepMs(10);
@@ -321,20 +364,26 @@ auto cVaapiDevice::Freeze() -> void {
     cDevice::Freeze();
     paused.store(true, std::memory_order_relaxed);
 
-    // Drain queue for instant visual pause (at most one in-flight frame). Do not call ResetSync() -- preserves sync
-    // across pause/resume.
+    // Drop the queued packets so the next frame after un-pause is the user's intended one,
+    // not stale lookahead. Deliberately does NOT touch sync state -- pause/resume should
+    // preserve the EMA so we don't reseed from a transient.
     if (decoder) [[likely]] {
         decoder->DrainQueue();
     }
 
-    // Drop ALSA buffers immediately so audio stops in sync with the visual freeze.
+    // Drop ALSA buffers so audio cuts out in sync with the visual freeze (otherwise the
+    // sink keeps playing whatever is already queued, ~100-200 ms past the freeze).
     if (audioProcessor) [[likely]] {
         audioProcessor->Clear();
     }
 }
 
 auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> void {
-    // Fast path: authoritative cached values from display.
+    // Three tiers because VDR may call this before display is up (e.g. during plugin
+    // setup-menu rendering) and because skins re-call it constantly during repaint.
+    //   1. cached  -- normal hot path, no display call.
+    //   2. live    -- first call after display init populates the cache.
+    //   3. config  -- pre-init fallback. NOT cached: the real display may resolve later.
     if (osdWidth > 0 && osdHeight > 0 && display) [[likely]] {
         Width = osdWidth;
         Height = osdHeight;
@@ -342,7 +391,6 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
         return;
     }
 
-    // Slow path: populate cache from live display.
     if (display && display->IsInitialized()) {
         osdWidth = static_cast<int>(display->GetOutputWidth());
         osdHeight = static_cast<int>(display->GetOutputHeight());
@@ -353,15 +401,18 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
         return;
     }
 
-    // Fallback: config defaults (not cached -- display may initialize later).
     Width = static_cast<int>(vaapiConfig.display.GetWidth());
     Height = static_cast<int>(vaapiConfig.display.GetHeight());
     PixelAspect = static_cast<double>(Width) / Height;
 }
 
 [[nodiscard]] auto cVaapiDevice::GetSTC() -> int64_t {
-    // VDR expects a 90 kHz clock. Last decoded frame PTS is the best available approximation
-    // since we have no independent system-time-based STC.
+    // VDR consumes this in 90 kHz units (PTS scale). The "true" STC would be the audio
+    // clock from cAudioProcessor::GetClock(), but cDvbPlayer only uses the value for
+    // editing-mark / position math where last-decoded-video PTS is accurate to within
+    // one frame period and avoids returning AV_NOPTS_VALUE during the audio prime window.
+    // Do NOT reuse this for A/V sync -- it can lag the real audio output by the decoder/
+    // display pipeline depth.
     if (!decoder) [[unlikely]] {
         return -1;
     }
@@ -370,7 +421,8 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
 }
 
 auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) -> void {
-    // Return 0x0 when no codec is open; VDR skins detect the 0->real transition to trigger repaints.
+    // Skins watch the 0->real transition to trigger a repaint, so report 0x0 (not last
+    // known dimensions) whenever no codec is open or no frame has been decoded yet.
     if (!HasDecoder()) [[unlikely]] {
         Width = Height = 0;
         VideoAspect = 1.0;
@@ -381,9 +433,8 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
     Height = decoder->GetStreamHeight();
     VideoAspect = decoder->GetStreamAspect();
 
-    // Codec open but no frames decoded yet -- dimensions still unknown.
     if (Width == 0 || Height == 0) [[unlikely]] {
-        VideoAspect = 1.0;
+        VideoAspect = 1.0; // codec open but pre-first-frame; aspect would be NaN
     }
 }
 
@@ -399,7 +450,8 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
     if (On) {
         if (IsPrimaryDevice()) {
             isyslog("vaapivideo/device: activated as primary device");
-            // VDR owns the OSD provider lifecycle via cOsdProvider::Shutdown(); create only once.
+            // OSD provider lifecycle is owned by VDR (cOsdProvider::Shutdown()), so we
+            // create at most one and reuse on subsequent activations.
             if (!::osdProvider && display) {
                 ::osdProvider = new cVaapiOsdProvider(display.get());
                 isyslog("vaapivideo/device: OSD provider registered");
@@ -411,7 +463,8 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
         }
     } else {
         isyslog("vaapivideo/device: deactivated as primary device");
-        // VDR calls cOsdProvider::Shutdown() to tear down all providers after our Stop().
+        // OSD provider is intentionally NOT torn down here -- VDR will run
+        // cOsdProvider::Shutdown() globally after our Stop() during process exit.
     }
 }
 
@@ -426,9 +479,11 @@ auto cVaapiDevice::Mute() -> void {
 auto cVaapiDevice::Play() -> void {
     cDevice::Play();
 
-    // Deferred trick exit: VDR calls Play() both to genuinely resume and during internal
-    // backward-speed transitions (REW->PLAY->REW). The decoder auto-exits trick mode if
-    // TrickSpeed() does not follow within one frame period.
+    // VDR calls Play() both for a genuine "resume normal speed" AND as a transition step
+    // inside compound trick sequences like REW->PLAY->REW. We can't distinguish the two
+    // up front, so we *request* trick exit and let the decoder confirm: if a TrickSpeed()
+    // call follows within one frame period, the request is canceled, otherwise the decoder
+    // exits trick mode for real on the next frame.
     if (trickSpeed.exchange(0, std::memory_order_release) != 0) {
         if (decoder) [[likely]] {
             decoder->RequestTrickExit();
@@ -453,14 +508,17 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
-    // Codec detection runs once per mode cycle: audioCodecId is reset to NONE by
-    // SetPlayMode(pmNone) or SetAudioTrackDevice(). Mid-stream codec changes arrive
-    // via a PMT update -> SetAudioTrackDevice() -> re-detection cycle.
+    // Codec detection only runs while audioCodecId == NONE. It is reset by SetPlayMode(pmNone),
+    // by SetDigitalAudioDevice() / SetAudioTrackDevice() via HandleAudioTrackChange(), and by
+    // Clear() (for the cDvbPlayer-driven replay audi-N path). Mid-stream PMT updates flow
+    // through one of those handlers and arrive here as "currentCodec == NONE".
     const AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
     bool isLive = liveMode.load(std::memory_order_relaxed);
 
     if (currentCodec == AV_CODEC_ID_NONE) {
-        // Detect live mode (covers pmAudioOnly where no video arrives).
+        // pmAudioOnly never opens the video path so liveMode hasn't been latched there;
+        // do it on the first audio PES instead (Transferring() distinguishes live cTransfer
+        // from replay cDvbPlayer).
         if (!isLive) {
             isLive = Transferring();
             liveMode.store(isLive, std::memory_order_relaxed);
@@ -474,17 +532,46 @@ auto cVaapiDevice::Play() -> void {
             return Length;
         }
 
+        // 2-of-2 confirmation, ALWAYS (not just when matching previousAudioCodec). The race:
+        //   PlayTs runs on the receiver thread and reads currentAudioTrack lock-free per TS
+        //   packet. SVDRP `audi N` updates currentAudioTrack on the main thread, then fires
+        //   SetDigitalAudioDevice -> HandleAudioTrackChange. Between the assignment and the
+        //   handler, PlayTs may have ALREADY buffered a full PES of bytes from the OLD PID
+        //   inside tsToPesAudio. That PES is emitted on the next PUSI boundary and arrives
+        //   here AFTER audioCodecId was reset to NONE -- detection picks the OLD codec, we
+        //   open the wrong decoder, and then the fresh new-PID packets cascade INVALIDDATA.
+        //
+        // Cost: ~24-32 ms (one audio frame) of extra detection latency. Worth it.
+        // Depth=2 is sufficient because tsToPesAudio.Reset() fires on every PUSI and the
+        // PID filter is re-checked per TS packet, so at most ONE stale PES can sneak through.
+        if (detectedCodec == audioCodecCandidate) {
+            ++audioCodecCandidateCount;
+        } else {
+            audioCodecCandidate = detectedCodec;
+            audioCodecCandidateCount = 1;
+        }
+        if (audioCodecCandidateCount < 2) {
+            dsyslog("vaapivideo/device: audio codec %s -- awaiting confirmation (%d/2)",
+                    avcodec_get_name(detectedCodec), audioCodecCandidateCount);
+            return Length;
+        }
+
+        audioCodecCandidate = AV_CODEC_ID_NONE;
+        audioCodecCandidateCount = 0;
+
         if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
             return Length;
         }
 
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
-        isyslog("vaapivideo/device: audio codec %s (%s, %s)", avcodec_get_name(detectedCodec),
+        isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s)", avcodec_get_name(detectedCodec),
                 isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
     }
 
-    // Radio detection: audio playing but no video codec opened within the timeout.
+    // Radio detection: SetPlayMode(pmAudioVideo) arms a 3 s timer; if no video codec has
+    // opened by the time we see audio after that, treat the channel as radio and clear the
+    // residual picture from the previous channel with a one-shot black frame.
     if (radioBlackPending && radioBlackTimer.TimedOut()) [[unlikely]] {
         radioBlackPending = false;
         if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && display && vaapi.hwDeviceRef) {
@@ -493,13 +580,13 @@ auto cVaapiDevice::Play() -> void {
         }
     }
 
-    // Replay: return 0 to trigger VDR's Poll() backpressure. Live TV: always accept to
-    // keep pace with cTransfer, which has no backpressure mechanism.
+    // Replay: return 0 to make VDR's Poll() throttle the source. Live: cTransfer has no
+    // backpressure mechanism so we MUST always accept and rely on the audio queue's
+    // drop-oldest policy if it overflows.
     if (!isLive && audioProcessor->IsQueueFull()) [[unlikely]] {
         return 0;
     }
 
-    // Audio plays independently -- parser handles frame extraction and PTS tracking.
     audioProcessor->Decode(pes.payload, pes.payloadSize, pes.pts);
     return Length;
 }
@@ -509,7 +596,8 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
-    // Block while paused (except trick mode)
+    // Trick mode passes through paused state because VDR sets paused=true before slow trick
+    // (Freeze() then TrickSpeed()) and we still need those packets.
     if (paused.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) == 0) [[unlikely]] {
         return Length;
     }
@@ -529,19 +617,27 @@ auto cVaapiDevice::Play() -> void {
     bool isLive = liveMode.load(std::memory_order_relaxed);
 
     if (currentCodec == AV_CODEC_ID_NONE) [[unlikely]] {
-        // Detect live vs replay (cTransferControl may not exist at SetPlayMode() time).
+        // Defer the live/replay decision to the first PES: cTransferControl is not yet
+        // visible to Transferring() at SetPlayMode() time.
         isLive = Transferring();
         liveMode.store(isLive, std::memory_order_relaxed);
         decoder->SetLiveMode(isLive);
 
         const AVCodecID detectedCodec = ::DetectVideoCodec({pes.payload, pes.payloadSize});
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
-            return Length; // No strong marker found -- wait for next packet
+            return Length; // no codec marker yet, wait for the next PES
         }
 
-        // Guard against stale PES from the previous channel's ring buffer. When the detected codec
-        // matches the previous channel's codec, require 2 consecutive detections to confirm (~1 GOP
-        // period) to avoid false-positive opens on leftover buffer data.
+        // Stale-PES guard: when the detected codec equals the previous channel's codec,
+        // require 2 consecutive detections (~1 GOP) to confirm. Without this, leftover bytes
+        // in cReceiver's ring buffer can re-open the OLD decoder right after a channel
+        // switch and we'd then feed it the new channel's bitstream.
+        //
+        // INTENTIONALLY narrower than the audio-side guard in PlayAudio(): video has no
+        // equivalent of the audio-track-switch (audi N) path, so the previous-codec match
+        // is sufficient here. Do not "harmonize" by making this unconditional without first
+        // re-reading the audio guard's race analysis -- the audio side is broader because
+        // tsToPesAudio can buffer a stale PES across the SetCurrentAudioTrack assignment.
         if (detectedCodec == previousVideoCodec && previousVideoCodec != AV_CODEC_ID_NONE) [[unlikely]] {
             if (detectedCodec == videoCodecCandidate) {
                 ++videoCodecCandidateCount;
@@ -569,10 +665,12 @@ auto cVaapiDevice::Play() -> void {
         videoCodecId.store(detectedCodec, std::memory_order_relaxed);
         isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     }
-    // Mid-stream video codec changes trigger a SetPlayMode(pmNone) cycle; videoCodecId resets there.
+    // Mid-stream codec changes go through SetPlayMode(pmNone), which resets videoCodecId.
+    // We do not handle a mid-stream change here.
 
-    // Replay backpressure via Poll(). Live TV: never block -- cTransfer has no backpressure.
-    // Trick mode: single-packet queue depth for responsive keyframe navigation.
+    // Replay: backpressure via Poll() (return 0 -> VDR retries). Live: never block -- cTransfer
+    // has no backpressure mechanism. Trick mode caps the depth at 1 so each keyframe is
+    // immediately visible to the user.
     if (!isLive) [[unlikely]] {
         const int currentSpeed = trickSpeed.load(std::memory_order_relaxed);
 
@@ -594,7 +692,8 @@ auto cVaapiDevice::Play() -> void {
         return true;
     }
 
-    // Live TV: cTransfer calls PlayVideo/PlayAudio directly and never calls Poll.
+    // Live TV: cTransfer pushes via PlayVideo/PlayAudio and never asks Poll(). Returning
+    // true is the safe default for any unexpected live caller.
     if (liveMode.load(std::memory_order_relaxed)) {
         return true;
     }
@@ -602,7 +701,8 @@ auto cVaapiDevice::Play() -> void {
     const int currentSpeed = trickSpeed.load(std::memory_order_relaxed);
 
     auto hasSpace = [&]() -> bool {
-        // Trick mode: gate on both the time budget and the single-slot queue.
+        // Trick mode also gates on the per-frame pacing timer so we don't burst-feed the
+        // decoder past what the display will actually show.
         if (currentSpeed != 0) {
             return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
         }
@@ -613,8 +713,9 @@ auto cVaapiDevice::Play() -> void {
         return true;
     }
 
-    // Spin-wait up to TimeoutMs: avoids a round-trip through VDR's outer Poll() retry loop,
-    // which adds one full MainLoopInterval (~100 ms) of unnecessary latency per cycle.
+    // Spin in-place rather than returning false. Returning false makes VDR retry through
+    // its outer Poll() loop, which adds a full MainLoopInterval (~100 ms) per cycle and
+    // visibly slows down replay startup / seek-confirm.
     if (TimeoutMs > 0) {
         const cTimeMs timeout(TimeoutMs);
         while (!hasSpace() && !timeout.TimedOut()) {
@@ -628,25 +729,21 @@ auto cVaapiDevice::Play() -> void {
 
 [[nodiscard]] auto cVaapiDevice::Ready() -> bool { return initState.load(std::memory_order_acquire) == 2; }
 
-auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
-    const tTrackId *track = GetTrack(Type);
-    dsyslog("vaapivideo/device: SetAudioTrackDevice(%s %d%s%s)",
-            IS_AUDIO_TRACK(Type)   ? "audio"
-            : IS_DOLBY_TRACK(Type) ? "dolby"
-                                   : "unknown",
-            static_cast<int>(Type), track ? ", lang=" : "", track ? track->language : "");
+auto cVaapiDevice::SetAudioTrackDevice(eTrackType /*Type*/) -> void {
+    // Legacy/safety hook: VDR only routes through here when no cPlayer is attached, which
+    // in modern VDR is effectively never (live=cTransfer, replay=cDvbPlayer, both cPlayers).
+    // Fires AFTER currentAudioTrack is assigned -> read in the handler is reliable, so we
+    // take the dedup-against-current-track path.
+    HandleAudioTrackChange("SetAudioTrackDevice", /*enteringDolby=*/false);
+}
 
-    // Reset codec so PlayAudio() re-detects on the next PES packet.
-    // Not redundant with Clear(): SetAudioTrackDevice can be called without a preceding Clear().
-    audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-
-    // Flush old track's tail and reset A/V sync for the new audio clock.
-    if (audioProcessor) [[likely]] {
-        audioProcessor->Clear();
-    }
-    if (decoder) [[likely]] {
-        decoder->NotifyAudioChange();
-    }
+auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
+    // The actually-fired audio-track-change hook for both live and replay. cDevice fires
+    // it with On=true *BEFORE* assigning currentAudioTrack (vdr/device.c:1172-1180), so on
+    // dolby-track switches GetCurrentAudioTrack() would still return the OLD track and the
+    // dedup would silently swallow the change. Pass On through so the handler takes the
+    // "walk dolby slots" stale-read workaround.
+    HandleAudioTrackChange("SetDigitalAudioDevice", /*enteringDolby=*/On);
 }
 
 [[nodiscard]] auto cVaapiDevice::SetPlayMode(ePlayMode PlayMode) -> bool {
@@ -656,16 +753,22 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
     const auto idx = static_cast<unsigned>(PlayMode);
     dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
 
-    // Reset paused -- prevents stale Freeze() state from blocking next session.
+    // Always clear paused first -- a stale Freeze() flag from a prior session would otherwise
+    // block PlayVideo() in the new mode and the user would see a frozen picture.
     paused.store(false, std::memory_order_relaxed);
 
     switch (PlayMode) {
         case pmNone:
-            // Full codec state teardown. Doing this here (not in Clear()) lets seek/skip within
-            // a recording reuse the open codec context via Clear() without a teardown cycle.
+            // Full codec teardown. Capture the previous codec ids BEFORE clearing them: the
+            // 2-of-2 confirmation guards in PlayVideo()/PlayAudio() use these to defer the
+            // next OpenCodec when the new channel happens to share the old channel's codec
+            // -- this catches stale TS-buffer bytes from the channel we are leaving. The
+            // audio side's full reset (audioCodecId + candidate fields) is deferred to
+            // Clear() -> ResetAudioCodecState(); only the video fields need explicit cleanup
+            // here because Clear() does not touch them.
             radioBlackPending = false;
             previousVideoCodec = videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-            audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+            previousAudioCodec = audioCodecId.load(std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
@@ -675,11 +778,16 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             }
             videoCodecCandidate = AV_CODEC_ID_NONE;
             videoCodecCandidateCount = 0;
+            // Reset the dedup so the new channel's first SetDigitalAudioDevice() always
+            // fires a fresh codec re-detect, even if the new track shares the old (type,PID).
+            lastHandledAudioTrack = ttNone;
+            lastHandledAudioPid = 0;
             Clear();
             break;
         case pmAudioOnly:
         case pmAudioOnlyBlack:
-            // Radio channel: clear buffers and show black so the previous channel's last picture disappears.
+            // Radio: clear buffers and paint a black frame so the previous channel's last
+            // picture disappears (DRM scanout would otherwise hold it indefinitely).
             radioBlackPending = false;
             Clear();
             if (display && vaapi.hwDeviceRef) [[likely]] {
@@ -688,11 +796,11 @@ auto cVaapiDevice::SetAudioTrackDevice(eTrackType Type) -> void {
             break;
         case pmAudioVideo:
         case pmVideoOnly:
-            // Codec state was already reset by the preceding pmNone from VDR's mode transition
-            // sequence. liveMode is determined from the first PES packet via Transferring().
+            // VDR always emits a pmNone before this in its transition sequence, so codec
+            // state is already clean. liveMode is latched from the first PES via Transferring().
             Clear();
-            // Arm radio detection: if no video codec opens within 3 s, assume radio-only
-            // and submit a black frame to replace the previous channel's residual picture.
+            // Radio-fallback arm: 3 s grace for video to start. If only audio arrives we
+            // hit the radio-detection branch in PlayAudio() and paint black.
             radioBlackTimer.Set(3000);
             radioBlackPending = true;
             break;
@@ -715,19 +823,37 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
 
     dsyslog("vaapivideo/device: StillPicture(%d bytes)", Length);
 
-    // TS input (0x47 sync byte): VDR's base class converts TS -> PES then re-calls our PlayVideo().
+    // VDR may hand us either TS (0x47 sync byte; base class re-PES'es and re-enters via
+    // PlayVideo) or a buffer that's already PES (or, for some legacy callers, raw ES that
+    // happens to start with a startcode). The non-TS branch passes the bytes straight to
+    // PlayVideo, which feeds av_parser_parse2 -- the parser tolerates both PES with header
+    // and bare startcode-prefixed ES, so we don't need to discriminate further here.
     if (Data[0] == 0x47) {
         cDevice::StillPicture(Data, Length);
         return;
     }
 
-    // Temporarily clear paused so PlayVideo() accepts the packet; restore afterward.
+    // Bypass paused for the duration of this submit so PlayVideo() actually accepts the
+    // packet; restore on the way out.
     const bool wasPaused = paused.exchange(false, std::memory_order_relaxed);
-    if (PlayVideo(Data, Length) == 0) {
-        // Queue was full despite the preceding Freeze()/DrainQueue(). Retry once after a brief drain window.
+    int played = PlayVideo(Data, Length);
+    if (played == 0) {
+        // Queue was full despite the preceding Freeze()/DrainQueue(). One retry after a
+        // brief drain window is enough in practice.
         cCondWait::SleepMs(5);
-        PlayVideo(Data, Length);
+        played = PlayVideo(Data, Length);
     }
+    dsyslog("vaapivideo/device: StillPicture: PlayVideo accepted %d/%d bytes", played, Length);
+
+    // VDR delivers a single isolated I-frame here (editing-mark keys 4/6/7/9 / Goto Still),
+    // and the bitstream parser only emits an AU once the *next* AU's start code arrives.
+    // Without this drain the lone AU sits in the parser forever and the display keeps
+    // showing the previously frozen buffer -- the user sees nothing happen on key press.
+    // See decoder.cpp DrainPendingParserAU() for the full story.
+    if (decoder) [[likely]] {
+        decoder->FlushParser();
+    }
+
     if (wasPaused) {
         paused.store(true, std::memory_order_relaxed);
     }
@@ -736,8 +862,9 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
 auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     dsyslog("vaapivideo/device: TrickSpeed(%d, %s)", Speed, Forward ? "forward" : "backward");
 
-    // VDR calls Freeze() before slow trick modes (setting paused=true) but not before fast FF/REW.
-    // Use paused state to distinguish: paused -> slow trick, !paused -> fast trick.
+    // VDR's API doesn't pass fast/slow directly. The convention it uses is: Freeze() (which
+    // sets paused=true) is called BEFORE slow trick, but NOT before fast FF/REW. So paused
+    // at this point implies slow mode.
     const bool isFast = !paused.load(std::memory_order_relaxed);
 
     trickSpeed.store(Speed, std::memory_order_release);
@@ -746,8 +873,8 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
         decoder->SetTrickSpeed(Speed, Forward, isFast);
     }
 
-    // Audio during trick play is meaningless; clear immediately.
-    // VDR may also call Mute() separately, but this covers the gap.
+    // Drop audio explicitly. VDR usually calls Mute() too but not always at the same edge,
+    // and a delay leaves the user hearing 100-200 ms of stale audio after the trick command.
     if (audioProcessor) [[likely]] {
         audioProcessor->Clear();
     }
@@ -758,7 +885,8 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiDevice::Attach() -> bool {
-    // Re-open DRM/VAAPI hardware using the stored drmPath and audioDevice from the last Initialize() call.
+    // SVDRP ATTA: re-open the same DRM/VAAPI/audio combo we last had. drmPath/audioDevice
+    // were latched in the prior Initialize() so SVDRP doesn't need to re-pass them.
     if (drmPath.empty()) [[unlikely]] {
         esyslog("vaapivideo/device: cannot attach - no DRM device path recorded");
         return false;
@@ -779,8 +907,36 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
 }
 
 auto cVaapiDevice::Detach() -> void {
-    // Release DRM fd and VAAPI context so other applications can use the display.
+    // SVDRP DETA: release DRM fd + VAAPI context so another app can take the display.
     isyslog("vaapivideo/device: detaching from hardware");
+
+    // *** Silence all upstream sources BEFORE Stop(). ***
+    //
+    // Hazard: in live TV cTransfer is a cReceiver on the DVB tuner AND a cPlayer on us.
+    // The tuner's worker thread runs:
+    //   cTransfer::Receive -> cPlayer::PlayTs -> our PlayTs -> PlayVideo/Audio -> decoder->...
+    // PlayVideo/PlayAudio dereference the `decoder` unique_ptr. If Stop() resets it
+    // concurrently, the tuner thread races between `if (!decoder)` and `decoder->IsReady()`
+    // and reads a dangling pointer -> use-after-free.
+    //
+    // Two upstreams must be quiesced first:
+    //   1. cControl (cTransferControl live, cReplayControl replay). cControl::Shutdown()
+    //      destroys it; the destructor chain ~cTransferControl -> ~cTransfer ->
+    //      cReceiver::Detach() + cPlayer::Detach() severs both: no further PlayTs reaches
+    //      us AND the DVB tuner's worker thread stops. VDR rebuilds it on the next channel
+    //      switch / ATTA.
+    //   2. Any direct cReceiver on us (none in normal use; safety net matching ~cDevice).
+    //
+    // ORDER: cControl::Shutdown() MUST run before our Stop() because the cPlayer::Detach()
+    // unwinding triggers SetPlayMode(pmNone) on us, and our SetPlayMode override calls
+    // Clear() -- which needs decoder/display/audioProcessor still alive.
+    //
+    // The destructor does NOT need this dance: VDR's main shutdown calls cControl::Shutdown
+    // before cDevice::Shutdown (see the shutdown sequence at the end of vdr.c's main loop),
+    // so ~cVaapiDevice runs after cTransfer is already gone. SVDRP DETA fires at runtime,
+    // outside that sequence, so we have to replicate the order here ourselves.
+    cControl::Shutdown();
+    DetachAllReceivers();
 
     // Sever the OSD provider's display reference before destroying the display.
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
@@ -790,31 +946,36 @@ auto cVaapiDevice::Detach() -> void {
 
     Stop();
 
-    // Release DRM dumb buffers held by active OSD instances. VDR owns the cVaapiOsd objects and may not destroy them
-    // until later; their mmap'd buffers hold kernel references preventing the DRM device from being fully released.
+    // VDR owns cVaapiOsd objects and may keep them alive past our Detach(); their mmap'd
+    // dumb buffers hold kernel refs that would otherwise prevent drmDropMaster/close from
+    // releasing the device. Force-release the buffers ourselves while the OSDs live on.
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
         provider->ReleaseAllOsdResources();
     }
 
-    // Drop DRM master before closing fd so another client can claim it immediately.
+    // drmDropMaster BEFORE close: lets another client take master immediately at next open
+    // instead of waiting for fd-close to propagate through libdrm's master accounting.
     if (drmFd >= 0) {
         drmDropMaster(drmFd);
     }
 
     ReleaseHardware();
 
-    // Force the kernel console to redraw after releasing the DRM device.
+    // fbcon won't redraw on its own -- see RestoreConsole().
     RestoreConsole();
 
-    // Reset playback/codec state so Attach() starts clean; stale IDs would skip codec detection.
+    // Reset everything so a subsequent Attach() does not skip codec detection on stale ids.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     previousVideoCodec = AV_CODEC_ID_NONE;
+    previousAudioCodec = AV_CODEC_ID_NONE;
     videoCodecCandidate = AV_CODEC_ID_NONE;
     videoCodecCandidateCount = 0;
+    ResetAudioCodecState();
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
     paused.store(false, std::memory_order_relaxed);
+    lastHandledAudioTrack = ttNone;
+    lastHandledAudioPid = 0;
     osdWidth = 0;
     osdHeight = 0;
     initState.store(0, std::memory_order_release);
@@ -822,7 +983,8 @@ auto cVaapiDevice::Detach() -> void {
 }
 
 [[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath) -> bool {
-    // Atomic state transition: 0 (uninit) -> 1 (in progress) -> 2 (ready).
+    // 0 -> 1 (in-progress) -> 2 (ready). The CAS protects against double-Initialize from
+    // a racing SVDRP ATTA + plugin Start() during process bring-up.
     int expected = 0;
     if (!initState.compare_exchange_strong(expected, 1)) [[unlikely]] {
         esyslog("vaapivideo/device: already initialized (state=%d)", expected);
@@ -840,8 +1002,9 @@ auto cVaapiDevice::Detach() -> void {
         return false;
     }
 
-    // Audio processor starts first: the decoder needs a valid audio clock reference for A/V sync
-    // from the moment its thread runs.
+    // Construction order: audioProcessor, then display, then decoder. The decoder is given
+    // raw pointers to the other two and queries them on every frame, so they must already
+    // exist (and be valid for its thread's lifetime). Stop() reverses this order.
     audioProcessor = std::make_unique<cAudioProcessor>();
     if (!audioProcessor->Initialize(audioDevice)) [[unlikely]] {
         esyslog("vaapivideo/device: audio initialization failed");
@@ -855,31 +1018,32 @@ auto cVaapiDevice::Detach() -> void {
     if (!display->Initialize(drmFd, vaapi.hwDeviceRef, crtcId, connectorId, activeMode)) [[unlikely]] {
         esyslog("vaapivideo/device: display initialization failed");
         display.reset();
-        audioProcessor->Stop();
+        audioProcessor->Shutdown();
         audioProcessor.reset();
         ReleaseHardware();
         initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
-    // Decoder starts without an open codec; OpenCodec() is called on the first video PES packet.
+    // Decoder starts codec-less; PlayVideo()'s detection path opens it on the first PES.
     decoder = std::make_unique<cVaapiDecoder>(display.get(), &vaapi);
     if (!decoder->Initialize()) [[unlikely]] {
         esyslog("vaapivideo/device: decoder initialization failed");
         decoder.reset();
         display->Shutdown();
         display.reset();
-        audioProcessor->Stop();
+        audioProcessor->Shutdown();
         audioProcessor.reset();
         ReleaseHardware();
         initState.store(0, std::memory_order_relaxed);
         return false;
     }
 
-    // Give decoder access to audio for A/V sync.
+    // Hand the decoder its audio-clock source for A/V sync.
     decoder->SetAudioProcessor(audioProcessor.get());
 
-    // Pre-cache OSD size before MakePrimaryDevice() calls GetOsdSize().
+    // Populate the OSD-size cache eagerly: the upcoming MakePrimaryDevice() may call
+    // GetOsdSize() before display has been queried otherwise.
     osdWidth = static_cast<int>(display->GetOutputWidth());
     osdHeight = static_cast<int>(display->GetOutputHeight());
     dsyslog("vaapivideo/device: pre-cached OSD size %dx%d", osdWidth, osdHeight);
@@ -887,28 +1051,39 @@ auto cVaapiDevice::Detach() -> void {
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
-    // Show a black frame immediately so the display doesn't show stale framebuffer
-    // content before the first channel is tuned.
+    // Paint black so we don't expose whatever the last DRM client (or boot splash) left
+    // in the scanout buffer until the first real frame arrives.
     SubmitBlackFrame();
 
     return true;
 }
 
 auto cVaapiDevice::Stop() -> void {
-    // Shutdown order matters: display holds surface references from decoder, decoder holds
-    // audio clock reference. Reverse of Initialize() creation order.
-    if (display) [[likely]] {
-        display->Shutdown();
-        display.reset();
-    }
-
+    // Tear-down order = reverse of Initialize() construction = decoder, then display, then
+    // audioProcessor. This is NOT cosmetic.
+    //
+    // The decoder Action thread holds raw pointers to display (constructor arg) and
+    // audioProcessor (SetAudioProcessor) and dereferences both per decoded frame
+    // (SubmitFrame, GetVaDriverMutex, GetClock, ...). Destroying either while the decoder
+    // thread is still alive is a use-after-free. decoder->Shutdown() blocks until the
+    // Action thread observes hasExited, so a sequential Shutdown+reset is safe.
+    //
+    // No back-references in the other direction: display only owns its own surface refs
+    // (ref-counted via av_buffer_ref, survive codec teardown), audioProcessor owns nothing
+    // pointing back at the decoder. So once the decoder thread is gone the remaining order
+    // is for cleanliness, not safety.
+    //
+    // Each Shutdown() is idempotent and runs thread-stop + resource-release.
     if (decoder) [[likely]] {
         decoder->Shutdown();
         decoder.reset();
     }
-
+    if (display) [[likely]] {
+        display->Shutdown();
+        display.reset();
+    }
     if (audioProcessor) [[likely]] {
-        audioProcessor->Stop();
+        audioProcessor->Shutdown();
         audioProcessor.reset();
     }
 }
@@ -917,13 +1092,115 @@ auto cVaapiDevice::Stop() -> void {
 // === INTERNAL METHODS ===
 // ============================================================================
 
+auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby) -> void {
+    // Single funnel for every VDR audio-track notification. Three steps:
+    //   1. Resolve the new track (current-track read, or dolby-slot walk for the stale-read case).
+    //   2. Dedup against the last (type, PID) we handled -- VDR re-fires the hook on PMT churn
+    //      with no actual change and we'd otherwise spam logs and burn decoder state.
+    //   3. On a real change: drop audioCodecId, drain the audio queue + ALSA, arm the
+    //      decoder's A/V sync grace window. PlayAudio() then re-detects on the next PES.
+    //
+    // Hook routing (which path VDR takes from cDevice::SetCurrentAudioTrack):
+    //   SetAudioTrackDevice()   - only when no cPlayer is attached. Reliable post-assignment read.
+    //   SetDigitalAudioDevice() - always called. On=true fires *before* the assignment when
+    //                             switching TO a dolby track -> stale read; On=false fires
+    //                             after the assignment for normal audio tracks -> reliable read.
+    //   Clear() via Empty/Goto  - replay-path safety net via cDvbPlayer.
+    //
+    // Concurrency: every entry point runs on the main VDR thread under
+    // cDevice::mutexCurrentAudioTrack, so dedup state needs no further locking. PlayAudio
+    // runs on the receiver/dvbplayer thread; audioCodecId's atomic gives the happens-before
+    // for the producer side, and audioProcessor->Clear() takes its own mutex.
+
+    eTrackType type = ttNone;
+    const tTrackId *track = nullptr;
+
+    if (enteringDolby) {
+        // Stale-read workaround: VDR fires SetDigitalAudioDevice(true) BEFORE assigning
+        // currentAudioTrack, so GetCurrentAudioTrack() would return the OLD track. We
+        // can't observe which dolby slot VDR is about to assign, so walk the dolby slots
+        // ourselves and pick the unique populated one. Correct in the >99% case (single
+        // dolby track per channel). For multi-dolby channels we fall back to "unknown
+        // dolby" -- the reset still fires and PlayAudio's per-PES detection finds the
+        // right codec on the next AC-3/E-AC-3 sync word.
+        //
+        // The integer-to-enum casts are flagged by clang-tidy's enum-range checker because
+        // ttDolbyFirst+1..ttDolbyLast are not declared enumerators -- but they ARE valid
+        // arguments to VDR's GetTrack() (see vdr/device.h IS_DOLBY_TRACK macro, which uses
+        // exactly the same range). Suppress per-cast with the specific check name.
+        for (int offset = 0; offset <= ttDolbyLast - ttDolbyFirst; ++offset) {
+            // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- VDR API range
+            const auto candidateType = static_cast<eTrackType>(static_cast<int>(ttDolbyFirst) + offset);
+            const tTrackId *candidate = GetTrack(candidateType);
+            if (candidate == nullptr || candidate->id == 0) {
+                continue;
+            }
+            if (track == nullptr) {
+                type = candidateType;
+                track = candidate;
+            } else {
+                // Ambiguous -- multiple dolby tracks present. Fall back to "unknown".
+                type = ttNone;
+                track = nullptr;
+                break;
+            }
+        }
+    } else {
+        // Reliable post-assignment read path.
+        type = GetCurrentAudioTrack();
+        track = GetTrack(type);
+    }
+
+    const auto pid = static_cast<uint16_t>(track ? track->id : 0);
+
+    if (type != ttNone && type == lastHandledAudioTrack && pid == lastHandledAudioPid) {
+        // PMT churn / re-selection of the same track. No reset, but log at info level so
+        // the operator can still correlate every SVDRP `audi N` with the hook firing.
+        isyslog("vaapivideo/device: %s -> %s track %d (PID=%u) -- no change", reason,
+                IS_AUDIO_TRACK(type) ? "audio" : (IS_DOLBY_TRACK(type) ? "dolby" : "unknown"), static_cast<int>(type),
+                pid);
+        return;
+    }
+    lastHandledAudioTrack = type;
+    lastHandledAudioPid = pid;
+
+    const char *kind = "unknown";
+    if (IS_AUDIO_TRACK(type)) {
+        kind = "audio";
+    } else if (IS_DOLBY_TRACK(type) || enteringDolby) {
+        // enteringDolby covers the ambiguous-dolby fallback above where we couldn't pin
+        // the exact track but know we're entering a dolby selection.
+        kind = "dolby";
+    }
+
+    if (track != nullptr) {
+        isyslog("vaapivideo/device: %s -> %s track %d (lang=%s, desc=%s, PID=%u)", reason, kind, static_cast<int>(type),
+                (track->language[0] != '\0') ? track->language : "?",
+                (track->description[0] != '\0') ? track->description : "?", pid);
+    } else {
+        // Ambiguous-dolby fallback: the next-packet "audio codec X" log will identify
+        // the codec the operator actually got.
+        isyslog("vaapivideo/device: %s -> %s track switch (codec re-detect on next packet)", reason, kind);
+    }
+
+    // Trigger PlayAudio()'s detection cycle and clear stale audio state.
+    ResetAudioCodecState();
+    if (audioProcessor) [[likely]] {
+        audioProcessor->Clear();
+    }
+    if (decoder) [[likely]] {
+        decoder->NotifyAudioChange();
+    }
+}
+
 [[nodiscard]] auto cVaapiDevice::OpenHardware() -> bool {
     if (drmPath.empty()) [[unlikely]] {
         esyslog("vaapivideo/device: no DRM device specified");
         return false;
     }
 
-    // Read for resource queries, write for KMS mode-setting ioctls.
+    // R for the resource query ioctls, W for KMS modeset/atomic ioctls. Group membership
+    // ('video' or 'render') is the usual gotcha here, hence the explicit hint below.
     if (access(drmPath.c_str(), R_OK | W_OK) != 0) [[unlikely]] {
         esyslog("vaapivideo/device: DRM device '%s' not accessible -- %s", drmPath.c_str(), strerror(errno));
         esyslog("vaapivideo/device: ensure user is in 'video' or 'render' group");
@@ -944,7 +1221,8 @@ auto cVaapiDevice::Stop() -> void {
         return false;
     }
 
-    // VAAPI requires the render node (/dev/dri/renderD*); obtain its path from drmGetDevice2().
+    // VAAPI must use the render node (/dev/dri/renderD*), not the primary card node we
+    // opened above. drmGetDevice2 gives us the matching render path for the same GPU.
     ::drmDevicePtr rawDevInfo = nullptr;
     if (drmGetDevice2(drmFd, 0, &rawDevInfo) != 0 || !rawDevInfo) [[unlikely]] {
         esyslog("vaapivideo/device: drmGetDevice2 failed");
@@ -990,7 +1268,9 @@ auto cVaapiDevice::Stop() -> void {
 }
 
 [[nodiscard]] auto cVaapiDevice::ProbeVppCapabilities(std::string_view renderNode) -> bool {
-    // Probe decode profiles and VPP capabilities. Returns false if VAEntrypointVideoProc is missing (fatal).
+    // Populates the vaapi.hw* / has* / deinterlaceMode flags consumed by the decoder and
+    // filter graph. Fatal-fails if VAEntrypointVideoProc is missing -- without VPP we can
+    // neither deinterlace nor color-convert and the GPU is unusable for this plugin.
     vaapi.hasDenoise = false;
     vaapi.hasSharpness = false;
     vaapi.hwH264 = false;
@@ -998,8 +1278,9 @@ auto cVaapiDevice::Stop() -> void {
     vaapi.hwMpeg2 = false;
     vaapi.deinterlaceMode.clear();
 
-    // Use a throwaway VADisplay for probing; sharing FFmpeg's VADisplay causes vaCreateContext
-    // failures on some Intel iHD driver versions (tested iHD 24.x).
+    // Throwaway VADisplay for probing. Reusing FFmpeg's VADisplay tickles a bug in some
+    // iHD driver versions (observed on iHD 24.x) where vaCreateContext starts failing
+    // intermittently after the first probe context is destroyed.
     const std::string renderPath{renderNode};
     const int renderFd = open(renderPath.c_str(), O_RDWR | O_CLOEXEC);
     if (renderFd < 0) [[unlikely]] {
@@ -1025,7 +1306,8 @@ auto cVaapiDevice::Stop() -> void {
     const char *vendorStr = vaQueryVendorString(vaDisplay);
     isyslog("vaapivideo/device: VA-API driver -- %s", vendorStr ? vendorStr : "(unknown)");
 
-    // Check which broadcast codecs support HW decode (VLD + YUV420).
+    // Walk the driver's profile list and tag the broadcast codecs we care about as HW
+    // capable iff they support both VLD (= bitstream decode) and YUV420 surfaces.
     const int maxProfiles = vaMaxNumProfiles(vaDisplay);
     if (maxProfiles <= 0) [[unlikely]] {
         esyslog("vaapivideo/device: vaMaxNumProfiles failed");
@@ -1071,7 +1353,8 @@ auto cVaapiDevice::Stop() -> void {
     isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s", vaapi.hwMpeg2 ? "hw" : "sw",
             vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw");
 
-    // vaQueryVideoProcFilters() requires a live VPP context; create throwaway resources.
+    // vaQueryVideoProcFilters needs a live VPP context (config + surface + context).
+    // Build a minimal one just for the probe and tear it all down at the bottom.
     VAConfigID configId = VA_INVALID_ID;
     if (vaCreateConfig(vaDisplay, VAProfileNone, VAEntrypointVideoProc, nullptr, 0, &configId) != VA_STATUS_SUCCESS)
         [[unlikely]] {
@@ -1081,8 +1364,9 @@ auto cVaapiDevice::Stop() -> void {
         return false;
     }
 
-    // vaCreateContext requires at least one render target surface.
-    // iHD driver crashes with 0x0 dimensions; use 64x64 as a safe minimum.
+    // vaCreateContext requires at least one render target surface. Use 64x64 instead of
+    // a 1x1 placeholder: the iHD driver SIGSEGVs on zero-size dimensions and some VPP
+    // entrypoints reject sub-block sizes outright.
     VASurfaceID surface = VA_INVALID_SURFACE;
     if (vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, 64, 64, &surface, 1, nullptr, 0) != VA_STATUS_SUCCESS)
         [[unlikely]] {
@@ -1117,8 +1401,10 @@ auto cVaapiDevice::Stop() -> void {
         }
     }
 
-    // Deinterlace mode selection: ordered by quality (motion-compensated > adaptive > weave > bob);
-    // pick the first mode the driver advertises.
+    // Pick the best deinterlace mode the driver advertises. Quality order:
+    // motion_compensated > motion_adaptive > weave > bob. The decoder uses this string in
+    // its deinterlace_vaapi filter on the HW-decode path; if empty, the HW path runs with
+    // no deinterlacer (the SW-decode path uses bwdif unconditionally).
     VAProcFilterCapDeinterlacing deintCaps[VAProcDeinterlacingCount];
     auto numDeintCaps = static_cast<unsigned int>(VAProcDeinterlacingCount);
     if (vaQueryVideoProcFilterCaps(vaDisplay, contextId, VAProcFilterDeinterlacing, deintCaps, &numDeintCaps) ==
@@ -1143,7 +1429,7 @@ auto cVaapiDevice::Stop() -> void {
         }
     }
 
-    // No RAII wrapper for VADisplay -- manual teardown in reverse creation order.
+    // libva offers no RAII wrappers; tear down in reverse creation order by hand.
     vaDestroyContext(vaDisplay, contextId);
     vaDestroySurfaces(vaDisplay, &surface, 1);
     vaDestroyConfig(vaDisplay, configId);
@@ -1159,13 +1445,23 @@ auto cVaapiDevice::Stop() -> void {
 auto cVaapiDevice::ReleaseHardware() -> void {
     if (vaapi.hwDeviceRef) {
         av_buffer_unref(&vaapi.hwDeviceRef);
-        vaapi.drmFd = -1; // Borrowed fd -- actual close happens below.
+        vaapi.drmFd = -1; // vaapi.drmFd is a borrowed copy of drmFd; the real close is below.
     }
 
     if (drmFd >= 0) {
         close(drmFd);
         drmFd = -1;
     }
+}
+
+auto cVaapiDevice::ResetAudioCodecState() -> void {
+    // Forget the audio stream identity. PlayAudio() re-runs detection on its next PES.
+    // Clearing the candidate fields too is REQUIRED -- a stale partial 2-of-2 count would
+    // otherwise let the next single detection result confirm against the previous cycle's
+    // codec and re-open the wrong decoder.
+    audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    audioCodecCandidate = AV_CODEC_ID_NONE;
+    audioCodecCandidateCount = 0;
 }
 
 [[nodiscard]] auto cVaapiDevice::SelectDrmConnector() -> bool {
@@ -1181,7 +1477,8 @@ auto cVaapiDevice::ReleaseHardware() -> void {
         return false;
     }
 
-    // Probe plane resource availability (required for atomic modesetting); result itself is unused.
+    // Existence-check the plane resources -- atomic modesetting needs them, but we don't
+    // use the values here (the display module re-queries planes during modeset).
     if (!std::unique_ptr<drmModePlaneRes, FreeDrmPlaneResources>{drmModeGetPlaneResources(drmFd)}) [[unlikely]] {
         esyslog("vaapivideo/device: failed to get DRM plane resources (atomic required)");
         return false;
@@ -1191,7 +1488,10 @@ auto cVaapiDevice::ReleaseHardware() -> void {
     const auto targetHeight = vaapiConfig.display.GetHeight();
     const auto targetRate = vaapiConfig.display.GetRefreshRate();
 
-    // Mode priority: (1) exact config match, (2) driver-preferred flag, (3) first listed.
+    // Mode selection priority:
+    //   1. exact (width, height, refresh) match against the plugin config -- operator wins
+    //   2. driver's PREFERRED mode (typically the panel's native mode)
+    //   3. first listed mode (the connector won't expose any if nothing is connected)
 
     for (int i = 0; i < resources->count_connectors; ++i) {
         std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
@@ -1229,8 +1529,9 @@ auto cVaapiDevice::ReleaseHardware() -> void {
             for (uint32_t propIdx = 0; propIdx < props->count_props; ++propIdx) {
                 std::unique_ptr<drmModePropertyRes, FreeDrmProperty> prop{
                     drmModeGetProperty(drmFd, props->props[propIdx])};
-                // CRTC_ID from the connector property is more reliable than walking the encoder chain
-                // on atomic-capable drivers (legacy encoder_id may be stale).
+                // Read CRTC_ID directly from the connector's atomic property: on atomic
+                // drivers the legacy encoder_id walk can return a stale CRTC, while the
+                // CRTC_ID property always reflects the current binding.
                 if (prop && std::strcmp(prop->name, "CRTC_ID") == 0) {
                     crtcId = static_cast<uint32_t>(props->prop_values[propIdx]);
                     break;

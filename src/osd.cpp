@@ -2,7 +2,18 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file osd.cpp
- * @brief OSD overlay using DRM dumb buffers
+ * @brief OSD overlay backed by DRM dumb buffers, scanned out on the OSD plane.
+ *
+ * Each cVaapiOsd owns one CPU-accessible (dumb) GEM buffer + KMS framebuffer; VDR's
+ * cPixmap renderer paints ARGB8888 directly into the mmap'd region in Flush(), and the
+ * display thread picks up the framebuffer-id (and geometry) on the next atomic commit
+ * via cVaapiDisplay::SetOsd().
+ *
+ * Threading: cPixmap rendering runs under VDR's LOCK_PIXMAPS macro and feeds Flush() on
+ * the main VDR thread; provider->UpdateOsd() is called *after* releasing LOCK_PIXMAPS so
+ * we don't hold the global pixmap lock across the display's atomic-commit path. The
+ * display reads no pixel data from us -- it scans the dumb buffer directly via KMS, so
+ * the OSD lifetime must outlive any pageflip that referenced its fbId (see ~cVaapiOsd).
  */
 
 #include "osd.h"
@@ -37,8 +48,9 @@
 // === GLOBAL STATE ===
 // ============================================================================
 
-// VDR's cOsdProvider::Install() is singleton-only and unsuitable for multi-plugin coexistence;
-// we track the active provider manually so device.cpp can manage attach/detach across stream switches.
+// VDR's cOsdProvider::Install() is a singleton with no detach hook, which doesn't survive
+// the SVDRP DETA/ATTA cycle in device.cpp. We keep our own pointer so device.cpp can swap
+// the live display under us across stream switches without re-creating the provider.
 cOsdProvider *osdProvider = nullptr;
 
 // ============================================================================
@@ -53,7 +65,9 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
     dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(display_));
 
-    // Guard against rapid teardown/restart: another provider instance may have already replaced us.
+    // Conditional clear: a fast restart can install a new provider before VDR destroys
+    // the old one, in which case ::osdProvider already points at the replacement and we
+    // must NOT null it.
     if (::osdProvider == this) {
         ::osdProvider = nullptr;
     }
@@ -77,6 +91,10 @@ auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
 }
 
 auto cVaapiOsdProvider::ReleaseAllOsdResources() -> void {
+    // Called from cVaapiDevice::Detach(): VDR may keep cVaapiOsd objects alive past our
+    // hardware release, but their dumb buffers hold kernel refs that would block
+    // drmDropMaster/close. Force-release the buffers in place; the cVaapiOsd objects
+    // become render-no-ops (pixels_==nullptr) until VDR finally destroys them.
     const cMutexLock lock(&osdListMutex_);
     for (auto *osd : activeOsds_) {
         osd->DestroyDumbBuffer();
@@ -98,7 +116,9 @@ auto cVaapiOsdProvider::UntrackOsd(cVaapiOsd *osd) -> void {
 
 auto cVaapiOsdProvider::HideOsd(const uint32_t fbId) -> void {
     if (display_) [[likely]] {
-        // Only clear if this is the active framebuffer; destroying a non-active OSD must not hide the active one.
+        // Conditional clear: VDR can have several cVaapiOsds alive concurrently (e.g. menu
+        // over playback), only one of which is currently presented. Tearing down a
+        // non-active OSD must NOT yank the visible OSD off the plane.
         display_->ClearOsdIfActive(fbId);
     }
 }
@@ -131,8 +151,10 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
         return nullptr;
     }
 
-    // Framebuffer spans from OSD origin to screen edge; oversized skin content is clipped scanline-by-scanline
-    // in Flush() to avoid out-of-bounds writes into the mmap'd dumb buffer.
+    // Size the FB to "from (left, top) to the bottom-right screen corner" instead of
+    // pre-asking the skin how big it wants to be: VDR's cOsd API has no width/height
+    // negotiation at construction. Pixmaps that exceed this rectangle are clipped per
+    // scanline in Flush() so we never write past the mmap'd region.
     const auto screenWidth = static_cast<int>(display_->GetOutputWidth());
     const auto screenHeight = static_cast<int>(display_->GetOutputHeight());
     const int osdWidth = screenWidth - left;
@@ -161,10 +183,14 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
 
 cVaapiOsd::cVaapiOsd(const int posX, const int posY, const uint lvl, const int fd, const int fbWidth,
                      const int fbHeight, cVaapiOsdProvider *provider)
-    // cOsd does not expose width/height as settable fields after construction; we store our own.
+    // cOsd has no width/height accessors past construction, so we keep our own. Width and
+    // height represent the dumb-buffer extent (= screen minus OSD origin), NOT the visible
+    // pixmap region.
     : cOsd(posX, posY, lvl), drmFd_(fd), height_(static_cast<uint32_t>(fbHeight)), provider_(provider),
       width_(static_cast<uint32_t>(fbWidth)) {
-    // drmFd_ is borrowed from the display; it must remain valid for the OSD lifetime.
+    // drmFd_ is BORROWED from the display. The display outlives every cVaapiOsd by virtue
+    // of cVaapiDevice::Detach() running provider->ReleaseAllOsdResources() before
+    // ReleaseHardware(), so we don't need to ref-count the fd here.
     provider_->TrackOsd(this);
 }
 
@@ -176,14 +202,16 @@ cVaapiOsd::~cVaapiOsd() noexcept {
     if (provider_ && framebufferId_ != 0) [[likely]] {
         provider_->HideOsd(framebufferId_);
 
-        // Wait for the display thread to finish scanning out this framebuffer; freeing the GEM object
-        // while KMS still references it causes a kernel use-after-free.
+        // STRICT ordering: hide -> await -> destroy. The display thread must observe the
+        // hide and present at least one frame without our fbId before we free the GEM
+        // object, otherwise the kernel reads freed memory on its next scanout. AwaitOsdHidden
+        // is the synchronization point; without it the next two lines race the display thread.
         if (cVaapiDisplay *display = provider_->GetDisplay(); display && display->IsInitialized()) {
             display->AwaitOsdHidden(framebufferId_);
         }
     }
 
-    // Save before DestroyDumbBuffer() zeroes framebufferId_.
+    // Snapshot before DestroyDumbBuffer() zeroes framebufferId_, otherwise we log "fbId=0".
     const uint32_t logFbId = framebufferId_;
     DestroyDumbBuffer();
     dsyslog("vaapivideo/osd: destroyed fbId=%u", logFbId);
@@ -214,7 +242,10 @@ cVaapiOsd::~cVaapiOsd() noexcept {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiOsd::CanHandleAreas(const tArea *areas, const int numAreas) -> eOsdError {
-    // TrueColor provider: VDR handles color-depth conversion. Delegate structural checks to base class.
+    // We expose ARGB8888 surfaces and VDR's TrueColor pipeline owns any palette/depth
+    // conversion -- our framebuffer never sees indexed pixels through this entry point.
+    // The base class implementation already validates the structural constraints (area
+    // count, overlap, dimensions) we'd otherwise have to repeat, so just delegate.
     return cOsd::CanHandleAreas(areas, numAreas);
 }
 
@@ -223,8 +254,10 @@ auto cVaapiOsd::Flush() -> void {
         return;
     }
 
-    // RenderPixmaps() returns one dirty ARGB8888 region per call; loop until nullptr.
-    // LOCK_PIXMAPS must be held across the entire sequence -- VDR's cPixmap is not thread-safe.
+    // RenderPixmaps() pops one dirty pixmap per call and returns null when done. The
+    // LOCK_PIXMAPS macro takes VDR's per-OSD pixmap mutex; it MUST be held for the whole
+    // pop-loop, not just per call -- otherwise a concurrent SetPixmap()/AddPixmap() can
+    // mutate the list mid-iteration and we'd skip or double-render regions.
     bool rendered = false;
     {
         LOCK_PIXMAPS;
@@ -233,7 +266,9 @@ auto cVaapiOsd::Flush() -> void {
             const uint8_t *src = pm->Data();
             const size_t srcStride = static_cast<size_t>(vp.Width()) * 4;
 
-            // Clip to framebuffer boundaries (skins may produce oversized pixmaps).
+            // Clip the pixmap's destination rect to our FB. Skins routinely place pixmaps
+            // partially off-screen (e.g. animated slides) and we'd write past mappedSize_
+            // without this clamp.
             const int dstX = std::max(vp.X(), 0);
             const int dstY = std::max(vp.Y(), 0);
             const int dstRight = std::min(vp.X() + vp.Width(), static_cast<int>(width_));
@@ -241,7 +276,9 @@ auto cVaapiOsd::Flush() -> void {
 
             if (dstX < dstRight && dstY < dstBottom) [[likely]] {
                 const size_t copyBytes = static_cast<size_t>(dstRight - dstX) * 4;
-                // stride_ may exceed width_*4 due to DRM pitch alignment requirements.
+                // stride_ may exceed width_*4 -- the DRM driver returned the pitch via
+                // drm_mode_create_dumb.pitch and we use that value verbatim. Always step
+                // dst rows by stride_, never by width_*4.
                 uint8_t *dst = pixels_ + (static_cast<size_t>(dstY) * stride_) + (static_cast<size_t>(dstX) * 4);
                 const uint8_t *srcRow =
                     src + (static_cast<size_t>(dstY - vp.Y()) * srcStride) + (static_cast<size_t>(dstX - vp.X()) * 4);
@@ -256,8 +293,11 @@ auto cVaapiOsd::Flush() -> void {
         }
     }
 
-    // Notify display after releasing LOCK_PIXMAPS to avoid holding VDR's global lock during an atomic commit.
-    // UpdateOsd() passes only geometry; the display reads pixel data directly from the mmap'd dumb buffer.
+    // UpdateOsd() is called OUTSIDE LOCK_PIXMAPS: it ends up in display->SetOsd() which
+    // takes osdMutex, and the display thread holds osdMutex during PresentBuffer's atomic
+    // commit. Holding LOCK_PIXMAPS across that path would gate every VDR pixmap operation
+    // on the display's vsync cadence. Only fbId + geometry crosses; the kernel scans the
+    // dumb buffer directly so we don't need to copy pixels here.
     if (rendered) {
         provider_->UpdateOsd(*this);
         return;
@@ -267,8 +307,9 @@ auto cVaapiOsd::Flush() -> void {
         return;
     }
 
-    // Indexed-color fallback: convert dirty bitmap regions from VDR palette to ARGB8888 pixel-by-pixel.
-    // Only reached by legacy 4/8bpp skins; TrueColor skins use the RenderPixmaps() path above.
+    // Indexed-color fallback (cBitmap path). VDR's TrueColor skins go through RenderPixmaps
+    // above; only legacy 4/8bpp skins still use the bitmap API. We palette-convert per
+    // pixel into ARGB8888 -- slow but only hit by old skins.
     bool anyDirty = false;
     for (int i = 0; cBitmap *bitmap = GetBitmap(i); ++i) {
         int x1 = 0;
@@ -279,7 +320,8 @@ auto cVaapiOsd::Flush() -> void {
             continue;
         }
 
-        // Clamp dirty region to framebuffer; bitmap pixel (x,y) maps to framebuffer (X0()+x, Y0()+y).
+        // Clamp the dirty rect to the FB. Coordinate mapping: bitmap-local (x,y) lands at
+        // FB (bmpX0+x, bmpY0+y), so the FB-bounds clamp on x is "x >= -bmpX0" / "x < width-bmpX0".
         const int bmpX0 = bitmap->X0();
         const int bmpY0 = bitmap->Y0();
         const int cx1 = std::max(x1, -bmpX0);
@@ -317,7 +359,10 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Allocate a dumb (CPU-accessible) GEM buffer -- the only buffer type guaranteed by all DRM drivers.
+    // Dumb buffers are the lowest-common-denominator GEM allocation: every DRM driver
+    // implements them, they're CPU-mappable (which we need for direct ARGB writes), and
+    // they need no GPU API. The trade-off is no tiling and no compression -- fine here
+    // because the OSD plane is small relative to the video plane.
     drm_mode_create_dumb createReq{};
     createReq.width = fbWidth;
     createReq.height = fbHeight;
@@ -329,10 +374,12 @@ auto cVaapiOsd::Flush() -> void {
     }
 
     gemHandle_ = createReq.handle;
-    stride_ = createReq.pitch; // may exceed fbWidth*4 due to GPU-specific pitch alignment
+    // Use the driver-returned pitch verbatim; do NOT recompute as fbWidth*4. Drivers may
+    // pad rows for hardware alignment, and Flush() steps by this stride value.
+    stride_ = createReq.pitch;
     mappedSize_ = createReq.size;
 
-    // Register as a KMS framebuffer. ARGB8888 is single-plane (index 0 only).
+    // Register the GEM buffer as a KMS FB. ARGB8888 has one plane, so handles[0] only.
     const uint32_t handles[4] = {gemHandle_, 0, 0, 0};
     const uint32_t pitches[4] = {stride_, 0, 0, 0};
     const uint32_t offsets[4] = {0, 0, 0, 0};
@@ -344,7 +391,11 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // mmap for direct CPU pixel writes; PROT_READ is needed for potential read-back by FBC/PSR.
+    // mmap the buffer so Flush() can write ARGB pixels directly into the scanout memory.
+    // PROT_READ is requested in addition to PROT_WRITE so std::memcpy reads-around-writes
+    // don't trap (some hardened libc builds and ASan modes verify the source mapping is
+    // readable even when only writes are issued from this address). The kernel-side FBC/PSR
+    // read paths run via the GPU mapping, NOT via our user mmap, and don't depend on this.
     drm_mode_map_dumb mapReq{};
     mapReq.handle = gemHandle_;
 
@@ -364,14 +415,17 @@ auto cVaapiOsd::Flush() -> void {
         return false;
     }
 
-    // Start with a fully transparent framebuffer so no garbage is visible before the first Flush().
+    // Zero-fill = fully transparent ARGB. Without this the first commit would show
+    // whatever stale data the kernel handed us in the dumb-buffer pages.
     std::memset(pixels_, 0, mappedSize_);
     return true;
 }
 
 auto cVaapiOsd::DestroyDumbBuffer() -> void {
-    // Reverse allocation order: unmap -> remove FB -> destroy GEM handle.
-    // FB must be removed before closing the GEM handle: the kernel asserts no active FB references remain.
+    // STRICT release order (reverse of allocation): munmap -> drmModeRmFB -> destroy GEM.
+    // drmModeRmFB MUST come before destroy_dumb -- the kernel WARN_ON()s and refuses if a
+    // GEM handle still has an FB attached. Idempotent: every step zeroes its handle so a
+    // double-call (e.g. ReleaseAllOsdResources then ~cVaapiOsd) is a no-op.
     if (pixels_) [[likely]] {
         munmap(pixels_, mappedSize_);
         pixels_ = nullptr;

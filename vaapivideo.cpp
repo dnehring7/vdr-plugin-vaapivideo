@@ -65,19 +65,30 @@ namespace {
 /// only written back to the global config when the user confirms with Store().
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
-    cMenuSetupVaapi() : editLatency(vaapiConfig.audioLatency.load(std::memory_order_relaxed)) {
+    cMenuSetupVaapi()
+        : editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
+          editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
-        Add(new cMenuEditIntItem(tr("Audio Latency (ms)"), &editLatency, 0, 200));
+        // Two independent A/V offsets: one used while audio is decoded to PCM, the other while audio
+        // is forwarded as IEC61937 passthrough. Bounds come from config.h so the menu and the
+        // setup.conf parser share a single source of truth.
+        Add(new cMenuEditIntItem(tr("PCM Audio Latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
+                                 CONFIG_AUDIO_LATENCY_MAX_MS));
+        Add(new cMenuEditIntItem(tr("Passthrough Audio Latency (ms)"), &editPassthroughLatency,
+                                 CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
     }
 
   protected:
     auto Store() -> void override {
-        vaapiConfig.audioLatency.store(editLatency, std::memory_order_relaxed);
-        SetupStore("AudioLatency", editLatency);
+        vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
+        vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
+        SetupStore("PcmLatency", editPcmLatency);
+        SetupStore("PassthroughLatency", editPassthroughLatency);
     }
 
   private:
-    int editLatency; ///< Scratch copy; prevents live config changes while the user is still editing.
+    int editPcmLatency;         ///< Scratch copy of pcmLatency; not committed until Store().
+    int editPassthroughLatency; ///< Scratch copy of passthroughLatency; not committed until Store().
 };
 
 // ============================================================================

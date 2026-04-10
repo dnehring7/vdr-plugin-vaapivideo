@@ -66,9 +66,12 @@ struct VaapiConfig {
     // ========================================================================
     // === DATA MEMBERS ===
     // ========================================================================
-    std::atomic<int> audioLatency{0}; ///< Extra A/V synchronization offset (ms); positive shifts video earlier to
-                                      ///< compensate for external audio delay (read by decode thread)
-    DisplayConfig display;            ///< Desired display output parameters
+    DisplayConfig display;                  ///< Desired display output parameters
+    std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) when audio is in IEC61937 passthrough; positive
+                                            ///< delays audio relative to video, negative shifts audio earlier (read by
+                                            ///< decode thread)
+    std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) when audio is decoded to PCM; positive delays audio
+                                    ///< relative to video, negative shifts audio earlier (read by decode thread)
 
     // ========================================================================
     // === METHODS ===
@@ -78,6 +81,13 @@ struct VaapiConfig {
     [[nodiscard]] auto SetupParse(const char *name, const char *value)
         -> bool; ///< Handle a VDR setup.conf key/value pair; returns true when the key is recognized
 };
+
+// ============================================================================
+// === LATENCY BOUNDS ===
+// ============================================================================
+
+inline constexpr int CONFIG_AUDIO_LATENCY_MIN_MS = -200; ///< Lower bound for PCM/passthrough latency compensation (ms)
+inline constexpr int CONFIG_AUDIO_LATENCY_MAX_MS = 200;  ///< Upper bound for PCM/passthrough latency compensation (ms)
 
 // ============================================================================
 // === GLOBAL INSTANCE ===

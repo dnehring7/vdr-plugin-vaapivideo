@@ -281,20 +281,20 @@ class cVaapiDisplay : public cThread {
     uint32_t connectorId{};                           ///< DRM connector object ID
     uint32_t crtcId{};                                ///< DRM CRTC object ID
     OsdOverlay currentOsd{};                          ///< OSD overlay parameters staged for the next frame commit
-    DrmFramebuffer displayedBuffer;    ///< Framebuffer currently being scanned out by the CRTC (front buffer)
-    int drmFd{-1};                     ///< Open DRM device file descriptor (not owned)
-    drmEventContext eventContext{};    ///< Registered DRM event handler table
-    cCondVar frameSlotCond;            ///< Signalled when pendingFrame is consumed and the slot becomes free
-    std::atomic<bool> hasThreadExited; ///< Set by the display thread just before it returns (happens-before Shutdown())
-    AVBufferRef *hwDeviceRef{};        ///< VAAPI hardware device context reference (owned)
-    mutable cMutex importMutex; ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()
+    DrmFramebuffer displayedBuffer; ///< Framebuffer currently being scanned out by the CRTC (front buffer)
+    int drmFd{-1};                  ///< Open DRM device file descriptor (not owned)
+    drmEventContext eventContext{}; ///< Registered DRM event handler table
+    cCondVar frameSlotCond;         ///< Signalled when pendingFrame is consumed and the slot becomes free
+    std::atomic<bool> hasExited;    ///< Set by the display thread just before it returns (happens-before Shutdown())
+    AVBufferRef *hwDeviceRef{};     ///< VAAPI hardware device context reference (owned)
+    mutable cMutex importMutex;     ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()
 
     mutable cMutex vaDriverMutex;    ///< Serializes VA driver calls between display (MapVaapiFrame) and decode thread
                                      ///< (VPP filter graph); the iHD VEBOX path is not thread-safe concurrently.
     std::atomic<bool> isClearing;    ///< Set during a stream switch to block new frame imports
     std::atomic<bool> isFlipPending; ///< Set between an atomic page-flip commit and the corresponding DRM flip event
-    std::atomic<bool> isReady;       ///< Set after successful Initialize(); cleared at the start of Shutdown()
-    std::atomic<bool> isStopping;    ///< Signals the display thread to exit its run loop
+    std::atomic<bool> ready;         ///< Set after successful Initialize(); cleared at the start of Shutdown()
+    std::atomic<bool> stopping;      ///< Signals the display thread to exit its run loop
     std::atomic<uint64_t> lastVSyncTimeMs{0}; ///< Wall-clock timestamp (ms) of the most recent page-flip event
     uint32_t modeBlobId{};                    ///< KMS property blob ID for the current mode (managed lifetime)
     ModesetProps modesetProps{};              ///< Cached DRM atomic property IDs for the CRTC and connector

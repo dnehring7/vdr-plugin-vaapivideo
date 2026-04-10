@@ -74,6 +74,8 @@ class cVaapiDecoder : public cThread {
     auto DrainQueue() -> void; ///< Discard all queued packets without touching the codec or filter state
     auto EnqueueData(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parse raw PES payload and push resulting packets onto the decode queue
+    auto FlushParser()
+        -> void; ///< Drain any access unit the bitstream parser is holding back; required by the still-picture path
     [[nodiscard]] auto GetLastPts() const noexcept
         -> int64_t; ///< Return the PTS of the most recently submitted frame (90 kHz), or AV_NOPTS_VALUE
     [[nodiscard]] auto GetQueueSize() const
@@ -119,6 +121,8 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt,
                                        std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool; ///< Send one packet to the VAAPI decoder and drain all resulting filtered frames into outFrames
+    auto DrainPendingParserAU()
+        -> void; ///< Push the parser's held-back access unit (if any) onto the queue. Caller must hold codecMutex.
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame)
         -> bool; ///< Build VPP filter graph: HW path or SW (bwdif/hqdn3d -> hwupload) + scale/sharpen
     auto ResetFilterGraph() -> void; ///< Null filter pointers and destroy the graph (idempotent)
@@ -126,14 +130,21 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Trick-mode pacing: enforce timing, reverse-PTS filtering, then submit
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Apply A/V sync policy (wait / drop / pass) and forward the frame to the display
-    [[nodiscard]] auto SyncLatency90k() const noexcept
-        -> int64_t; ///< Combined A/V sync latency: audioLatency + one-frame pipeline delay (90 kHz ticks)
+    [[nodiscard]] auto SyncLatency90k(const cAudioProcessor *ap) const noexcept
+        -> int64_t; ///< Combined A/V sync latency in 90 kHz ticks: configured audio offset (PCM or passthrough variant,
+                    ///< chosen from @p ap->IsPassthrough()) + a 2-frame DRM/HDMI scanout pipeline delay (one frame for
+                    ///< decoder-to-scanout, one for HDMI link / panel input lag). Pass nullptr to force the PCM variant
+                    ///< (used as a safe default before the audio processor is attached).
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
         -> void; ///< Update the EMA-smoothed A/V delta; warms up from N samples after a reset
     auto ResetSmoothedDelta() noexcept -> void; ///< Invalidate EMA and clear warmup accumulator
     auto LogSyncStats(int64_t rawDelta90k, const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
-    auto RunJitterPrimeSync(cAudioProcessor *ap)
-        -> void; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0
+    [[nodiscard]] auto RunJitterPrimeSync(cAudioProcessor *ap)
+        -> bool; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0.
+                 ///< Returns true when alignment ran (or there was nothing to align), false when the audio clock is
+                 ///< not yet available and the caller should retry on the next Action() iteration. The deferral
+                 ///< prevents the one-shot opportunity from being wasted when prime fires before audio comes back
+                 ///< (e.g. an audi-track switch that arms freerun while the new audio clock takes ~200 ms to start).
     auto SkipStaleJitterFrames(cAudioProcessor *ap)
         -> void; ///< Pop jitter-buffer frames whose PTS is past the hard-late threshold (transient catch-up)
     auto WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta)

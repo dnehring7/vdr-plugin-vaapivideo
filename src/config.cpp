@@ -2,7 +2,13 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file config.cpp
- * @brief Plugin configuration and setup storage
+ * @brief Plugin configuration: resolution parsing + setup.conf load/store.
+ *
+ * The global `vaapiConfig` is shared across the VDR main thread (setup menu),
+ * the audio thread, and the device thread. Mutable fields (`pcmLatency`,
+ * `passthroughLatency`) are `std::atomic<int>` with relaxed ordering -- they
+ * are scalar tunables read on slow paths, so no acquire/release pairing is
+ * needed and we deliberately avoid a mutex here.
  */
 
 #include "config.h"
@@ -14,6 +20,7 @@
 #include <cstring>
 #include <format>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 // VDR
@@ -26,11 +33,10 @@
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr int CONFIG_AUDIO_LATENCY_MAX_MS = 200; ///< Upper bound for audio-latency compensation (ms)
-constexpr int CONFIG_AUDIO_LATENCY_MIN_MS = 0;   ///< Lower bound for audio-latency compensation (ms)
-constexpr uint32_t CONFIG_MAX_VIDEO_HEIGHT =
-    2160U; ///< Maximum display height accepted by ParseResolution() (4K UHD, px)
-constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width accepted by ParseResolution() (4K UHD, px)
+// Audio latency bounds live in config.h (CONFIG_AUDIO_LATENCY_{MIN,MAX}_MS) so the parse path
+// here and the setup-menu UI share one source of truth -- keep them in lockstep.
+constexpr uint32_t CONFIG_MAX_VIDEO_HEIGHT = 2160U; ///< 4K UHD ceiling for ParseResolution() (px)
+constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for ParseResolution() (px)
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===
@@ -49,7 +55,8 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return false;
     }
 
-    // Expected format: WIDTHxHEIGHT@RATE (e.g. "1920x1080@50"). All three fields are mandatory.
+    // Required format: WIDTHxHEIGHT@RATE (e.g. "1920x1080@50"). No optional fields, no
+    // whitespace tolerance -- callers feed values straight from setup.conf / CLI args.
     const char *widthStart = resolutionStr;
     const char *xPos = std::strchr(widthStart, 'x');
     if (!xPos) [[unlikely]] {
@@ -67,7 +74,8 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
     const char *rateStart = atPos + 1;
     const char *rateEnd = rateStart + std::strlen(rateStart);
 
-    // Verify end pointer matches delimiter to reject trailing garbage (e.g. "1920abc").
+    // For each field, require std::from_chars to consume *exactly* up to the delimiter:
+    // ec == errc{} alone would accept "1920abc" by stopping at 'a'.
     uint32_t width{};
     auto [ptrW, ecW] = std::from_chars(widthStart, xPos, width);
     if (ecW != std::errc{} || ptrW != xPos) [[unlikely]] {
@@ -89,9 +97,10 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
         return false;
     }
 
-    // Lower bounds: 640x480 is the smallest meaningful SD resolution; 23 fps covers 24p content with a small rounding
-    // margin. Upper bounds: 3840x2160 and 120 Hz are the maximums the VAAPI/DRM stack is expected to handle; anything
-    // higher is almost certainly a typo.
+    // Sanity bounds, not hardware limits: 640x480 / 23 Hz catches 24p content with rounding
+    // slack; 4K / 120 Hz is the ceiling the VAAPI/DRM stack is exercised against. Anything
+    // outside is almost certainly a typo and would just propagate to a confusing modeset
+    // failure later.
     if (width < 640 || width > CONFIG_MAX_VIDEO_WIDTH) [[unlikely]] {
         esyslog("vaapivideo/config: width %u outside valid range [640, %u]", width, CONFIG_MAX_VIDEO_WIDTH);
         return false;
@@ -118,40 +127,58 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U; ///< Maximum display width ac
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
-    return std::format("Audio Latency: {}ms", audioLatency.load(std::memory_order_relaxed));
+    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms", pcmLatency.load(std::memory_order_relaxed),
+                       passthroughLatency.load(std::memory_order_relaxed));
 }
+
+namespace {
+
+/// Parse a latency value (ms) into @p target after range-clamping to
+/// [CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS]. Stores with relaxed ordering;
+/// the audio path re-reads on every packet so torn writes don't matter here.
+[[nodiscard]] auto ParseLatencyValue(const char *key, const char *value, std::atomic<int> &target) -> bool {
+    int parsed{};
+    const auto *end = value + std::strlen(value);
+    const auto [ptr, ec] = std::from_chars(value, end, parsed);
+
+    if (ec != std::errc{} || ptr != end) {
+        esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
+        return false;
+    }
+    if (parsed < CONFIG_AUDIO_LATENCY_MIN_MS || parsed > CONFIG_AUDIO_LATENCY_MAX_MS) {
+        esyslog("vaapivideo/config: %s %d outside valid range [%d,%d]", key, parsed, CONFIG_AUDIO_LATENCY_MIN_MS,
+                CONFIG_AUDIO_LATENCY_MAX_MS);
+        return false;
+    }
+
+    dsyslog("vaapivideo/config: %s updated from %d to %d ms", key, target.load(std::memory_order_relaxed), parsed);
+    target.store(parsed, std::memory_order_relaxed);
+    return true;
+}
+
+} // namespace
 
 [[nodiscard]] auto VaapiConfig::SetupParse(const char *name, const char *value) -> bool {
     if (!name || !value) [[unlikely]] {
         return false;
     }
 
-    // Key must match the string passed to SetupStore() in vaapivideo.cpp; VDR persists these in setup.conf.
-    if (std::string_view{name} == "AudioLatency") {
-        int parsed{};
-        const auto *end = value + std::strlen(value);
-        const auto [ptr, ec] = std::from_chars(value, end, parsed);
-
-        if (ec != std::errc{} || ptr != end) {
-            esyslog("vaapivideo/config: invalid AudioLatency value '%s'", value);
-            return false;
-        }
-        if (parsed < CONFIG_AUDIO_LATENCY_MIN_MS || parsed > CONFIG_AUDIO_LATENCY_MAX_MS) {
-            esyslog("vaapivideo/config: AudioLatency %d outside valid range [%d,%d]", parsed,
-                    CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS);
-            return false;
-        }
-
-        dsyslog("vaapivideo/config: audio latency updated from %d to %d ms",
-                audioLatency.load(std::memory_order_relaxed), parsed);
-        audioLatency.store(parsed, std::memory_order_relaxed);
-        return true;
+    // Key strings must stay in sync with the SetupStore() calls in vaapivideo.cpp -- VDR
+    // round-trips these verbatim through setup.conf, so a typo silently drops the setting.
+    const std::string_view key{name};
+    if (key == "PcmLatency") {
+        return ParseLatencyValue("PcmLatency", value, pcmLatency);
+    }
+    if (key == "PassthroughLatency") {
+        return ParseLatencyValue("PassthroughLatency", value, passthroughLatency);
     }
 
-    return false; // Unknown key: VDR will offer it to other plugins.
+    return false; // Unknown key: ignore so older/newer setup.conf entries don't break load.
 }
 
 // ----------------------------------------------------------------------------
 
-// Singleton; written once during plugin init, then effectively read-only. Declared extern in config.h.
+// Process-wide singleton (declared extern in config.h). Display fields are written once
+// during plugin init; latency atomics may be re-written from the VDR main thread whenever
+// the user edits the setup menu, hence the std::atomic types.
 VaapiConfig vaapiConfig;

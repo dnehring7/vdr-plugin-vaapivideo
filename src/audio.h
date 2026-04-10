@@ -86,7 +86,8 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper: configures codec, sample rate, and channel count in one call
     auto SetVolume(int vol) -> void; ///< Sets PCM playback volume in the range 0 (mute) to 255 (full scale)
-    auto Stop() -> void;             ///< Signals the processing thread to exit, waits for it, then calls Shutdown()
+    auto Shutdown() -> void; ///< Stops the processing thread, then closes ALSA + decoder + parser. Idempotent. Called
+                             ///< by the destructor; also reachable via Initialize() when reopening on a new device.
 
   protected:
     // ========================================================================
@@ -99,19 +100,28 @@ class cAudioProcessor : public cThread {
     // === INTERNAL METHODS ===
     // ========================================================================
     [[nodiscard]] auto CanPassthrough(AVCodecID codecId) const
-        -> bool; ///< Returns true if sinkCaps advertises IEC61937 support for this codec
+        -> bool;                ///< Returns true if sinkCaps advertises IEC61937 support for this codec
+    auto CloseDevice() -> void; ///< Closes ALSA + decoder + spdif muxer and resets all device state. Does NOT touch
+                                ///< the processing thread; called from Shutdown() (after the thread has exited) and
+                                ///< from Initialize() (when re-opening on a different ALSA device).
     auto SetStreamParams(const AudioStreamParams &params)
         -> void;                 ///< Reconfigures ALSA and the FFmpeg decoder when the codec or sample format changes
-    auto Shutdown() -> void;     ///< Closes ALSA and frees codec resources; the processing thread continues running
     auto CloseDecoder() -> void; ///< Waits for in-flight decode calls, then frees the decoder and parser contexts
-    auto FlushDecoderState() -> void; ///< Flushes FFmpeg decoder, resets swr context, clears error/grace counters
+    auto DrainPacketQueue()
+        -> void; ///< Pops every queued packet, freeing each via FreeAVPacket. Caller must hold mutex
+    auto FlushDecoderState() -> void;  ///< Flushes FFmpeg decoder, resets swr context, clears error/grace counters
+    auto ResetPlaybackClock() -> void; ///< Drops the cached PCM PTSs and the stale-clock timestamp; used by every flush
+                                       ///< / reopen path so the video sync controller observes a clean reset
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns the ALSA sample rate required for the given codec and passthrough mode
     [[nodiscard]] auto ConfigureAlsaParams(snd_pcm_t *handle, snd_pcm_format_t format, unsigned channels, unsigned rate,
                                            bool allowResample)
         -> bool; ///< Applies hardware and software ALSA parameters to an open PCM handle
-    [[nodiscard]] auto DecodeToPcm(std::span<const uint8_t> data, int64_t pts)
-        -> bool; ///< Decodes a compressed packet via FFmpeg and forwards the resulting S16LE PCM to WritePcmToAlsa()
+    [[nodiscard]] auto DecodeToPcm(std::span<const uint8_t> data, int64_t pts, uint32_t expectedGeneration)
+        -> bool; ///< Decodes a compressed packet via FFmpeg and forwards the resulting S16LE PCM to WritePcmToAlsa();
+                 ///< @p expectedGeneration is the value of clearGeneration captured at packet dequeue time. If it
+                 ///< no longer matches, a Clear() / codec swap ran between dequeue and now and the packet's bytes
+                 ///< belong to the previous codec era -- drop them instead of feeding them to the wrong decoder.
     [[nodiscard]] auto EnqueuePacket(const AVPacket *packet)
         -> bool; ///< Clones the packet and appends it to the processing queue; returns false if full
     [[nodiscard]] auto OpenAlsaDevice()
@@ -142,8 +152,11 @@ class cAudioProcessor : public cThread {
                                            ///<   WriteToAlsa() can read it without holding the mutex
     snd_pcm_t *alsaHandle{nullptr};        ///< ALSA PCM device handle; nullptr when closed
     unsigned alsaIec958CtlIndex{0};        ///< IEC958 Playback Default control index for this HDMI port
-    bool alsaPassthroughActive{false};     ///< True when the device is open in IEC61937 passthrough mode
-    unsigned alsaSampleRate{0};            ///< Hardware sample rate negotiated with ALSA (Hz)
+    std::atomic<bool> alsaPassthroughActive{false}; ///< True when the device is open in IEC61937 passthrough mode.
+                                                    ///< Atomic because IsPassthrough() is read lock-free from the
+                                                    ///< decoder thread (SyncLatency90k) on every video frame; all
+                                                    ///< writes happen on the audio thread under `mutex`.
+    unsigned alsaSampleRate{0};                     ///< Hardware sample rate negotiated with ALSA (Hz)
 
     // ========================================================================
     // === IEC61937 SPDIF MUXER ===
@@ -156,10 +169,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     int consecutiveDecodeErrors{}; ///< Consecutive avcodec_send_packet failures for error recovery
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder{
-        nullptr};                        ///< FFmpeg decoder context; nullptr when closed
-    int decoderGracePackets{0};          ///< Remaining packets to silently discard after decoder reinit
-    std::atomic<int> decoderRefCount{0}; ///< Count of threads currently inside DecodeToPcm()
-    std::atomic<bool> needsFlush{false}; ///< Signals DecodeToPcm() to flush the decoder on next entry
+        nullptr};                              ///< FFmpeg decoder context; nullptr when closed
+    int decoderGracePackets{0};                ///< Remaining packets to silently discard after decoder reinit
+    std::atomic<int> decoderRefCount{0};       ///< Count of threads currently inside DecodeToPcm()
+    std::atomic<bool> needsFlush{false};       ///< Signals DecodeToPcm() to flush the decoder on next entry
+    std::atomic<bool> parserNeedsReset{false}; ///< Set by the audio Action thread when an INVALIDDATA cascade hits the
+                                               ///< 50-error limit; consumed by Decode() on the producer thread (which
+                                               ///< already holds mutex). Recreates parserCtx so a corrupted bitstream
+                                               ///< parser fragment cannot keep poisoning every subsequent packet.
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
         parserCtx;                                ///< FFmpeg bitstream parser for access-unit framing
     int swrChannels{};                            ///< Channel count for which swrCtx was last initialized
@@ -176,6 +193,10 @@ class cAudioProcessor : public cThread {
     // === PCM CLOCK ===
     // ========================================================================
     std::atomic<uint32_t> clearGeneration{0};         ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
+    std::atomic<uint64_t> lastClockUpdateMs{0};       ///< cTimeMs::Now() at the last successful playbackPts write; 0 =
+                                                      ///< never written / just cleared. Read by GetClock() to detect a
+                                                      ///< stuck audio pipeline (decode failures, dead ALSA) and return
+                                                      ///< AV_NOPTS_VALUE instead of a stale value
     int64_t pcmNextPts{AV_NOPTS_VALUE};               ///< DVB-anchored 90 kHz PTS for the next ALSA write
     int64_t pcmQueueEndPts{AV_NOPTS_VALUE};           ///< 90 kHz PTS of the last sample written into the ALSA ring
     std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< DAC-output PTS (endPts minus ALSA delay) at each write

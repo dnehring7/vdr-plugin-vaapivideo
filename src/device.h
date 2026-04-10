@@ -138,7 +138,11 @@ class cVaapiDevice : public cDevice {
         -> int override;                         ///< Demux one video PES packet and enqueue for decoding
     [[nodiscard]] auto Ready() -> bool override; ///< True once Initialize() has completed successfully
     auto SetAudioTrackDevice(eTrackType Type)
-        -> void override; ///< Reset audio codec state and flush on track switch (user or PMT)
+        -> void override; ///< Reset audio codec state and flush on track switch (live TV path)
+    auto SetDigitalAudioDevice(bool On)
+        -> void override; ///< Notification fired by cDevice::SetCurrentAudioTrack() in BOTH live and replay; the
+                          ///< only audio-track-change hook that reaches the device during replay (the live TV path
+                          ///< also routes through SetAudioTrackDevice). Used here to log the new track.
     [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
         -> bool override;                              ///< Reset state machine and flush on mode transitions
     auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
@@ -147,10 +151,16 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
+    auto HandleAudioTrackChange(const char *reason, bool enteringDolby)
+        -> void; ///< Log + run full audio re-detection on track change. @p enteringDolby is set when called from
+                 ///< SetDigitalAudioDevice(true), where VDR fires the hook BEFORE assigning currentAudioTrack and
+                 ///< the read would otherwise return the OLD (stale) selection.
     [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI device context, log codec support
     [[nodiscard]] auto ProbeVppCapabilities(std::string_view renderNode)
-        -> bool;                    ///< Query VAAPI decode profiles and VPP filter capabilities
-    auto ReleaseHardware() -> void; ///< Close VAAPI device reference and DRM file descriptor
+        -> bool;                         ///< Query VAAPI decode profiles and VPP filter capabilities
+    auto ReleaseHardware() -> void;      ///< Close VAAPI device reference and DRM file descriptor
+    auto ResetAudioCodecState() -> void; ///< Drop the cached audio codec id and any in-flight 2-of-2 confirmation state
+                                         ///< so the next PlayAudio() packet re-runs codec detection
     [[nodiscard]] auto SelectDrmConnector()
         -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order
@@ -173,7 +183,13 @@ class cVaapiDevice : public cDevice {
     std::atomic<bool> liveMode;                      ///< True in Transfer Mode (live TV); false during replay
     int osdHeight{};                                 ///< Cached display height for OSD allocation (pixels)
     int osdWidth{};                                  ///< Cached display width for OSD allocation (pixels)
+    AVCodecID audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate audio codec pending confirmation
+    int audioCodecCandidateCount{};                  ///< Consecutive detections of candidate audio codec
+    eTrackType lastHandledAudioTrack{ttNone};        ///< Last (type, PID) seen by HandleAudioTrackChange(); used for
+    uint16_t lastHandledAudioPid{};                  ///< deduplication so VDR's repeat SetCurrentAudioTrack() calls
+                                                     ///< during channel setup do not trigger redundant resets / logs
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
+    AVCodecID previousAudioCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     bool radioBlackPending{false};                   ///< True while waiting to detect radio-only channel
     cTimeMs radioBlackTimer;                         ///< Timeout for radio-mode detection (no video -> black frame)
