@@ -191,6 +191,7 @@ class cVaapiDevice : public cDevice {
     std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
     AVCodecID previousAudioCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
+    bool inStillPicture{false};                      ///< Re-entry guard: true while cDevice::StillPicture re-enters
     bool radioBlackPending{false};                   ///< True while waiting to detect radio-only channel
     cTimeMs radioBlackTimer;                         ///< Timeout for radio-mode detection (no video -> black frame)
     std::atomic<int> trickSpeed;                     ///< Active VDR trick speed index; 0 = normal playback

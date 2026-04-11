@@ -191,9 +191,9 @@ class cVaapiDisplay : public cThread {
         uint32_t fbId{};      ///< KMS framebuffer object ID (0 = invalid)
         AVFrame *frame{};     ///< AVFrame whose VAAPI surface backs this FB (owned)
         uint32_t gemHandle{}; ///< GEM buffer handle imported from the PRIME fd
-        uint32_t height{};    ///< Frame height in pixels
+        uint32_t height{};    ///< Surface height in pixels (full allocation, may include padding)
         uint64_t modifier{};  ///< DRM format modifier (e.g. tiling layout)
-        uint32_t width{};     ///< Frame width in pixels
+        uint32_t width{};     ///< Surface width in pixels (full allocation, may include padding)
     };
 
     // -------------------------------------------------------------------------

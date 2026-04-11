@@ -999,9 +999,9 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         ret = av_hwframe_map(mappedFrame, srcFrame, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
     }
     if (ret < 0) [[unlikely]] {
-        // EIO is the expected error when the codec is being torn down underneath us --
-        // the VA surface is already gone. Suppress the log to avoid spam during channel
-        // switches; isClearing is the secondary guard for the same race.
+        // EIO during teardown: the VA surface is already gone (expected race).
+        // isClearing is the secondary guard for the same race. Suppress both to avoid
+        // spam during channel switches.
         if (ret != AVERROR(EIO) && !isClearing.load(std::memory_order_relaxed)) {
             dsyslog("vaapivideo/display: av_hwframe_map failed: %s", AvErr(ret).data());
         }

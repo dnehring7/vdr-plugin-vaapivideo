@@ -98,6 +98,10 @@ class cVaapiDecoder : public cThread {
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void;                         ///< Attach the audio processor used as the A/V sync master clock
     auto SetLiveMode(bool live) -> void; ///< Enable jitter buffering for live TV; disable for replay
+    auto RequestCodecDrain()
+        -> void; ///< Request the decode thread to drain any frame the codec is holding back (e.g. for B-frame reorder)
+    auto SetStillPictureMode(bool mode)
+        -> void; ///< Enable/disable still-picture mode (forces spatial-only deinterlace for single-frame output)
     auto RequestCodecReopen()
         -> void; ///< Force the next OpenCodec() call to do a full teardown/reopen even for the same codec
     auto RequestTrickExit()
@@ -123,6 +127,12 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Send one packet to the VAAPI decoder and drain all resulting filtered frames into outFrames
     auto DrainPendingParserAU()
         -> void; ///< Push the parser's held-back access unit (if any) onto the queue. Caller must hold codecMutex.
+    auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
+        -> void; ///< Push decodedFrame through the filter graph (rebuilding it lazily) and append outputs with
+                 ///< monotonically stamped PTS. Caller must hold codecMutex and populate decodedFrame.
+    auto DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
+        -> void; ///< Send NULL to the codec, drain remaining output frames through the filter, then flush_buffers to
+                 ///< re-arm for the next packet. Caller must hold codecMutex.
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame)
         -> bool; ///< Build VPP filter graph: HW path or SW (bwdif/hqdn3d -> hwupload) + scale/sharpen
     auto ResetFilterGraph() -> void; ///< Null filter pointers and destroy the graph (idempotent)
@@ -176,6 +186,9 @@ class cVaapiDecoder : public cThread {
     std::unique_ptr<AVFrame, FreeAVFrame> decodedFrame; ///< Reusable staging frame for avcodec_receive_frame() output
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
         filterGraph; ///< VAAPI post-processing filter graph; null until first frame
+    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
+        previousFilterGraph; ///< Previous filter graph kept alive so its VPP surfaces survive until the next graph
+                             ///< replaces it
     std::unique_ptr<AVFrame, FreeAVFrame>
         filteredFrame; ///< Reusable staging frame for av_buffersink_get_frame() output
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
@@ -190,8 +203,10 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === PLAYBACK STATE ===
     // ========================================================================
-    std::atomic<bool> hasExited;                  ///< Set to true by the decode thread just before it returns
-    std::atomic<bool> hasLoggedFirstFrame;        ///< Guards the one-time first-frame info log
+    std::atomic<bool> codecDrainPending;   ///< When true the decode thread drains the codec after the next packet
+    std::atomic<bool> stillPictureMode;    ///< When true, InitFilterGraph selects bob (spatial-only) deinterlace
+    std::atomic<bool> hasExited;           ///< Set to true by the decode thread just before it returns
+    std::atomic<bool> hasLoggedFirstFrame; ///< Guards the one-time first-frame info log
     std::atomic<int64_t> lastPts{AV_NOPTS_VALUE}; ///< PTS of the last submitted frame, read by GetLastPts() / GetSTC()
     std::atomic<bool> liveMode;                   ///< True for live TV (jitter buffer active); false for replay
     std::atomic<bool> ready;                      ///< True once Initialize() has succeeded
