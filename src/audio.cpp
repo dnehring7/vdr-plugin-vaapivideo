@@ -183,30 +183,36 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::GetClock() const noexcept -> int64_t {
-    // PTS at the DAC output: endPts - snd_pcm_delay, refreshed on each ALSA write (~24-32 ms).
+    // Returns the estimated DAC playback position in 90 kHz ticks.
     //
-    // Stale-clock guard: if WritePcmToAlsa() stops firing (decoder error after a channel
-    // switch with stale TS, codec swap mid-stream) playbackPts freezes. The video sync
-    // controller would treat the frozen value as authoritative and let drift balloon to
-    // multi-second levels. Returning AV_NOPTS_VALUE forces the freerun branch -- video
-    // keeps playing unpaced and lipsync re-anchors at the next valid clock.
+    // WritePcmToAlsa() snapshots playbackPts once per ALSA period (~25 ms). Reading
+    // it verbatim would introduce up to 25 ms of staleness into rawDelta. Instead,
+    // extrapolate forward by ageMs * 90: audio plays in real time so the DAC position
+    // advances by exactly that amount.
     //
-    // Load order matters: WritePcmToAlsa() stores playbackPts THEN lastClockUpdateMs
-    // (release on each). Loading lastMs first guarantees a fresh stamp pairs with the
-    // matching pts on the second load -- the opposite order would race.
+    // If WritePcmToAlsa() stops firing (channel switch, codec swap), playbackPts
+    // freezes and extrapolation would balloon drift. Return AV_NOPTS_VALUE after
+    // AUDIO_CLOCK_STALE_MS to force the decoder into freerun; lipsync re-anchors at
+    // the next valid write.
+    //
+    // Load order: WritePcmToAlsa() stores playbackPts THEN lastClockUpdateMs. Load
+    // lastMs first so a fresh timestamp always pairs with its matching pts.
     const uint64_t lastMs = lastClockUpdateMs.load(std::memory_order_acquire);
     const int64_t pts = playbackPts.load(std::memory_order_acquire);
     if (lastMs == 0) {
-        // Never written (post-construct or post-Clear()). No usable clock yet.
+        // Post-construct or post-Clear(): no write has occurred yet.
         return AV_NOPTS_VALUE;
     }
     if (pts == AV_NOPTS_VALUE) {
         return AV_NOPTS_VALUE;
     }
-    if (cTimeMs::Now() - lastMs > AUDIO_CLOCK_STALE_MS) {
+    const uint64_t nowMs = cTimeMs::Now();
+    // Unsigned wrap on clock skew / atomic race makes ageMs huge -> stale check fires.
+    const uint64_t ageMs = nowMs - lastMs;
+    if (ageMs > AUDIO_CLOCK_STALE_MS) {
         return AV_NOPTS_VALUE;
     }
-    return pts;
+    return pts + (static_cast<int64_t>(ageMs) * 90);
 }
 
 [[nodiscard]] auto cAudioProcessor::Initialize(std::string_view alsaDevice) -> bool {

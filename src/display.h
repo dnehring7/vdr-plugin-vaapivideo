@@ -121,6 +121,10 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t { ///< Return the active display height in pixels
         return outputHeight;
     }
+    [[nodiscard]] auto GetOutputRefreshRate() const noexcept
+        -> uint32_t { ///< Return the active display refresh rate in Hz
+        return refreshRate;
+    }
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t { ///< Return the active display width in pixels
         return outputWidth;
     }

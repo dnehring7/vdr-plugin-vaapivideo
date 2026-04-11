@@ -138,7 +138,8 @@ class cVaapiDecoder : public cThread {
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
         -> void; ///< Update the EMA-smoothed A/V delta; warms up from N samples after a reset
     auto ResetSmoothedDelta() noexcept -> void; ///< Invalidate EMA and clear warmup accumulator
-    auto LogSyncStats(int64_t rawDelta90k, const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
+    auto LogSyncStats(int64_t rawDelta90k, int64_t latency90k,
+                      const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
     [[nodiscard]] auto RunJitterPrimeSync(cAudioProcessor *ap)
         -> bool; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0.
                  ///< Returns true when alignment ran (or there was nothing to align), false when the audio clock is
@@ -222,9 +223,15 @@ class cVaapiDecoder : public cThread {
     int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log (decoder thread only)
     int syncSkipSinceLog{};           ///< Frames whose render was delayed (video ahead) since last sync log
     int pendingDrops{};               ///< Remaining frames to drop in the current soft-correction burst
+    int64_t rawDeltaSumSinceLog90k{}; ///< Sum of rawDelta samples since last sync log, for interval mean
+    int rawDeltaCountSinceLog{};      ///< Number of rawDelta samples summed into rawDeltaSumSinceLog90k
     int warmupSampleCount{};          ///< Samples accumulated during EMA warmup phase (post-reset)
     int64_t warmupSampleSum90k{};     ///< Sum of warmup-phase samples in 90 kHz ticks
     int64_t smoothedDelta90k{};       ///< EMA-smoothed A/V sync delta in 90 kHz ticks (decoder thread only)
+    int64_t emaResidual90k{};         ///< Fractional accumulator for the integer EMA update; the
+                                      ///< remainder of (diff % EMA_SAMPLES) is carried across samples
+                                      ///< so the smoother converges exactly to the mean instead of
+                                      ///< stalling whenever |diff| < EMA_SAMPLES ticks.
     bool smoothedDeltaValid{false};   ///< True once the EMA has been seeded (warmup complete)
     cTimeMs syncCooldown;             ///< Rate-limit timer between soft corrections
 
