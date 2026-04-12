@@ -83,6 +83,10 @@ extern "C" {
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
+/// Replay audio backpressure threshold (~320 ms at AC-3 32 ms framing).  Keeps the queue
+/// shallow so a tail-drop doesn't create a PTS gap that derails A/V sync seconds later.
+static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
+
 /// VT bounce after dropping DRM master. fbcon does not auto-reclaim the display when another
 /// DRM client (typically systemd-logind) still holds the device open, so we VT_ACTIVATE to a
 /// different VT and back -- the kernel reprograms the CRTC on each switch and the second
@@ -568,9 +572,9 @@ auto cVaapiDevice::Play() -> void {
         }
     }
 
-    // Replay: return 0 for Poll() backpressure. Live: always accept, rely on the audio
-    // queue's drop-oldest policy on overflow.
-    if (!isLive && audioProcessor->IsQueueFull()) [[unlikely]] {
+    // Replay backpressure: cap audio queue at the low watermark so tail-drops (and the
+    // resulting PTS gaps / sync disruptions) are avoided. Live: always accept.
+    if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_REPLAY_QUEUE_HIGHWATER) [[unlikely]] {
         return 0;
     }
 
@@ -681,7 +685,8 @@ auto cVaapiDevice::Play() -> void {
         if (currentSpeed != 0) {
             return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
         }
-        return !decoder->IsQueueFull() && (!audioProcessor || !audioProcessor->IsQueueFull());
+        return !decoder->IsQueueFull() &&
+               (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_REPLAY_QUEUE_HIGHWATER);
     };
 
     if (hasSpace()) {
@@ -866,9 +871,10 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
         esyslog("vaapivideo/device: cannot attach - no DRM device path recorded");
         return false;
     }
-    isyslog("vaapivideo/device: re-attaching to hardware (DRM=%s audio=%s)", drmPath.c_str(), audioDevice.c_str());
+    isyslog("vaapivideo/device: re-attaching to hardware (DRM=%s audio=%s connector=%s)", drmPath.c_str(),
+            audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
 
-    if (!Initialize(drmPath, audioDevice)) [[unlikely]] {
+    if (!Initialize(drmPath, audioDevice, connectorName)) [[unlikely]] {
         return false;
     }
 
@@ -932,7 +938,8 @@ auto cVaapiDevice::Detach() -> void {
     isyslog("vaapivideo/device: detached");
 }
 
-[[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath) -> bool {
+[[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
+                                            std::string_view connectorNameFilter) -> bool {
     // 0 -> 1 (in-progress) -> 2 (ready). The CAS protects against double-Initialize from
     // a racing SVDRP ATTA + plugin Start() during process bring-up.
     int expected = 0;
@@ -943,8 +950,10 @@ auto cVaapiDevice::Detach() -> void {
 
     drmPath = drmDevicePath;
     audioDevice = audioDevicePath;
+    connectorName = connectorNameFilter;
 
-    dsyslog("vaapivideo/device: initializing - DRM '%s', audio '%s'", drmPath.c_str(), audioDevice.c_str());
+    dsyslog("vaapivideo/device: initializing - DRM '%s', audio '%s', connector '%s'", drmPath.c_str(),
+            audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
 
     if (!OpenHardware()) [[unlikely]] {
         esyslog("vaapivideo/device: hardware initialization failed");
@@ -1000,10 +1009,6 @@ auto cVaapiDevice::Detach() -> void {
 
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
-
-    // Paint black so we don't expose whatever the last DRM client (or boot splash) left
-    // in the scanout buffer until the first real frame arrives.
-    SubmitBlackFrame();
 
     return true;
 }
@@ -1417,6 +1422,17 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
             continue;
         }
 
+        // If the user requested a specific connector, build the kernel-style name
+        // (e.g. "HDMI-A-1", "DP-2") and skip non-matching connectors.
+        if (!connectorName.empty()) {
+            const char *typeName = drmModeGetConnectorTypeName(connector->connector_type);
+            const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
+            if (name != connectorName) {
+                dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
+                continue;
+            }
+        }
+
         bool modeFound = false;
         for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
             const auto &mode = connector->modes[modeIdx];
@@ -1468,6 +1484,10 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
         }
     }
 
-    esyslog("vaapivideo/device: no connected display found");
+    if (!connectorName.empty()) {
+        esyslog("vaapivideo/device: connector '%s' not found or not connected", connectorName.c_str());
+    } else {
+        esyslog("vaapivideo/device: no connected display found");
+    }
     return false;
 }

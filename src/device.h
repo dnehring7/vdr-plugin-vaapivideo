@@ -123,7 +123,8 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     [[nodiscard]] auto Attach() -> bool; ///< Re-open hardware and restart all threads after a prior Detach()
     auto Detach() -> void;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume
-    [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath)
+    [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
+                                  std::string_view connectorNameFilter = {})
         -> bool; ///< Open DRM/VAAPI hardware and start decoder, display, and audio threads
 
   protected:
@@ -174,6 +175,7 @@ class cVaapiDevice : public cDevice {
     std::string audioDevice;                               ///< ALSA device name (e.g. "default", "hw:0,3")
     std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
     uint32_t connectorId{};                                ///< DRM connector ID chosen by SelectDrmConnector()
+    std::string connectorName;                             ///< User-requested connector (e.g. "HDMI-A-1"); empty = auto
     uint32_t crtcId{};                                     ///< DRM CRTC ID associated with the selected connector
     std::unique_ptr<cVaapiDecoder> decoder;                ///< Threaded VAAPI packet decoder
     std::unique_ptr<cVaapiDisplay> display;                ///< DRM atomic page-flip display manager

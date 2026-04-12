@@ -128,10 +128,12 @@ class cVaapiVideoPlugin : public cPlugin {
     /// libdrm enumeration.
     [[nodiscard]] auto ResolveDrmDevice() const -> cString;
 
-    cString audioDevice; ///< ALSA device passed via -a / --audio; defaults to
-                         ///< "default".
-    cString drmPath;     ///< DRM device path passed via -d / --drm; empty means
-                         ///< auto-detect.
+    cString audioDevice;   ///< ALSA device passed via -a / --audio; defaults to
+                           ///< "default".
+    cString connectorName; ///< DRM connector name passed via -c / --connector;
+                           ///< empty means first connected output.
+    cString drmPath;       ///< DRM device path passed via -d / --drm; empty means
+                           ///< auto-detect.
 
     /// Non-owning pointer to the active output device.
     /// All cDevice instances self-register with VDR in their constructor and
@@ -199,6 +201,8 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
                     "(default: auto-detect)\n"
                     "  -a DEV, --audio=DEV         Use ALSA audio device DEV "
                     "(default: 'default')\n"
+                    "  -c NAME, --connector=NAME   Use DRM connector NAME "
+                    "(default: first connected)\n"
                     "  -r RES, --resolution=RES    Output resolution "
                     "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n",
                     DISPLAY_DEFAULT_WIDTH, DISPLAY_DEFAULT_HEIGHT, DISPLAY_DEFAULT_REFRESH_RATE);
@@ -227,7 +231,8 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
     dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s)", *resolvedDrm, *audioDevice);
     vaapiDevice = new cVaapiDevice();
 
-    if (!vaapiDevice->Initialize(*resolvedDrm, *audioDevice)) {
+    if (!vaapiDevice->Initialize(*resolvedDrm, *audioDevice,
+                                 isempty(*connectorName) ? std::string_view{} : std::string_view{*connectorName})) {
         esyslog("vaapivideo: ========================================");
         esyslog("vaapivideo: device initialization FAILED");
         esyslog("vaapivideo: plugin will not be available");
@@ -244,16 +249,17 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
     // NOLINTNEXTLINE(misc-include-cleaner)
-    static constexpr std::array<option, 4> kLongOptions = {
+    static constexpr std::array<option, 5> kLongOptions = {
         {{.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'}, // NOLINT(misc-include-cleaner)
          {.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
+         {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
          {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
     optind = 1; // Reset global getopt state; VDR may call ProcessArgs() more than once. // NOLINT(misc-include-cleaner)
     int opt{};
     // NOLINTNEXTLINE(misc-include-cleaner)
-    while ((opt = getopt_long(argc, argv, "d:a:r:", kLongOptions.data(), nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:a:c:r:", kLongOptions.data(), nullptr)) != -1) {
         switch (opt) {
             case 'd':
                 if (optarg == nullptr || *optarg == '\0') { // NOLINT(misc-include-cleaner)
@@ -270,6 +276,14 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
                 }
                 audioDevice = optarg;
                 dsyslog("vaapivideo: audio device set to '%s'", *audioDevice);
+                break;
+            case 'c':
+                if (optarg == nullptr || *optarg == '\0') {
+                    esyslog("vaapivideo: empty connector argument");
+                    return false;
+                }
+                connectorName = optarg;
+                dsyslog("vaapivideo: connector set to '%s'", *connectorName);
                 break;
             case 'r':
                 if (optarg == nullptr || *optarg == '\0') {

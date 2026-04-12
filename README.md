@@ -234,15 +234,18 @@ sink's EDID at startup:
 
 ### Command-line options
 
-    vdr -P 'vaapivideo [-d DEV] [-a DEV] [-r WxH@R]'
+    vdr -P 'vaapivideo [-d DEV] [-a DEV] [-c NAME] [-r WxH@R]'
 
-| Option     | Default        | Description                                           |
-|------------|----------------|-------------------------------------------------------|
-| `-d DEV`   | auto-detect    | DRM device path (`/dev/dri/cardN`)                    |
-| `-a DEV`   | `default`      | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
-| `-r WxH@R` | `1920x1080@50` | Output resolution and refresh rate (max 3840×2160)    |
+| Option     | Default           | Description                                           |
+|------------|-------------------|-------------------------------------------------------|
+| `-d DEV`   | auto-detect       | DRM device path (`/dev/dri/cardN`)                    |
+| `-a DEV`   | `default`         | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
+| `-c NAME`  | first connected   | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
+| `-r WxH@R` | `1920x1080@50`    | Output resolution and refresh rate (max 3840×2160)    |
 
-Use `-d` explicitly when multiple GPUs are present.
+Use `-d` explicitly when multiple GPUs are present. Use `-c` to select a
+specific output when multiple displays are connected — connector names match
+the kernel's naming scheme visible under `/sys/class/drm/`.
 
 ### VDR setup menu
 

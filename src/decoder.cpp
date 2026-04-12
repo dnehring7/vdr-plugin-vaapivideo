@@ -84,7 +84,7 @@ extern "C" {
 // ============================================================================
 
 constexpr int DECODER_JITTER_BUFFER_MS =
-    1000; ///< Live jitter buffer fill target; 1 s = 25–50 frames, absorbs burst gaps on weak transponders.
+    1000; ///< Live jitter buffer fill target; 1 s = 25-50 frames, absorbs burst gaps on weak transponders.
 constexpr size_t DECODER_QUEUE_CAPACITY =
     200; ///< Packet queue (~4 s @ 50 fps / ~8 s @ 25 fps); drops oldest when full, sized to match jitter buffer.
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< Max VSync backpressure wait inside display->SubmitFrame() (ms).
@@ -159,13 +159,25 @@ auto cVaapiDecoder::Clear() -> void {
 
     DrainQueue();
 
-    // Flush decoder; the codec context stays open so the next I-frame can continue.
-    if (codecCtx) {
-        avcodec_flush_buffers(codecCtx.get());
-    }
+    {
+        // vaDriverMutex: flush and graph teardown make VA API calls that
+        // would otherwise race with the display thread's PRIME export.
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
 
-    // Filter graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily.
-    ResetFilterGraph();
+        // Flush decoder; the codec context stays open so the next I-frame can continue.
+        if (codecCtx) {
+            avcodec_flush_buffers(codecCtx.get());
+        }
+
+        // Filter graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily.
+        ResetFilterGraph();
+        if (decodedFrame) {
+            av_frame_unref(decodedFrame.get());
+        }
+        if (filteredFrame) {
+            av_frame_unref(filteredFrame.get());
+        }
+    }
     // hasLoggedFirstFrame NOT reset: only OpenCodec() resets it to avoid duplicate logs.
 
     // AVCodecParserContext has no flush API; recreate.
@@ -173,13 +185,6 @@ auto cVaapiDecoder::Clear() -> void {
         parserCtx.reset(av_parser_init(currentCodecId));
     } else {
         parserCtx.reset();
-    }
-
-    if (decodedFrame) {
-        av_frame_unref(decodedFrame.get());
-    }
-    if (filteredFrame) {
-        av_frame_unref(filteredFrame.get());
     }
 
     lastPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -451,8 +456,13 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
     // not safe to reuse. hasLoggedFirstFrame is reset here (and only here) so the per-codec
     // "first frame" line still fires once per real reopen.
     parserCtx.reset();
-    codecCtx.reset();
-    ResetFilterGraph();
+    {
+        // vaDriverMutex: codec context destruction (vaDestroyContext for VAAPI hwaccel)
+        // and graph teardown (VPP pipeline teardown) make VA API calls.
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        codecCtx.reset();
+        ResetFilterGraph();
+    }
     currentCodecId = AV_CODEC_ID_NONE;
     hasLoggedFirstFrame.store(false, std::memory_order_relaxed);
 
@@ -584,20 +594,28 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
 
         if (needsFlush) {
             DrainQueue();
-            if (codecCtx) {
-                avcodec_flush_buffers(codecCtx.get());
+            {
+                // vaDriverMutex: avcodec_flush_buffers (VAAPI hwaccel) and
+                // ResetFilterGraph (avfilter_graph_free -> VPP teardown) both
+                // make VA API calls. Without the mutex the display thread's
+                // av_hwframe_map (PRIME export) races on the same VADisplay,
+                // crashing iHD. Lock order: codecMutex -> vaDriverMutex.
+                const cMutexLock vaLock(&display->GetVaDriverMutex());
+                if (codecCtx) {
+                    avcodec_flush_buffers(codecCtx.get());
+                }
+                // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref.
+                ResetFilterGraph();
+                if (decodedFrame) {
+                    av_frame_unref(decodedFrame.get());
+                }
+                if (filteredFrame) {
+                    av_frame_unref(filteredFrame.get());
+                }
             }
             // No parser flush API; recreate to discard stale partial NALs.
             if (currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
-            }
-            // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref.
-            ResetFilterGraph();
-            if (decodedFrame) {
-                av_frame_unref(decodedFrame.get());
-            }
-            if (filteredFrame) {
-                av_frame_unref(filteredFrame.get());
             }
         }
 
@@ -957,7 +975,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
         FilterAndAppendDecodedFrame(outFrames);
     }
-    avcodec_flush_buffers(codecCtx.get());
+    // vaDriverMutex: avcodec_flush_buffers touches the VA driver (VAAPI hwaccel
+    // reset); without it the display thread's av_hwframe_map races on iHD.
+    {
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        avcodec_flush_buffers(codecCtx.get());
+    }
 }
 
 [[nodiscard]] auto cVaapiDecoder::DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
@@ -984,7 +1007,10 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             if (ret < 0 && ret != AVERROR_EOF) [[unlikely]] {
                 // Hard failure (corrupt HEVC NAL etc.): flush and drop the filter graph
                 // so the next IDR can recover without stale VAAPI surfaces.
+                // vaDriverMutex: avcodec_flush_buffers touches the VA driver;
+                // without it the display thread's av_hwframe_map races on iHD.
                 dsyslog("vaapivideo/decoder: send_packet failed: %s -- flushing for recovery", AvErr(ret).data());
+                const cMutexLock vaLock(&display->GetVaDriverMutex());
                 avcodec_flush_buffers(codecCtx.get());
                 ResetFilterGraph();
                 return anyFrameDecoded;

@@ -59,22 +59,37 @@ CXX ?= g++
 # C++ Compiler Flags
 CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 
-# Debugging Flags for AddressSanitizer and UndefinedBehaviorSanitizer (uncomment for development builds)
-#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto -fsanitize=address,undefined
-# Suggested runtime options for ASan and UBSan
-#   export ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:symbolize=1:fast_unwind_on_malloc=0:strict_init_order=1
-#   export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
-#   export LD_PRELOAD="/usr/lib64/libasan.so.8:/usr/lib64/libubsan.so.1"
+# Debugging Flags for AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer
+# (uncomment for development builds — mutually exclusive with ThreadSanitizer)
+#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+#           -fsanitize=address,undefined,leak \
+#           -fsanitize-address-use-after-scope \
+#           -fstack-protector-strong \
+#           -ftrivial-auto-var-init=zero
+# Runtime options (copy into shell before starting VDR):
+#   export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:symbolize=1:fast_unwind_on_malloc=0:strict_init_order=1:check_initialization_order=1:detect_stack_use_after_return=1"
+#   export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
+#   export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$(gcc -print-file-name=libubsan.so)"
 
-# Debugging Flags for ThreadSanitizer (uncomment for development builds)
-#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto -fsanitize=thread
-# Suggested runtime options for TSan
+# Debugging Flags for ThreadSanitizer
+# (uncomment for development builds — mutually exclusive with AddressSanitizer)
+#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+#           -fsanitize=thread \
+#           -ftrivial-auto-var-init=zero
+# Runtime options (copy into shell before starting VDR):
 #   export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:detect_deadlocks=1:report_thread_leaks=1:history_size=7:symbolize=1"
-#   export LD_PRELOAD="/usr/lib64/libtsan.so.2"
+#   export LD_PRELOAD="$(gcc -print-file-name=libtsan.so)"
 
 # Development Flags (uncomment for development builds)
 #CXXFLAGS += -pedantic-errors -Wall -Wextra
 #CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
+
+# libstdc++ debug mode — bounds checking on iterators, vectors, strings
+# WARNING: changes ABI; VDR and all plugins must be recompiled with this flag
+#CXXFLAGS += -D_GLIBCXX_DEBUG -D_GLIBCXX_DEBUG_PEDANTIC
+
+# GCC static analyzer (slow — finds null-deref, use-after-free, double-free at compile time)
+#CXXFLAGS += -fanalyzer
 
 CXXFLAGS += -std=c++20 -fPIC
 CXXFLAGS += -DPLUGIN_NAME_I18N='"$(PLUGIN)"'
@@ -83,9 +98,9 @@ CXXFLAGS += $(shell $(PKG_CONFIG) --cflags $(REQUIRED_LIBS))
 
 LDFLAGS := -shared -Wl,--no-as-needed
 
-# Debugging Flags for AddressSanitizer and UndefinedBehaviorSanitizer (uncomment for development builds)
-#LDFLAGS += -fsanitize=address,undefined
-# Debugging Flags for ThreadSanitizer (uncomment for development builds)
+# Debugging Flags for AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer
+#LDFLAGS += -fsanitize=address,undefined,leak
+# Debugging Flags for ThreadSanitizer
 #LDFLAGS += -fsanitize=thread
 
 LDLIBS = $(shell $(PKG_CONFIG) --libs $(REQUIRED_LIBS)) -pthread
