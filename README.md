@@ -96,6 +96,39 @@ not implement the Video Processing Pipeline (VPP) that this plugin requires.
 
 ## Setup
 
+### Pre-built packages
+
+Pre-built packages for Fedora 44 and Debian 13 (Trixie) are published with
+each [GitHub release](https://github.com/dnehring7/vdr-plugin-vaapivideo/releases)
+and served as GPG-signed repositories via GitHub Pages. The signing key
+is published at https://github.com/dnehring7.gpg (fingerprint
+`617BD4B433CE88729B6D46816C7069D18A46683A`).
+
+<details>
+<summary>Fedora 44 (x86_64)</summary>
+
+```sh
+sudo dnf config-manager addrepo \
+  --from-repofile=https://dnehring7.github.io/vdr-plugin-vaapivideo/fedora/44/vdr-vaapivideo.repo
+sudo dnf install vdr-vaapivideo
+```
+
+</details>
+
+<details>
+<summary>Debian 13 / Trixie (amd64)</summary>
+
+```sh
+curl -fsSL https://github.com/dnehring7.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/dnehring7.gpg
+sudo curl -fsSL https://dnehring7.github.io/vdr-plugin-vaapivideo/debian/vdr-vaapivideo.sources \
+  -o /etc/apt/sources.list.d/vdr-vaapivideo.sources
+sudo apt update
+sudo apt install vdr-plugin-vaapivideo
+```
+
+</details>
+
 ### 1. Install build dependencies
 
 <details>

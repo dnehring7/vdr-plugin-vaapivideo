@@ -1,0 +1,30 @@
+Source: vdr-plugin-vaapivideo
+Section: video
+Priority: optional
+Maintainer: Dirk Nehring <dnehring@gmx.net>
+Build-Depends: debhelper-compat (= 13),
+               vdr-dev (>= 2.6.0),
+               libavcodec-dev,
+               libavfilter-dev,
+               libavformat-dev,
+               libavutil-dev,
+               libswresample-dev,
+               libdrm-dev,
+               libva-dev,
+               libasound2-dev
+Standards-Version: 4.7.4
+Homepage: https://github.com/dnehring7/vdr-plugin-vaapivideo
+Vcs-Git: https://github.com/dnehring7/vdr-plugin-vaapivideo.git
+Vcs-Browser: https://github.com/dnehring7/vdr-plugin-vaapivideo
+Rules-Requires-Root: no
+
+Package: vdr-plugin-vaapivideo
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${vdr:Depends}
+Description: VAAPI video output plugin for VDR
+ Hardware-accelerated video output plugin for VDR using VAAPI decode, DRM
+ atomic modesetting, and ALSA audio.
+ .
+ This plugin drives the display directly through the kernel DRM/KMS
+ subsystem -- no X11, Wayland, or OpenGL required.  It runs on a bare
+ console, in a systemd service, or headless.

@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+%:
+	dh $@ --with vdrplugin
+
+override_dh_auto_build:
+	dh_auto_build
+	g++ $$(dpkg-buildflags --get CXXFLAGS) -std=c++20 \
+	  $$(pkg-config --cflags libdrm libva libva-drm) \
+	  $$(dpkg-buildflags --get LDFLAGS) \
+	  -o vaapivideo-probe vaapivideo-probe.cpp \
+	  $$(pkg-config --libs libdrm libva libva-drm)
+
+override_dh_auto_install:
+	dh_auto_install
+	install -Dpm 755 vaapivideo-probe \
+	  debian/vdr-plugin-vaapivideo/usr/bin/vaapivideo-probe
