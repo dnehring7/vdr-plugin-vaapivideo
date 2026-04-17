@@ -69,6 +69,11 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+constexpr int AUDIO_ALSA_BUFFER_MS = 400;       ///< ALSA hardware ring size (ms). The ring stays near full in steady
+                                                ///< state, so the reported audio clock lags real time by ~this much.
+                                                ///< The video due-gate then accumulates ~(MS/frameDur) extra frames in
+                                                ///< jitterBuf -- audio and video share one cushion, lip-sync preserved.
+                                                ///< Floor, not ceiling. See AVSYNC.md.
 constexpr int AUDIO_ALSA_ERROR_LIMIT = 5;       ///< Consecutive ALSA write failures that trigger a full device reopen
 constexpr uint64_t AUDIO_CLOCK_STALE_MS = 1000; ///< If WritePcmToAlsa() has not refreshed playbackPts within this many
                                                 ///< ms, GetClock() returns AV_NOPTS_VALUE so the video sync controller
@@ -79,7 +84,9 @@ constexpr int AUDIO_DECODER_ERROR_LIMIT = 50;     ///< Consecutive decode failur
 constexpr int AUDIO_DECODER_GRACE_PACKETS = 3;    ///< Decode-error logs suppressed right after (re)init to swallow
                                                   ///< priming garbage from the parser's first frames
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Throttle for repeated decode-error log messages
-constexpr size_t AUDIO_QUEUE_CAPACITY = 100;      ///< Audio packet queue depth (~3 s at AC-3 ~32 ms framing)
+constexpr size_t AUDIO_QUEUE_CAPACITY = 300;      ///< Audio packet queue depth (~10 s at AC-3 ~32 ms framing).
+                                                  ///< Sized to absorb the OSD-load + codec-prime burst at channel
+                                                  ///< switch / VDR start without dropping packets.
 
 // ============================================================================
 // === AUDIO PROCESSOR CLASS ===
@@ -610,9 +617,9 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // 25 ms period keeps WritePcmToAlsa() refreshes frequent enough for the A/V sync clock;
-    // 200 ms buffer leaves headroom against scheduler jitter.
-    auto bufferSize = static_cast<snd_pcm_uframes_t>(actualRate / 5);  // 200 ms
+    // Buffer sized to AUDIO_ALSA_BUFFER_MS: ALSA backlog lags the audio clock
+    // by this amount so the video due-gate mirrors the same cushion.
+    auto bufferSize = static_cast<snd_pcm_uframes_t>(static_cast<uint64_t>(actualRate) * AUDIO_ALSA_BUFFER_MS / 1000);
     auto periodSize = static_cast<snd_pcm_uframes_t>(actualRate / 40); // 25 ms
 
     if (snd_pcm_hw_params_set_buffer_size_near(handle, hwParams, &bufferSize) < 0 ||
@@ -630,14 +637,24 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // Start playback once half the buffer is filled: trades ~100 ms of initial latency
-    // for headroom against a startup underrun.
-    const snd_pcm_uframes_t startThreshold = bufferSize / 2;
+    // Start playback at 1/3 buffer: bounds the channel-switch-to-first-audio
+    // window at MS/3 while giving enough prebuffer for the decode ramp-up.
+    const snd_pcm_uframes_t startThreshold = bufferSize / 3;
     if (snd_pcm_sw_params_set_start_threshold(handle, swParams, startThreshold) < 0 ||
         snd_pcm_sw_params_set_avail_min(handle, swParams, periodSize) < 0 || snd_pcm_sw_params(handle, swParams) < 0) {
         esyslog("vaapivideo/audio: software parameter configuration failed");
         return false;
     }
+
+    // HW may have rounded buffer/period; log the negotiated values.
+    snd_pcm_uframes_t actualBuffer = 0;
+    snd_pcm_uframes_t actualPeriod = 0;
+    (void)snd_pcm_hw_params_get_buffer_size(hwParams, &actualBuffer);
+    (void)snd_pcm_hw_params_get_period_size(hwParams, &actualPeriod, nullptr);
+    const unsigned bufMs = (actualRate > 0) ? static_cast<unsigned>(actualBuffer * 1000 / actualRate) : 0;
+    const unsigned periodMs = (actualRate > 0) ? static_cast<unsigned>(actualPeriod * 1000 / actualRate) : 0;
+    isyslog("vaapivideo/audio: ALSA buffer=%ums period=%ums start=%ums (target=%dms)", bufMs, periodMs, bufMs / 3,
+            AUDIO_ALSA_BUFFER_MS);
 
     snd_pcm_hw_params_get_channels(hwParams, &alsaChannels);
     snd_pcm_hw_params_get_rate(hwParams, &alsaSampleRate, nullptr);

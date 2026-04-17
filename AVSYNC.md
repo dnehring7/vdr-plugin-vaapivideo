@@ -2,46 +2,39 @@
 
 ## Problem
 
-A DVB stream encodes audio and video PTS values against a single 90 kHz program
-clock (PCR). On playback the audio DAC is driven by a sink oscillator that is
-independent of the source — 5–50 ppm off on healthy hardware, several hundred
-ppm on pathological SAT>IP deployments. Without active correction, lip sync
-drifts by milliseconds per minute.
+A DVB stream encodes audio and video against a single 90 kHz program clock
+(PCR). On playback the audio DAC runs on its own oscillator — typically
+5–50 ppm off the broadcaster, several hundred ppm on poor SAT>IP gear.
+Without active correction, lip-sync drifts by milliseconds per minute.
 
-## Design
+## Architecture
 
 ```
 DVB stream (PCR)
-    │
-    ├─► Audio PTS ─► decoder ─► ALSA ─► DAC
-    │                                   │
-    │                             GetClock()  ◄── master clock
-    │                                   │
-    │                                   ▼
-    └─► Video PTS ─► decoder ─► filter ─► jitter buffer ─► SyncAndSubmitFrame
+  ├── audio PTS → decoder → ALSA ring → DAC ── GetClock() ── master
+  └── video PTS → decoder → filter → jitterBuf → SyncAndSubmitFrame → display
 ```
 
-**Three invariants.**
+Three invariants:
 
-1. **Audio is master.** `cAudioProcessor::GetClock()` returns the PTS of the
-   sample currently at the DAC: `playbackPts + (age × 90)`, where
-   `age = cTimeMs::Now() − lastClockUpdateMs`. ALSA writes refresh
-   `playbackPts` once per ~25 ms period; the age-compensated read gives a
-   live DAC-position estimate instead of a piecewise-constant snapshot, so
-   `rawDelta` has scheduling-jitter precision (~1 ms) rather than period-size
-   quantisation (~25 ms). Beyond `AUDIO_CLOCK_STALE_MS = 1 s`, or before PCM
-   has been written, `GetClock()` returns `AV_NOPTS_VALUE` and the controller
-   falls through to the unpaced freerun branch.
+1. **Audio is master.** `cAudioProcessor::GetClock()` returns the DAC
+   playback PTS, computed as `playbackPts + (now − lastClockUpdateMs)`.
+   `playbackPts` is refreshed once per ALSA period (~25 ms); the
+   age-extrapolation collapses period quantization to scheduling-jitter
+   precision (~1 ms). After `AUDIO_CLOCK_STALE_MS = 1 s` without a write,
+   or before any write has fired, `GetClock()` returns `AV_NOPTS_VALUE`
+   and the controller falls into freerun.
 
-2. **Audio is never resampled.** No `swr_set_compensation`, no software PLL.
-   Audio plays at the DAC's native rate; only video adapts. This keeps the
-   system stateless across channel switches and eliminates the feedback-loop
-   instabilities that plague software audio resampling.
+2. **Audio is never resampled.** No `swr_set_compensation`, no software
+   PLL. Only video adapts. This keeps the system stateless across
+   channel switches and avoids the feedback-loop instabilities of
+   software audio resampling.
 
-3. **Video is uniformly 50 fps (or display refresh).** The filter graph
-   upconverts sub-display-rate progressive sources with `fps=<displayFps>`
-   so 25p, 25i-deinterlaced, and native 50p all reach `SyncAndSubmitFrame()`
-   at the same cadence. One controller regime covers every source type.
+3. **Video output cadence is uniform.** The filter graph appends
+   `fps=<displayFps>` whenever the source rate is below the display
+   refresh, so 25p, 25i-deinterlaced and native 50p all reach
+   `SyncAndSubmitFrame` at the same cadence. One controller regime fits
+   every source.
 
 ## Filter pipeline
 
@@ -50,205 +43,227 @@ SW decode: [bwdif] → [hqdn3d] → format=nv12 → hwupload → scale_vaapi →
 HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
 ```
 
-The trailing `fps=<displayFps>` node is appended whenever the natural output
-rate (source fps, doubled for `rate=field` deinterlacing) is below the
-display refresh rate. `fps` has `AVFILTER_FLAG_METADATA_ONLY` in FFmpeg so it
-duplicates `AVFrame` references without touching pixel data and works equally
-well with VAAPI surfaces and SW frames. Placement at the chain tail is
-deliberate: scale/denoise/sharpen each run once per *input* frame, only the
-metadata is duplicated to hit the target cadence.
+`fps` is metadata-only in FFmpeg (`AVFILTER_FLAG_METADATA_ONLY`) so it
+duplicates `AVFrame` references without touching pixels. Placement at the
+chain tail keeps scale/denoise/sharpen at one execution per *input* frame.
 
-## Measurement
-
-For every video frame, `SyncAndSubmitFrame()` computes:
+## Per-frame sync (`SyncAndSubmitFrame`)
 
 ```
 rawDelta = videoPTS − GetClock() − pipelineLatency
 ```
 
-`rawDelta > 0` = video ahead of audio; `rawDelta < 0` = behind.
+`rawDelta > 0` ⇒ video ahead, `< 0` ⇒ behind. `pipelineLatency` is the
+configured operator knob plus a fixed two-frame tail (one decoder→scanout
+period, one HDMI/panel period). The knob is split per output mode:
 
-### Pipeline latency
+| Mode                 | `setup.conf` key     | Range       | Default |
+| -------------------- | -------------------- | ----------- | ------- |
+| PCM (decoded)        | `PcmLatency`         | −200…200 ms | 0       |
+| IEC61937 passthrough | `PassthroughLatency` | −200…200 ms | 0       |
 
-`SyncLatency90k(ap)` returns the operator knob plus a fixed tail of **two
-output frame periods** (`2 × outputFrameDurationMs`):
+Active variant is selected per stream via `cAudioProcessor::IsPassthrough()`.
 
-1. **Decoder → scanout.** A frame submitted in iteration N appears at vsync
-   N+1 — one full frame period.
-2. **HDMI link + panel input lag.** Another empirical frame period, not
-   exposed by any DRM API.
+### EMA smoother
 
-Two operator knobs, selected per-stream via `cAudioProcessor::IsPassthrough()`:
+`rawDelta` carries up to ~150 ms field-alternation aliasing on
+deinterlaced 50p output; using it directly for soft corrections would
+churn. The smoother runs in two phases:
 
-| Mode                 | Setup-menu key                   | `setup.conf` key     | Range       | Default |
-| -------------------- | -------------------------------- | -------------------- | ----------- | ------- |
-| PCM (decoded by us)  | `PCM Audio Latency (ms)`         | `PcmLatency`         | −200…200 ms | 0       |
-| IEC61937 passthrough | `Passthrough Audio Latency (ms)` | `PassthroughLatency` | −200…200 ms | 0       |
+1. **Warmup.** First `WARMUP_SAMPLES = 50` samples (~1 s @ 50 fps) feed a
+   simple mean. The soft path is gated on `smoothedDeltaValid`, so no
+   correction fires off a partial mean.
+2. **Steady-state EMA.** Integer EMA with a residual accumulator that
+   carries the `diff mod N` remainder across samples — guarantees exact
+   convergence to the rawDelta mean even when `|diff| < N`. Time
+   constant ~1 s (`EMA_SAMPLES = 50`).
 
-Defaults are zero because the 2-frame tail already covers typical HDMI/TV
-bias. Positive → audio delayed (TV in cinema/movie mode); negative → audio
-advanced (TV in gaming/bypass mode, slow AV receiver).
+`ResetSmoothedDelta()` clears warmup, EMA, residual, hard-streaks and
+catch-up state in one call. Triggered on channel switch, hard-behind
+fire, catch-up exit and `WaitForAudioCatchUp`.
 
-### Two-phase smoother
+## Correction regimes
 
-Raw delta carries ~150 ms field-alternation aliasing on deinterlaced 50p. It
-is used only for the hard-transient threshold and as a log diagnostic; every
-soft-correction decision goes through the smoother.
+Symmetric: every regime has a behind and an ahead path. Hard transients
+bypass the cooldown.
 
-1. **Warmup.** After any reset (channel switch, hard transient, prime-sync),
-   the first `WARMUP_SAMPLES = 50` samples feed a simple mean instead of the
-   EMA. At 50 fps the window is ~1 s — within the cooldown, so no soft
-   correction fires off a partial mean. `√50 ≈ 7×` seed-bias reduction.
+### Soft corridor — `|smoothed| > CORRIDOR (40 ms)`, cooldown elapsed
 
-2. **Steady-state residual EMA.**
+Let `correctMs = min(|smoothed|/90, MAX_CORRECTION_MS = 200)`.
 
-   ```
-   residual += rawDelta − smoothed
-   step      = residual / EMA_SAMPLES      (integer)
-   smoothed += step
-   residual -= step × EMA_SAMPLES
-   ```
+| Direction | Action                                                                                           |
+| --------- | ------------------------------------------------------------------------------------------------ |
+| ahead     | `SleepMs(correctMs + frameDur)`, submit, then `smoothed −= (elapsed − frameDur) × 90`            |
+| behind    | Drop `max(1, round(correctMs / frameDur))` frames (one now, rest via `pendingDrops`); per drop `smoothed += frameDur × 90` |
 
-   With `EMA_SAMPLES = 50` the time constant is ~1 s. The residual accumulator
-   carries the `diff mod N` remainder that integer division would otherwise
-   discard, so the smoother converges **exactly** to the rawDelta mean instead
-   of stalling whenever `|diff| < N` ticks (as a plain integer EMA does).
+The `+ frameDur` padding on the sleep is load-bearing: a bare
+`SleepMs(correctMs)` only lengthens the iteration by `correctMs − frameDur`
+(the missing `frameDur` is absorbed by the next iteration's natural
+packet wait), so without padding the smoother sees half the requested
+shift and re-fires forever.
 
-The soft path is gated on `smoothedDeltaValid`, so nothing fires during
-warmup.
+Both paths feed back the **measured** effect, not the requested amount —
+this preserves the smoother across the correction and is what makes
+post-correction `d ≈ 0` reliably reproducible.
 
-## Correction
-
-Correction is **symmetric**: both directions use the same proportional,
-rate-limited mechanism. Hard transients bypass the rate limit.
-
-### Soft corridor (`|smoothed| > CORRIDOR = 20 ms`, cooldown elapsed)
-
-`CORRIDOR` is sized at `frameDur` (20 ms at 50 fps) because any sleep shorter
-than `frameDur` is absorbed into the natural packet wait at the top of the
-next `Action()` iteration — a narrower corridor would re-fire forever without
-effect.
-
-Let `correctMs = min(|smoothed|/90, MAX_CORRECTION_MS = 100)`.
-
-| Smoothed                | Action                                                                                                                                  |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `> +CORRIDOR` (ahead)   | `SleepMs(correctMs + frameDur)`, submit; post-submit adjust `smoothed −= (elapsed − frameDur) × 90` (measured after `SubmitFrame`)      |
-| `< −CORRIDOR` (behind)  | Drop `max(1, round(correctMs / frameDur))` frames: first now, remainder via `pendingDrops`; adjust `smoothed += frameDur × 90` per drop |
-
-Both paths adjust `smoothed` by the **measured** effect of the correction,
-not by the requested amount. This preserves the smoother's history — the next
-sample no longer reseeds from a single noisy raw value, which was the dominant
-source of post-correction oscillation in earlier designs.
-
-The `+ frameDur` padding on the sleep is critical. A bare `SleepMs(correctMs)`
-only lengthens the iteration by `(correctMs − frameDur)`: the missing
-`frameDur` is absorbed by the next iteration's natural packet wait (the packet
-was queued while we were sleeping). Padding forces the iteration one full
-frame period past normal, so the measured `extraMs ≈ correctMs` and the
-controller converges in a single fire. Drop rounding is nearest-integer,
-bounding the residual to `±frameDur/2`.
+`MAX_CORRECTION_MS = HARD_THRESHOLD = 200` so a single soft event can
+fully close the corridor; no sub-corridor residual is left for the
+controller to refuse-fire on. `CORRIDOR = 40` sits above the IEC61937
+EMA noise envelope (snd_pcm_delay quantises AC-3 in 1536-sample bursts
+≈ 32 ms) and below the human perceptual threshold (~80 ms). A narrower
+corridor would re-fire on quantization noise; a wider one would let
+genuine drift accumulate.
 
 ### Cooldown
 
-One event per `COOLDOWN_MS = 5 s` = 5 EMA time constants, so the smoother has
-absorbed the previous correction plus several cycles of fresh samples before
-re-firing. Also armed by hard transients, prime-sync, and
-`WaitForAudioCatchUp`. With `MAX_CORRECTION_MS = 100` per event the soft
-controller absorbs up to ~20 ms/s sustained drift — orders of magnitude above
-any realistic stream. A healthy stream requires zero corrections in steady
-state.
+`COOLDOWN_MS = 5 s` = 5 EMA time constants. Armed by every soft fire,
+hard transient, catch-up exit and `WaitForAudioCatchUp`. The smoother
+has therefore absorbed the previous correction plus several cycles of
+fresh samples before the next event can fire.
 
-### Hard transients (raw delta, not gated by cooldown)
+### Hard transients (raw delta, no cooldown gate)
 
-| Condition                                   | Action                                                                                                     |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `rawDelta < −HARD_THRESHOLD` (−200 ms)      | Drop frame, reset EMA, clear `pendingDrops`, arm cooldown                                                  |
-| `rawDelta > +HARD_THRESHOLD`, replay        | `WaitForAudioCatchUp()` blocks until audio catches up (capped at 5 s), then submit; arm cooldown           |
-| `rawDelta > +HARD_THRESHOLD`, live          | One sleep up to `HARD_AHEAD_MAX_MS = 500 ms`, bypassing `MAX_CORRECTION_MS` and cooldown; measured adjust  |
+| Condition                                | Action                                                                                |
+| ---------------------------------------- | ------------------------------------------------------------------------------------- |
+| `rawDelta < −HARD_THRESHOLD` (−200 ms)   | Drop frame, reset EMA, arm cooldown                                                   |
+| `rawDelta > +HARD_THRESHOLD`, replay     | `WaitForAudioCatchUp()` blocks (≤ 5 s) until audio catches up, then submit            |
+| `rawDelta > +HARD_THRESHOLD`, live       | One sleep ≤ `HARD_AHEAD_MAX_MS = 500 ms`, bypassing `MAX_CORRECTION_MS` and cooldown  |
 
-The live-mode hard-ahead path exists because the soft corridor caps at
-20 ms/s correction rate. A marginal transponder can drift faster than that,
-and the soft controller then chases the bias indefinitely. A single ~500 ms
-glitch to drag the system back into the soft corridor is a better UX than an
-indefinite stall, and the 500 ms cap prevents the upstream packet queue from
-overflowing during the sleep.
+Both directions are **streak-debounced** (`hardAheadStreak`,
+`hardBehindStreak`): a single sample over threshold submits unpaced and
+waits for the next sample to confirm. Real PCR discontinuities shift
+`pts` for every subsequent frame, so the streak reaches 2 within one
+frame period and the correction still fires within ~20 ms. Isolated
+outliers (`snd_pcm_delay` quantization, scheduler hiccups, the
+`GetClock()` load-pair race) clear on the next sample and never trigger
+a 500 ms freeze.
 
-The 200 ms threshold sits well above the EMA noise floor and below the
-perceptual annoyance threshold for a single corrective event.
+The live hard-ahead path exists because the soft corridor caps at
+~40 ms/s correction rate and a marginal transponder can drift faster.
+A single ≤ 500 ms glitch back into the corridor is preferable to an
+indefinite slow chase, and the cap prevents the upstream packet queue
+from overflowing during the sleep.
+
+### Catch-up — `rawDelta < −2 × HARD_THRESHOLD` (−400 ms)
+
+Catastrophic backlog (cold start with slow codec prime, post-seek,
+multi-second decoder stall). Every incoming frame is dropped silently —
+no per-event log, no EMA churn, no cooldown arm — until `rawDelta >
+−HARD_THRESHOLD`. Two log lines bracket the pass:
+
+```
+vaapivideo/decoder: catch-up entered raw=-2738ms
+vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-192ms
+```
+
+`SkipStaleJitterFrames()` lifts its "keep ≥ 1" guard while catching up
+since the kept frame would be dropped next iteration anyway. On exit,
+EMA is reset, `pendingDrops` cleared, cooldown armed, and the exiting
+frame is submitted normally.
 
 ## Jitter buffer (live TV)
 
-A count-based buffer at ~1 s of output rate (`DECODER_JITTER_BUFFER_MS = 1000`
-→ 50 frames at 50 fps) absorbs DVB-over-IP arrival jitter and weak-signal
-bursts. Three states:
+Audio and video share a single end-to-end cushion controlled by
+`AUDIO_ALSA_BUFFER_MS` (default 400 ms, in `src/audio.cpp`).
 
-1. **Filling.** Frames accumulate until `jitterTarget` is reached.
+- **Audio side** = ALSA hardware ring sized to `bufferSize =
+  AUDIO_ALSA_BUFFER_MS`. Steady-state the ring stays near full so
+  `GetClock()` lags wall time by roughly that amount.
+- **Video side** = `jitterBuf` (`std::deque`). Drain is **due-based**:
 
-2. **Prime-sync.** `RunJitterPrimeSync()` performs a one-shot coarse alignment
-   of the buffer head against the audio clock before the first drain:
-   - **Behind** (`initDelta < 0`): drop stale heads until the head pts
-     reaches the clock.
-   - **Ahead** (`initDelta > 0`): busy-wait in 10 ms slices until audio
-     catches up, then trim any heads that overshot during the wait. At least
-     one frame is always retained so the display is not starved.
+  ```
+  dueIn = headPts − GetClock() − latency
+  if dueIn > halfFrame: break          // head not yet due, hold buffer
+  else:                 submit head    // via SyncAndSubmitFrame
+  ```
 
-   If the audio clock is still `AV_NOPTS_VALUE` when prime-sync runs (typical
-   right after a track switch), the one-shot is **deferred** rather than
-   fired against a clockless buffer. The buffer continues to drain via
-   `SyncAndSubmitFrame()`'s "no clock" branch, and the alignment runs the
-   moment a real clock arrives. This avoids the failure mode where the
-   one-shot fires against NOPTS and never re-runs, leaving the EMA to seed
-   from a several-hundred-ms transient skew.
+  Head frames sit in the buffer for as long as the lagged clock plus
+  the broadcaster's own `video_pts − audio_pts` offset puts them in the
+  future, so the deque accumulates `(MS + broadcastLead) / frameDur`
+  frames at steady state.
 
-   Prime-sync resets the EMA and arms the cooldown so the steady-state
-   controller does not react to the (possibly large) raw deltas right after
-   the coarse jump.
+Both sides delay by the same amount, so lip-sync is preserved. The
+trade-off is channel-switch-to-audio latency: the first audio plays at
+~`MS / 3` (the ALSA `startThreshold`).
 
-3. **Draining.** The drain loop consumes exactly `pushedCount` fresh frames
-   per `Action()` iteration — the same count the decoder just pushed (1 for
-   native 50p, 2 for 25i `rate=field` or 25p upconverted) — plus any
-   `pendingDrops` carried over from a soft-correction burst. This keeps the
-   buffer level constant from iteration to iteration regardless of source
-   type. `SubmitFrame()`'s single-slot VSync backpressure paces the loop.
+### Per-stream variance
 
-`SkipStaleJitterFrames()` purges heads more than `HARD_THRESHOLD` behind the
-audio clock at CPU speed, in one shot, so the soft path doesn't have to drop
-them one-by-one and burn a per-drop grace window. At least one frame is
-always retained.
+`buf` reflects the broadcaster's own offset on top of the ALSA floor.
+Sampled values: SWR ~0 ms, RTLup ~400 ms, Das Erste ~500 ms, ZDF HD /
+UHD1 ~700–750 ms, SES UHD Demo ~1700 ms. 4K VBR streams can swing `buf`
+by a full second within seconds as bitrate peaks stall packet arrival.
+None of this can be compressed without breaking lip-sync; the jitter
+knob is a **floor, not a ceiling**.
 
-Replay mode skips the jitter buffer entirely — the source is local and there
-is no arrival jitter to absorb.
+### Drain bypasses
+
+The due check is bypassed for:
+- **Freerun** (`freerunFrames > 0` after `Clear()`, trick exit, audio
+  codec change) — gives an instant first picture.
+- **`pendingDrops`** from a soft-behind burst — one drop per drain
+  iteration until exhausted.
+
+`SkipStaleJitterFrames()` runs at the top of every drain pass and
+bulk-drops heads more than `HARD_THRESHOLD` (200 ms) behind the clock.
+Cheaper than routing each through catch-up.
+
+### Cold-boot startup
+
+On a cold VDR start, VAAPI codec init + filter graph + parser warm-up
+emit the first video frame significantly later than audio reaches the
+DAC. A large catch-up correction (hundreds of frames in tens of ms)
+followed by a single soft-behind is normal and expected.
+
+The cushion rebuilds over the next 1–2 s: the audio packet queue
+accumulated during the OSD load drains into the ALSA ring faster than
+real-time, `snd_pcm_delay` climbs from `startThreshold` toward full
+`bufferSize`, and the lagged clock pulls `buf` up to its steady value.
+The first sync-log line typically shows a small `buf`; one or two
+intervals later it has converged.
+
+If `buf` stays at 0 across many sync-log lines, the configured
+`AUDIO_ALSA_BUFFER_MS` is too small — raise it.
+
+### Audio packet queue (`aq`)
+
+`aq` is the FIFO between `Decode()` and the audio thread. The thread
+decodes packets as fast as they arrive and writes PCM to ALSA, so `aq`
+drains almost instantaneously and `aq = 0` is healthy. A persistently
+non-zero `aq` indicates the audio decoder is falling behind real-time
+(CPU contention, ALSA write stall). The real audio cushion is the
+**ALSA ring**, not this queue.
+
+Replay mode skips the jitter buffer entirely — the source is local and
+there is no arrival jitter to absorb.
 
 ## Sync bypass
 
-The sync gate is bypassed in these cases (frame submitted unpaced):
+The sync gate is bypassed (frame submitted unpaced) in:
 
-- **Trick mode** — `SubmitTrickFrame()` paces via its own timer; audio is muted.
-- **Freerun window** — `freerunFrames > 0` after `Clear()`, trick exit, or
-  `NotifyAudioChange()`; the audio clock has not yet re-anchored.
-- **No audio processor / NOPTS frame** — radio mode, MPEG-2 B-frames without PTS.
-- **Audio not yet running** — `GetClock()` is NOPTS until `WritePcmToAlsa()`
-  has fired at least once.
+- Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
+- Freerun window after `Clear()`, trick exit or `NotifyAudioChange()`.
+- Radio mode / NOPTS frame (no audio processor or no PTS to align on).
+- Audio not yet running (`GetClock()` is NOPTS until the first
+  `WritePcmToAlsa()` fires).
 
 ## Lifecycle
 
-| Event                          | EMA                          | Cooldown  | Jitter buffer                                 |
-| ------------------------------ | ---------------------------- | --------- | --------------------------------------------- |
-| Plugin start                   | invalid                      | —         | empty                                         |
-| Channel switch (`Clear()`)     | reset                        | —         | flushed; freerun armed                        |
-| Jitter prime-sync              | reset                        | armed     | aligned by `RunJitterPrimeSync()`             |
-| Soft drop                      | `+= frameDur × 90` per drop  | armed     | one frame removed per drop                    |
-| Soft sleep                     | `-= measured extra`          | armed     | unchanged                                     |
-| Hard transient (behind)        | reset                        | armed     | one frame dropped                             |
-| Hard-ahead (replay)            | (post-wait resync)           | armed     | unchanged                                     |
-| Hard-ahead (live)              | `-= measured extra`          | armed     | unchanged                                     |
-| Audio codec / track change     | unchanged                    | unchanged | preserved; freerun armed; prime-sync re-armed |
+| Event                      | EMA            | Cooldown   | Jitter buffer                    |
+| -------------------------- | -------------- | ---------- | -------------------------------- |
+| Plugin start               | invalid        | —          | empty                            |
+| Channel switch (`Clear()`) | reset          | —          | flushed; freerun armed           |
+| Catch-up enter             | (drops silent) | —          | drained silently to alignment    |
+| Catch-up exit              | reset          | armed      | one frame submitted normally     |
+| Soft drop                  | `+= frameDur × 90` per drop | armed | one frame removed per drop |
+| Soft sleep                 | `−= measured`  | armed      | unchanged                        |
+| Hard-behind                | reset          | armed      | one frame dropped                |
+| Hard-ahead (replay)        | (post-wait resync) | armed  | unchanged                        |
+| Hard-ahead (live)          | `−= measured`  | armed      | unchanged                        |
+| Audio codec / track change | unchanged      | unchanged  | preserved; freerun armed         |
 
-"Audio codec / track change" is the non-obvious row: dropping the buffer
-would strand ~1 s of valid video and force a full re-prime, so we re-arm the
-prime-sync one-shot against the existing buffer and let it run the moment a
-new audio clock arrives.
+Audio codec / track change preserves the buffer across the switch — the
+catch-up path will silently realign against the new clock once it
+arrives, so dropping ~1 s of still-valid video buys nothing.
 
 ## Log format
 
@@ -256,53 +271,56 @@ new audio clock arrives.
 sync d=+12.5ms avg=+11.7ms lat=40ms buf=50 aq=0 miss=0 drop=0 skip=0
 ```
 
-| Field  | Meaning                                                                                                                     |
-| ------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `d`    | **Interval mean** of raw delta since the last log (tenths of ms). Directly comparable to `avg` — both are means             |
-| `avg`  | EMA-smoothed delta (tenths of ms); drives every soft-correction decision                                                    |
-| `lat`  | Active `SyncLatency90k` value in ms (2-frame tail + operator knob); flags whether the PCM or passthrough knob is in effect  |
-| `buf`  | Jitter buffer depth (frames) at log emission                                                                                |
-| `aq`   | Audio queue depth (packets)                                                                                                 |
-| `miss` | Per-frame drain gaps > 2 × output frame period since last log (vsync backpressure, decode stall, our own sleeps)            |
-| `drop` | Frames dropped (video behind) since last log — soft + hard combined                                                         |
-| `skip` | Render delays (video ahead) since last log — soft sleep + live hard-ahead + replay hard-hold combined                       |
+| Field  | Meaning                                                                        |
+| ------ | ------------------------------------------------------------------------------ |
+| `d`    | Interval mean of `rawDelta` since the last log; comparable to `avg`            |
+| `avg`  | EMA-smoothed delta; drives every soft-correction decision                      |
+| `lat`  | Active `SyncLatency90k` (2-frame tail + active operator knob)                  |
+| `buf`  | `jitterBuf` depth in frames at log emission                                    |
+| `aq`   | Audio packet queue depth                                                       |
+| `miss` | Drain gaps > 2 × output frame period since last log (vsync backpressure, our sleeps) |
+| `drop` | Frames dropped (video behind) since last log — soft + hard combined            |
+| `skip` | Render delays (video ahead) since last log — soft sleep + hard-ahead combined  |
 
-`d` is the interval mean, not a point sample, so `d ≈ avg` in steady state
-means the EMA has converged on the current reality. The log line is
-suppressed during warmup and reissued immediately after warmup completes.
-Periodic interval is `LOG_INTERVAL_MS = 30 s`.
+`d ≈ avg` in steady state means the EMA has converged on current
+reality. The line is suppressed during warmup and reissued immediately
+on warmup completion. Periodic interval `LOG_INTERVAL_MS = 2 s`.
 
-**Healthy steady state:** `avg` inside `±CORRIDOR`, `d ≈ avg`, `buf` stable,
-`miss = drop = skip = 0`.
+**Healthy steady state:** `avg` inside `±CORRIDOR`, `d ≈ avg`, `buf`
+stable, `miss = drop = skip = 0`.
+
+Each soft / hard event also emits a per-event `dsyslog` line naming the
+cause (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead
+replay`, `hard-behind`, `stale-jitter bulk`, `catch-up entered`,
+`catch-up complete`) for "why did this fire?" without waiting for the
+next periodic line.
 
 ### Steady-state offset
 
-The EMA does not necessarily settle at zero. A constant few-millisecond
-offset typically reflects residual HDMI scanout / TV input lag beyond the
-two output-frame periods that `SyncLatency90k()` already covers. As long as
-the offset is inside `±CORRIDOR` the controller leaves it alone: correcting
-a non-drifting bias would only introduce visible jank. Operators who want
-`avg` to centre on zero can absorb the bias by tuning the appropriate
-latency knob (`PcmLatency` for PCM output, `PassthroughLatency` for IEC61937).
+The EMA does not necessarily settle at zero — a constant few-ms offset
+typically reflects residual HDMI/TV scanout bias beyond the 2-frame
+tail. Inside `±CORRIDOR` the controller leaves it alone (correcting a
+non-drifting bias would only introduce visible jank). To re-center,
+tune `PcmLatency` or `PassthroughLatency`.
 
 ## Constants
 
-All sync constants live in [src/decoder.cpp](src/decoder.cpp) at file scope as
-`constexpr` values. Grep for `DECODER_SYNC_` and `DECODER_JITTER_`; each
-carries a `///<` comment documenting purpose and unit.
+Sync constants live at file scope in [src/decoder.cpp](src/decoder.cpp);
+the cushion floor sits in [src/audio.cpp](src/audio.cpp). Each carries a
+`///<` comment with purpose and unit.
 
-| Constant                          | Value  | Purpose                                                               |
-| --------------------------------- | ------ | --------------------------------------------------------------------- |
-| `DECODER_SYNC_HARD_THRESHOLD`     | 200 ms | Raw-delta threshold for emergency drop / hold                         |
-| `DECODER_SYNC_CORRIDOR`           | 20 ms  | Soft corridor = frameDur at 50 fps                                    |
-| `DECODER_SYNC_MAX_CORRECTION_MS`  | 100    | Soft-event cap (sleep ms or drop-burst ms)                            |
-| `HARD_AHEAD_MAX_MS` *(local)*     | 500    | Live-mode hard-ahead sleep cap                                        |
-| `DECODER_SYNC_COOLDOWN_MS`        | 5000   | Min interval between soft corrections (= 5 EMA time constants)        |
-| `DECODER_SYNC_EMA_SAMPLES`        | 50     | EMA divisor (~1 s @ 50 fps; residual accumulator → exact convergence) |
-| `DECODER_SYNC_WARMUP_SAMPLES`     | 50     | Samples averaged before EMA seed (~1 s @ 50 fps)                      |
-| `DECODER_SYNC_FREERUN_FRAMES`     | 1      | Unpaced frames after sync-disrupting events (Clear, track switch, …)  |
-| `DECODER_SYNC_LOG_INTERVAL_MS`    | 30000  | Periodic sync diagnostic interval                                     |
-| `DECODER_JITTER_BUFFER_MS`        | 1000   | Jitter buffer target depth (absorbs weak-signal arrival bursts)       |
-| `DECODER_QUEUE_CAPACITY`          | 200    | Video packet queue depth (~4 s @ 50 fps / ~8 s @ 25 fps)              |
-| `AUDIO_CLOCK_STALE_MS` *(audio)*  | 1000   | Max age for `GetClock()` extrapolation before returning NOPTS         |
-| `AUDIO_QUEUE_CAPACITY` *(audio)*  | 100    | Audio packet queue depth (~3 s at AC-3 ~32 ms framing)                |
+| Constant                         | Value | Purpose                                                                |
+| -------------------------------- | ----- | ---------------------------------------------------------------------- |
+| `AUDIO_ALSA_BUFFER_MS`           | 400   | ALSA ring size (ms); lagged audio clock pulls video buf to ~MS/frameDur |
+| `DECODER_SYNC_HARD_THRESHOLD`    | 200   | Raw-delta threshold for hard transients (ms); 2× = catch-up entry      |
+| `DECODER_SYNC_CORRIDOR`          | 40    | Soft corridor half-width (ms); above AC-3 EMA noise envelope           |
+| `DECODER_SYNC_MAX_CORRECTION_MS` | 200   | Soft-event cap (= HARD_THRESHOLD) so one event fully closes corridor   |
+| `HARD_AHEAD_MAX_MS` *(local)*    | 500   | Live hard-ahead sleep cap (ms)                                         |
+| `DECODER_SYNC_COOLDOWN_MS`       | 5000  | Min interval between soft corrections (= 5 EMA time constants)         |
+| `DECODER_SYNC_EMA_SAMPLES`       | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence  |
+| `DECODER_SYNC_WARMUP_SAMPLES`    | 50    | Samples averaged before EMA seed (~1 s @ 50 fps)                       |
+| `DECODER_SYNC_FREERUN_FRAMES`    | 1     | Unpaced frames after sync-disrupting events                            |
+| `DECODER_SYNC_LOG_INTERVAL_MS`   | 2000  | Periodic sync diagnostic interval (ms)                                 |
+| `DECODER_QUEUE_CAPACITY`         | 200   | Video packet queue depth (~4 s @ 50 fps)                               |
+| `AUDIO_CLOCK_STALE_MS`           | 1000  | `GetClock()` extrapolation timeout before returning NOPTS              |
+| `AUDIO_QUEUE_CAPACITY`           | 300   | Audio packet queue depth (~10 s AC-3); sized for slow-start decoders   |

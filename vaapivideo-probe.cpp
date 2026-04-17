@@ -336,7 +336,7 @@ auto main(int argc, char *argv[]) -> int {
     }
     std::printf("Render node: %s\n", renderNode.c_str());
 
-    // --- Open render node and initialise VAAPI ---
+    // --- Open render node and initialize VAAPI ---
     const int renderFd = open(renderNode.c_str(), O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
     if (renderFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open render node '%s': %s\n", renderNode.c_str(),

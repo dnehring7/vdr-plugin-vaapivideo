@@ -150,12 +150,6 @@ class cVaapiDecoder : public cThread {
     auto ResetSmoothedDelta() noexcept -> void; ///< Invalidate EMA and clear warmup accumulator
     auto LogSyncStats(int64_t rawDelta90k, int64_t latency90k,
                       const cAudioProcessor *ap) -> void; ///< Periodic A/V sync diagnostic log
-    [[nodiscard]] auto RunJitterPrimeSync(cAudioProcessor *ap)
-        -> bool; ///< One-shot align: drop stale or wait for audio so the first drained frame is at delta ~= 0.
-                 ///< Returns true when alignment ran (or there was nothing to align), false when the audio clock is
-                 ///< not yet available and the caller should retry on the next Action() iteration. The deferral
-                 ///< prevents the one-shot opportunity from being wasted when prime fires before audio comes back
-                 ///< (e.g. an audi-track switch that arms freerun while the new audio clock takes ~200 ms to start).
     auto SkipStaleJitterFrames(cAudioProcessor *ap)
         -> void; ///< Pop jitter-buffer frames whose PTS is past the hard-late threshold (transient catch-up)
     auto WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta)
@@ -229,7 +223,10 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === A/V SYNC ===
     // ========================================================================
-    std::atomic<int> freerunFrames; ///< Frames to submit without sync after Clear() (written by main thread)
+    std::atomic<int> freerunFrames{1}; ///< Frames to submit without sync (written by main thread). Default 1 so the
+                                       ///< very first frame after construction surfaces immediately; without it the
+                                       ///< drain due-gate would hold the buffer (no clock yet) and the screen would
+                                       ///< stay black until ALSA's startThreshold is crossed.
     std::atomic<bool> jitterFlushPending{
         false};                       ///< Set by Clear(); decode thread applies jitter reset on next delivery cycle
     std::atomic<bool> syncLogPending; ///< Triggers sync log on next frame
@@ -248,14 +245,20 @@ class cVaapiDecoder : public cThread {
                                       ///< so the smoother converges exactly to the mean instead of
                                       ///< stalling whenever |diff| < EMA_SAMPLES ticks.
     bool smoothedDeltaValid{false};   ///< True once the EMA has been seeded (warmup complete)
+    int hardAheadStreak{};            ///< Consecutive rawDelta > +HARD_THRESHOLD samples; debounces lone noise
+                                      ///< spikes that would otherwise fire a 500 ms live-hard-ahead freeze.
+    int hardBehindStreak{};           ///< Consecutive rawDelta < -HARD_THRESHOLD samples; debounces lone
+                                      ///< GetClock() overestimates that would drop a frame and wipe the EMA.
+    bool catchingUp{};                ///< True while bulk-flushing a catastrophic backlog (startup, seek).
+    int catchUpDrops{};               ///< Frames dropped silently during current catch-up pass.
+    uint64_t catchUpStartMs{};        ///< Wall-clock start time of the current catch-up pass (ms).
     cTimeMs syncCooldown;             ///< Rate-limit timer between soft corrections
 
     // ========================================================================
     // === JITTER BUFFER (live TV only) ===
     // ========================================================================
-    std::deque<std::unique_ptr<VaapiFrame>> jitterBuf; ///< Decoded frames awaiting display (decoder thread only)
-    bool jitterPrimed{};                               ///< True once jitterBuf has accumulated enough frames
-    int jitterTarget{};            ///< Frame count needed to fill DECODER_JITTER_BUFFER_MS (set by InitFilterGraph)
+    std::deque<std::unique_ptr<VaapiFrame>> jitterBuf; ///< Decoded frames awaiting display (decoder thread only);
+                                                       ///< due-based drain, see AVSYNC.md.
     int outputFrameDurationMs{20}; ///< Duration per output frame in ms (e.g. 20 for 50fps, 40 for 25fps)
 };
 
