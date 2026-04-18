@@ -127,8 +127,9 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
-    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms", pcmLatency.load(std::memory_order_relaxed),
-                       passthroughLatency.load(std::memory_order_relaxed));
+    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Clear on channel switch: {}",
+                       pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
+                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off");
 }
 
 namespace {
@@ -171,6 +172,23 @@ namespace {
     }
     if (key == "PassthroughLatency") {
         return ParseLatencyValue("PassthroughLatency", value, passthroughLatency);
+    }
+    if (key == "ClearOnChannelSwitch") {
+        // Accept VDR's canonical 0/1 encoding for booleans; anything else is a malformed entry.
+        const std::string_view v{value};
+        bool parsed{};
+        if (v == "0") {
+            parsed = false;
+        } else if (v == "1") {
+            parsed = true;
+        } else {
+            esyslog("vaapivideo/config: invalid ClearOnChannelSwitch value '%s'", value);
+            return false;
+        }
+        const bool previous = clearOnChannelSwitch.load(std::memory_order_relaxed);
+        clearOnChannelSwitch.store(parsed, std::memory_order_relaxed);
+        dsyslog("vaapivideo/config: ClearOnChannelSwitch updated from %d to %d", previous ? 1 : 0, parsed ? 1 : 0);
+        return true;
     }
 
     return false; // Unknown key: ignore so older/newer setup.conf entries don't break load.

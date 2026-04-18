@@ -66,7 +66,9 @@ struct VaapiConfig {
     // ========================================================================
     // === DATA MEMBERS ===
     // ========================================================================
-    DisplayConfig display;                  ///< Desired display output parameters
+    std::atomic<bool> clearOnChannelSwitch{false}; ///< Paint a black frame on channel switch (pmNone teardown) instead
+                                                   ///< of leaving the previous channel's last frame on screen
+    DisplayConfig display;                         ///< Desired display output parameters
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) when audio is in IEC61937 passthrough; positive
                                             ///< delays audio relative to video, negative shifts audio earlier (read by
                                             ///< decode thread)

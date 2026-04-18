@@ -288,12 +288,20 @@ the kernel's naming scheme visible under `/sys/class/drm/`.
 |----------------------------------|----------------|-------------------------------------------------------------------|
 | `PCM Audio Latency (ms)`         | −200 … 200     | A/V offset applied when audio is decoded to PCM by the plugin     |
 | `Passthrough Audio Latency (ms)` | −200 … 200     | A/V offset applied when audio is forwarded as IEC61937 to an AVR  |
+| `Clear display on channel switch`| no / yes       | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
 to **0 ms** — adjust only if a residual offset is visible after the controller
 has settled. See [AVSYNC.md](AVSYNC.md) for the full sign convention and tuning
 guidance.
+
+`Clear display on channel switch` defaults to **no**: on `SetPlayMode(pmNone)`
+the DRM scanout keeps the last decoded frame until the new channel produces
+its first picture. Enable it to blank the screen between channels — the plugin
+submits a BT.709 TV-range black VAAPI surface through the normal display path
+right after the teardown. Radio (`pmAudioOnly`) always paints black and is not
+affected by this setting.
 
 ### SVDRP commands
 

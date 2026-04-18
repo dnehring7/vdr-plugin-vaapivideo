@@ -66,8 +66,9 @@ namespace {
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
     cMenuSetupVaapi()
-        : editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
-          editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)) {
+        : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
+          editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
+          editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
         // Two independent A/V offsets: one used while audio is decoded to PCM, the other while audio
         // is forwarded as IEC61937 passthrough. Bounds come from config.h so the menu and the
@@ -76,19 +77,23 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                  CONFIG_AUDIO_LATENCY_MAX_MS));
         Add(new cMenuEditIntItem(tr("Passthrough Audio Latency (ms)"), &editPassthroughLatency,
                                  CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
+        Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch));
     }
 
   protected:
     auto Store() -> void override {
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
+        vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
+        SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
     }
 
   private:
-    int editPcmLatency;         ///< Scratch copy of pcmLatency; not committed until Store().
-    int editPassthroughLatency; ///< Scratch copy of passthroughLatency; not committed until Store().
+    int editClearOnChannelSwitch; ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
+    int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
+    int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
 };
 
 // ============================================================================

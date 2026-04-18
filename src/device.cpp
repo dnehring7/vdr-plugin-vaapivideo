@@ -205,10 +205,17 @@ DrmDevices::~DrmDevices() noexcept {
 // ============================================================================
 
 auto cVaapiDevice::SubmitBlackFrame() -> void {
-    // Used to clear the previous channel's residual picture on radio channels and on
-    // hardware (re)init -- the DRM scanout buffer would otherwise hold whatever was last
-    // displayed. Allocates its own one-shot hw_frames_ctx so it does not depend on the
-    // decoder pipeline being up.
+    // Used to clear the previous channel's residual picture on radio channels, on hardware
+    // (re)init, and (when the user opts in) on channel switch -- the DRM scanout buffer
+    // would otherwise hold whatever was last displayed. Allocates its own one-shot
+    // hw_frames_ctx so it does not depend on the decoder pipeline being up.
+    //
+    // Self-guarded: bail out early if the display or VAAPI context is unavailable so
+    // callers don't have to repeat the same null checks.
+    if (!display || !vaapi.hwDeviceRef) [[unlikely]] {
+        return;
+    }
+
     const auto w = static_cast<int>(display->GetOutputWidth());
     const auto h = static_cast<int>(display->GetOutputHeight());
 
@@ -567,7 +574,7 @@ auto cVaapiDevice::Play() -> void {
     // the previous channel's residual picture.
     if (radioBlackPending && radioBlackTimer.TimedOut()) [[unlikely]] {
         radioBlackPending = false;
-        if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && display && vaapi.hwDeviceRef) {
+        if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
             isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
             SubmitBlackFrame();
         }
@@ -758,15 +765,19 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             lastHandledAudioTrack = ttNone;
             lastHandledAudioPid = 0;
             Clear();
+            // Optional: clear residual scanout on channel switch. Default off keeps the
+            // previous channel's last frame on screen until the new one decodes its first
+            // frame -- enabling this paints black in the gap instead.
+            if (vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed)) {
+                SubmitBlackFrame();
+            }
             break;
         case pmAudioOnly:
         case pmAudioOnlyBlack:
             // Radio: paint black so DRM scanout doesn't hold the previous channel's picture.
             radioBlackPending = false;
             Clear();
-            if (display && vaapi.hwDeviceRef) [[likely]] {
-                SubmitBlackFrame();
-            }
+            SubmitBlackFrame();
             break;
         case pmAudioVideo:
         case pmVideoOnly:
