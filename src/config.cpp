@@ -127,10 +127,12 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
-    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, Clear on channel switch: {}",
-                       pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
-                       PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
-                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off");
+    return std::format(
+        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}",
+        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
+        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
+        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
+        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off");
 }
 
 namespace {
@@ -189,6 +191,22 @@ namespace {
         const auto previous = passthroughMode.exchange(mode, std::memory_order_relaxed);
         dsyslog("vaapivideo/config: PassthroughMode updated from %s to %s", PassthroughModeName(previous),
                 PassthroughModeName(mode));
+        return true;
+    }
+    if (key == "HdrMode") {
+        // Encoded as the integer value of HdrMode -- written by cMenuEditStraItem, read
+        // back here. Range [Auto..Off] is contiguous so a single bounds check suffices.
+        int parsed{};
+        const auto *end = value + std::strlen(value);
+        const auto [ptr, ec] = std::from_chars(value, end, parsed);
+        if (ec != std::errc{} || ptr != end || parsed < static_cast<int>(HdrMode::Auto) ||
+            parsed > static_cast<int>(HdrMode::Off)) {
+            esyslog("vaapivideo/config: invalid HdrMode value '%s'", value);
+            return false;
+        }
+        const auto mode = static_cast<HdrMode>(parsed);
+        const auto previous = hdrMode.exchange(mode, std::memory_order_relaxed);
+        dsyslog("vaapivideo/config: HdrMode updated from %s to %s", HdrModeName(previous), HdrModeName(mode));
         return true;
     }
     if (key == "ClearOnChannelSwitch") {

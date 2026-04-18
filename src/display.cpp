@@ -29,10 +29,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
+#include <vector>
 
 // FFmpeg
 #pragma GCC diagnostic push
@@ -44,7 +47,9 @@ extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/rational.h>
 }
 #pragma GCC diagnostic pop
 
@@ -85,6 +90,79 @@ constexpr int MAX_DRAIN_ITERATIONS = 10;         ///< Bound on post-shutdown DRM
             return "???";
     }
 }
+
+namespace {
+
+// CTA-861-G decode constants. EOTF bits are in HDR SMDB byte 2; BT.2020 flags in
+// Colorimetry Data Block byte 2. Bit 0 (SDR) / bit 1 (HDR gamma) are implicit.
+constexpr uint8_t EDID_EOTF_PQ = 1U << 2;
+constexpr uint8_t EDID_EOTF_HLG = 1U << 3;
+constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6;
+constexpr size_t EDID_BLOCK_SIZE = 128;
+constexpr size_t EDID_CHECKSUM_OFFSET = 127;
+constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;
+
+/// Parse one 128-byte CTA-861 extension block for HDR EOTF + BT.2020 YCC advertisement.
+/// Per CTA-861-G section 7.3, a DTD offset of 0 means "no DTDs"; data blocks then fill [4, 127)
+/// (byte 127 is the checksum). Malformed blocks are tolerated silently.
+auto ParseCtaExtension(std::span<const uint8_t> ext, cVaapiDisplay::SinkHdrCaps &caps) -> void {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
+    if (ext.size() < 4 || ext[0] != 0x02) {
+        return;
+    }
+    const size_t dtdOffset = ext[2];
+    const size_t dataBlockEnd = (dtdOffset == 0) ? EDID_CHECKSUM_OFFSET : dtdOffset;
+    if (dataBlockEnd < 4 || dataBlockEnd > ext.size()) {
+        return;
+    }
+    size_t offset = 4;
+    while (offset < dataBlockEnd) {
+        const uint8_t header = ext[offset];
+        const uint8_t blockTag = header >> 5;
+        const uint8_t payloadLen = header & 0x1F;
+        if (offset + 1 + payloadLen > dataBlockEnd) {
+            break;
+        }
+        const std::span<const uint8_t> payload = ext.subspan(offset + 1, payloadLen);
+        // Tag 7 = "Use Extended Tag Code"; payload[0] carries the extended tag.
+        if (blockTag == 7 && !payload.empty()) {
+            const uint8_t extTag = payload[0];
+            if (extTag == 0x06 && payload.size() >= 3) {
+                // HDR Static Metadata Data Block. payload[1] = supported EOTFs bitmap.
+                // OR across extension blocks -- a second block must not erase support
+                // discovered in an earlier one.
+                caps.hdr10 = caps.hdr10 || (payload[1] & EDID_EOTF_PQ) != 0;
+                caps.hlg = caps.hlg || (payload[1] & EDID_EOTF_HLG) != 0;
+            } else if (extTag == 0x05 && payload.size() >= 2) {
+                // Colorimetry Data Block. payload[1] carries the BT.2020 flags. Same
+                // accumulation rule as the HDR SMDB above.
+                caps.bt2020Ycc = caps.bt2020Ycc || (payload[1] & EDID_COLORIMETRY_BT2020_YCC) != 0;
+            }
+        }
+        offset += 1 + payloadLen;
+    }
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
+
+/// Walk every CTA-861 extension block in a raw EDID blob and OR the results into `caps`.
+auto ParseEdidHdrCaps(std::span<const uint8_t> edid) -> cVaapiDisplay::SinkHdrCaps {
+    cVaapiDisplay::SinkHdrCaps caps{};
+    if (edid.size() < EDID_BLOCK_SIZE) {
+        return caps;
+    }
+    const size_t extCount =
+        edid[EDID_EXTENSION_COUNT_OFFSET]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    for (size_t i = 0; i < extCount; ++i) {
+        const size_t extOffset = EDID_BLOCK_SIZE * (i + 1);
+        if (extOffset + EDID_BLOCK_SIZE > edid.size()) {
+            break;
+        }
+        ParseCtaExtension(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
+    }
+    return caps;
+}
+
+} // namespace
 
 // ============================================================================
 // === ATOMIC REQUEST ===
@@ -324,6 +402,12 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     // OSD is best-effort: a missing ARGB plane only loses on-screen overlays, not playback.
     (void)BindDrmPlane(0, DRM_FORMAT_ARGB8888);
 
+    // HDR capability probe runs AFTER the video plane is bound -- planeSupportsP010 needs
+    // videoPlaneId to query the plane's IN_FORMATS blob. The probe is best-effort: logs
+    // the discovered sink + connector capabilities so operators can see why HDR is (or
+    // isn't) available, but never blocks SDR output.
+    ProbeHdrCapabilities();
+
     if (!ApplyDisplayMode(displayMode)) {
         esyslog("vaapivideo/display: failed to set display mode");
         return false;
@@ -430,6 +514,18 @@ auto cVaapiDisplay::Shutdown() -> void {
     // Detach planes + deactivate CRTC so fbcon (or the next DRM client) can take over.
     if (drmFd >= 0) {
         AtomicRequest req;
+        // Reset connector HDR properties to SDR defaults in the same atomic that disables
+        // the CRTC, otherwise the next DRM client inherits our BT.2020 / 10 bpc settings.
+        if (hdrProps.hdrOutputMetadata != 0) {
+            req.AddProperty(connectorId, hdrProps.hdrOutputMetadata, 0);
+        }
+        if (hdrProps.colorspaceValid) {
+            req.AddProperty(connectorId, hdrProps.colorspace, hdrProps.colorspaceDefault);
+        }
+        if (hdrProps.maxBpc != 0) {
+            const uint64_t sdrBpc = std::clamp<uint64_t>(8U, hdrProps.maxBpcMin, hdrProps.maxBpcMax);
+            req.AddProperty(connectorId, hdrProps.maxBpc, sdrBpc);
+        }
         if (videoPlaneId != 0) {
             req.AddProperty(videoPlaneId, videoProps.fbId, 0);
             req.AddProperty(videoPlaneId, videoProps.crtcId, 0);
@@ -465,6 +561,24 @@ auto cVaapiDisplay::Shutdown() -> void {
         drmModeDestroyPropertyBlob(drmFd, modeBlobId);
         modeBlobId = 0;
     }
+    // HDR property blobs: same rationale as modeBlobId -- the CRTC has already been
+    // disabled, so the kernel is no longer referencing either of these. Not freeing them
+    // here would leak kernel memory for the plugin-unload duration.
+    if (appliedHdrBlobId != 0 && drmFd >= 0) {
+        if (drmModeDestroyPropertyBlob(drmFd, appliedHdrBlobId) != 0) [[unlikely]] {
+            esyslog("vaapivideo/display: failed to destroy applied HDR blob: %s", strerror(errno));
+        }
+        appliedHdrBlobId = 0;
+    }
+    if (pendingDestroyHdrBlobId != 0 && drmFd >= 0) {
+        if (drmModeDestroyPropertyBlob(drmFd, pendingDestroyHdrBlobId) != 0) [[unlikely]] {
+            esyslog("vaapivideo/display: failed to destroy pending HDR blob: %s", strerror(errno));
+        }
+        pendingDestroyHdrBlobId = 0;
+    }
+    // Reset tracked HDR state so a re-Initialize() starts from a known SDR baseline.
+    appliedHdrState = {};
+    stagedHdrState = {};
 }
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
@@ -698,6 +812,22 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(crtcId, modesetProps.crtcActive, 1);
     req.AddProperty(crtcId, modesetProps.crtcModeId, modeBlobId);
     req.AddProperty(connectorId, modesetProps.connectorCrtcId, crtcId);
+    // Fold the SDR baseline for HDR connector properties into the modeset atomic so no
+    // second ALLOW_MODESET commit is needed later to clear state left by a previous DRM
+    // client. Doing it here keeps the single HDMI link retrain that ApplyDisplayMode
+    // already forces -- a second retrain after the audio sink has locked onto an IEC61937
+    // bitstream causes the sink to fall out of passthrough and treat subsequent payload
+    // as raw PCM (i.e. noise).
+    if (hdrProps.hdrOutputMetadata != 0) {
+        req.AddProperty(connectorId, hdrProps.hdrOutputMetadata, 0);
+    }
+    if (hdrProps.colorspaceValid) {
+        req.AddProperty(connectorId, hdrProps.colorspace, hdrProps.colorspaceDefault);
+    }
+    if (hdrProps.maxBpc != 0) {
+        const uint64_t sdrBpc = std::clamp<uint64_t>(8U, hdrProps.maxBpcMin, hdrProps.maxBpcMax);
+        req.AddProperty(connectorId, hdrProps.maxBpc, sdrBpc);
+    }
 
     if (!AtomicCommit(req, DRM_MODE_ATOMIC_ALLOW_MODESET)) {
         esyslog("vaapivideo/display: failed to set mode");
@@ -705,6 +835,11 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     }
 
     activeMode = mode;
+    // SDR baseline is now programmed; subsequent page flips suppress the HDR property
+    // write while staged == applied (both Sdr), so the PresentBuffer() path runs without
+    // ALLOW_MODESET and the AVR never sees a stray retrain while holding an IEC61937 lock.
+    appliedHdrState = HdrStreamInfo{};
+    appliedHdrBlobId = 0;
     return true;
 }
 
@@ -738,7 +873,16 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
     dsyslog("vaapivideo/display: searching for plane %d (format 0x%08x)", planeIndex, format);
 
+    // Video-plane discovery (first NV12 call) prefers a plane that also supports the HDR
+    // triad (P010 + BT.2020 + BT.709 COLOR_ENCODING). Some GPUs expose the first NV12
+    // plane as SDR-only and put P010 on a later one; falling for the first-match would
+    // disable HDR unnecessarily. We keep the first SDR-only candidate as a fallback for
+    // the case where no HDR-capable plane exists.
+    const bool preferHdrCapable = (videoPlaneId == 0 && planeIndex == 0 && format == DRM_FORMAT_NV12);
     int found = 0;
+    uint32_t fallbackPlaneId = 0;
+    uint32_t fallbackPlaneType = DRM_PLANE_TYPE_OVERLAY;
+    DrmPlaneProps fallbackProps{};
     for (uint32_t i = 0; i < planeRes->count_planes; ++i) {
         auto plane = std::unique_ptr<drmModePlane, decltype(&drmModeFreePlane)>(
             drmModeGetPlane(drmFd, planeRes->planes[i]), drmModeFreePlane);
@@ -777,9 +921,12 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
             const char *name = prop->name;
 
-            // IN_FORMATS blob lists (format, modifier) pairs the plane accepts. We only
-            // need to confirm the format is present -- the actual modifier check happens
-            // implicitly when KMS validates the FB at commit time.
+            // IN_FORMATS blob lists (format, modifier) pairs the plane accepts. We confirm
+            // the requested format and, in the same sweep, record whether the plane can
+            // also scan out DRM_FORMAT_P010 -- the HDR passthrough path needs that and
+            // otherwise we'd re-iterate the whole blob from ProbeHdrCapabilities just to
+            // answer the same question. The (format, modifier) pair is validated at commit
+            // time by KMS; scanning for the fourcc alone is sufficient here.
             if (!hasFormatSupport && strcmp(name, "IN_FORMATS") == 0) {
                 const auto blobId = static_cast<uint32_t>(planeProps->prop_values[j]);
                 if (blobId != 0) {
@@ -795,7 +942,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         for (uint32_t k = 0; k < modBlob->count_formats; ++k) {
                             if (formats[k] == format) {
                                 hasFormatSupport = true;
-                                break;
+                            } else if (formats[k] == DRM_FORMAT_P010) {
+                                tempProps.supportsP010 = true;
                             }
                         }
                     }
@@ -830,15 +978,19 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             } else if (strcmp(name, "COLOR_ENCODING") == 0) {
                 tempProps.colorEncoding = prop->prop_id;
                 for (int e = 0; e < prop->count_enums; ++e) {
-                    if (strcmp(prop->enums[e].name, "ITU-R BT.709 YCbCr") == 0) {
+                    const char *enumName = prop->enums[e].name;
+                    if (strcmp(enumName, "ITU-R BT.709 YCbCr") == 0) {
                         tempProps.colorEncodingBt709 = prop->enums[e].value;
                         tempProps.colorEncodingValid = true;
-                        break;
+                    } else if (strcmp(enumName, "ITU-R BT.2020 YCbCr") == 0) {
+                        tempProps.colorEncodingBt2020 = prop->enums[e].value;
+                        tempProps.colorEncodingBt2020Valid = true;
                     }
                 }
-                dsyslog("vaapivideo/display: plane %u COLOR_ENCODING prop=%u bt709_value=%lu found=%d", plane->plane_id,
-                        tempProps.colorEncoding, (unsigned long)tempProps.colorEncodingBt709,
-                        tempProps.colorEncodingValid);
+                dsyslog("vaapivideo/display: plane %u COLOR_ENCODING prop=%u bt709=%lu(%s) bt2020=%lu(%s)",
+                        plane->plane_id, tempProps.colorEncoding, (unsigned long)tempProps.colorEncodingBt709,
+                        tempProps.colorEncodingValid ? "yes" : "no", (unsigned long)tempProps.colorEncodingBt2020,
+                        tempProps.colorEncodingBt2020Valid ? "yes" : "no");
             } else if (strcmp(name, "COLOR_RANGE") == 0) {
                 tempProps.colorRange = prop->prop_id;
                 for (int e = 0; e < prop->count_enums; ++e) {
@@ -872,23 +1024,44 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         dsyslog("vaapivideo/display: candidate plane %u type=%s (found=%d, need=%d)", plane->plane_id,
                 GetPlaneTypeName(planeType), found, planeIndex);
 
-        if (found == planeIndex) {
-            const uint32_t planeId = plane->plane_id;
-            const bool isVideo = (videoPlaneId == 0);
-            DrmPlaneProps &props = isVideo ? videoProps : osdProps;
-            props = tempProps;
-
-            if (isVideo) {
-                videoPlaneId = planeId;
-                isyslog("vaapivideo/display: video plane %u type=%s", videoPlaneId, GetPlaneTypeName(props.type));
-            } else {
-                osdPlaneId = planeId;
-                isyslog("vaapivideo/display: OSD plane %u type=%s zpos=%s", osdPlaneId, GetPlaneTypeName(props.type),
-                        props.zpos ? "yes" : "no");
+        if (preferHdrCapable) {
+            const bool hdrCapable =
+                tempProps.supportsP010 && tempProps.colorEncodingValid && tempProps.colorEncodingBt2020Valid;
+            if (!hdrCapable) {
+                if (fallbackPlaneId == 0) {
+                    fallbackPlaneId = plane->plane_id;
+                    fallbackPlaneType = planeType;
+                    fallbackProps = tempProps;
+                }
+                continue;
             }
-            return true;
+        } else if (found != planeIndex) {
+            found++;
+            continue;
         }
-        found++;
+
+        const uint32_t planeId = plane->plane_id;
+        const bool isVideo = (videoPlaneId == 0);
+        DrmPlaneProps &props = isVideo ? videoProps : osdProps;
+        props = tempProps;
+
+        if (isVideo) {
+            videoPlaneId = planeId;
+            isyslog("vaapivideo/display: video plane %u type=%s", videoPlaneId, GetPlaneTypeName(props.type));
+        } else {
+            osdPlaneId = planeId;
+            isyslog("vaapivideo/display: OSD plane %u type=%s zpos=%s", osdPlaneId, GetPlaneTypeName(props.type),
+                    props.zpos ? "yes" : "no");
+        }
+        return true;
+    }
+
+    if (fallbackPlaneId != 0) {
+        videoPlaneId = fallbackPlaneId;
+        videoProps = fallbackProps;
+        isyslog("vaapivideo/display: video plane %u type=%s (fallback: no HDR-capable plane)", videoPlaneId,
+                GetPlaneTypeName(fallbackPlaneType));
+        return true;
     }
 
     esyslog("vaapivideo/display: no suitable plane found for index %d format 0x%08x", planeIndex, format);
@@ -971,6 +1144,281 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     return modesetProps.isValid;
 }
 
+auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
+    // Optional connector properties: a missing id just disables HDR, never breaks SDR.
+    auto connProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
+        drmModeObjectGetProperties(drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR), drmModeFreeObjectProperties);
+
+    std::vector<uint8_t> edidBlob;
+    bool haveBt2020Ycc = false;
+    bool haveDefault = false;
+    if (connProps) {
+        for (uint32_t i = 0; i < connProps->count_props; ++i) {
+            auto prop = std::unique_ptr<drmModePropertyRes, decltype(&drmModeFreeProperty)>(
+                drmModeGetProperty(drmFd, connProps->props[i]), drmModeFreeProperty);
+            if (!prop) {
+                continue;
+            }
+            const char *name = prop->name;
+            if (strcmp(name, "HDR_OUTPUT_METADATA") == 0) {
+                hdrProps.hdrOutputMetadata = prop->prop_id;
+            } else if (strcmp(name, "Colorspace") == 0) {
+                hdrProps.colorspace = prop->prop_id;
+                for (int e = 0; e < prop->count_enums; ++e) {
+                    if (strcmp(prop->enums[e].name, "BT2020_YCC") == 0) {
+                        hdrProps.colorspaceBt2020Ycc = prop->enums[e].value;
+                        haveBt2020Ycc = true;
+                    } else if (strcmp(prop->enums[e].name, "Default") == 0) {
+                        hdrProps.colorspaceDefault = prop->enums[e].value;
+                        haveDefault = true;
+                    }
+                }
+                // Refuse drivers that map BT2020_YCC and Default to the same numeric value --
+                // SDR and HDR commits would be indistinguishable.
+                hdrProps.colorspaceValid =
+                    haveBt2020Ycc && haveDefault && hdrProps.colorspaceBt2020Ycc != hdrProps.colorspaceDefault;
+            } else if (strcmp(name, "max bpc") == 0 && prop->count_values >= 2) {
+                // Range property: [min, max]. Skipping entries without both bounds keeps the
+                // commit path from requesting clamp(10, 0, 0) == 0 bpc, which the kernel rejects.
+                hdrProps.maxBpc = prop->prop_id;
+                hdrProps.maxBpcMin = prop->values[0];
+                hdrProps.maxBpcMax = prop->values[1];
+            } else if (strcmp(name, "EDID") == 0) {
+                const auto blobId = static_cast<uint32_t>(connProps->prop_values[i]);
+                if (blobId != 0) {
+                    auto blob = std::unique_ptr<drmModePropertyBlobRes, decltype(&drmModeFreePropertyBlob)>(
+                        drmModeGetPropertyBlob(drmFd, blobId), drmModeFreePropertyBlob);
+                    if (blob && blob->data && blob->length > 0) {
+                        const auto *src = static_cast<const uint8_t *>(blob->data);
+                        edidBlob.assign(src, src + blob->length);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!edidBlob.empty()) {
+        sinkHdrCaps = ParseEdidHdrCaps(std::span<const uint8_t>{edidBlob});
+    }
+    // BindDrmPlane(NV12) already sniffed the video plane's IN_FORMATS blob for P010.
+    planeSupportsP010 = (videoPlaneId != 0) && videoProps.supportsP010;
+
+    isyslog("vaapivideo/display: HDR caps -- connector: metadata=%s colorspace=%s max_bpc=%s[%lu..%lu]; "
+            "sink: pq=%s hlg=%s bt2020ycc=%s; plane: p010=%s bt2020enc=%s",
+            hdrProps.hdrOutputMetadata ? "yes" : "no", hdrProps.colorspaceValid ? "yes" : "no",
+            hdrProps.maxBpc ? "yes" : "no", static_cast<unsigned long>(hdrProps.maxBpcMin),
+            static_cast<unsigned long>(hdrProps.maxBpcMax), sinkHdrCaps.hdr10 ? "yes" : "no",
+            sinkHdrCaps.hlg ? "yes" : "no", sinkHdrCaps.bt2020Ycc ? "yes" : "no", planeSupportsP010 ? "yes" : "no",
+            videoProps.colorEncodingBt2020Valid ? "yes" : "no");
+}
+
+[[nodiscard]] auto cVaapiDisplay::CanDriveHdrPlane() const noexcept -> bool {
+    // Every property PresentBuffer() writes on an HDR transition must be present; HdrMode::On
+    // skips only the sink EDID gate (some TVs lie), never these commit-path prerequisites.
+    return planeSupportsP010 && videoProps.colorEncodingValid && videoProps.colorEncodingBt2020Valid &&
+           hdrProps.hdrOutputMetadata != 0 && hdrProps.colorspaceValid && hdrProps.maxBpc != 0 &&
+           hdrProps.maxBpcMax >= 10;
+}
+
+auto cVaapiDisplay::SetHdrOutputState(const HdrStreamInfo &info) -> void {
+    // Mutexed so the display thread reads a torn-write-free snapshot of the AVMasteringDisplay
+    // / AVContentLight multi-word fields on the next PresentBuffer().
+    const cMutexLock lock(&hdrStateMutex);
+    stagedHdrState = info;
+}
+
+namespace {
+
+/// Round a non-negative double to uint16_t with clamping. std::lround rounds half-away-from-
+/// zero for both signs, whereas naive `cast(d + 0.5)` produces wrong results when d is very
+/// small negative -- we never pass negatives here, but prefer the correct primitive anyway.
+[[nodiscard]] auto RoundU16(double d) noexcept -> uint16_t {
+    if (!(d > 0.0)) { // covers NaN too
+        return 0;
+    }
+    if (d >= 65535.0) {
+        return 0xFFFF;
+    }
+    return static_cast<uint16_t>(std::lround(d));
+}
+
+/// Convert an AVRational in [0, 1] range to the unsigned 16-bit EDID/HDMI primary
+/// coordinate (units of 0.00002, so 1.0 == 0xC350). Clamped to [0, 0xFFFF].
+[[nodiscard]] auto EncodePrimary(AVRational r) noexcept -> uint16_t {
+    if (r.den == 0) {
+        return 0;
+    }
+    return RoundU16(av_q2d(r) * 50000.0);
+}
+
+[[nodiscard]] auto AvRationalEqual(AVRational x, AVRational y) noexcept -> bool {
+    return x.num == y.num && x.den == y.den;
+}
+
+/// Compare two 2-element AVRational arrays (chromaticity XY). Wraps the constant-index
+/// accesses to a C array (FFmpeg ABI type) in a single scope, so call sites stay NOLINT-free.
+[[nodiscard]] auto XyRationalEqual(const AVRational (&a)[2], const AVRational (&b)[2]) noexcept -> bool {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
+    return AvRationalEqual(a[0], b[0]) && AvRationalEqual(a[1], b[1]);
+    // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
+}
+
+[[nodiscard]] auto MasteringEqual(const AVMasteringDisplayMetadata &a, const AVMasteringDisplayMetadata &b) noexcept
+    -> bool {
+    // Field-by-field: memcmp would compare implementation-defined padding bytes that
+    // AVMasteringDisplayMetadata's trivial assignment operator does NOT copy.
+    if (a.has_primaries != b.has_primaries || a.has_luminance != b.has_luminance) {
+        return false;
+    }
+    if (a.has_primaries) {
+        for (int i = 0; i < 3; ++i) {
+            if (!XyRationalEqual(a.display_primaries[i], b.display_primaries[i])) {
+                return false;
+            }
+        }
+        if (!XyRationalEqual(a.white_point, b.white_point)) {
+            return false;
+        }
+    }
+    if (a.has_luminance &&
+        (!AvRationalEqual(a.max_luminance, b.max_luminance) || !AvRationalEqual(a.min_luminance, b.min_luminance))) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto HdrOutputStateEqual(const HdrStreamInfo &a, const HdrStreamInfo &b) noexcept -> bool {
+    if (a.kind != b.kind || a.hasMasteringDisplay != b.hasMasteringDisplay || a.hasContentLight != b.hasContentLight) {
+        return false;
+    }
+    if (a.hasMasteringDisplay && !MasteringEqual(a.mastering, b.mastering)) {
+        return false;
+    }
+    if (a.hasContentLight &&
+        (a.contentLight.MaxCLL != b.contentLight.MaxCLL || a.contentLight.MaxFALL != b.contentLight.MaxFALL)) {
+        return false;
+    }
+    return true;
+}
+
+// HDMI EOTF codes per CTA-861.3 / HDMI 2.0a.
+constexpr uint8_t HDMI_EOTF_SMPTE_ST_2084 = 2; // HDR10 PQ
+constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
+
+/// Populate a Static Metadata Type 1 infoframe from a stream's HDR side-data. Missing
+/// mastering / content-light side-data leaves the corresponding fields zero, which per
+/// HDMI 2.1 section 7.6.1 the sink interprets as "unknown" (accepted for HDR10 and HLG alike).
+[[nodiscard]] auto BuildHdrMetadataInfoframe(const HdrStreamInfo &info) noexcept -> hdr_output_metadata {
+    hdr_output_metadata meta{};
+    meta.metadata_type = 0; // HDMI_STATIC_METADATA_TYPE1
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access) -- DRM ABI requires union access
+    auto &m = meta.hdmi_metadata_type1;
+    m.metadata_type = 0;
+    m.eotf = (info.kind == StreamHdrKind::Hlg) ? HDMI_EOTF_ARIB_STD_B67 : HDMI_EOTF_SMPTE_ST_2084;
+    if (info.hasMasteringDisplay) {
+        if (info.mastering.has_primaries) {
+            // AVMasteringDisplayMetadata and hdr_metadata_infoframe both document (r, g, b)
+            // primary order; FFmpeg's HEVC decoder already translates the SEI's native
+            // (g, b, r) layout, so no further reordering is needed here.
+            for (int i = 0; i < 3; ++i) {
+                // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
+                m.display_primaries[i].x = EncodePrimary(info.mastering.display_primaries[i][0]);
+                m.display_primaries[i].y = EncodePrimary(info.mastering.display_primaries[i][1]);
+                // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
+            }
+            m.white_point.x = EncodePrimary(info.mastering.white_point[0]);
+            m.white_point.y = EncodePrimary(info.mastering.white_point[1]);
+        }
+        if (info.mastering.has_luminance) {
+            // drm_mode.h: max_display_mastering_luminance in cd/m^2, min in 0.0001 cd/m^2.
+            m.max_display_mastering_luminance = RoundU16(av_q2d(info.mastering.max_luminance));
+            m.min_display_mastering_luminance = RoundU16(av_q2d(info.mastering.min_luminance) * 10000.0);
+        }
+    }
+    if (info.hasContentLight) {
+        // AVContentLightMetadata fields are unsigned int; the HDMI infoframe slots are u16.
+        constexpr unsigned int LIGHT_MAX = 0xFFFFU;
+        m.max_cll = static_cast<__u16>(std::min(info.contentLight.MaxCLL, LIGHT_MAX));
+        m.max_fall = static_cast<__u16>(std::min(info.contentLight.MaxFALL, LIGHT_MAX));
+    }
+    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
+    return meta;
+}
+
+} // namespace
+
+[[nodiscard]] auto cVaapiDisplay::MaybeAppendHdrOutputState(AtomicRequest &req, bool &failed) -> bool {
+    failed = false;
+    HdrStreamInfo staged;
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        staged = stagedHdrState;
+    }
+    if (HdrOutputStateEqual(staged, appliedHdrState)) {
+        return false; // ApplyDisplayMode() pre-programmed the SDR baseline, so the first
+                      // real frame with staged == Sdr legitimately skips the write here.
+    }
+
+    const bool wantActive = (staged.kind != StreamHdrKind::Sdr);
+    uint32_t newBlobId = 0;
+
+    if (wantActive && hdrProps.hdrOutputMetadata != 0) {
+        const hdr_output_metadata meta = BuildHdrMetadataInfoframe(staged);
+        if (drmModeCreatePropertyBlob(drmFd, &meta, sizeof(meta), &newBlobId) != 0) [[unlikely]] {
+            // Shipping BT.2020 + 10 bpc without an EOTF blob renders as crushed green on most
+            // sinks, so abort the whole commit and retry on the next frame.
+            esyslog("vaapivideo/display: drmModeCreatePropertyBlob(HDR_OUTPUT_METADATA) failed: %s", strerror(errno));
+            failed = true;
+            return false;
+        }
+    }
+
+    bool appended = false;
+    if (hdrProps.hdrOutputMetadata != 0) {
+        req.AddProperty(connectorId, hdrProps.hdrOutputMetadata, newBlobId);
+        appended = true;
+    }
+    if (hdrProps.colorspaceValid) {
+        req.AddProperty(connectorId, hdrProps.colorspace,
+                        wantActive ? hdrProps.colorspaceBt2020Ycc : hdrProps.colorspaceDefault);
+        appended = true;
+    }
+    if (hdrProps.maxBpc != 0) {
+        // 10 bpc for HDR, 8 bpc for SDR -- clamped to the property's advertised range because
+        // some HDR-only displays expose a minimum > 8 bpc and would reject an unconditional 8.
+        const uint64_t requestedBpc = wantActive ? 10U : 8U;
+        const uint64_t bpc = std::clamp(requestedBpc, hdrProps.maxBpcMin, hdrProps.maxBpcMax);
+        req.AddProperty(connectorId, hdrProps.maxBpc, bpc);
+        appended = true;
+    }
+
+    // Optimistically promote the new blob; PresentBuffer() rolls back on commit failure.
+    pendingDestroyHdrBlobId = appliedHdrBlobId;
+    appliedHdrBlobId = newBlobId;
+    appliedHdrState = staged;
+    if (appended) {
+        isyslog("vaapivideo/display: HDR state -- committing kind=%s blob=%u", StreamHdrKindName(staged.kind),
+                newBlobId);
+    }
+    return appended;
+}
+
+[[nodiscard]] auto cVaapiDisplay::SupportsHdrPassthrough(StreamHdrKind kind) const noexcept -> bool {
+    if (kind == StreamHdrKind::Sdr || !CanDriveHdrPlane()) {
+        return false;
+    }
+    // Auto mode adds the sink-side EDID gate on top of CanDriveHdrPlane().
+    switch (kind) {
+        case StreamHdrKind::Hdr10:
+            return sinkHdrCaps.hdr10 && sinkHdrCaps.bt2020Ycc;
+        case StreamHdrKind::Hlg:
+            return sinkHdrCaps.hlg && sinkHdrCaps.bt2020Ycc;
+        case StreamHdrKind::Sdr:
+            return false;
+    }
+    return false;
+}
+
 [[nodiscard]] auto cVaapiDisplay::MapVaapiFrame(std::unique_ptr<VaapiFrame> vaapiFrame) const -> DrmFramebuffer {
     if (!vaapiFrame || !vaapiFrame->avFrame || vaapiFrame->avFrame->format != AV_PIX_FMT_VAAPI) [[unlikely]] {
         return {};
@@ -1038,7 +1486,20 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
     // drmModeAddFB2WithModifiers takes parallel arrays per FB plane (handle/pitch/offset/
     // modifier). Walk the AVDRMFrameDescriptor's layers/planes to populate them.
-    const uint32_t format = DRM_FORMAT_NV12;
+    //
+    // Pick the DRM fourcc from hw_frames_ctx->sw_format -- the VPP surface was explicitly
+    // allocated with this layout, so it's the authoritative source. The PRIME descriptor's
+    // layer[0].format is NOT reliable: iHD 25.x has been observed to report a fourcc that
+    // KMS rejects in combination with the exported modifier, producing spurious AddFB2
+    // EINVAL on plain SDR NV12 scanout.
+    uint32_t format = DRM_FORMAT_NV12;
+    if (srcFrame->hw_frames_ctx) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
+        const auto *framesCtx = reinterpret_cast<const AVHWFramesContext *>(srcFrame->hw_frames_ctx->data);
+        if (framesCtx->sw_format == AV_PIX_FMT_P010) {
+            format = DRM_FORMAT_P010;
+        }
+    }
     const auto width = static_cast<uint32_t>(srcFrame->width);
     const auto height = static_cast<uint32_t>(srcFrame->height);
 
@@ -1060,10 +1521,11 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         }
     }
 
-    // NV12 = Y plane + interleaved UV plane, exactly two. Anything else means the
-    // descriptor doesn't actually describe NV12 and AddFB2 would reject it anyway.
+    // NV12 and P010 both: one Y plane + one interleaved UV plane. Anything else means the
+    // descriptor doesn't actually describe a 4:2:0 two-plane layout and AddFB2 would reject
+    // it anyway.
     if (planeIdx != 2) [[unlikely]] {
-        esyslog("vaapivideo/display: unexpected plane count %d (expected 2 for NV12)", planeIdx);
+        esyslog("vaapivideo/display: unexpected plane count %d (expected 2 for NV12/P010)", planeIdx);
         drm_gem_close closeArgs{.handle = gemHandle, .pad = 0};
         drmIoctl(drmFd, DRM_IOCTL_GEM_CLOSE, &closeArgs);
         av_frame_free(&mappedFrame);
@@ -1127,11 +1589,29 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     AtomicRequest req;
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
     req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
-    // Force BT.709 limited-range explicitly. Defaults vary by driver: i915 is BT.601 full
-    // range, AMD is BT.709 full range. Either mismatches our scale_vaapi output (BT.709 TV)
-    // and produces washed-out / green-tinted colors. Properties may be absent on older
-    // drivers; AddProperty(propId==0) silently no-ops in that case.
-    if (videoProps.colorEncodingValid) {
+
+    // HDR connector signalling is written only on state transitions, and must precede the
+    // per-frame COLOR_ENCODING below so the kernel sees a coherent HDR picture in one atomic.
+    // Snapshot the previous applied state for rollback: MaybeAppendHdrOutputState updates
+    // appliedHdrState/appliedHdrBlobId optimistically even though the kernel only observes
+    // them once this commit lands.
+    const HdrStreamInfo previousHdrState = appliedHdrState;
+    const uint32_t previousHdrBlobId = appliedHdrBlobId;
+    bool hdrStateFailed = false;
+    const bool hdrStateChanged = MaybeAppendHdrOutputState(req, hdrStateFailed);
+    if (hdrStateFailed) [[unlikely]] {
+        return false;
+    }
+
+    // COLOR_ENCODING follows the applied HDR state. Forcing the enum explicitly matters
+    // because driver defaults (i915 BT.601 full / AMD BT.709 full) mismatch scale_vaapi's
+    // limited-range output. An HDR-active state with no BT.2020 enum is refused upstream
+    // by CanDriveHdrPlane(); intentionally no BT.709 fallback here (would produce a green cast).
+    if (appliedHdrState.kind != StreamHdrKind::Sdr) {
+        if (videoProps.colorEncodingBt2020Valid) {
+            req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt2020);
+        }
+    } else if (videoProps.colorEncodingValid) {
         req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt709);
     }
     if (videoProps.colorRangeValid) {
@@ -1164,13 +1644,40 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         }
     }
 
-    const bool success = AtomicCommit(req, 0);
+    // ALLOW_MODESET is required on AMDGPU (and i915 on some kernels) whenever we change
+    // HDR_OUTPUT_METADATA / Colorspace / max bpc -- those can force a link retrain that a
+    // "pure page-flip" commit is not permitted to trigger. The brief blackout is acceptable
+    // because HDR transitions only happen at channel-switch time, never per-frame.
+    const uint32_t commitFlags = hdrStateChanged ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0U;
+    const bool success = AtomicCommit(req, commitFlags);
 
     // Only clear osdDirty when the commit actually landed -- a failed commit (e.g. EBUSY)
     // must keep the OSD update queued for the next attempt.
     if (success && osdCommitted) {
         const cMutexLock lock(&osdMutex);
         osdDirty = false;
+    }
+
+    // HDR blob lifecycle. On success the kernel has taken over the reference; drop the
+    // previous userspace one. On failure, discard the new blob that never reached the
+    // kernel and restore the previously-applied state so the next frame can retry cleanly.
+    if (hdrStateChanged) {
+        if (success) {
+            if (pendingDestroyHdrBlobId != 0) {
+                if (drmModeDestroyPropertyBlob(drmFd, pendingDestroyHdrBlobId) != 0) [[unlikely]] {
+                    esyslog("vaapivideo/display: failed to free previous HDR blob: %s", strerror(errno));
+                }
+                pendingDestroyHdrBlobId = 0;
+            }
+        } else {
+            if (appliedHdrBlobId != 0 && drmModeDestroyPropertyBlob(drmFd, appliedHdrBlobId) != 0) [[unlikely]] {
+                esyslog("vaapivideo/display: failed to free rejected HDR blob: %s", strerror(errno));
+            }
+            appliedHdrBlobId = previousHdrBlobId;
+            pendingDestroyHdrBlobId = 0;
+            appliedHdrState = previousHdrState;
+            esyslog("vaapivideo/display: atomic commit failed during HDR transition -- will retry next frame");
+        }
     }
 
     return success;

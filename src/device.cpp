@@ -122,10 +122,11 @@ static auto RestoreConsole() -> void {
     dsyslog("vaapivideo/device: console VT%d restored", currentVt);
 }
 
-/// True iff the driver advertises VLD bitstream decode + YUV420 surface output for this
-/// profile. Both are required for our pipeline; HW-accel pickers in OpenCodec() use the
-/// per-profile flags this populates.
-[[nodiscard]] static auto HasVldDecode(VADisplay display, VAProfile profile) -> bool {
+/// True iff the driver advertises VLD bitstream decode + the requested RT surface format
+/// for this profile. Both are required for our pipeline; HW-accel pickers in OpenCodec()
+/// use the per-profile flags this populates. `rtFormat` is typically VA_RT_FORMAT_YUV420
+/// (8-bit) or VA_RT_FORMAT_YUV420_10 (10-bit, HDR passthrough prerequisite).
+[[nodiscard]] static auto HasVldDecode(VADisplay display, VAProfile profile, unsigned int rtFormat) -> bool {
     const int maxEp = vaMaxNumEntrypoints(display);
     if (maxEp <= 0) [[unlikely]] {
         return false;
@@ -147,7 +148,7 @@ static auto RestoreConsole() -> void {
     if (vaGetConfigAttributes(display, profile, VAEntrypointVLD, &attrib, 1) != VA_STATUS_SUCCESS) {
         return false;
     }
-    return (attrib.value & VA_RT_FORMAT_YUV420) != 0;
+    return (attrib.value & rtFormat) != 0;
 }
 
 // ============================================================================
@@ -215,6 +216,15 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
     if (!display || !vaapi.hwDeviceRef) [[unlikely]] {
         return;
     }
+
+    // The black frame is SDR NV12 BT.709 TV-range. If the connector was left in HDR mode
+    // from a previous stream, the sink would scan SDR pixels as if they were BT.2020 PQ /
+    // HLG -- crushed blacks, wrong colors. Stage an SDR HDR-state BEFORE submitting so the
+    // next atomic commit clears HDR_OUTPUT_METADATA / Colorspace / BT.2020 COLOR_ENCODING
+    // in the same atomic as the black framebuffer. This path is used on radio mode,
+    // channel-switch blanking, and hardware reinit -- all cases where the decoder's
+    // normal SDR staging has been skipped.
+    display->SetHdrOutputState(HdrStreamInfo{});
 
     const auto w = static_cast<int>(display->GetOutputWidth());
     const auto h = static_cast<int>(display->GetOutputHeight());
@@ -1206,9 +1216,11 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     // filter graph. Fatal-fails if VAEntrypointVideoProc is missing -- without VPP we can
     // neither deinterlace nor color-convert and the GPU is unusable for this plugin.
     vaapi.hasDenoise = false;
+    vaapi.hasP010 = false;
     vaapi.hasSharpness = false;
     vaapi.hwH264 = false;
     vaapi.hwHevc = false;
+    vaapi.hwHevcMain10 = false;
     vaapi.hwMpeg2 = false;
     vaapi.deinterlaceMode.clear();
 
@@ -1258,34 +1270,42 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
             switch (profile) {
                 case VAProfileMPEG2Simple:
                 case VAProfileMPEG2Main:
-                    if (!vaapi.hwMpeg2 && HasVldDecode(vaDisplay, profile)) {
+                    if (!vaapi.hwMpeg2 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
                         vaapi.hwMpeg2 = true;
                     }
                     break;
                 case VAProfileH264ConstrainedBaseline:
                 case VAProfileH264Main:
                 case VAProfileH264High:
-                    if (!vaapi.hwH264 && HasVldDecode(vaDisplay, profile)) {
+                    if (!vaapi.hwH264 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
                         vaapi.hwH264 = true;
                     }
                     break;
                 case VAProfileHEVCMain:
-                case VAProfileHEVCMain10:
-                    if (!vaapi.hwHevc && HasVldDecode(vaDisplay, profile)) {
+                    if (!vaapi.hwHevc && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
                         vaapi.hwHevc = true;
+                    }
+                    break;
+                case VAProfileHEVCMain10:
+                    if (!vaapi.hwHevc && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
+                        vaapi.hwHevc = true;
+                    }
+                    if (!vaapi.hwHevcMain10 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420_10)) {
+                        vaapi.hwHevcMain10 = true;
                     }
                     break;
                 default:
                     break;
             }
-            if (vaapi.hwMpeg2 && vaapi.hwH264 && vaapi.hwHevc) {
+            // hwHevcMain10 may still be pending when we already have 8-bit HEVC; keep scanning.
+            if (vaapi.hwMpeg2 && vaapi.hwH264 && vaapi.hwHevc && vaapi.hwHevcMain10) {
                 break;
             }
         }
     }
 
-    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s", vaapi.hwMpeg2 ? "hw" : "sw",
-            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw");
+    isyslog("vaapivideo/device: VAAPI decode -- mpeg2=%s h264=%s hevc=%s hevc-main10=%s", vaapi.hwMpeg2 ? "hw" : "sw",
+            vaapi.hwH264 ? "hw" : "sw", vaapi.hwHevc ? "hw" : "sw", vaapi.hwHevcMain10 ? "hw" : "no");
 
     // vaQueryVideoProcFilters needs a live VPP context (config + surface + context).
     // Build a minimal one just for the probe and tear it all down at the bottom.
@@ -1309,6 +1329,16 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
         vaTerminate(vaDisplay);
         close(renderFd);
         return false;
+    }
+
+    // Probe P010 (YUV420_10) surface creation -- the HDR passthrough prerequisite. Non-fatal:
+    // no P010 => no HDR, but SDR playback remains fully functional.
+    VASurfaceID p010Surface = VA_INVALID_SURFACE;
+    if (vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420_10, 64, 64, &p010Surface, 1, nullptr, 0) == VA_STATUS_SUCCESS) {
+        vaapi.hasP010 = true;
+        if (vaDestroySurfaces(vaDisplay, &p010Surface, 1) != VA_STATUS_SUCCESS) [[unlikely]] {
+            esyslog("vaapivideo/device: failed to free P010 probe surface");
+        }
     }
 
     VAContextID contextId = VA_INVALID_ID;
@@ -1370,9 +1400,9 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     vaTerminate(vaDisplay);
     close(renderFd);
 
-    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s",
+    isyslog("vaapivideo/device: VPP capabilities -- denoise=%s sharpen=%s deinterlace=%s p010=%s",
             vaapi.hasDenoise ? "yes" : "no", vaapi.hasSharpness ? "yes" : "no",
-            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str());
+            vaapi.deinterlaceMode.empty() ? "none" : vaapi.deinterlaceMode.c_str(), vaapi.hasP010 ? "yes" : "no");
     return true;
 }
 

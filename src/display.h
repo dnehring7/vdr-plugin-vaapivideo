@@ -92,6 +92,16 @@ class cVaapiDisplay : public cThread {
         int32_t y{};       ///< OSD overlay top edge, relative to display origin
     };
 
+    /// EDID-advertised sink HDR capabilities, populated once by ProbeHdrCapabilities().
+    /// Exposed at class scope so the CTA-861 parser can live in display.cpp's anonymous
+    /// namespace without needing a friend declaration.
+    struct SinkHdrCaps {
+        // === DATA ===
+        bool bt2020Ycc{}; ///< Colorimetry Data Block advertises BT2020 Y'CbCr
+        bool hdr10{};     ///< HDR Static Metadata Data Block advertises EOTF SMPTE ST 2084 (PQ)
+        bool hlg{};       ///< HDR Static Metadata Data Block advertises EOTF ARIB STD-B67 (HLG)
+    };
+
     // ========================================================================
     // === LIFECYCLE ===
     // ========================================================================
@@ -150,6 +160,14 @@ class cVaapiDisplay : public cThread {
         -> cMutex & { ///< Return the VA driver mutex for cross-thread serialization (decoder <-> display)
         return vaDriverMutex;
     }
+    [[nodiscard]] auto CanDriveHdrPlane() const noexcept -> bool; ///< True when every commit-path prerequisite for HDR
+                                                                  ///< is present (plane P010, both COLOR_ENCODING
+                                                                  ///< enums, connector HDR properties, max bpc >= 10).
+                                                                  ///< Used by HdrMode::On to skip the sink EDID gate.
+    auto SetHdrOutputState(const HdrStreamInfo &info)
+        -> void; ///< Stage the HDR output signalling for the next atomic commit; thread-safe under hdrStateMutex.
+    [[nodiscard]] auto SupportsHdrPassthrough(StreamHdrKind kind) const noexcept
+        -> bool; ///< True iff the display AND the sink EDID both advertise support for @p kind; used by HdrMode::Auto.
 
   protected:
     // ========================================================================
@@ -210,6 +228,8 @@ class cVaapiDisplay : public cThread {
     struct DrmPlaneProps {
         // === DATA ===
         uint32_t colorEncoding{};              ///< COLOR_ENCODING property ID for YUV planes
+        uint64_t colorEncodingBt2020{};        ///< Enum value for BT.2020 encoding (HDR passthrough)
+        bool colorEncodingBt2020Valid{};       ///< True when the BT.2020 enum value was resolved
         uint64_t colorEncodingBt709{};         ///< Enum value for BT.709 encoding
         bool colorEncodingValid{};             ///< True when the BT.709 enum value was resolved
         uint32_t colorRange{};                 ///< COLOR_RANGE property ID for YUV planes
@@ -226,6 +246,7 @@ class cVaapiDisplay : public cThread {
         uint32_t srcW{};                       ///< SRC_W property ID (source crop width, 16.16 fixed-point)
         uint32_t srcX{};                       ///< SRC_X property ID (source crop X, 16.16 fixed-point)
         uint32_t srcY{};                       ///< SRC_Y property ID (source crop Y, 16.16 fixed-point)
+        bool supportsP010{};                   ///< Plane's IN_FORMATS blob advertises DRM_FORMAT_P010 (HDR passthrough)
         uint32_t type{DRM_PLANE_TYPE_OVERLAY}; ///< Plane type value (DRM_PLANE_TYPE_PRIMARY / _OVERLAY / _CURSOR)
         uint32_t zpos{};                       ///< zpos property ID (Z-order / layer priority)
     };
@@ -249,6 +270,21 @@ class cVaapiDisplay : public cThread {
         bool isValid{};             ///< True once all three property IDs have been resolved
     };
 
+    /// Cached connector property IDs and enum values for HDR output signalling. Populated
+    /// by ProbeHdrCapabilities(); any zero id means the driver does not expose that feature
+    /// and the HDR gate falls back to SDR.
+    struct HdrConnectorProps {
+        // === DATA ===
+        uint32_t colorspace{};          ///< "Colorspace" enum property id
+        uint64_t colorspaceBt2020Ycc{}; ///< Enum value for "BT2020_YCC"
+        uint64_t colorspaceDefault{};   ///< Enum value for "Default"
+        bool colorspaceValid{};         ///< True iff both enums were found AND their values differ (usable for commits)
+        uint32_t hdrOutputMetadata{};   ///< "HDR_OUTPUT_METADATA" blob property id
+        uint32_t maxBpc{};    ///< "max bpc" range property id; 0 when range is unusable (e.g. count_values < 2)
+        uint64_t maxBpcMin{}; ///< Minimum bpc accepted by the property range
+        uint64_t maxBpcMax{}; ///< Maximum bpc accepted by the property range
+    };
+
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
@@ -265,6 +301,12 @@ class cVaapiDisplay : public cThread {
                                                               ///< true if an event was handled
     [[nodiscard]] auto LoadDrmProperties() -> bool; ///< Cache the DRM atomic property IDs for the CRTC, connector
                                                     ///< and planes
+    [[nodiscard]] auto MaybeAppendHdrOutputState(AtomicRequest &req, bool &failed)
+        -> bool; ///< If the staged HDR state differs from the applied one, append HDR_OUTPUT_METADATA + Colorspace +
+                 ///< max bpc to @p req; returns true when any property was appended. Sets @p failed on blob-alloc
+                 ///< failure -- caller must abort the commit in that case.
+    auto ProbeHdrCapabilities()
+        -> void; ///< Populate hdrProps, sinkHdrCaps, and planeSupportsP010; best-effort, failure disables HDR only.
     [[nodiscard]] auto MapVaapiFrame(std::unique_ptr<VaapiFrame> vaapiFrame) const
         -> DrmFramebuffer; ///< Import a VAAPI surface as a DRM PRIME framebuffer, taking ownership of the frame
     static auto OnPageFlipEvent(int fd, unsigned int seq, unsigned int sec, unsigned int usec, void *data)
@@ -313,6 +355,19 @@ class cVaapiDisplay : public cThread {
     uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active display refresh rate in Hz
     uint32_t videoPlaneId{};                            ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{};                         ///< Cached atomic property IDs for the video plane
+
+    // ========================================================================
+    // === HDR STATE ===
+    // ========================================================================
+    uint32_t appliedHdrBlobId{};        ///< HDR_OUTPUT_METADATA blob id currently committed to the kernel (0 = none)
+    HdrStreamInfo appliedHdrState{};    ///< HDR state most recently *committed* to the kernel -- compare against staged
+                                        ///< under hdrStateMutex to decide whether a new HDR commit is needed
+    HdrConnectorProps hdrProps{};       ///< Connector HDR property ids (HDR_OUTPUT_METADATA, Colorspace, max bpc)
+    cMutex hdrStateMutex;               ///< Guards stagedHdrState against concurrent SetHdrOutputState writes
+    uint32_t pendingDestroyHdrBlobId{}; ///< Previous blob id awaiting deletion on the next successful page-flip
+    bool planeSupportsP010{};       ///< True when the bound video plane advertises DRM_FORMAT_P010 in its IN_FORMATS
+    SinkHdrCaps sinkHdrCaps{};      ///< HDR EOTFs + Colorimetry advertised by the sink's EDID
+    HdrStreamInfo stagedHdrState{}; ///< HDR state staged for the next atomic commit (decoder writes, display reads)
 };
 
 #endif // VDR_VAAPIVIDEO_DISPLAY_H

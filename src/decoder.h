@@ -135,6 +135,8 @@ class cVaapiDecoder : public cThread {
                  ///< re-arm for the next packet. Caller must hold codecMutex.
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame)
         -> bool; ///< Build VPP filter graph: HW path or SW (bwdif/hqdn3d -> hwupload) + scale/sharpen
+    [[nodiscard]] auto ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept
+        -> bool;                     ///< True iff stream + GPU + display + user config all allow HDR passthrough.
     auto ResetFilterGraph() -> void; ///< Null filter pointers and destroy the graph (idempotent)
     [[nodiscard]] auto SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Trick-mode pacing: enforce timing, reverse-PTS filtering, then submit

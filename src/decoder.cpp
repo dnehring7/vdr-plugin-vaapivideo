@@ -64,9 +64,11 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/rational.h>
 }
 #pragma GCC diagnostic pop
 
@@ -94,6 +96,98 @@ constexpr int64_t DECODER_SYNC_HARD_THRESHOLD = 200 * 90; ///< Emergency raw-del
 constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000;        ///< Periodic sync-stats dsyslog cadence (ms).
 constexpr int DECODER_SYNC_MAX_CORRECTION_MS = 200; ///< Per-event correction cap (ms); covers any in-corridor offset.
 constexpr int DECODER_SYNC_WARMUP_SAMPLES = 50; ///< Samples averaged to seed the EMA; sqrt(N) cuts deinterlace bias.
+
+// ============================================================================
+// === HDR CLASSIFICATION HELPERS ===
+// ============================================================================
+
+namespace {
+
+/// Return the underlying 8-/10-bit software pixel format for a (possibly VAAPI) frame.
+/// For SW decode this is just frame->format. For HW decode (AV_PIX_FMT_VAAPI) the real
+/// sample-layout is on the hw_frames_ctx -- digging it out is the only way to learn the
+/// bit depth before av_hwframe_transfer_data() pulls the surface back to system memory.
+[[nodiscard]] auto ResolveSwPixFmt(const AVFrame *frame) noexcept -> AVPixelFormat {
+    if (!frame) [[unlikely]] {
+        return AV_PIX_FMT_NONE;
+    }
+    if (frame->format != AV_PIX_FMT_VAAPI) {
+        return static_cast<AVPixelFormat>(frame->format);
+    }
+    if (!frame->hw_frames_ctx) {
+        return AV_PIX_FMT_NONE;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
+    const auto *framesCtx = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
+    return framesCtx->sw_format;
+}
+
+/// True iff the frame's sample layout carries at least @p minBits per luma sample. Uses
+/// the pix-fmt descriptor instead of hard-coding the handful of 10-bit formats we expect,
+/// so surface types the driver picks for us (P010, NV20, YUV420P10LE ...) all resolve.
+[[nodiscard]] auto FrameBitDepthAtLeast(const AVFrame *frame, int minBits) noexcept -> bool {
+    const AVPixelFormat swFmt = ResolveSwPixFmt(frame);
+    if (swFmt == AV_PIX_FMT_NONE) [[unlikely]] {
+        return false;
+    }
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(swFmt);
+    if (!desc || desc->nb_components == 0) [[unlikely]] {
+        return false;
+    }
+    return desc->comp[0].depth >= minBits;
+}
+
+/// Classify a decoded frame's HDR kind from its color_primaries + color_trc + bit depth.
+/// Codec profile is NOT a gate here -- an HEVC Main10 stream may still carry BT.709 SDR,
+/// and a stray SDR frame in an HDR program (ads, filler) will correctly resolve to Sdr.
+[[nodiscard]] auto ClassifyStream(const AVFrame *frame) noexcept -> StreamHdrKind {
+    if (!frame) [[unlikely]] {
+        return StreamHdrKind::Sdr;
+    }
+    if (frame->color_primaries != AVCOL_PRI_BT2020) {
+        return StreamHdrKind::Sdr;
+    }
+    if (!FrameBitDepthAtLeast(frame, 10)) {
+        return StreamHdrKind::Sdr;
+    }
+    switch (frame->color_trc) {
+        case AVCOL_TRC_SMPTE2084:
+            return StreamHdrKind::Hdr10;
+        case AVCOL_TRC_ARIB_STD_B67:
+            return StreamHdrKind::Hlg;
+        default:
+            return StreamHdrKind::Sdr;
+    }
+}
+
+/// Extract HDR10 static metadata side-data (mastering display + content light) from a
+/// decoded frame. Side-data absence is non-fatal: caller must check `hasMasteringDisplay`
+/// / `hasContentLight` before reading the payload structs. HLG streams typically omit
+/// these, in which case the sink receives all-zero bits per HDMI 2.1 section 7.6.1 ("unknown").
+[[nodiscard]] auto ExtractHdrInfo(const AVFrame *frame) noexcept -> HdrStreamInfo {
+    HdrStreamInfo info{};
+    info.kind = ClassifyStream(frame);
+    if (info.kind == StreamHdrKind::Sdr) {
+        return info; // null-frame case already resolved to Sdr inside ClassifyStream
+    }
+    // Side-data size check guards against header/runtime ABI skew: FFmpeg's contract
+    // promises sizeof(AVMastering...), but >= lets us tolerate a larger future layout.
+    if (const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+        sd != nullptr && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
+        info.hasMasteringDisplay = true;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
+        info.mastering = *reinterpret_cast<const AVMasteringDisplayMetadata *>(sd->data);
+    }
+    if (const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+        sd != nullptr && sd->size >= sizeof(AVContentLightMetadata)) {
+        info.hasContentLight = true;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
+        info.contentLight = *reinterpret_cast<const AVContentLightMetadata *>(sd->data);
+    }
+    return info;
+}
+
+} // namespace
 
 // ============================================================================
 // === STRUCTURES ===
@@ -552,7 +646,11 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
 
     codecCtx = std::move(decoderCtx);
     currentCodecId = codecId;
-    isyslog("vaapivideo/decoder: opened %s (%s)", decoder->name, useHwDecode ? "hardware" : "software");
+    // avcodec_profile_name returns nullptr for FF_PROFILE_UNKNOWN (set before any header is
+    // parsed). The post-first-frame logs will fill in the profile once it's known.
+    const char *profileName = av_get_profile_name(decoder, codecCtx->profile);
+    isyslog("vaapivideo/decoder: opened %s (%s, profile=%s)", decoder->name, useHwDecode ? "hardware" : "software",
+            profileName ? profileName : "unknown");
 
     return true;
 }
@@ -996,9 +1094,26 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
-                isyslog("vaapivideo/decoder: first frame %dx%d %s%s", decodedFrame->width, decodedFrame->height,
-                        fmtName ? fmtName : "unknown",
+                const char *swFmtName = av_get_pix_fmt_name(ResolveSwPixFmt(decodedFrame.get()));
+                const HdrStreamInfo hdr = ExtractHdrInfo(decodedFrame.get());
+                isyslog("vaapivideo/decoder: first frame %dx%d %s (sw=%s)%s", decodedFrame->width, decodedFrame->height,
+                        fmtName ? fmtName : "unknown", swFmtName ? swFmtName : "unknown",
                         (decodedFrame->flags & AV_FRAME_FLAG_INTERLACED) ? " interlaced" : "");
+                isyslog("vaapivideo/decoder: colorimetry -- primaries=%d trc=%d space=%d range=%d kind=%s",
+                        static_cast<int>(decodedFrame->color_primaries), static_cast<int>(decodedFrame->color_trc),
+                        static_cast<int>(decodedFrame->colorspace), static_cast<int>(decodedFrame->color_range),
+                        StreamHdrKindName(hdr.kind));
+                if (hdr.hasMasteringDisplay) {
+                    // Luminance fields are in 1/10000 cd/m^2 per AVMasteringDisplayMetadata.
+                    const double maxLuma = hdr.mastering.has_luminance ? av_q2d(hdr.mastering.max_luminance) : 0.0;
+                    const double minLuma = hdr.mastering.has_luminance ? av_q2d(hdr.mastering.min_luminance) : 0.0;
+                    isyslog("vaapivideo/decoder: mastering display -- max=%.0f cd/m^2 min=%.4f cd/m^2", maxLuma,
+                            minLuma);
+                }
+                if (hdr.hasContentLight) {
+                    isyslog("vaapivideo/decoder: content light -- MaxCLL=%u MaxFALL=%u", hdr.contentLight.MaxCLL,
+                            hdr.contentLight.MaxFALL);
+                }
             }
 
             // SD DVB streams omit color_description; default to BT.470BG (PAL) so
@@ -1169,6 +1284,29 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     const bool needsResize =
         (filterWidth != static_cast<uint32_t>(srcWidth) || filterHeight != static_cast<uint32_t>(srcHeight));
 
+    // HDR passthrough gate: stream colorimetry + GPU probe + display caps + user HdrMode.
+    // On denied/SDR, stage an explicit SDR descriptor so the display clears any previously-
+    // applied HDR_OUTPUT_METADATA / Colorspace on the next atomic commit.
+    const HdrStreamInfo hdrInfo = ExtractHdrInfo(firstFrame);
+    const bool hdrPassthrough = ShouldUseHdrPassthrough(hdrInfo);
+    if (display) {
+        display->SetHdrOutputState(hdrPassthrough ? hdrInfo : HdrStreamInfo{});
+    }
+    // Output pixel format for every stage that would otherwise force NV12, and scale_vaapi's
+    // color directive. Passed without a leading separator so the call site can pick ':'
+    // (after w=/h=) or '=' (no-resize: "scale_vaapi=<args>").
+    const char *pixFmt = hdrPassthrough ? "p010le" : "nv12";
+    std::string scaleColorArgs;
+    if (hdrPassthrough) {
+        // Pin the output colorimetry; scale_vaapi's "preserve input" default is driver-dependent.
+        const char *transfer = (hdrInfo.kind == StreamHdrKind::Hlg) ? "arib-std-b67" : "smpte2084";
+        scaleColorArgs = std::format(
+            "format={}:out_color_matrix=bt2020nc:out_color_primaries=bt2020:out_color_transfer={}:out_range=tv", pixFmt,
+            transfer);
+    } else {
+        scaleColorArgs = std::format("format={}:out_color_matrix=bt709:out_range=tv", pixFmt);
+    }
+
     // VBR DVB streams may report framerate==0; default to 50 fps (DVB-S/T baseline, = 25i).
     const int fpsNum = codecCtx->framerate.num > 0 ? codecCtx->framerate.num : 50;
     const int fpsDen = codecCtx->framerate.den > 0 ? codecCtx->framerate.den : 1;
@@ -1181,8 +1319,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         (!isInterlaced && naturalOutputFps > 0 && displayFps > 0 && naturalOutputFps < displayFps);
     const int outputFps = upconvertProgressive ? displayFps : naturalOutputFps;
 
-    // Filter chain (comma-joined). Both paths converge on NV12 BT.709 TV-range.
-    //   SW: [bwdif] -> [hqdn3d] -> format=nv12 -> hwupload -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
+    // Filter chain (comma-joined). SDR path emits NV12 BT.709 TV-range; HDR path emits
+    // P010 BT.2020 with the stream's native PQ/HLG transfer preserved.
+    //   SW: [bwdif] -> [hqdn3d] -> format -> hwupload -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
     //   HW: [deinterlace_vaapi] -> [denoise_vaapi] -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
     std::vector<std::string> filters;
 
@@ -1209,7 +1348,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             const int hqdn3dStrength = (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) ? 5 : 3;
             filters.push_back(std::format("hqdn3d={}", hqdn3dStrength));
         }
-        filters.emplace_back("format=nv12");
+        filters.push_back(std::format("format={}", pixFmt));
         filters.emplace_back("hwupload");
     } else {
         if (isInterlaced && !isStill && !vaapiContext->deinterlaceMode.empty()) {
@@ -1225,13 +1364,14 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
     }
 
-    // scale_vaapi unconditional: normalizes to NV12 BT.709 TV-range for the DRM plane.
+    // scale_vaapi unconditional: SDR path normalizes to NV12 BT.709 TV-range; HDR path
+    // preserves BT.2020 primaries and the stream's PQ/HLG transfer at 10-bit P010.
     if (needsResize) {
         const char *scaleMode = isUhd ? "" : ":mode=hq"; // hq (bicubic) too expensive at UHD
-        filters.push_back(std::format("scale_vaapi=w={}:h={}{}:format=nv12:out_color_matrix=bt709:out_range=tv",
-                                      filterWidth, filterHeight, scaleMode));
+        filters.push_back(
+            std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleMode, scaleColorArgs));
     } else {
-        filters.emplace_back("scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv");
+        filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
     }
 
     if (!useSimpleDeinterlace && sharpnessLevel > 0 && vaapiContext->hasSharpness) {
@@ -1369,11 +1509,30 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // Sync parameters: frame duration for the A/V controller.
     outputFrameDurationMs = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20;
 
-    isyslog("vaapivideo/decoder: VAAPI filter initialized (%dx%d -> %ux%u%s%s)", srcWidth, srcHeight, filterWidth,
-            filterHeight, isInterlaced ? ", deinterlaced" : "",
-            upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "");
+    isyslog("vaapivideo/decoder: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
+            filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "",
+            upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "", pixFmt,
+            hdrPassthrough ? StreamHdrKindName(hdrInfo.kind) : "SDR");
     dsyslog("vaapivideo/decoder: filter chain='%s'", filterChain.c_str());
     return true;
+}
+
+[[nodiscard]] auto cVaapiDecoder::ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept -> bool {
+    if (info.kind == StreamHdrKind::Sdr) {
+        return false;
+    }
+    const HdrMode userMode = vaapiConfig.hdrMode.load(std::memory_order_relaxed);
+    if (userMode == HdrMode::Off) {
+        return false;
+    }
+    // P010 VAAPI surfaces are the only GPU-side requirement: SW HEVC Main 10 decode is an
+    // accepted fallback via `format=p010le; hwupload` when the GPU lacks HW Main 10 decode.
+    if (!vaapiContext->hasP010 || !display) {
+        return false;
+    }
+    // HdrMode::On skips the sink EDID gate but still refuses configurations that would
+    // produce partial HDR signalling (black screen). Auto adds the EDID EOTF check on top.
+    return (userMode == HdrMode::On) ? display->CanDriveHdrPlane() : display->SupportsHdrPassthrough(info.kind);
 }
 
 auto cVaapiDecoder::ResetFilterGraph() -> void {

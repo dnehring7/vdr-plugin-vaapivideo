@@ -63,7 +63,7 @@ struct DisplayConfig {
 
 /// User policy for IEC61937 audio passthrough. Numeric values are part of the setup.conf
 /// wire format -- do not renumber. See README for the full user-facing description.
-enum class PassthroughMode : int {
+enum class PassthroughMode : std::uint8_t {
     Auto = 0, ///< Passthrough iff the sink advertises support in the ELD
     On = 1,   ///< Force passthrough for every IEC61937-wrappable codec; ignore the ELD
     Off = 2,  ///< Never passthrough; always decode to PCM
@@ -71,13 +71,39 @@ enum class PassthroughMode : int {
 
 /// Lowercase wire-format label for a PassthroughMode. Single source of truth shared by
 /// config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
-[[nodiscard]] inline constexpr auto PassthroughModeName(PassthroughMode mode) noexcept -> const char * {
+[[nodiscard]] constexpr auto PassthroughModeName(PassthroughMode mode) noexcept -> const char * {
     switch (mode) {
         case PassthroughMode::Auto:
             return "auto";
         case PassthroughMode::On:
             return "on";
         case PassthroughMode::Off:
+            return "off";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
+// === HDR PASSTHROUGH MODE ===
+// ============================================================================
+
+/// User policy for HDR10 / HLG output passthrough. Numeric values are part of the
+/// setup.conf wire format -- do not renumber. See README for the full description.
+enum class HdrMode : std::uint8_t {
+    Auto = 0, ///< Passthrough iff stream is HDR AND GPU and sink both advertise HDR support
+    On = 1,   ///< Force HDR output when the stream is HDR; skip the sink-capability gate
+    Off = 2,  ///< Never passthrough; always use the existing SDR BT.709 output path
+};
+
+/// Lowercase wire-format label for an HdrMode. Single source of truth shared by
+/// config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
+[[nodiscard]] constexpr auto HdrModeName(HdrMode mode) noexcept -> const char * {
+    switch (mode) {
+        case HdrMode::Auto:
+            return "auto";
+        case HdrMode::On:
+            return "on";
+        case HdrMode::Off:
             return "off";
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
@@ -95,6 +121,8 @@ struct VaapiConfig {
     std::atomic<bool> clearOnChannelSwitch{false}; ///< Paint a black frame on channel switch (pmNone teardown) instead
                                                    ///< of leaving the previous channel's last frame on screen
     DisplayConfig display;                         ///< Desired display output parameters
+    std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< User policy for HDR10/HLG passthrough; re-read on every codec
+                                                   ///< change / filter-graph rebuild
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) when audio is in IEC61937 passthrough; positive
                                             ///< delays audio relative to video, negative shifts audio earlier (read by
                                             ///< decode thread)

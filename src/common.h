@@ -67,6 +67,7 @@ extern "C" {
 #include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/log.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
@@ -103,13 +104,51 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.4.2";
+inline constexpr const char *PLUGIN_VERSION = "1.5.0";
 
 // ============================================================================
 // === CONSTANTS ===
 // ============================================================================
 
 inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (ms)
+
+// ============================================================================
+// === HDR STREAM CLASSIFICATION ===
+// ============================================================================
+
+/// Coarse HDR classification of an incoming video stream. Produced by the decoder on the
+/// first decoded frame (from codec profile + AVFrame color_* fields) and consumed by the
+/// display to decide the DRM/KMS output path (SDR BT.709 NV12 vs HDR10/HLG P010 BT.2020).
+enum class StreamHdrKind : uint8_t {
+    Sdr = 0,   ///< Not HDR -- use the existing SDR BT.709 pipeline
+    Hdr10 = 1, ///< BT.2020 primaries + SMPTE ST 2084 (PQ) transfer, 10-bit
+    Hlg = 2,   ///< BT.2020 primaries + ARIB STD-B67 (HLG) transfer, 10-bit
+};
+
+/// HDR metadata extracted from the first frame of an HDR stream. `kind == Sdr` means the
+/// `mastering*` / `contentLight*` fields are meaningless and must be ignored. For HLG,
+/// mastering-display metadata is uncommon; absence is non-fatal (emit all-zero bits per
+/// HDMI 2.1 section 7.6.1 -- the sink treats that as "unknown").
+struct HdrStreamInfo {
+    StreamHdrKind kind{StreamHdrKind::Sdr}; ///< Classification result
+    bool hasMasteringDisplay{};             ///< True iff AV_FRAME_DATA_MASTERING_DISPLAY_METADATA was present
+    bool hasContentLight{};                 ///< True iff AV_FRAME_DATA_CONTENT_LIGHT_LEVEL was present
+    AVMasteringDisplayMetadata mastering{}; ///< Display primaries + luminance; valid iff hasMasteringDisplay
+    AVContentLightMetadata contentLight{};  ///< MaxCLL / MaxFALL; valid iff hasContentLight
+};
+
+/// Human-readable name for a StreamHdrKind; shared by decoder logs and display logs.
+[[nodiscard]] constexpr auto StreamHdrKindName(StreamHdrKind kind) noexcept -> const char * {
+    switch (kind) {
+        case StreamHdrKind::Sdr:
+            return "SDR";
+        case StreamHdrKind::Hdr10:
+            return "HDR10";
+        case StreamHdrKind::Hlg:
+            return "HLG";
+    }
+    return "?";
+}
 
 // ============================================================================
 // === FFMPEG UTILITIES ===

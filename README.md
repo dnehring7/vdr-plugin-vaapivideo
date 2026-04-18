@@ -20,7 +20,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 | Decode    | H.264, HEVC, MPEG-2 — hardware (VAAPI) with automatic per-codec software fallback                  |
 | Filters   | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
 | Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, DTS-HD, TrueHD, AC-4, MPEG-H 3D)   |
-| Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR, up to 3840×2160                     |
+| Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
 | OSD       | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | A/V sync  | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
@@ -40,15 +40,17 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
                                     │                         │
                                     └────────────┬────────────┘
                                                  ▼
-                                   scale_vaapi (BT.709 NV12)
+                                   scale_vaapi
                                    + sharpness_vaapi
+                                   (SDR: BT.709 NV12; HDR: BT.2020 P010)
                                                  │
                                                  ▼
                                      DRM PRIME (zero-copy)
                                                  │
                                     ┌────────────┴────────────┐
                                     ▼                         ▼
-                              Video Plane (NV12)       OSD Plane (ARGB8888)
+                              Video Plane              OSD Plane (ARGB8888)
+                              (NV12 SDR / P010 HDR)
                                     │                         │
                                     └────────────┬────────────┘
                                                  ▼
@@ -411,11 +413,58 @@ threading primitives (`cThread`, `cMutex`, `cCondVar`) over `std::thread` /
     vdr -l 3 -P vaapivideo
 
 
+## HDR passthrough
+
+HDR10 (BT.2020 + SMPTE ST 2084 / PQ) and HLG (BT.2020 + ARIB STD-B67) streams
+are detected on the first decoded frame from the AVFrame colour metadata and
+the frame's bit depth (10-bit minimum). Detection is codec-agnostic — HEVC
+Main 10 is the common case, but any FFmpeg decoder that produces BT.2020 + PQ/HLG
+10-bit frames will engage passthrough.
+
+When passthrough is active, the entire output chain switches in lockstep:
+
+- `scale_vaapi` emits `P010` 10-bit samples with BT.2020 primaries and the
+  stream-native transfer function preserved (no tone-mapping, no BT.709 clamp).
+- The DRM video plane scans out `DRM_FORMAT_P010` with `COLOR_ENCODING` set to
+  BT.2020 YCbCr.
+- The connector's `HDR_OUTPUT_METADATA` blob carries the stream's mastering
+  display and content-light side data (HDMI Static Metadata Type 1), with
+  `Colorspace=BT2020_YCC` and `max_bpc=10`.
+
+HDR→SDR, SDR→HDR, and HDR10↔HLG transitions are handled atomically in a single
+KMS commit per channel switch. SDR streams bypass this path entirely and run
+the BT.709 NV12 TV-range pipeline unchanged; any previously programmed HDR
+connector state is explicitly reset to SDR defaults before the next frame
+lands, so a stream change never leaves stale BT.2020 signalling on the wire.
+
+Three gates must all pass for HDR to engage in `auto` mode:
+1. **Stream** — ≥10-bit samples, BT.2020 primaries, PQ or HLG transfer.
+2. **GPU** — VAAPI VPP can allocate `P010` (YUV420_10) surfaces. Hardware HEVC
+   Main 10 decode is preferred; if it's missing the FFmpeg software HEVC
+   decoder fills in, its output is uploaded to a P010 VAAPI surface, and HDR
+   still engages.
+3. **Display** — the connector exposes `HDR_OUTPUT_METADATA`, the bound video
+   plane advertises `DRM_FORMAT_P010` and both BT.709 + BT.2020 `COLOR_ENCODING`
+   enums, and the sink's EDID CTA-861 HDR Static Metadata block advertises the
+   requested EOTF.
+
+User configuration (VDR setup menu → "VAAPI Video" → **HDR Passthrough**):
+
+- `auto` — autodetect via the three gates above (default).
+- `on` — force HDR output whenever the stream is HDR; skips only the sink-EDID
+  gate. The plane-support and connector-property gates still apply, so
+  configurations that would produce a black screen are refused.
+- `off` — never pass through; always use the existing SDR output path.
+
+Tone-mapping (HDR→SDR or SDR→HDR) is deliberately **not** implemented. HDR
+content forced through the SDR pipeline (HdrMode::Off, or `auto` with any gate
+failing) will show clipped highlights and compressed primaries because no
+PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
+
 ## Roadmap
 
 - Expose filter controls (denoise strength, sharpen level) in the VDR setup menu
 - Dynamic resolution switching on SD / HD / UHD channel changes
-- HDR10 / HLG passthrough
 - GPU memory and ALSA underrun counters in `STAT` output
 - Detached-state startup with deferred hardware initialization
 

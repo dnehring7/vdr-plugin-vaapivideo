@@ -68,6 +68,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
   public:
     cMenuSetupVaapi()
         : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
+          editHdrMode(
+              std::clamp(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed)), 0, kHdrModeCount - 1)),
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
           // Clamp so cMenuEditStraItem never indexes past kPassthroughModeLabels.
           editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
@@ -83,6 +85,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                  CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
         Add(new cMenuEditStraItem(tr("Audio Passthrough"), &editPassthroughMode, kPassthroughModeCount,
                                   kPassthroughModeLabels.data()));
+        Add(new cMenuEditStraItem(tr("HDR Passthrough"), &editHdrMode, kHdrModeCount, kHdrModeLabels.data()));
         // Override the default "no"/"yes" so both boolean-style items in this page read "off"/"on".
         Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, tr("off"),
                                   tr("on")));
@@ -93,10 +96,12 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
+        vaapiConfig.hdrMode.store(static_cast<HdrMode>(editHdrMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
         SetupStore("PassthroughMode", editPassthroughMode);
+        SetupStore("HdrMode", editHdrMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
     }
 
@@ -112,7 +117,16 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
 
+    // HdrMode menu labels -- same pattern, rooted in HdrModeName() for single-source-of-truth.
+    static constexpr std::array kHdrModeLabels{
+        HdrModeName(HdrMode::Auto),
+        HdrModeName(HdrMode::On),
+        HdrModeName(HdrMode::Off),
+    };
+    static constexpr int kHdrModeCount = static_cast<int>(kHdrModeLabels.size());
+
     int editClearOnChannelSwitch; ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
+    int editHdrMode;              ///< Scratch copy of hdrMode as int (index into kHdrModeLabels).
     int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
     int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
     int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
