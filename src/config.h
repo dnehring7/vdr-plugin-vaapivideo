@@ -58,6 +58,32 @@ struct DisplayConfig {
 };
 
 // ============================================================================
+// === AUDIO PASSTHROUGH MODE ===
+// ============================================================================
+
+/// User policy for IEC61937 audio passthrough. Numeric values are part of the setup.conf
+/// wire format -- do not renumber. See README for the full user-facing description.
+enum class PassthroughMode : int {
+    Auto = 0, ///< Passthrough iff the sink advertises support in the ELD
+    On = 1,   ///< Force passthrough for every IEC61937-wrappable codec; ignore the ELD
+    Off = 2,  ///< Never passthrough; always decode to PCM
+};
+
+/// Lowercase wire-format label for a PassthroughMode. Single source of truth shared by
+/// config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
+[[nodiscard]] inline constexpr auto PassthroughModeName(PassthroughMode mode) noexcept -> const char * {
+    switch (mode) {
+        case PassthroughMode::Auto:
+            return "auto";
+        case PassthroughMode::On:
+            return "on";
+        case PassthroughMode::Off:
+            return "off";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
 // === PLUGIN CONFIGURATION ===
 // ============================================================================
 
@@ -72,6 +98,8 @@ struct VaapiConfig {
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) when audio is in IEC61937 passthrough; positive
                                             ///< delays audio relative to video, negative shifts audio earlier (read by
                                             ///< decode thread)
+    std::atomic<PassthroughMode> passthroughMode{
+        PassthroughMode::Auto};     ///< User policy for IEC61937 passthrough; re-read on every codec change
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) when audio is decoded to PCM; positive delays audio
                                     ///< relative to video, negative shifts audio earlier (read by decode thread)
 

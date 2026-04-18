@@ -127,8 +127,9 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
-    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Clear on channel switch: {}",
+    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, Clear on channel switch: {}",
                        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
+                       PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
                        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off");
 }
 
@@ -172,6 +173,23 @@ namespace {
     }
     if (key == "PassthroughLatency") {
         return ParseLatencyValue("PassthroughLatency", value, passthroughLatency);
+    }
+    if (key == "PassthroughMode") {
+        // Encoded as the integer value of PassthroughMode -- written by cMenuEditStraItem,
+        // read back here. Range [Auto..Off] is contiguous so a single bounds check suffices.
+        int parsed{};
+        const auto *end = value + std::strlen(value);
+        const auto [ptr, ec] = std::from_chars(value, end, parsed);
+        if (ec != std::errc{} || ptr != end || parsed < static_cast<int>(PassthroughMode::Auto) ||
+            parsed > static_cast<int>(PassthroughMode::Off)) {
+            esyslog("vaapivideo/config: invalid PassthroughMode value '%s'", value);
+            return false;
+        }
+        const auto mode = static_cast<PassthroughMode>(parsed);
+        const auto previous = passthroughMode.exchange(mode, std::memory_order_relaxed);
+        dsyslog("vaapivideo/config: PassthroughMode updated from %s to %s", PassthroughModeName(previous),
+                PassthroughModeName(mode));
+        return true;
     }
     if (key == "ClearOnChannelSwitch") {
         // Accept VDR's canonical 0/1 encoding for booleans; anything else is a malformed entry.

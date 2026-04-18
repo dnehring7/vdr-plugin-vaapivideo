@@ -29,6 +29,7 @@
 #include <xf86drm.h>
 
 // C++ Standard Library
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -68,6 +69,9 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     cMenuSetupVaapi()
         : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
+          // Clamp so cMenuEditStraItem never indexes past kPassthroughModeLabels.
+          editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
+                                         0, kPassthroughModeCount - 1)),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
         // Two independent A/V offsets: one used while audio is decoded to PCM, the other while audio
@@ -77,22 +81,40 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                  CONFIG_AUDIO_LATENCY_MAX_MS));
         Add(new cMenuEditIntItem(tr("Passthrough Audio Latency (ms)"), &editPassthroughLatency,
                                  CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
-        Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch));
+        Add(new cMenuEditStraItem(tr("Audio Passthrough"), &editPassthroughMode, kPassthroughModeCount,
+                                  kPassthroughModeLabels.data()));
+        // Override the default "no"/"yes" so both boolean-style items in this page read "off"/"on".
+        Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, tr("off"),
+                                  tr("on")));
     }
 
   protected:
     auto Store() -> void override {
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
+        vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
+        SetupStore("PassthroughMode", editPassthroughMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
     }
 
   private:
+    // Labels for cMenuEditStraItem, derived from PassthroughModeName() so the enum, the
+    // setup.conf log output, and the setup-menu display can never drift apart. Order must
+    // match the enum's numeric values: cMenuEditStraItem stores the selected index and we
+    // round-trip it through setup.conf as PassthroughMode(int).
+    static constexpr std::array kPassthroughModeLabels{
+        PassthroughModeName(PassthroughMode::Auto),
+        PassthroughModeName(PassthroughMode::On),
+        PassthroughModeName(PassthroughMode::Off),
+    };
+    static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
+
     int editClearOnChannelSwitch; ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
     int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
+    int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
     int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
 };
 

@@ -284,11 +284,12 @@ the kernel's naming scheme visible under `/sys/class/drm/`.
 
     Setup → Plugins → vaapivideo
 
-| Setting                          | Range          | Description                                                       |
-|----------------------------------|----------------|-------------------------------------------------------------------|
-| `PCM Audio Latency (ms)`         | −200 … 200     | A/V offset applied when audio is decoded to PCM by the plugin     |
-| `Passthrough Audio Latency (ms)` | −200 … 200     | A/V offset applied when audio is forwarded as IEC61937 to an AVR  |
-| `Clear display on channel switch`| no / yes       | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
+| Setting                          | Range             | Description                                                       |
+|----------------------------------|-------------------|-------------------------------------------------------------------|
+| `PCM Audio Latency (ms)`         | −200 … 200        | A/V offset applied when audio is decoded to PCM by the plugin     |
+| `Passthrough Audio Latency (ms)` | −200 … 200        | A/V offset applied when audio is forwarded as IEC61937 to an AVR  |
+| `Audio Passthrough`              | auto / on / off   | IEC61937 passthrough policy (see below)                           |
+| `Clear display on channel switch`| off / on          | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -296,12 +297,37 @@ to **0 ms** — adjust only if a residual offset is visible after the controller
 has settled. See [AVSYNC.md](AVSYNC.md) for the full sign convention and tuning
 guidance.
 
-`Clear display on channel switch` defaults to **no**: on `SetPlayMode(pmNone)`
+`Clear display on channel switch` defaults to **off**: on `SetPlayMode(pmNone)`
 the DRM scanout keeps the last decoded frame until the new channel produces
 its first picture. Enable it to blank the screen between channels — the plugin
 submits a BT.709 TV-range black VAAPI surface through the normal display path
 right after the teardown. Radio (`pmAudioOnly`) always paints black and is not
 affected by this setting.
+
+`Audio Passthrough` defaults to **auto**: the plugin reads the HDMI sink's ELD
+at startup and forwards a compressed codec as IEC61937 only when the sink
+advertises support for it — everything else is decoded to stereo PCM. Use
+**on** to unconditionally force passthrough for every wrappable codec (AC-3,
+E-AC-3, TrueHD, DTS, AC-4, MPEG-H 3D Audio) and **ignore the ELD entirely**.
+This is the knob for topologies where the probed capabilities are wrong — the
+typical case being an AVR behind a TV, where the TV's EDID masks the AVR's
+real decoder support. When **on** overrides a negative ELD, the plugin logs
+a `PassthroughMode=on overriding ELD for X (sink advertises no support); …`
+line so the override is visible in the journal. Codecs without IEC61937
+framing (AAC, MP2, …) are always decoded to PCM. Use **off** to disable
+passthrough entirely and always decode to PCM — convenient for sinks that
+only accept stereo PCM or for troubleshooting.
+
+Note that ALSA cannot signal a silent decode failure at the sink. The
+`default` device in particular is a plug wrapper that accepts IEC61937 bursts
+as plain S16LE PCM; if the real downstream device cannot decode the burst
+you will simply hear nothing. When using **on**, make sure the downstream
+device really does decode the codec — otherwise switch back to **auto** or
+**off**.
+
+Changes to this setting only take effect when the audio device is reopened —
+i.e. on the next channel switch or codec change. Switch channels once after
+leaving the setup menu to activate the new mode.
 
 ### SVDRP commands
 

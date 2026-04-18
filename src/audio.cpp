@@ -16,6 +16,7 @@
 
 #include "audio.h"
 #include "common.h"
+#include "config.h"
 
 // ALSA
 #include <alsa/asoundlib.h>
@@ -315,14 +316,32 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
 
     const cMutexLock lock(mutex.get());
 
+    // Probe before computing wantPassthrough so CanPassthrough() reads fresh sinkCaps, and
+    // so the fast-path bailout below sees the current ELD-derived support set.
+    ProbeSinkCaps();
+
+    const bool wantPassthrough = CanPassthrough(params.codecId);
+    const bool currentlyPassthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
+
+    // Fast path: identical stream params AND the passthrough decision is unchanged. The
+    // PassthroughMode check is load-bearing: the user can flip Auto <-> On <-> Off from
+    // the setup menu between identical-codec calls, and that must still trigger a reopen.
     if (streamParams.codecId == params.codecId && streamParams.sampleRate == params.sampleRate &&
-        streamParams.channels == params.channels) {
+        streamParams.channels == params.channels && wantPassthrough == currentlyPassthrough) {
         return;
     }
 
-    const AVCodecID oldCodecId = streamParams.codecId;
+    // One-shot per codec change: On deliberately ignores the ELD, so when the ELD would
+    // have denied passthrough, leave a breadcrumb in the journal pointing straight at the
+    // override -- this is the line a "no audio on On" report should turn up.
+    if (wantPassthrough && vaapiConfig.passthroughMode.load(std::memory_order_relaxed) == PassthroughMode::On &&
+        sinkCaps.eldValid && !SinkSupports(params.codecId)) {
+        isyslog("vaapivideo/audio: PassthroughMode=on overriding ELD for %s (sink advertises no support); "
+                "expect silence if the downstream device cannot actually decode IEC61937",
+                avcodec_get_name(params.codecId));
+    }
 
-    ProbeSinkCaps();
+    const AVCodecID oldCodecId = streamParams.codecId;
 
     while (!packetQueue.empty()) {
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
@@ -331,11 +350,9 @@ auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> void {
 
     streamParams = params;
 
-    const bool wantPassthrough = CanPassthrough(params.codecId);
     const auto targetRate = ComputeAlsaRate(params.codecId, static_cast<unsigned>(params.sampleRate), wantPassthrough);
 
     // Reopen ALSA only when the hardware format changes. Passthrough is always 2 ch.
-    const bool currentlyPassthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
     const bool needsReconfig =
         !initialized.load(std::memory_order_relaxed) || currentlyPassthrough != wantPassthrough ||
         (wantPassthrough ? targetRate != alsaSampleRate
@@ -543,19 +560,50 @@ auto cAudioProcessor::Action() -> void {
 // ============================================================================
 
 [[nodiscard]] auto cAudioProcessor::CanPassthrough(AVCodecID codecId) const -> bool {
+    // See README for the full user-facing semantics. Non-wrappable codecs (AAC, MP2, ...)
+    // always take the PCM path because both CodecWrappable() and SinkSupports() return false.
+    switch (vaapiConfig.passthroughMode.load(std::memory_order_relaxed)) {
+        case PassthroughMode::Off:
+            return false;
+        case PassthroughMode::On:
+            return CodecWrappable(codecId);
+        case PassthroughMode::Auto:
+            break;
+    }
+    return SinkSupports(codecId);
+}
+
+[[nodiscard]] auto cAudioProcessor::CodecWrappable(AVCodecID codecId) -> bool {
+    // Exactly the codecs for which OpenSpdifMuxer() can produce IEC61937 bursts. Keep this
+    // list aligned with SinkSupports() -- every codec listed here must also have a sinkCaps
+    // case there (otherwise Auto mode can never select it even with matching ELD support).
+    switch (codecId) {
+        case AV_CODEC_ID_AC3:
+        case AV_CODEC_ID_AC4:
+        case AV_CODEC_ID_DTS:
+        case AV_CODEC_ID_EAC3:
+        case AV_CODEC_ID_MPEGH_3D_AUDIO:
+        case AV_CODEC_ID_TRUEHD:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] auto cAudioProcessor::SinkSupports(AVCodecID codecId) const -> bool {
     switch (codecId) {
         case AV_CODEC_ID_AC3:
             return sinkCaps.ac3;
-        case AV_CODEC_ID_EAC3:
-            return sinkCaps.eac3;
-        case AV_CODEC_ID_TRUEHD:
-            return sinkCaps.truehd;
-        case AV_CODEC_ID_DTS:
-            return sinkCaps.dts || sinkCaps.dtshd; // DTS-HD-capable sinks always decode the DTS core layer.
         case AV_CODEC_ID_AC4:
             return sinkCaps.ac4;
+        case AV_CODEC_ID_DTS:
+            return sinkCaps.dts || sinkCaps.dtshd; // DTS-HD-capable sinks always decode the DTS core layer.
+        case AV_CODEC_ID_EAC3:
+            return sinkCaps.eac3;
         case AV_CODEC_ID_MPEGH_3D_AUDIO:
             return sinkCaps.mpegh3d;
+        case AV_CODEC_ID_TRUEHD:
+            return sinkCaps.truehd;
         default:
             return false;
     }
@@ -1342,6 +1390,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             foundValidEld = true;
         }
 
+        sinkCaps.eldValid = foundValidEld;
         if (!foundValidEld) {
             dsyslog("vaapivideo/audio: no valid ELD found across all indices");
         }

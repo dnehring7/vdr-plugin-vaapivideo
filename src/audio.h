@@ -23,13 +23,16 @@ struct AVIOContext;
 
 /// HDMI sink compressed-audio format capabilities decoded from the ELD Short Audio Descriptors.
 struct HdmiSinkCaps {
-    bool ac3{false};     ///< IEC61937 AC-3 (Dolby Digital) passthrough supported
-    bool ac4{false};     ///< IEC61937 AC-4 passthrough supported
-    bool dts{false};     ///< IEC61937 DTS passthrough supported
-    bool dtshd{false};   ///< IEC61937 DTS-HD passthrough supported
-    bool eac3{false};    ///< IEC61937 E-AC-3 (Dolby Digital Plus) passthrough supported
-    bool mpegh3d{false}; ///< IEC61937 MPEG-H 3D Audio passthrough supported
-    bool truehd{false};  ///< IEC61937 Dolby TrueHD passthrough supported
+    bool ac3{false};      ///< IEC61937 AC-3 (Dolby Digital) passthrough supported
+    bool ac4{false};      ///< IEC61937 AC-4 passthrough supported
+    bool dts{false};      ///< IEC61937 DTS passthrough supported
+    bool dtshd{false};    ///< IEC61937 DTS-HD passthrough supported
+    bool eac3{false};     ///< IEC61937 E-AC-3 (Dolby Digital Plus) passthrough supported
+    bool eldValid{false}; ///< True when ProbeSinkCaps() read a valid ELD. Distinguishes "sink advertises no
+                          ///< compressed support" (eldValid=true, all codec bools false) from "we have no
+                          ///< ELD info at all" (eldValid=false) -- used only by the On-mode diagnostic.
+    bool mpegh3d{false};  ///< IEC61937 MPEG-H 3D Audio passthrough supported
+    bool truehd{false};   ///< IEC61937 Dolby TrueHD passthrough supported
 };
 
 /// Codec identity and format parameters for a single audio elementary stream.
@@ -100,7 +103,13 @@ class cAudioProcessor : public cThread {
     // === INTERNAL METHODS ===
     // ========================================================================
     [[nodiscard]] auto CanPassthrough(AVCodecID codecId) const
-        -> bool;                ///< Returns true if sinkCaps advertises IEC61937 support for this codec
+        -> bool; ///< Returns true when IEC61937 passthrough should be used for this codec; honors
+                 ///< vaapiConfig.passthroughMode (Auto = ELD-driven, On = any wrappable codec, Off = never)
+    [[nodiscard]] static auto CodecWrappable(AVCodecID codecId)
+        -> bool; ///< Returns true iff the spdif muxer can frame this codec as IEC61937 (AC-3, AC-4,
+                 ///< DTS, E-AC-3, MPEG-H 3D Audio, TrueHD)
+    [[nodiscard]] auto SinkSupports(AVCodecID codecId) const
+        -> bool;                ///< Returns true iff the HDMI sink's ELD advertises IEC61937 support for this codec
     auto CloseDevice() -> void; ///< Closes ALSA + decoder + spdif muxer and resets all device state. Does NOT touch
                                 ///< the processing thread; called from Shutdown() (after the thread has exited) and
                                 ///< from Initialize() (when re-opening on a different ALSA device).
