@@ -299,7 +299,7 @@ static auto PrintColorConversions(bool hasMpeg2, bool hasH264, bool hasHevc, boo
     // HEVC Main 10 decode to 8-bit output.
     PrintCapability("P010 -> NV12      (10->8 bit)", hasHevc && hasP010 && hasNV12);
 
-    // HLG is backwards-compatible, no tone mapping needed.
+    // HLG is backward-compatible, no tone mapping needed.
     PrintCapability("HLG -> SDR   (no TM required)", hasHevc);
 
     // Requires VPP tone mapping with HDR->SDR support.

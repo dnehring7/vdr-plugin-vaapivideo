@@ -288,7 +288,7 @@ class cVaapiDisplay : public cThread {
     DrmFramebuffer displayedBuffer; ///< Framebuffer currently being scanned out by the CRTC (front buffer)
     int drmFd{-1};                  ///< Open DRM device file descriptor (not owned)
     drmEventContext eventContext{}; ///< Registered DRM event handler table
-    cCondVar frameSlotCond;         ///< Signalled when pendingFrame is consumed and the slot becomes free
+    cCondVar frameSlotCond;         ///< Signaled when pendingFrame is consumed and the slot becomes free
     std::atomic<bool> hasExited;    ///< Set by the display thread just before it returns (happens-before Shutdown())
     AVBufferRef *hwDeviceRef{};     ///< VAAPI hardware device context reference (owned)
     mutable cMutex importMutex;     ///< Guards the VAAPI -> DRM import + commit cycle; held across BeginStreamSwitch()

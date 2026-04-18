@@ -136,8 +136,12 @@ class cAudioProcessor : public cThread {
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; result is cached per device
     auto SetIec958NonAudio(bool enable)
         -> void; ///< Sets or clears the IEC958 non-audio bit on the HDMI mixer control for passthrough mode
-    [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames)
-        -> bool; ///< Writes PCM to ALSA and advances the 90 kHz playback clock by the number of written frames
+    [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,
+                                      uint32_t expectedGeneration)
+        -> bool; ///< Writes PCM to ALSA and advances the 90 kHz playback clock by the number of written frames.
+                 ///< Gated by @p expectedGeneration: if a Clear()/codec swap raced in between the caller's gen
+                 ///< snapshot and the write, the ALSA write AND the clock publish are both skipped so an
+                 ///< old-era packet cannot resurrect a stale playbackPts past the reset.
     [[nodiscard]] auto WriteToAlsa(std::span<const uint8_t> data)
         -> bool; ///< Raw ALSA write loop with volume scaling, frame alignment, and three-tier error recovery
 
@@ -193,6 +197,14 @@ class cAudioProcessor : public cThread {
     // === PCM CLOCK ===
     // ========================================================================
     std::atomic<uint32_t> clearGeneration{0};         ///< Bumped on Clear(); stale DecodeToPcm calls skip clock writes
+    std::atomic<uint32_t> clockSequence{0};           ///< Seqlock protecting the (playbackPts, lastClockUpdateMs) pair.
+                                                      ///< Single-writer invariant: every bump runs under `mutex`
+                                                      ///< (WritePcmToAlsa() acquires the mutex around its publish;
+                                                      ///< ResetPlaybackClock() is only called from mutex-holding
+                                                      ///< callers). GetClock() retries until two reads of an even
+                                                      ///< sequence match. Required because acquire/release on a
+                                                      ///< single atomic only guards one direction of the load-pair
+                                                      ///< race.
     std::atomic<uint64_t> lastClockUpdateMs{0};       ///< cTimeMs::Now() at the last successful playbackPts write; 0 =
                                                       ///< never written / just cleared. Read by GetClock() to detect a
                                                       ///< stuck audio pipeline (decode failures, dead ALSA) and return

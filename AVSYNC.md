@@ -117,7 +117,9 @@ genuine drift accumulate.
 ### Cooldown
 
 `COOLDOWN_MS = 5 s` = 5 EMA time constants. Armed by every soft fire,
-hard transient, catch-up exit and `WaitForAudioCatchUp`. The smoother
+hard transient and `WaitForAudioCatchUp`. Catch-up exit does *not* arm
+it — the tighter exit threshold leaves the residual inside the corridor,
+and warmup alone gates soft until the EMA reseeds. The smoother
 has therefore absorbed the previous correction plus several cycles of
 fresh samples before the next event can fire.
 
@@ -147,19 +149,29 @@ from overflowing during the sleep.
 ### Catch-up — `rawDelta < −2 × HARD_THRESHOLD` (−400 ms)
 
 Catastrophic backlog (cold start with slow codec prime, post-seek,
-multi-second decoder stall). Every incoming frame is dropped silently —
-no per-event log, no EMA churn, no cooldown arm — until `rawDelta >
-−HARD_THRESHOLD`. Two log lines bracket the pass:
+multi-second decoder stall, or a hardware-limited decoder whose audio
+side publishes a large forward clock jump). Every incoming frame is
+dropped silently — no per-event log, no EMA churn, no cooldown arm —
+until `rawDelta > −CORRIDOR`. Two log lines bracket the pass:
 
 ```
 vaapivideo/decoder: catch-up entered raw=-2738ms
-vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-192ms
+vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms
 ```
+
+Hysteresis is entry −400 ms vs exit −40 ms (360 ms gap), well above any
+single-sample clock jitter. The exit at `-CORRIDOR` (rather than
+`-HARD_THRESHOLD`) places the residual inside the soft corridor so no
+follow-up soft event is required; a tighter exit avoids a visible
+multi-second desync when `COOLDOWN + WARMUP` would otherwise block the
+post-catch-up soft-behind from firing.
 
 `SkipStaleJitterFrames()` lifts its "keep ≥ 1" guard while catching up
 since the kept frame would be dropped next iteration anyway. On exit,
-EMA is reset, `pendingDrops` cleared, cooldown armed, and the exiting
-frame is submitted normally.
+EMA is reset, `pendingDrops` cleared, and the exiting frame is submitted
+normally. Cooldown is **not** re-armed here: the residual is inside the
+corridor so soft cannot fire anyway, and warmup (~1 s) alone keeps the
+controller quiescent while the EMA reseeds.
 
 ## Jitter buffer (live TV)
 
@@ -253,7 +265,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | Plugin start               | invalid        | —          | empty                            |
 | Channel switch (`Clear()`) | reset          | —          | flushed; freerun armed           |
 | Catch-up enter             | (drops silent) | —          | drained silently to alignment    |
-| Catch-up exit              | reset          | armed      | one frame submitted normally     |
+| Catch-up exit              | reset          | —          | one frame submitted normally     |
 | Soft drop                  | `+= frameDur × 90` per drop | armed | one frame removed per drop |
 | Soft sleep                 | `−= measured`  | armed      | unchanged                        |
 | Hard-behind                | reset          | armed      | one frame dropped                |

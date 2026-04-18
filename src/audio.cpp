@@ -202,10 +202,28 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // AUDIO_CLOCK_STALE_MS to force the decoder into freerun; lipsync re-anchors at
     // the next valid write.
     //
-    // Load order: WritePcmToAlsa() stores playbackPts THEN lastClockUpdateMs. Load
-    // lastMs first so a fresh timestamp always pairs with its matching pts.
-    const uint64_t lastMs = lastClockUpdateMs.load(std::memory_order_acquire);
-    const int64_t pts = playbackPts.load(std::memory_order_acquire);
+    // Seqlock read of the (playbackPts, lastClockUpdateMs) pair. An acquire/release on a
+    // single atomic only catches the "observed new stamp -> must also see new pts" half of
+    // the race; the inverse (observe old stamp, see new pts) would bias the extrapolation
+    // by a full ALSA period. Retry until two loads of an even sequence match.
+    //
+    // Bounded spin in practice: the writer's critical section is snd_pcm_delay() plus four
+    // atomic stores, so the odd-sequence window is microseconds. A preemption during that
+    // window is possible but rare; the loop cost caps out at a few scheduler ticks.
+    uint64_t lastMs = 0;
+    int64_t pts = AV_NOPTS_VALUE;
+    while (true) {
+        const uint32_t seq1 = clockSequence.load(std::memory_order_acquire);
+        if ((seq1 & 1U) != 0U) {
+            continue; // writer mid-update
+        }
+        lastMs = lastClockUpdateMs.load(std::memory_order_relaxed);
+        pts = playbackPts.load(std::memory_order_relaxed);
+        const uint32_t seq2 = clockSequence.load(std::memory_order_acquire);
+        if (seq1 == seq2) {
+            break;
+        }
+    }
     if (lastMs == 0) {
         // Post-construct or post-Clear(): no write has occurred yet.
         return AV_NOPTS_VALUE;
@@ -428,9 +446,16 @@ auto cAudioProcessor::DrainPacketQueue() -> void {
 auto cAudioProcessor::ResetPlaybackClock() -> void {
     // GetClock()'s stale-clock guard treats lastClockUpdateMs == 0 as "no clock yet", so
     // it must be cleared alongside playbackPts on every flush/reopen. pcm{Next,QueueEnd}Pts
-    // re-anchor the next ALSA write onto the new timeline.
+    // re-anchor the next ALSA write onto the new timeline. Bracket the pair stores with
+    // clockSequence bumps so GetClock()'s seqlock retries past the transient odd sequence.
+    //
+    // Caller MUST hold `mutex` (all current callers -- Clear(), SetStreamParams(),
+    // CloseDevice(), Action()'s 5-s jump -- do). The mutex serializes this writer against
+    // WritePcmToAlsa()'s publish, preserving the seqlock's single-writer invariant.
+    clockSequence.fetch_add(1, std::memory_order_acq_rel);
     playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
-    lastClockUpdateMs.store(0, std::memory_order_release);
+    lastClockUpdateMs.store(0, std::memory_order_relaxed);
+    clockSequence.fetch_add(1, std::memory_order_release);
     pcmNextPts = AV_NOPTS_VALUE;
     pcmQueueEndPts = AV_NOPTS_VALUE;
 }
@@ -466,6 +491,14 @@ auto cAudioProcessor::Action() -> void {
             generationAtDequeue = clearGeneration.load(std::memory_order_relaxed);
         }
 
+        // Drop stale-era packets before they can touch pcmNextPts or the 5 s jump path.
+        // Without this the Action thread would overwrite pcmNextPts with an old-era PTS;
+        // if the next fresh-era packet carries AV_NOPTS_VALUE it would silently inherit
+        // the stale anchor and WritePcmToAlsa() would publish a bogus playbackPts.
+        if (clearGeneration.load(std::memory_order_acquire) != generationAtDequeue) {
+            continue;
+        }
+
         const int64_t pts = packet->pts;
         if (pts != AV_NOPTS_VALUE) {
             // >5 s PTS jump (channel switch, seek, wrap): drop queued audio so the next
@@ -478,9 +511,7 @@ auto cAudioProcessor::Action() -> void {
                         (void)snd_pcm_drop(alsaHandle);
                         (void)snd_pcm_prepare(alsaHandle);
                     }
-                    pcmQueueEndPts = AV_NOPTS_VALUE;
-                    playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
-                    lastClockUpdateMs.store(0, std::memory_order_release);
+                    ResetPlaybackClock();
                 }
             }
             pcmNextPts = pts;
@@ -496,7 +527,7 @@ auto cAudioProcessor::Action() -> void {
             if (!burst.empty()) {
                 const size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
                 const unsigned burstFrames = (bpf > 0) ? static_cast<unsigned>(burst.size() / bpf) : 0;
-                (void)WritePcmToAlsa(burst, pcmNextPts, burstFrames);
+                (void)WritePcmToAlsa(burst, pcmNextPts, burstFrames, generationAtDequeue);
             }
         } else {
             (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), pts, generationAtDequeue);
@@ -681,7 +712,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     decoderRefCount.fetch_add(1, std::memory_order_acquire);
 
     // Re-check decoder pointer AND generation. The refcount only blocks *concurrent*
-    // teardown -- a teardown that already completed (with a fresh OpenDecoder afterwards)
+    // teardown -- a teardown that already completed (with a fresh OpenDecoder afterward)
     // before we incremented would slip through. The generation marker, bumped by Clear()
     // and SetStreamParams() before any swap, catches the case where our packet was
     // produced by the previous codec era's parser; sending it to the new decoder would
@@ -817,12 +848,19 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         }
 
         const int64_t startPts90k = pcmNextPts;
-        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, sampleCount);
+        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, sampleCount, expectedGeneration);
         av_frame_unref(frame.get());
 
         if (!writeOk) {
             decoderRefCount.fetch_sub(1, std::memory_order_release);
             return false;
+        }
+
+        // Generation may have bumped during WritePcmToAlsa(); do not advance pcmNextPts with
+        // a stale startPts90k or we would re-anchor the fresh-era timeline to an old-era PTS.
+        if (clearGeneration.load(std::memory_order_acquire) != expectedGeneration) [[unlikely]] {
+            decoderRefCount.fetch_sub(1, std::memory_order_release);
+            return true;
         }
 
         if (startPts90k != AV_NOPTS_VALUE && alsaSampleRate > 0U) {
@@ -1348,10 +1386,20 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     isyslog("vaapivideo/audio: %s%s", msg.c_str(), hasAny ? "" : " PCM-only");
 }
 
-[[nodiscard]] auto cAudioProcessor::WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames)
-    -> bool {
+[[nodiscard]] auto cAudioProcessor::WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,
+                                                   uint32_t expectedGeneration) -> bool {
+    // Pre-write gate: skip writing old-era bytes over a freshly re-prepared ALSA handle.
+    if (clearGeneration.load(std::memory_order_acquire) != expectedGeneration) [[unlikely]] {
+        return true;
+    }
     if (!WriteToAlsa(data)) {
         return false;
+    }
+    // Opportunistic post-write gate: lets us skip the mutex entirely in the common
+    // "Clear() already ran while we were in snd_pcm_writei" case. The authoritative
+    // re-check happens below under the mutex; this one is a fast path only.
+    if (clearGeneration.load(std::memory_order_acquire) != expectedGeneration) [[unlikely]] {
+        return true;
     }
 
     const unsigned rate = alsaSampleRate;
@@ -1362,19 +1410,40 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const int64_t endPts = startPts90k + static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
     pcmQueueEndPts = endPts;
 
+    // Take the mutex briefly around snd_pcm_delay + the seqlock publish. Rationale:
+    //   1. Clear() / SetStreamParams() / CloseDevice() hold the mutex while calling
+    //      ResetPlaybackClock(), which ALSO brackets the pair with clockSequence. Without
+    //      this lock two seqlock writers would interleave and leave the pair torn even
+    //      though the sequence ends up even; readers would accept a mismatched snapshot.
+    //   2. A racing Clear() can reopen the ALSA handle; snd_pcm_delay on a torn-down
+    //      handle returns stale state. Serializing with Clear() also serializes against
+    //      snd_pcm_drop / snd_pcm_close on alsaHandle.
+    //   3. The re-check of clearGeneration under the lock turns the post-write gate into
+    //      a definitive decision: once we hold the mutex, no Clear() can race between the
+    //      check and the publish.
+    // Critical section is one ALSA ioctl + four atomic stores -- sub-millisecond.
+    const cMutexLock lock(mutex.get());
+    if (clearGeneration.load(std::memory_order_acquire) != expectedGeneration) [[unlikely]] {
+        return true;
+    }
+
     // playbackPts represents the PTS leaving the DAC: endPts minus the live ring-buffer
     // backlog reported by snd_pcm_delay.
+    int64_t currentPlaybackPts = endPts;
     snd_pcm_sframes_t delayFrames = 0;
     if (alsaHandle && snd_pcm_delay(alsaHandle, &delayFrames) == 0) {
         delayFrames = std::max<snd_pcm_sframes_t>(delayFrames, 0);
         const auto delay90k = static_cast<int64_t>((static_cast<uint64_t>(delayFrames) * 90000ULL) / rate);
-        playbackPts.store(endPts - delay90k, std::memory_order_release);
-    } else {
-        playbackPts.store(endPts, std::memory_order_release);
+        currentPlaybackPts = endPts - delay90k;
     }
-    // Stamp lastClockUpdateMs *after* playbackPts: GetClock() loads the timestamp first,
-    // so a fresh stamp here guarantees a matching pts on its second load.
-    lastClockUpdateMs.store(cTimeMs::Now(), std::memory_order_release);
+
+    // Single-writer seqlock now that the mutex excludes ResetPlaybackClock(). GetClock()
+    // retries past the odd sequence so a concurrent reader can never observe a torn pair.
+    const uint64_t nowMs = cTimeMs::Now();
+    clockSequence.fetch_add(1, std::memory_order_acq_rel);
+    playbackPts.store(currentPlaybackPts, std::memory_order_relaxed);
+    lastClockUpdateMs.store(nowMs, std::memory_order_relaxed);
+    clockSequence.fetch_add(1, std::memory_order_release);
 
     return true;
 }
