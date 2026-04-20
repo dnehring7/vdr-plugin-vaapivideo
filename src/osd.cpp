@@ -53,13 +53,35 @@
 // the live display under us across stream switches without re-creating the provider.
 cOsdProvider *osdProvider = nullptr;
 
+namespace {
+
+// No-op cOsd returned by CreateOsd() while detached. cOsd's three-arg constructor is
+// protected and only befriended to cOsdProvider, so we can't `new cOsd(...)` directly
+// from cVaapiOsdProvider; this thin derived adapter exposes it. Inheriting cOsd's
+// default behavior (no painting, level=999 not active) gives skins something safe to
+// hold until SVDRP ATTA installs a real cVaapiOsd.
+class cVaapiDummyOsd : public cOsd {
+  public:
+    cVaapiDummyOsd(int left, int top, uint level) : cOsd(left, top, level) {}
+};
+
+} // namespace
+
 // ============================================================================
 // === OSD PROVIDER ===
 // ============================================================================
 
 cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(display) {
-    dsyslog("vaapivideo/osd: provider created %ux%u (TrueColor only)", display_->GetOutputWidth(),
-            display_->GetOutputHeight());
+    // display_ may be null when --detached defers hardware init: skin plugins still need to
+    // see the provider during VDR Start() so they can probe TrueColor support, and a later
+    // AttachDisplay() (from MakePrimaryDevice or Attach) wires up the live display. The
+    // pixel-path methods (CreateOsd, UpdateOsd, HideOsd) already guard on display_.
+    if (display_) {
+        dsyslog("vaapivideo/osd: provider created %ux%u (TrueColor only)", display_->GetOutputWidth(),
+                display_->GetOutputHeight());
+    } else {
+        dsyslog("vaapivideo/osd: provider created detached (no display yet, TrueColor only)");
+    }
 }
 
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
@@ -140,15 +162,22 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiOsdProvider::CreateOsd(const int left, const int top, const uint level) -> cOsd * {
+    // Returning nullptr from CreateOsd while a provider is installed is unsafe: VDR's
+    // cOsdProvider::NewOsd (vdr/osd.c:2295-2304) only synthesizes a dummy when *no*
+    // provider is registered; otherwise it hands the nullptr straight back to the caller
+    // (and even dereferences cOsd::Osds[0] before returning). On any failure -- including
+    // the --detached case where display_ is null because hardware init was deferred --
+    // return the same kind of base-class dummy VDR uses as its own fallback so callers
+    // (skins, OSD probes) get a no-op object instead of a null.
     if (!display_ || !display_->IsInitialized()) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd failed - display not ready");
-        return nullptr;
+        dsyslog("vaapivideo/osd: CreateOsd while detached -- returning dummy cOsd");
+        return new cVaapiDummyOsd(left, top, level);
     }
 
     const int drmFd = display_->GetDrmFd();
     if (drmFd < 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd failed - invalid DRM fd");
-        return nullptr;
+        esyslog("vaapivideo/osd: CreateOsd - invalid DRM fd, returning dummy cOsd");
+        return new cVaapiDummyOsd(left, top, level);
     }
 
     // Size the FB to "from (left, top) to the bottom-right screen corner" instead of
@@ -161,15 +190,15 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
     const int osdHeight = screenHeight - top;
 
     if (osdWidth <= 0 || osdHeight <= 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd failed - invalid dimensions %dx%d", osdWidth, osdHeight);
-        return nullptr;
+        esyslog("vaapivideo/osd: CreateOsd - invalid dimensions %dx%d, returning dummy cOsd", osdWidth, osdHeight);
+        return new cVaapiDummyOsd(left, top, level);
     }
 
     auto *osd = new cVaapiOsd(left, top, level, drmFd, osdWidth, osdHeight, this);
     if (!osd->Allocate()) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd failed - initialization error");
+        esyslog("vaapivideo/osd: CreateOsd - allocation error, returning dummy cOsd");
         delete osd;
-        return nullptr;
+        return new cVaapiDummyOsd(left, top, level);
     }
 
     dsyslog("vaapivideo/osd: CreateOsd() fbId=%u %dx%d at (%d,%d) level=%u", osd->GetFramebufferId(), osdWidth,

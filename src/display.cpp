@@ -1338,8 +1338,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     if (info.hasContentLight) {
         // AVContentLightMetadata fields are unsigned int; the HDMI infoframe slots are u16.
         constexpr unsigned int LIGHT_MAX = 0xFFFFU;
-        m.max_cll = static_cast<__u16>(std::min(info.contentLight.MaxCLL, LIGHT_MAX));
-        m.max_fall = static_cast<__u16>(std::min(info.contentLight.MaxFALL, LIGHT_MAX));
+        m.max_cll = static_cast<uint16_t>(std::min(info.contentLight.MaxCLL, LIGHT_MAX));
+        m.max_fall = static_cast<uint16_t>(std::min(info.contentLight.MaxFALL, LIGHT_MAX));
     }
     // NOLINTEND(cppcoreguidelines-pro-type-union-access)
     return meta;

@@ -9,8 +9,8 @@
  *   - Receiver / dvbplayer thread: PlayVideo / PlayAudio / Poll / Flush.
  *   - Decoder/audio/display threads: owned by their subsystems.
  *
- * Subsystem lifetime is bound to a tri-state initState (0=none, 1=in-progress, 2=ready)
- * managed via CAS in Initialize() / Stop() / Detach(). The decoder Action thread holds raw
+ * Subsystem lifetime is bound to a tri-state initState (0=detached, 1=in-progress, 2=ready)
+ * managed via CAS in AttachHardware() / Detach(). The decoder Action thread holds raw
  * pointers to display + audioProcessor, so Stop() MUST tear them down in the order
  * decoder -> display -> audioProcessor (see Stop() comment).
  *
@@ -91,18 +91,43 @@ static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
 /// VT bounce after dropping DRM master. fbcon does not auto-reclaim the display when another
 /// DRM client (typically systemd-logind) still holds the device open, so we VT_ACTIVATE to a
 /// different VT and back -- the kernel reprograms the CRTC on each switch and the second
-/// switch hands the framebuffer back to the console.
-static auto RestoreConsole() -> void {
+/// switch hands the framebuffer back to the console. Returns true iff the bounce really
+/// completed; the caller surfaces failure in the SVDRP reply so the operator knows to
+/// either fix the setup or press Alt+F1 manually.
+///
+/// Only /dev/tty0 needs to be accessible. VT_ACTIVATE takes a VT *number* as its ioctl
+/// argument, not a file descriptor, so /dev/tty1, /dev/tty2, ... do not need to be open.
+///
+/// Three prerequisites must ALL hold; see README "SVDRP commands" for full instructions.
+/// Summary:
+///   1. Readable /dev/tty0 -- typically mode 0660 via a udev rule (distros ship 0600).
+///   2. The vdr service user in the 'tty' supplementary group.
+///   3. CAP_SYS_TTY_CONFIG in the running vdr process's ambient set, which is where the
+///      subtlety lives. VDR's '-u vdr' flag does setuid(0 -> vdr) inside the process, and
+///      the kernel clears ambient capabilities on any 0->non-0 UID change. So setting
+///      AmbientCapabilities= alone in the systemd unit is NOT enough if vdr starts as
+///      root. The drop-in must instead make systemd do the user switch itself:
+///          [Service]
+///          User=vdr
+///          Group=video                     # vdr's primary group (DRM/ALSA access)
+///          SupplementaryGroups=tty
+///          AmbientCapabilities=CAP_SYS_TTY_CONFIG
+///      With this, vdr starts already as the vdr user; '-u vdr' becomes a no-op, no
+///      setuid is called, and the ambient cap reaches this function intact.
+[[nodiscard]] static auto RestoreConsole() -> bool {
     const int ttyFd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if (ttyFd < 0) {
-        dsyslog("vaapivideo/device: console restore skipped (no /dev/tty0)");
-        return;
+        esyslog("vaapivideo/device: console restore FAILED -- cannot open /dev/tty0: %s", strerror(errno));
+        esyslog("vaapivideo/device: add 'vdr' to the 'tty' group and widen /dev/tty0 to 0660 via udev "
+                "(KERNEL==\"tty0\", GROUP=\"tty\", MODE=\"0660\")");
+        return false;
     }
 
     struct vt_stat vtState{};
     if (ioctl(ttyFd, VT_GETSTATE, &vtState) != 0) {
+        esyslog("vaapivideo/device: console restore FAILED -- VT_GETSTATE: %s", strerror(errno));
         close(ttyFd);
-        return;
+        return false;
     }
 
     const auto currentVt = static_cast<int>(vtState.v_active);
@@ -111,15 +136,30 @@ static auto RestoreConsole() -> void {
     // real switch (and therefore a CRTC reprogram).
     const int tempVt = (currentVt == 1) ? 2 : 1;
 
-    if (ioctl(ttyFd, VT_ACTIVATE, tempVt) == 0) {
-        ioctl(ttyFd, VT_WAITACTIVE, tempVt);
+    // VT_ACTIVATE/VT_WAITACTIVE are gated by CAP_SYS_TTY_CONFIG for processes without a
+    // matching controlling tty. EPERM here means /dev/tty0 perms are fine but the daemon
+    // lacks the capability -- log once, abort the bounce cleanly.
+    if (ioctl(ttyFd, VT_ACTIVATE, tempVt) != 0) {
+        const int savedErrno = errno;
+        esyslog("vaapivideo/device: console restore FAILED -- VT_ACTIVATE(%d): %s", tempVt, strerror(savedErrno));
+        if (savedErrno == EPERM) {
+            esyslog("vaapivideo/device: vdr lacks CAP_SYS_TTY_CONFIG -- systemd must switch user itself "
+                    "(drop-in: User=vdr, Group=video, SupplementaryGroups=tty, "
+                    "AmbientCapabilities=CAP_SYS_TTY_CONFIG) so the ambient cap survives; setting "
+                    "AmbientCapabilities alone is cleared by vdr's internal -u vdr setuid");
+        }
+        close(ttyFd);
+        return false;
     }
+    ioctl(ttyFd, VT_WAITACTIVE, tempVt);
+
     if (ioctl(ttyFd, VT_ACTIVATE, currentVt) == 0) {
         ioctl(ttyFd, VT_WAITACTIVE, currentVt);
     }
 
     close(ttyFd);
-    dsyslog("vaapivideo/device: console VT%d restored", currentVt);
+    isyslog("vaapivideo/device: console VT%d restored", currentVt);
+    return true;
 }
 
 /// True iff the driver advertises VLD bitstream decode + the requested RT surface format
@@ -288,11 +328,14 @@ cVaapiDevice::cVaapiDevice() {
 }
 
 cVaapiDevice::~cVaapiDevice() noexcept {
-    dsyslog("vaapivideo/device: destroying (isPrimary=%d)", IsPrimaryDevice());
+    // CheckDecoder=false so a detached-primary shutdown still runs the base-class demote
+    // and has a truthful "isPrimary" log -- the default test would hide our primary status
+    // whenever the decoder has already been torn down (e.g. after Detach()).
+    dsyslog("vaapivideo/device: destroying (isPrimary=%d)", IsPrimaryDevice(/*CheckDecoder=*/false));
 
     // Demote ourselves first so VDR cannot route any further calls (PlayVideo / OSD lookups
     // / etc.) into a half-destroyed device.
-    if (IsPrimaryDevice()) {
+    if (IsPrimaryDevice(/*CheckDecoder=*/false)) {
         cDevice::MakePrimaryDevice(false);
     }
 
@@ -467,18 +510,46 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
 auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
     dsyslog("vaapivideo/device: MakePrimaryDevice(%s) called", On ? "true" : "false");
 
+    // Deferred-init trigger: after VDR startup, promote-to-primary opens the DRM/VAAPI/ALSA
+    // stack if we're still detached. The startupComplete gate is critical -- without it a
+    // setup.conf-driven primary restore during VDR bring-up would attach hardware and defeat
+    // --detached. The normal (non-deferred) path skips this block because state is already 2.
+    //
+    // Failure here is NOT a veto. VDR has already reassigned primaryDevice to us BEFORE
+    // calling this hook (vdr/device.c:201-202), so an early return would leave the previous
+    // primary demoted and us stranded as a half-primary that VDR no longer thinks needs
+    // attention. We log and fall through to cDevice::MakePrimaryDevice(On) so the device
+    // settles into the recoverable "detached primary" state -- SVDRP ATTA can retry later.
+    if (On && initState.load(std::memory_order_acquire) == 0 && !drmPath.empty() &&
+        startupComplete.load(std::memory_order_acquire)) {
+        isyslog("vaapivideo/device: primary activation after detached -- attaching hardware");
+        if (!AttachHardware()) [[unlikely]] {
+            esyslog("vaapivideo/device: deferred hardware init failed -- staying detached as "
+                    "primary; use SVDRP ATTA to retry");
+        }
+    }
+
     cDevice::MakePrimaryDevice(On);
 
     if (On) {
-        if (IsPrimaryDevice()) {
+        // Pass CheckDecoder=false: during --detached the decoder is not yet open, and the
+        // default IsPrimaryDevice() gates on HasDecoder(), which would misreport us as
+        // non-primary even though VDR has already assigned primaryDevice to us.
+        if (IsPrimaryDevice(/*CheckDecoder=*/false)) {
             isyslog("vaapivideo/device: activated as primary device");
-            // OSD provider lifecycle is owned by VDR (cOsdProvider::Shutdown()), so we
-            // create at most one and reuse on subsequent activations.
-            if (!::osdProvider && display) {
+            // OSD provider lifecycle is owned by VDR (cOsdProvider::Shutdown()): create once,
+            // reattach thereafter. We must register a provider even when detached so skin
+            // plugins see TrueColor support during their Start() (cOsdProvider::SupportsTrueColor()
+            // returns false and logs an error if no provider is registered yet). The pixel-path
+            // methods are display-null-safe; a later AttachDisplay() wires up the live display.
+            if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+                if (display) {
+                    provider->AttachDisplay(display.get());
+                    dsyslog("vaapivideo/device: OSD provider reattached to display");
+                }
+            } else {
                 ::osdProvider = new cVaapiOsdProvider(display.get());
-                isyslog("vaapivideo/device: OSD provider registered");
-            } else if (::osdProvider) {
-                dsyslog("vaapivideo/device: OSD provider already exists, reusing");
+                isyslog("vaapivideo/device: OSD provider registered%s", display ? "" : " (detached)");
             }
         } else {
             esyslog("vaapivideo/device: failed to activate as primary device");
@@ -887,29 +958,43 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiDevice::Attach() -> bool {
-    // SVDRP ATTA: re-open the same DRM/VAAPI/audio combo we last had. drmPath/audioDevice
-    // were latched in the prior Initialize() so SVDRP doesn't need to re-pass them.
+    // Open hardware using the arguments latched by Initialize(). Used both for the first
+    // attach after a detached startup and to resume after a Detach() -> SVDRP ATTA cycle.
     if (drmPath.empty()) [[unlikely]] {
-        esyslog("vaapivideo/device: cannot attach - no DRM device path recorded");
+        esyslog("vaapivideo/device: cannot attach - Initialize() has not run yet");
         return false;
     }
-    isyslog("vaapivideo/device: re-attaching to hardware (DRM=%s audio=%s connector=%s)", drmPath.c_str(),
+    isyslog("vaapivideo/device: attaching to hardware (DRM=%s audio=%s connector=%s)", drmPath.c_str(),
             audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
 
-    if (!Initialize(drmPath, audioDevice, connectorName)) [[unlikely]] {
+    if (!AttachHardware()) [[unlikely]] {
         return false;
     }
 
-    // Reconnect the OSD provider to the newly created display instance.
-    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
-        provider->AttachDisplay(display.get());
-        dsyslog("vaapivideo/device: OSD provider re-attached to display");
+    // Install or reattach the OSD provider when we're primary. Mirrors the MakePrimaryDevice()
+    // branch so the detached-primary -> SVDRP ATTA path (where MakePrimaryDevice() already ran
+    // with no display) also ends up with a working OSD.
+    if (IsPrimaryDevice()) {
+        if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+            provider->AttachDisplay(display.get());
+            dsyslog("vaapivideo/device: OSD provider reattached to display");
+        } else {
+            ::osdProvider = new cVaapiOsdProvider(display.get());
+            isyslog("vaapivideo/device: OSD provider registered");
+        }
     }
 
     return true;
 }
 
-auto cVaapiDevice::Detach() -> void {
+auto cVaapiDevice::Detach() -> bool {
+    // Idempotency guard: if we were never attached (detached startup or prior Detach()),
+    // skip the full teardown so we don't needlessly bounce the VT or spam the log.
+    if (initState.load(std::memory_order_acquire) == 0) [[unlikely]] {
+        dsyslog("vaapivideo/device: detach requested but hardware is not attached (no-op)");
+        return true;
+    }
+
     isyslog("vaapivideo/device: detaching from hardware");
 
     // Quiesce upstream sources BEFORE Stop() to avoid use-after-free: cTransfer's tuner
@@ -940,7 +1025,7 @@ auto cVaapiDevice::Detach() -> void {
     }
 
     ReleaseHardware();
-    RestoreConsole();
+    const bool consoleRestored = RestoreConsole();
 
     // Reset all state so a subsequent Attach() re-detects codecs from scratch.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -958,15 +1043,15 @@ auto cVaapiDevice::Detach() -> void {
     osdHeight = 0;
     initState.store(0, std::memory_order_release);
     isyslog("vaapivideo/device: detached");
+    return consoleRestored;
 }
 
 [[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
-                                            std::string_view connectorNameFilter) -> bool {
-    // 0 -> 1 (in-progress) -> 2 (ready). The CAS protects against double-Initialize from
-    // a racing SVDRP ATTA + plugin Start() during process bring-up.
-    int expected = 0;
-    if (!initState.compare_exchange_strong(expected, 1)) [[unlikely]] {
-        esyslog("vaapivideo/device: already initialized (state=%d)", expected);
+                                            std::string_view connectorNameFilter, bool deferred) -> bool {
+    // One-shot latch: Initialize() is called exactly once per device lifetime by the plugin.
+    // Subsequent attach cycles go through AttachHardware() / Attach() and reuse these args.
+    if (!drmPath.empty()) [[unlikely]] {
+        esyslog("vaapivideo/device: Initialize() called twice (already latched DRM '%s')", drmPath.c_str());
         return false;
     }
 
@@ -974,8 +1059,35 @@ auto cVaapiDevice::Detach() -> void {
     audioDevice = audioDevicePath;
     connectorName = connectorNameFilter;
 
+    if (deferred) {
+        // Detached startup: stay in state 0 (detached) and let the first primary-device
+        // promotion or an explicit SVDRP ATTA trigger AttachHardware().
+        isyslog("vaapivideo/device: starting detached - DRM '%s', audio '%s', connector '%s' "
+                "(hardware init deferred until attach)",
+                drmPath.c_str(), audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
+        return true;
+    }
+
     dsyslog("vaapivideo/device: initializing - DRM '%s', audio '%s', connector '%s'", drmPath.c_str(),
             audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
+    return AttachHardware();
+}
+
+auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.store(true, std::memory_order_release); }
+
+// ============================================================================
+// === INTERNAL METHODS ===
+// ============================================================================
+
+[[nodiscard]] auto cVaapiDevice::AttachHardware() -> bool {
+    // State transition 0 (detached) -> 1 (in-progress) -> 2 (ready). All attach callers
+    // (Initialize, Attach, MakePrimaryDevice) run on VDR's main thread, so the CAS is a
+    // defensive rejection of double-attach rather than a data-race guard.
+    int expected = 0;
+    if (!initState.compare_exchange_strong(expected, 1)) [[unlikely]] {
+        esyslog("vaapivideo/device: AttachHardware rejected -- already attached (state=%d)", expected);
+        return false;
+    }
 
     if (!OpenHardware()) [[unlikely]] {
         esyslog("vaapivideo/device: hardware initialization failed");
@@ -1030,33 +1142,10 @@ auto cVaapiDevice::Detach() -> void {
     dsyslog("vaapivideo/device: pre-cached OSD size %dx%d", osdWidth, osdHeight);
 
     initState.store(2, std::memory_order_release);
-    isyslog("vaapivideo/device: initialized - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
+    isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
     return true;
 }
-
-auto cVaapiDevice::Stop() -> void {
-    // Reverse of Initialize(): decoder first because its Action thread holds raw pointers
-    // to display + audioProcessor and dereferences both per frame. Destroying either while
-    // the thread is alive is a use-after-free. No back-references the other way, so the
-    // remaining order is for cleanliness. Each Shutdown() is idempotent.
-    if (decoder) [[likely]] {
-        decoder->Shutdown();
-        decoder.reset();
-    }
-    if (display) [[likely]] {
-        display->Shutdown();
-        display.reset();
-    }
-    if (audioProcessor) [[likely]] {
-        audioProcessor->Shutdown();
-        audioProcessor.reset();
-    }
-}
-
-// ============================================================================
-// === INTERNAL METHODS ===
-// ============================================================================
 
 auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby) -> void {
     // Single funnel for audio-track notifications: resolve track, dedup against last
@@ -1532,4 +1621,23 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
         esyslog("vaapivideo/device: no connected display found");
     }
     return false;
+}
+
+auto cVaapiDevice::Stop() -> void {
+    // Reverse of AttachHardware(): decoder first because its Action thread holds raw
+    // pointers to display + audioProcessor and dereferences both per frame. Destroying
+    // either while the thread is alive is a use-after-free. No back-references the other
+    // way, so the remaining order is for cleanliness. Each Shutdown() is idempotent.
+    if (decoder) [[likely]] {
+        decoder->Shutdown();
+        decoder.reset();
+    }
+    if (display) [[likely]] {
+        display->Shutdown();
+        display.reset();
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->Shutdown();
+        audioProcessor.reset();
+    }
 }

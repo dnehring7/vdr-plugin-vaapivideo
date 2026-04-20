@@ -267,18 +267,26 @@ sink's EDID at startup:
 
 ### Command-line options
 
-    vdr -P 'vaapivideo [-d DEV] [-a DEV] [-c NAME] [-r WxH@R]'
+    vdr -P 'vaapivideo [-d DEV] [-a DEV] [-c NAME] [-r WxH@R] [-D]'
 
-| Option     | Default           | Description                                           |
-|------------|-------------------|-------------------------------------------------------|
-| `-d DEV`   | auto-detect       | DRM device path (`/dev/dri/cardN`)                    |
-| `-a DEV`   | `default`         | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
-| `-c NAME`  | first connected   | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
-| `-r WxH@R` | `1920x1080@50`    | Output resolution and refresh rate (max 3840×2160)    |
+| Option            | Default           | Description                                           |
+|-------------------|-------------------|-------------------------------------------------------|
+| `-d DEV`          | auto-detect       | DRM device path (`/dev/dri/cardN`)                    |
+| `-a DEV`          | `default`         | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
+| `-c NAME`         | first connected   | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
+| `-r WxH@R`        | `1920x1080@50`    | Output resolution and refresh rate (max 3840×2160)    |
+| `-D`, `--detached`| off               | Start without opening the DRM/VAAPI/ALSA hardware     |
 
 Use `-d` explicitly when multiple GPUs are present. Use `-c` to select a
 specific output when multiple displays are connected — connector names match
 the kernel's naming scheme visible under `/sys/class/drm/`.
+
+`--detached` brings VDR up without grabbing the GPU, the DRM master, or the
+ALSA device. The plugin stays loaded but idle; hardware initialization runs on
+the first primary-device promotion (e.g. `Setup → OSD → Primary DVB interface`)
+or when `PLUG vaapivideo ATTA` is issued via SVDRP. Useful for hosts that want
+to yield the display to another application at boot, or for systemd units
+that start VDR before a user session claims the console.
 
 ### VDR setup menu
 
@@ -336,12 +344,103 @@ leaving the setup menu to activate the new mode.
 | `PLUG vaapivideo STAT`   | Device status, active resolution, refresh rate           |
 | `PLUG vaapivideo CONFIG` | Current configuration summary                            |
 | `PLUG vaapivideo DETA`   | Detach from DRM/VAAPI hardware (release for other apps)  |
-| `PLUG vaapivideo ATTA`   | Re-attach to DRM/VAAPI hardware and resume the pipeline  |
+| `PLUG vaapivideo ATTA`   | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 
 DETA hands the display to another application (an external player, a
-diagnostic tool, etc.) and ATTA reclaims it without restarting VDR. ATTA also
-forces a channel re-tune so data flows through the freshly initialized
-decoder/display pipeline.
+diagnostic tool, etc.) and ATTA reclaims it without restarting VDR. When the
+VAAPI device is the current primary device, ATTA also forces a channel
+re-tune so data flows through the freshly initialized decoder/display
+pipeline.
+
+### Automatic console restore after DETA
+
+For the text console (`fbcon`) to reclaim the display after DETA, the
+plugin does a VT bounce through `/dev/tty0`. Only `/dev/tty0` is touched
+— `VT_ACTIVATE` takes the target VT number as an ioctl argument, not a
+file descriptor, so `/dev/tty1`, `/dev/tty2`, … do not need to be
+accessible.
+
+Three things must be in place. If any are missing, `DETA` still releases
+the GPU correctly but the screen stays black until you press `Alt+F1` —
+the plugin logs a targeted error and the SVDRP reply spells out the
+remediation. Once all three are done, DETA restores the console
+automatically.
+
+**1. Widen `/dev/tty0` to mode `0660`.** Current mainstream distros
+(Debian, Fedora, …) ship it as `crw------- root:tty` (mode `0600`), so
+even members of the `tty` group cannot open it. Drop a udev rule:
+
+```
+# /etc/udev/rules.d/90-vdr-tty0.rules
+KERNEL=="tty0", GROUP="tty", MODE="0660"
+```
+
+Apply without rebooting:
+
+```sh
+sudo udevadm control --reload
+sudo udevadm trigger --sysname-match=tty0
+```
+
+`ls -l /dev/tty0` should now show `crw-rw---- root:tty`.
+
+**2. Put the vdr service user in the `tty` group** — `usermod -aG tty
+vdr`, or (preferred, scoped to the unit) add `SupplementaryGroups=tty`
+to the drop-in below.
+
+**3. Give vdr `CAP_SYS_TTY_CONFIG`, but do so on the already-unprivileged
+process.** This is the subtle part. The kernel's VT ioctl handler
+(`drivers/tty/vt/vt_ioctl.c`) requires either a matching controlling tty
+(a daemon has none) or this capability. Ordinarily `AmbientCapabilities=`
+in the systemd unit is the right answer — but most VDR packages use a
+`runvdr` wrapper and pass `-u vdr` on the vdr command line, which makes
+vdr call `setuid(root → vdr)` inside its own process. The kernel clears
+the ambient capability set on any 0 → non-0 UID change, so an ambient
+cap set by systemd on the root process is wiped before it reaches our
+code. The cure is to let **systemd** switch to the `vdr` user *before*
+applying the capability; vdr then starts already as `vdr`, and its own
+`-u vdr` becomes a no-op. One drop-in covers all of this:
+
+```sh
+sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
+
+sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
+[Service]
+User=vdr
+Group=video
+SupplementaryGroups=tty
+AmbientCapabilities=CAP_SYS_TTY_CONFIG
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart vdr.service
+```
+
+`Group=video` (not `Group=vdr`) matches the primary group that VDR
+packages typically install files under — required for access to
+`/dev/dri/*` and ALSA. If your distro uses a different primary group for
+the vdr user, substitute it here (check with `id vdr`).
+
+Verify the cap actually made it into the running process:
+
+```sh
+grep -E '^(Uid|Groups|CapAmb)' /proc/$(pidof vdr)/status
+# Uid    should be <vdr_uid> <vdr_uid> <vdr_uid> <vdr_uid>
+# Groups should include 5 (the tty group)
+# CapAmb should include bit 26 (CAP_SYS_TTY_CONFIG) = 0x0000000004000000
+```
+
+Do **not** add `CapabilityBoundingSet=CAP_SYS_TTY_CONFIG` — it would
+tighten the bounding set to that one capability, breaking VDR's
+`ExecStartPre=vdr-check-setup` (which needs `CAP_CHOWN` for initial
+file-ownership fixup). Leaving `CapabilityBoundingSet=` unset keeps the
+default full bounding set, which is the correct behavior here.
+
+Steps 1 and 2 get `open(/dev/tty0)` to succeed; step 3 gets `VT_ACTIVATE`
+to succeed. If any step is missing, DETA still releases the GPU but the
+screen stays black. The plugin logs a targeted error naming the missing
+prerequisite when this happens (open-EACCES, ioctl-EPERM, …) so the
+remediation is clear from the log.
 
 ### Inter-plugin service API
 
@@ -464,7 +563,6 @@ PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
 - Expose filter controls (denoise strength, sharpen level) in the VDR setup menu
 - Dynamic resolution switching on SD / HD / UHD channel changes
 - GPU memory and ALSA underrun counters in `STAT` output
-- Detached-state startup with deferred hardware initialization
 
 
 ## Credits

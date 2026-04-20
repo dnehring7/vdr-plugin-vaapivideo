@@ -7,8 +7,10 @@
  * VDR plugin lifecycle call order (relevant to this file):
  *   1. Constructor      -- object created, no hardware touched yet
  *   2. ProcessArgs()    -- command-line args parsed, stored for later use
- *   3. Initialize()     -- hardware opened, cVaapiDevice created and initialized
- *   4. Start()          -- primary device confirmed, startup finalized
+ *   3. Initialize()     -- cVaapiDevice created; hardware opens immediately unless
+ *                          --detached is set (then deferred to first attach)
+ *   4. Start()          -- startup finalized: attached mode confirms primary,
+ *                          detached mode releases the deferred-attach gate
  *   5. Housekeeping()   -- called periodically by VDR's main loop (empty here)
  *   6. Stop()           -- hardware released; VDR still owns cVaapiDevice
  *   7. Destructor       -- trivial; VDR destroys cVaapiDevice separately via
@@ -169,12 +171,14 @@ class cVaapiVideoPlugin : public cPlugin {
     /// libdrm enumeration.
     [[nodiscard]] auto ResolveDrmDevice() const -> cString;
 
-    cString audioDevice;   ///< ALSA device passed via -a / --audio; defaults to
-                           ///< "default".
-    cString connectorName; ///< DRM connector name passed via -c / --connector;
-                           ///< empty means first connected output.
-    cString drmPath;       ///< DRM device path passed via -d / --drm; empty means
-                           ///< auto-detect.
+    cString audioDevice;       ///< ALSA device passed via -a / --audio; defaults to
+                               ///< "default".
+    cString connectorName;     ///< DRM connector name passed via -c / --connector;
+                               ///< empty means first connected output.
+    cString drmPath;           ///< DRM device path passed via -d / --drm; empty means
+                               ///< auto-detect.
+    bool startDetached{false}; ///< -D / --detached: skip DRM/VAAPI/ALSA init until an
+                               ///< explicit attach (primary-device switch or SVDRP ATTA).
 
     /// Non-owning pointer to the active output device.
     /// All cDevice instances self-register with VDR in their constructor and
@@ -245,7 +249,11 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
                     "  -c NAME, --connector=NAME   Use DRM connector NAME "
                     "(default: first connected)\n"
                     "  -r RES, --resolution=RES    Output resolution "
-                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n",
+                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n"
+                    "  -D, --detached              Start without opening the "
+                    "DRM/VAAPI/ALSA hardware;\n"
+                    "                              attach later via the primary-device "
+                    "switch or SVDRP ATTA\n",
                     DISPLAY_DEFAULT_WIDTH, DISPLAY_DEFAULT_HEIGHT, DISPLAY_DEFAULT_REFRESH_RATE);
     return kHelp.c_str();
 }
@@ -269,11 +277,13 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
     // cVaapiDevice self-registers with VDR's device list in its cDevice constructor; ownership transfers to VDR
     // immediately and cDevice::Shutdown() (called from main()) will delete it. Never delete vaapiDevice manually.
-    dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s)", *resolvedDrm, *audioDevice);
+    dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s, detached=%d)", *resolvedDrm, *audioDevice,
+            startDetached ? 1 : 0);
     vaapiDevice = new cVaapiDevice();
 
     if (!vaapiDevice->Initialize(*resolvedDrm, *audioDevice,
-                                 isempty(*connectorName) ? std::string_view{} : std::string_view{*connectorName})) {
+                                 isempty(*connectorName) ? std::string_view{} : std::string_view{*connectorName},
+                                 startDetached)) {
         esyslog("vaapivideo: ========================================");
         esyslog("vaapivideo: device initialization FAILED");
         esyslog("vaapivideo: plugin will not be available");
@@ -290,17 +300,18 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
     // NOLINTNEXTLINE(misc-include-cleaner)
-    static constexpr std::array<option, 5> kLongOptions = {
+    static constexpr std::array<option, 6> kLongOptions = {
         {{.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'}, // NOLINT(misc-include-cleaner)
          {.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
          {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
+         {.name = "detached", .has_arg = no_argument, .flag = nullptr, .val = 'D'}, // NOLINT(misc-include-cleaner)
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
     optind = 1; // Reset global getopt state; VDR may call ProcessArgs() more than once. // NOLINT(misc-include-cleaner)
     int opt{};
     // NOLINTNEXTLINE(misc-include-cleaner)
-    while ((opt = getopt_long(argc, argv, "d:a:c:r:", kLongOptions.data(), nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:a:c:r:D", kLongOptions.data(), nullptr)) != -1) {
         switch (opt) {
             case 'd':
                 if (optarg == nullptr || *optarg == '\0') { // NOLINT(misc-include-cleaner)
@@ -337,6 +348,10 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
                 }
                 dsyslog("vaapivideo: resolution set to %ux%u@%u", vaapiConfig.display.GetWidth(),
                         vaapiConfig.display.GetHeight(), vaapiConfig.display.GetRefreshRate());
+                break;
+            case 'D':
+                startDetached = true;
+                dsyslog("vaapivideo: detached startup requested");
                 break;
             default:
                 esyslog("vaapivideo: unrecognized command-line option (see stderr)");
@@ -392,9 +407,20 @@ auto cVaapiVideoPlugin::SetupParse(const char *Name, const char *Value) -> bool 
 auto cVaapiVideoPlugin::Start() -> bool {
     isyslog("vaapivideo: starting VAAPI Video Plugin v%s", PLUGIN_VERSION);
 
-    if (!vaapiDevice || !vaapiDevice->IsReady()) [[unlikely]] {
-        esyslog("vaapivideo: device not initialized -- cannot start");
+    if (!vaapiDevice) [[unlikely]] {
+        esyslog("vaapivideo: device not created -- cannot start");
         return false;
+    }
+
+    // Detached startup: hardware is deliberately not open yet. Stay loaded and wait for an
+    // explicit attach (primary-device switch fires MakePrimaryDevice() or SVDRP ATTA).
+    // MarkStartupComplete() below releases the MakePrimaryDevice() deferred-attach gate so
+    // post-startup primary switches will attach -- but setup.conf-driven promotion during
+    // bring-up (which has already run by now) does not.
+    if (!vaapiDevice->IsReady()) {
+        isyslog("vaapivideo: started detached -- hardware init deferred until attach");
+        vaapiDevice->MarkStartupComplete();
+        return true;
     }
 
     // By this point VDR has processed setup.conf and called MakePrimaryDevice() on the stored primary device.
@@ -419,6 +445,7 @@ auto cVaapiVideoPlugin::Start() -> bool {
         return false;
     }
     isyslog("vaapivideo: primary device confirmed -- startup complete");
+    vaapiDevice->MarkStartupComplete();
     return true;
 }
 
@@ -448,9 +475,20 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "No VAAPI device";
         }
-        vaapiDevice->Detach();
+        if (!vaapiDevice->IsReady()) [[unlikely]] {
+            replyCode = 550;
+            return "VAAPI device is already detached";
+        }
+        const bool consoleRestored = vaapiDevice->Detach();
         replyCode = 900;
-        return "VAAPI device detached from hardware";
+        if (consoleRestored) {
+            return "VAAPI device detached from hardware";
+        }
+        // Hardware is released; fbcon couldn't be auto-restored (missing /dev/tty0 perms
+        // or CAP_SYS_TTY_CONFIG on the vdr service). Tell the operator what to do now so
+        // they don't stare at a black screen wondering -- log already has the details.
+        return "VAAPI device detached -- press Alt+F1 to restore the console "
+               "(see README: tty group + udev + CAP_SYS_TTY_CONFIG)";
     }
 
     if (strcasecmp(command, "ATTA") == 0) {
@@ -458,13 +496,18 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "No VAAPI device";
         }
+        if (vaapiDevice->IsReady()) [[unlikely]] {
+            replyCode = 550;
+            return "VAAPI device is already attached";
+        }
         if (!vaapiDevice->Attach()) {
             replyCode = 550;
             return "VAAPI device attach failed - check logs for details";
         }
-        // Force VDR to restart the current channel's transfer so data flows through the freshly
-        // re-initialized decoder/display pipeline.
-        {
+        // Only restart channel delivery when this device actually owns PrimaryDevice().
+        // With --detached, ATTA is also valid for a non-primary device; retuning whatever
+        // device happens to be primary in that case would interrupt unrelated playback.
+        if (vaapiDevice->IsPrimaryDevice()) {
             LOCK_CHANNELS_READ;
             if (const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel())) {
                 cDevice::PrimaryDevice()->SwitchChannel(channel, true);
@@ -475,9 +518,13 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
     }
 
     if (strcasecmp(command, "STAT") == 0) {
-        if (!vaapiDevice || !vaapiDevice->IsReady()) [[unlikely]] {
+        if (!vaapiDevice) [[unlikely]] {
             replyCode = 550;
-            return "VAAPI device inactive";
+            return "No VAAPI device";
+        }
+        if (!vaapiDevice->IsReady()) [[unlikely]] {
+            replyCode = 550;
+            return "VAAPI device detached (hardware not attached) -- use ATTA to attach";
         }
 
         int width = 0;

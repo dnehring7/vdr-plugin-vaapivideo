@@ -82,7 +82,9 @@ class DrmDevices {
  * @class cVaapiDevice
  * @brief Primary VDR output device: demuxes PES, decodes via VAAPI, and renders over DRM/KMS.
  *
- * Lifecycle: Initialize() opens hardware -> VDR calls SetPlayMode/PlayVideo/PlayAudio -> Stop() tears down.
+ * Lifecycle: Initialize() latches device arguments and either attaches hardware immediately
+ * or leaves the device detached (--detached). Once attached, VDR routes
+ * SetPlayMode/PlayVideo/PlayAudio here; Stop() tears the subsystems down.
  * All playback state transitions (pause, trick speed, track switch) are handled inline.
  */
 class cVaapiDevice : public cDevice {
@@ -123,11 +125,20 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    [[nodiscard]] auto Attach() -> bool; ///< Re-open hardware and restart all threads after a prior Detach()
-    auto Detach() -> void;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume
+    [[nodiscard]] auto Attach() -> bool; ///< Open DRM/VAAPI hardware and start decoder/display/audio threads; used
+                                         ///< for the first attach after a detached startup and to resume after Detach()
+    auto Detach() -> bool; ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume. Returns
+                           ///< true iff the VT bounce restored the text console; false means the hardware IS
+                           ///< released but fbcon did not reclaim the display (user needs to press Alt+F1, or
+                           ///< add the 'tty' group + CAP_SYS_TTY_CONFIG + the /dev/tty0 udev rule -- see README)
     [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
-                                  std::string_view connectorNameFilter = {})
-        -> bool; ///< Open DRM/VAAPI hardware and start decoder, display, and audio threads
+                                  std::string_view connectorNameFilter = {}, bool deferred = false)
+        -> bool; ///< Latch device arguments and, unless @p deferred is true, immediately open hardware and start
+                 ///< threads. When deferred, the device stays in the detached state until Attach() is called (by
+                 ///< MakePrimaryDevice() on the first primary promotion, or by the SVDRP ATTA command).
+    auto MarkStartupComplete() noexcept -> void; ///< Called by the plugin once VDR startup has finished. Enables the
+                                                 ///< MakePrimaryDevice() deferred-attach hook so a setup.conf-driven
+                                                 ///< primary promotion during VDR bring-up does not defeat --detached.
 
   protected:
     // ========================================================================
@@ -139,7 +150,8 @@ class cVaapiDevice : public cDevice {
         -> int override; ///< Demux one audio PES packet and enqueue for decoding
     [[nodiscard]] auto PlayVideo(const uchar *Data, int Length)
         -> int override;                         ///< Demux one video PES packet and enqueue for decoding
-    [[nodiscard]] auto Ready() -> bool override; ///< True once Initialize() has completed successfully
+    [[nodiscard]] auto Ready() -> bool override; ///< True once DRM/VAAPI/ALSA hardware is attached and the
+                                                 ///< decoder, display, and audio subsystems are initialized
     auto SetAudioTrackDevice(eTrackType Type)
         -> void override; ///< Reset audio codec state and flush on track switch (live TV path)
     auto SetDigitalAudioDevice(bool On)
@@ -154,6 +166,10 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
+    [[nodiscard]] auto AttachHardware()
+        -> bool; ///< Open DRM/VAAPI hardware and start the decoder, display, and audio subsystems. Guarded by the
+                 ///< initState CAS so double-attach is a no-op error. Requires drmPath to be populated (latched by
+                 ///< Initialize()). Internal implementation shared by Initialize() (non-deferred) and Attach().
     auto HandleAudioTrackChange(const char *reason, bool enteringDolby)
         -> void; ///< Log + run full audio re-detection on track change. @p enteringDolby is set when called from
                  ///< SetDigitalAudioDevice(true), where VDR fires the hook BEFORE assigning currentAudioTrack and
@@ -182,11 +198,14 @@ class cVaapiDevice : public cDevice {
     std::unique_ptr<cVaapiDecoder> decoder;                ///< Threaded VAAPI packet decoder
     std::unique_ptr<cVaapiDisplay> display;                ///< DRM atomic page-flip display manager
     int drmFd{-1};                                         ///< Open file descriptor for the DRM primary node
-    std::string drmPath;                             ///< Path to the DRM primary device node (e.g. "/dev/dri/card0")
-    std::atomic<int> initState;                      ///< Init state machine: 0=uninit, 1=pending, 2=ready
-    std::atomic<bool> liveMode;                      ///< True in Transfer Mode (live TV); false during replay
-    int osdHeight{};                                 ///< Cached display height for OSD allocation (pixels)
-    int osdWidth{};                                  ///< Cached display width for OSD allocation (pixels)
+    std::string drmPath;                      ///< Path to the DRM primary device node (e.g. "/dev/dri/card0")
+    std::atomic<int> initState;               ///< Init state machine: 0=detached/uninit, 1=pending, 2=ready
+    std::atomic<bool> startupComplete{false}; ///< True after plugin Start() returns; gates the MakePrimaryDevice()
+                                              ///< deferred-attach hook so setup.conf-driven primary promotion at
+                                              ///< VDR bring-up cannot defeat --detached
+    std::atomic<bool> liveMode;               ///< True in Transfer Mode (live TV); false during replay
+    int osdHeight{};                          ///< Cached display height for OSD allocation (pixels)
+    int osdWidth{};                           ///< Cached display width for OSD allocation (pixels)
     AVCodecID audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate audio codec pending confirmation
     int audioCodecCandidateCount{};                  ///< Consecutive detections of candidate audio codec
     eTrackType lastHandledAudioTrack{ttNone};        ///< Last (type, PID) seen by HandleAudioTrackChange(); used for
