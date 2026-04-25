@@ -4,24 +4,28 @@
  * @file decoder.cpp
  * @brief Threaded VAAPI decoder with VPP filter graph and audio-mastered A/V sync.
  *
- * Pipeline:  EnqueueData() -> packetQueue -> Action() -> VAAPI decode -> filter graph
- *            -> [live: jitterBuf] -> SyncAndSubmitFrame -> display->SubmitFrame
- * Filters:   [bwdif|deinterlace_vaapi rate=field] -> [hqdn3d|denoise_vaapi]
- *            -> scale_vaapi (NV12 BT.709 TV-range) -> [sharpness_vaapi]
- *            VPP nodes are probed per GPU at device init.
- * Sync:      Audio clock is master. Four regimes:
- *              freerun  (no clock / post-event window) -> submit unpaced
- *              catch-up (raw < -2*HARD_THRESHOLD)      -> silent bulk drop until in-range
- *              hard     (|raw| > HARD_THRESHOLD)       -> replay: block ahead / drop behind
- *                                                        live:   1 big sleep ahead / drop behind
- *              soft     (|EMA| > CORRIDOR, cooldown OK) -> round(EMA/frameDur) drops or one
- *                                                        sleep of (correctMs + frameDur);
- *                                                        EMA adjusted by measured effect
+ * Pipeline:
+ *   EnqueueData() -> packetQueue -> Action() -> VAAPI decode -> filter graph
+ *   -> [live: jitterBuf] -> SyncAndSubmitFrame -> display->SubmitFrame
  *
- * Threading: codecMutex protects codec/parser state; packetMutex protects packetQueue.
- *            Lock order is ALWAYS codecMutex -> packetMutex (Clear / EnqueueData / SetTrickSpeed
- *            all match this). Jitter buffer is decoder-thread-owned (no lock); cross-thread
- *            requests use atomics + a deferred apply at the top of Action().
+ * Filters:
+ *   [bwdif|deinterlace_vaapi rate=field] -> [hqdn3d|denoise_vaapi]
+ *   -> scale_vaapi (NV12 BT.709 TV-range) -> [sharpness_vaapi]
+ *   VPP nodes probed per GPU at device init (caps.cpp).
+ *
+ * Sync (audio-master, four regimes):
+ *   freerun  -- no clock / post-event window             -> submit unpaced
+ *   catch-up -- raw < -2xHARD_THRESHOLD                 -> silent bulk drop until in-range
+ *   hard     -- |raw| > HARD_THRESHOLD                   -> replay: block ahead / drop behind
+ *                                                           live: one big sleep ahead / drop behind
+ *   soft     -- |EMA| > CORRIDOR, cooldown OK            -> round(EMA/frameDur) drops or one
+ *                                                           sleep of (correctMs + frameDur);
+ *                                                           EMA adjusted by measured effect
+ *
+ * Threading: codecMutex guards codec/parser/filter state; packetMutex guards packetQueue.
+ *   Lock order: ALWAYS codecMutex -> packetMutex (Clear / EnqueueData / SetTrickSpeed match this).
+ *   jitterBuf is decode-thread-owned (no lock needed); cross-thread requests use atomics +
+ *   a deferred apply at the top of Action().
  */
 
 #include "decoder.h"
@@ -30,6 +34,8 @@
 #include "config.h"
 #include "device.h"
 #include "display.h"
+#include "filter.h"
+#include "stream.h"
 
 // C++ Standard Library
 #include <algorithm>
@@ -40,9 +46,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <format>
 #include <memory>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -56,9 +60,6 @@ extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavcodec/defs.h>
 #include <libavcodec/packet.h>
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
 #include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
 #include <libavutil/error.h>
@@ -86,108 +87,22 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr size_t DECODER_QUEUE_CAPACITY = 200;     ///< Packet queue depth (~4 s @ 50 fps); drops oldest when full.
-constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100;     ///< Max VSync backpressure wait inside display->SubmitFrame() (ms).
-constexpr int DECODER_SYNC_COOLDOWN_MS = 5000;     ///< Min interval between soft corrections (5x EMA time constant).
-constexpr int64_t DECODER_SYNC_CORRIDOR = 40 * 90; ///< Soft corridor half-width (40 ms); above AC-3 EMA noise floor.
-constexpr int DECODER_SYNC_EMA_SAMPLES = 50; ///< EMA window (1/N, ~1 s @ 50 fps); residual accumulator for convergence.
-constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;            ///< Unpaced frames after Clear() / track switch / trick exit.
-constexpr int64_t DECODER_SYNC_HARD_THRESHOLD = 200 * 90; ///< Emergency raw-delta threshold; bypasses soft corridor.
-constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000;        ///< Periodic sync-stats dsyslog cadence (ms).
-constexpr int DECODER_SYNC_MAX_CORRECTION_MS = 200; ///< Per-event correction cap (ms); covers any in-corridor offset.
-constexpr int DECODER_SYNC_WARMUP_SAMPLES = 50; ///< Samples averaged to seed the EMA; sqrt(N) cuts deinterlace bias.
-
-// ============================================================================
-// === HDR CLASSIFICATION HELPERS ===
-// ============================================================================
-
-namespace {
-
-/// Return the underlying 8-/10-bit software pixel format for a (possibly VAAPI) frame.
-/// For SW decode this is just frame->format. For HW decode (AV_PIX_FMT_VAAPI) the real
-/// sample-layout is on the hw_frames_ctx -- digging it out is the only way to learn the
-/// bit depth before av_hwframe_transfer_data() pulls the surface back to system memory.
-[[nodiscard]] auto ResolveSwPixFmt(const AVFrame *frame) noexcept -> AVPixelFormat {
-    if (!frame) [[unlikely]] {
-        return AV_PIX_FMT_NONE;
-    }
-    if (frame->format != AV_PIX_FMT_VAAPI) {
-        return static_cast<AVPixelFormat>(frame->format);
-    }
-    if (!frame->hw_frames_ctx) {
-        return AV_PIX_FMT_NONE;
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
-    const auto *framesCtx = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
-    return framesCtx->sw_format;
-}
-
-/// True iff the frame's sample layout carries at least @p minBits per luma sample. Uses
-/// the pix-fmt descriptor instead of hard-coding the handful of 10-bit formats we expect,
-/// so surface types the driver picks for us (P010, NV20, YUV420P10LE ...) all resolve.
-[[nodiscard]] auto FrameBitDepthAtLeast(const AVFrame *frame, int minBits) noexcept -> bool {
-    const AVPixelFormat swFmt = ResolveSwPixFmt(frame);
-    if (swFmt == AV_PIX_FMT_NONE) [[unlikely]] {
-        return false;
-    }
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(swFmt);
-    if (!desc || desc->nb_components == 0) [[unlikely]] {
-        return false;
-    }
-    return desc->comp[0].depth >= minBits;
-}
-
-/// Classify a decoded frame's HDR kind from its color_primaries + color_trc + bit depth.
-/// Codec profile is NOT a gate here -- an HEVC Main10 stream may still carry BT.709 SDR,
-/// and a stray SDR frame in an HDR program (ads, filler) will correctly resolve to Sdr.
-[[nodiscard]] auto ClassifyStream(const AVFrame *frame) noexcept -> StreamHdrKind {
-    if (!frame) [[unlikely]] {
-        return StreamHdrKind::Sdr;
-    }
-    if (frame->color_primaries != AVCOL_PRI_BT2020) {
-        return StreamHdrKind::Sdr;
-    }
-    if (!FrameBitDepthAtLeast(frame, 10)) {
-        return StreamHdrKind::Sdr;
-    }
-    switch (frame->color_trc) {
-        case AVCOL_TRC_SMPTE2084:
-            return StreamHdrKind::Hdr10;
-        case AVCOL_TRC_ARIB_STD_B67:
-            return StreamHdrKind::Hlg;
-        default:
-            return StreamHdrKind::Sdr;
-    }
-}
-
-/// Extract HDR10 static metadata side-data (mastering display + content light) from a
-/// decoded frame. Side-data absence is non-fatal: caller must check `hasMasteringDisplay`
-/// / `hasContentLight` before reading the payload structs. HLG streams typically omit
-/// these, in which case the sink receives all-zero bits per HDMI 2.1 section 7.6.1 ("unknown").
-[[nodiscard]] auto ExtractHdrInfo(const AVFrame *frame) noexcept -> HdrStreamInfo {
-    HdrStreamInfo info{};
-    info.kind = ClassifyStream(frame);
-    if (info.kind == StreamHdrKind::Sdr) {
-        return info; // null-frame case already resolved to Sdr inside ClassifyStream
-    }
-    // Side-data size check guards against header/runtime ABI skew: FFmpeg's contract
-    // promises sizeof(AVMastering...), but >= lets us tolerate a larger future layout.
-    if (const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-        sd != nullptr && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
-        info.hasMasteringDisplay = true;
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
-        info.mastering = *reinterpret_cast<const AVMasteringDisplayMetadata *>(sd->data);
-    }
-    if (const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-        sd != nullptr && sd->size >= sizeof(AVContentLightMetadata)) {
-        info.hasContentLight = true;
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
-        info.contentLight = *reinterpret_cast<const AVContentLightMetadata *>(sd->data);
-    }
-    return info;
-}
-
-} // namespace
+constexpr size_t DECODER_QUEUE_CAPACITY =
+    200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to TRICK_QUEUE_DEPTH.
+constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< VSync backpressure budget inside display->SubmitFrame().
+constexpr int DECODER_SYNC_COOLDOWN_MS = 5000; ///< Min interval between soft corrections; equals 5x EMA time constant.
+constexpr int64_t DECODER_SYNC_CORRIDOR =
+    30 * 90; ///< Soft half-width: 30 ms. Above IEC61937 jitter, below ~80 ms percept threshold.
+constexpr int DECODER_SYNC_EMA_SAMPLES =
+    50; ///< EMA alpha = 1/N (~= 1 s @ 50 fps). Residual accumulator avoids truncation stall.
+constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear() / track switch / trick-exit.
+constexpr int64_t DECODER_SYNC_HARD_THRESHOLD =
+    200 * 90; ///< 200 ms. Beyond this the soft corridor cannot recover in one event.
+constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Periodic sync-stats dsyslog cadence.
+constexpr int DECODER_SYNC_MAX_CORRECTION_MS =
+    200; ///< Per-event cap = HARD_THRESHOLD; one event clears any in-corridor offset.
+constexpr int DECODER_SYNC_WARMUP_SAMPLES =
+    50; ///< Mean-seed samples before EMA starts; sqrt(N) cuts 50p deinterlace bias.
 
 // ============================================================================
 // === STRUCTURES ===
@@ -240,23 +155,21 @@ cVaapiDecoder::~cVaapiDecoder() noexcept {
 // ============================================================================
 
 auto cVaapiDecoder::Clear() -> void {
-    // Lock ordering: codecMutex -> packetMutex prevents a deadlock with EnqueueData().
-    const cMutexLock decodeLock(&codecMutex);
+    const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex order (matches EnqueueData).
 
     DrainQueue();
 
     {
-        // vaDriverMutex: flush and graph teardown make VA API calls that
-        // would otherwise race with the display thread's PRIME export.
+        // vaDriverMutex: avcodec_flush_buffers (VAAPI hwaccel reset) and filterChain.Reset()
+        // (VPP teardown) make VA API calls that race the display thread's PRIME export.
         const cMutexLock vaLock(&display->GetVaDriverMutex());
 
-        // Flush decoder; the codec context stays open so the next I-frame can continue.
         if (codecCtx) {
-            avcodec_flush_buffers(codecCtx.get());
+            avcodec_flush_buffers(codecCtx.get()); // codec stays open; next I-frame continues without reopen.
         }
 
-        // Filter graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily.
-        ResetFilterGraph();
+        // Graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily on next frame.
+        filterChain.Reset();
         if (decodedFrame) {
             av_frame_unref(decodedFrame.get());
         }
@@ -264,12 +177,13 @@ auto cVaapiDecoder::Clear() -> void {
             av_frame_unref(filteredFrame.get());
         }
     }
-    // hasLoggedFirstFrame NOT reset: only OpenCodec() resets it to avoid duplicate logs.
+    // hasLoggedFirstFrame NOT reset here: only OpenCodecWithInfo() resets it, avoiding duplicate logs per reopen.
 
-    // AVCodecParserContext has no flush API; recreate.
-    if (currentCodecId != AV_CODEC_ID_NONE) {
+    // AVCodecParserContext has no flush API; recreate it. Null parserCtx means the mediaplayer
+    // path (extradata present); reintroducing a parser mid-stream would corrupt AU boundaries.
+    if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
         parserCtx.reset(av_parser_init(currentCodecId));
-    } else {
+    } else if (currentCodecId == AV_CODEC_ID_NONE) {
         parserCtx.reset();
     }
 
@@ -277,10 +191,9 @@ auto cVaapiDecoder::Clear() -> void {
     codecDrainPending.store(false, std::memory_order_relaxed);
     stillPictureMode.store(false, std::memory_order_relaxed);
 
-    // Flush deferred to the decode thread (owns jitterBuf + EMA/streak fields unlocked);
-    // it also calls ResetSmoothedDelta on the flag edge. freerunFrames must store BEFORE
-    // jitterFlushPending: otherwise the decoder could submit through the due-gate on a
-    // still-NOPTS audio clock and black the screen until ALSA re-anchors.
+    // jitterBuf and EMA state are decode-thread-owned; reset is deferred via atomic flag.
+    // freerunFrames MUST store before jitterFlushPending: if the order is reversed the
+    // decode thread could drain through the due-gate on a still-NOPTS clock and black the screen.
     freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
     jitterFlushPending.store(true, std::memory_order_release);
 
@@ -301,14 +214,13 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         return;
     }
 
-    // Lock ordering: codecMutex -> packetMutex prevents a deadlock with Clear().
-    const cMutexLock decodeLock(&codecMutex);
+    const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex order (matches Clear).
 
     if (!codecCtx || !parserCtx) {
         return;
     }
 
-    // pts applies only to the first call per AU; the parser propagates it internally.
+    // pts is valid only for the first segment of each AU; the parser propagates it internally.
     const uint8_t *parseData = data;
     if (size > static_cast<size_t>(INT_MAX)) [[unlikely]] {
         return;
@@ -317,7 +229,7 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
     int64_t currentPts = pts;
 
     while (parseSize > 0) {
-        uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness)
+        uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
         int parsedSize = 0;
 
         const int parsed = av_parser_parse2(parserCtx.get(), codecCtx.get(), &parsedData, &parsedSize, parseData,
@@ -337,8 +249,8 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         currentPts = AV_NOPTS_VALUE;
 
         if (parsedSize > 0) {
-            // Fast-forward only: drop non-keyframes (no refs). Reverse must keep
-            // key_frame=0 for PAFF interlaced second fields. Slow keeps all for smoothness.
+            // FF: drop non-keyframes (inter frames are undisplayable without reference frames).
+            // Reverse must not filter: PAFF second fields carry key_frame=0 but are needed.
             if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
                 parserCtx->key_frame == 0) {
                 continue;
@@ -361,22 +273,7 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
                 pkt->flags |= AV_PKT_FLAG_KEY;
             }
 
-            // Trick: depth-1, drop incoming (Poll throttles). Normal: drop oldest on overflow.
-            const cMutexLock lock(&packetMutex);
-            const bool isTrickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
-            const size_t maxDepth = isTrickMode ? DECODER_TRICK_QUEUE_DEPTH : DECODER_QUEUE_CAPACITY;
-            if (packetQueue.size() >= maxDepth) {
-                if (isTrickMode) {
-                    dsyslog("vaapivideo/decoder: trick enqueue: queue full (depth=%zu) -- dropping incoming",
-                            packetQueue.size());
-                    av_packet_free(&pkt);
-                    continue;
-                }
-                av_packet_free(&packetQueue.front());
-                packetQueue.pop();
-            }
-            packetQueue.push(pkt);
-            packetCondition.Broadcast();
+            PushPacketToQueue(pkt);
         }
     }
 
@@ -385,22 +282,102 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
     // fragment multi-PES I-frames into partial AUs.
 }
 
+auto cVaapiDecoder::EnqueuePacket(const AVPacket *packet) -> void {
+    // Container demuxers (av_read_frame) yield whole AUs, so no parser step is needed.
+    // Clone the caller's packet and push through the same trick/queue-depth policy as EnqueueData.
+    if (!packet || stopping.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const cMutexLock decodeLock(&codecMutex);
+    if (!codecCtx) {
+        return;
+    }
+
+    // Same FF keyframe filter as EnqueueData; AV_PKT_FLAG_KEY is the demuxer's equivalent of parserCtx->key_frame.
+    if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
+        (packet->flags & AV_PKT_FLAG_KEY) == 0) {
+        return;
+    }
+
+    AVPacket *pkt = av_packet_clone(packet);
+    if (!pkt) [[unlikely]] {
+        return;
+    }
+    PushPacketToQueue(pkt);
+}
+
+auto cVaapiDecoder::PushPacketToQueue(AVPacket *pkt) -> void {
+    // Takes ownership of pkt regardless of outcome: freed on overflow/trick drop, queued otherwise.
+    const cMutexLock lock(&packetMutex);
+    const bool isTrickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
+    const size_t maxDepth = isTrickMode ? DECODER_TRICK_QUEUE_DEPTH : DECODER_QUEUE_CAPACITY;
+    if (packetQueue.size() >= maxDepth) {
+        if (isTrickMode) {
+            dsyslog("vaapivideo/decoder: trick enqueue: queue full (depth=%zu) -- dropping incoming",
+                    packetQueue.size());
+            av_packet_free(&pkt);
+            return;
+        }
+        av_packet_free(&packetQueue.front());
+        packetQueue.pop();
+    }
+    packetQueue.push(pkt);
+    packetCondition.Broadcast();
+}
+
+auto cVaapiDecoder::NoteStarvationTick(const AVPacket *pkt) noexcept -> void {
+    // Single relaxed load on the fast path once first frame lands; no steady-state cost.
+    if (hasLoggedFirstFrame.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const size_t sent = packetsSinceOpen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pkt != nullptr && (pkt->flags & AV_PKT_FLAG_KEY) != 0) {
+        keyPacketsSinceOpen.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const uint64_t openedMs = codecOpenTimeMs.load(std::memory_order_relaxed);
+    if (openedMs == 0) [[unlikely]] {
+        return;
+    }
+    const uint64_t nowMs = cTimeMs::Now();
+    const uint64_t elapsed = nowMs - openedMs;
+
+    // Tier 1 (~3 s): typical for long-GOP streams where mid-entry must wait for the next IDR.
+    if (elapsed > 3000 && !starvationWarned.exchange(true, std::memory_order_relaxed)) {
+        isyslog("vaapivideo/decoder: no frame %llu ms after open (packets sent=%zu, "
+                "of which keyframes=%zu) -- FFmpeg is waiting for a random-access point; "
+                "likely mid-GOP entry on a long-GOP stream",
+                static_cast<unsigned long long>(elapsed), sent, keyPacketsSinceOpen.load(std::memory_order_relaxed));
+    }
+    // Tier 2 (~15 s): kf==0 -> upstream silent/off-air; kf>=1 -> HW decoder stall.
+    if (elapsed > 15000 && !starvationWarnedSustained.exchange(true, std::memory_order_relaxed)) {
+        const size_t kf = keyPacketsSinceOpen.load(std::memory_order_relaxed);
+        isyslog("vaapivideo/decoder: still no frame %llu ms after open (packets sent=%zu, "
+                "keyframes=%zu) -- %s",
+                static_cast<unsigned long long>(elapsed), sent, kf,
+                kf == 0 ? "no keyframe on the wire (upstream silent / off-air?)"
+                        : "keyframe arrived but decoder is not producing output (HW decoder stall)");
+    }
+}
+
 auto cVaapiDecoder::FlushParser() -> void {
-    // Still-picture / Goto(Still): drain the parser so the single I-frame surfaces.
+    // Still-picture / Goto(Still): the parser withholds the last AU until a start code follows.
+    // NULL-input flush surfaces the single I-frame immediately.
     const cMutexLock decodeLock(&codecMutex);
     DrainPendingParserAU();
 }
 
 auto cVaapiDecoder::DrainPendingParserAU() -> void {
-    // Bitstream parsers withhold an AU until the next start code. NULL/0 input is the
-    // documented EOS-flush. Callers: still-picture and reverse trick (isolated I-frames).
-    // Caller holds codecMutex; packetMutex taken inside.
-
+    // NULL/0 input is the documented EOS-flush idiom for av_parser_parse2.
+    // Callers: FlushParser (still-picture) and SetTrickSpeed (reverse isolated I-frames).
+    // Caller holds codecMutex; packetMutex taken internally.
     if (!codecCtx || !parserCtx) {
         return;
     }
 
-    uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness)
+    uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
     int parsedSize = 0;
     const int parsed = av_parser_parse2(parserCtx.get(), codecCtx.get(), &parsedData, &parsedSize, nullptr, 0,
                                         AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
@@ -409,7 +386,7 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
         return;
     }
 
-    // Fast-forward keyframe filter (mirrors EnqueueData). Reverse must not filter: PAFF needs key_frame=0.
+    // Same FF keyframe gate as EnqueueData; reverse must not filter (PAFF key_frame=0).
     if (trickSpeed.load(std::memory_order_relaxed) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
         parserCtx->key_frame == 0) {
         return;
@@ -432,7 +409,7 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
 
     {
         const cMutexLock lock(&packetMutex);
-        // Drop-oldest: in trick mode the freshly drained AU must not be rejected.
+        // Drop-oldest: the drained AU is the only one in trick mode and must not be silently lost.
         const bool isTrickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
         const size_t maxDepth = isTrickMode ? DECODER_TRICK_QUEUE_DEPTH : DECODER_QUEUE_CAPACITY;
         if (packetQueue.size() >= maxDepth) {
@@ -495,8 +472,7 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::IsQueueEmpty() const -> bool {
-    // VDR's Poll() asks this -- "true" means "send the next PES packet". Returning false
-    // throttles delivery and is how we apply backpressure on the dvbplayer thread.
+    // VDR Poll(): true -> dvbplayer sends the next PES packet; false -> backpressure.
     const cMutexLock lock(&packetMutex);
     return packetQueue.empty();
 }
@@ -526,6 +502,14 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::OpenCodec(AVCodecID codecId) -> bool {
+    // PES path: no extradata; SPS/PPS/VPS are inline, and FFmpeg infers profile on first frame.
+    // Backend table defaults to 8-bit row; bit-depth update requires a full reopen via OpenCodecWithInfo.
+    VideoStreamInfo info;
+    info.codecId = codecId;
+    return OpenCodecWithInfo(info);
+}
+
+[[nodiscard]] auto cVaapiDecoder::OpenCodecWithInfo(const VideoStreamInfo &info) -> bool {
     const cMutexLock decodeLock(&codecMutex);
 
     if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
@@ -533,49 +517,21 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
         return false;
     }
 
-    if (codecCtx && currentCodecId == codecId && !forceCodecReopen) {
-        return true;
-    }
-    forceCodecReopen = false;
-
-    // Full teardown: the filter graph holds a ref to the old codec's hw_frames_ctx and is
-    // not safe to reuse. hasLoggedFirstFrame is reset here (and only here) so the per-codec
-    // "first frame" line still fires once per real reopen.
-    parserCtx.reset();
-    {
-        // vaDriverMutex: codec context destruction (vaDestroyContext for VAAPI hwaccel)
-        // and graph teardown (VPP pipeline teardown) make VA API calls.
-        const cMutexLock vaLock(&display->GetVaDriverMutex());
-        codecCtx.reset();
-        ResetFilterGraph();
-    }
-    currentCodecId = AV_CODEC_ID_NONE;
-    hasLoggedFirstFrame.store(false, std::memory_order_relaxed);
-
-    const AVCodec *decoder = avcodec_find_decoder(codecId);
+    const AVCodec *decoder = avcodec_find_decoder(info.codecId);
     if (!decoder) [[unlikely]] {
-        esyslog("vaapivideo/decoder: codec %d not found", static_cast<int>(codecId));
+        esyslog("vaapivideo/decoder: codec %d not found", static_cast<int>(info.codecId));
         return false;
     }
 
-    // hwMpeg2 / hwH264 / hwHevc are populated once at device init by ProbeVppCapabilities().
+    // Table-driven (kVideoBackendTable in stream.h): returns the GpuCaps member pointer for this
+    // codec/profile/depth, or nullptr for SW-only. Adding a codec = one row in stream.h + one probe in caps.cpp.
     bool useHwDecode = false;
-    switch (codecId) {
-        case AV_CODEC_ID_MPEG2VIDEO:
-            useHwDecode = vaapiContext->hwMpeg2;
-            break;
-        case AV_CODEC_ID_H264:
-            useHwDecode = vaapiContext->hwH264;
-            break;
-        case AV_CODEC_ID_HEVC:
-            useHwDecode = vaapiContext->hwHevc;
-            break;
-        default:
-            break;
+    if (auto capFlag = SelectVideoBackendCap(info); capFlag != nullptr) {
+        useHwDecode = vaapiContext->caps.*capFlag;
     }
 
-    // The VA driver advertising a profile is necessary but not sufficient -- FFmpeg also
-    // needs a VAAPI hw_config entry. Walk the codec's configs and require both.
+    // VA driver advertising a profile is necessary but not sufficient; FFmpeg also needs
+    // a VAAPI AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX entry. Require both.
     if (useHwDecode) {
         bool hasHwConfig = false;
         for (int i = 0;; ++i) {
@@ -592,10 +548,54 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
         useHwDecode = hasHwConfig;
     }
 
-    parserCtx.reset(av_parser_init(codecId));
-    if (!parserCtx) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to create parser for %s", decoder->name);
-        return false;
+    // Reuse only when codec ID, HW/SW choice, AND extradata all match.
+    // Codec ID alone is insufficient: a same-codec stream change can switch bit-depth
+    // (8-bit Main->10-bit Main10 flips the kVideoBackendTable row) or replace extradata (seek).
+    bool extradataMatches = true;
+    if (codecCtx) {
+        if (codecCtx->extradata_size != info.extradataSize) {
+            extradataMatches = false;
+        } else if (info.extradataSize > 0) {
+            extradataMatches =
+                codecCtx->extradata != nullptr && info.extradata != nullptr &&
+                std::memcmp(codecCtx->extradata, info.extradata, static_cast<size_t>(info.extradataSize)) == 0;
+        }
+    }
+
+    if (codecCtx && currentCodecId == info.codecId && !forceCodecReopen &&
+        ((codecCtx->hw_device_ctx != nullptr) == useHwDecode) && extradataMatches) {
+        return true;
+    }
+    forceCodecReopen = false;
+
+    // Full teardown required: filter graph holds a hw_frames_ctx ref tied to the old context.
+    // hasLoggedFirstFrame reset here and ONLY here so the "first frame" line fires once per reopen.
+    parserCtx.reset();
+    {
+        // vaDriverMutex: vaDestroyContext (VAAPI hwaccel) + VPP teardown make VA API calls.
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        codecCtx.reset();
+        filterChain.Reset();
+    }
+    currentCodecId = AV_CODEC_ID_NONE;
+    hasLoggedFirstFrame.store(false, std::memory_order_relaxed);
+    // Reset so the 3 s and 15 s starvation tiers fire at most once per codec open.
+    starvationWarned.store(false, std::memory_order_relaxed);
+    starvationWarnedSustained.store(false, std::memory_order_relaxed);
+    packetsSinceOpen.store(0, std::memory_order_relaxed);
+    keyPacketsSinceOpen.store(0, std::memory_order_relaxed);
+    codecOpenTimeMs.store(cTimeMs::Now(), std::memory_order_relaxed);
+
+    // PES path: NAL stream -> parser mandatory. Mediaplayer path: pre-demuxed AUs + extradata -> no parser.
+    // info.extradata == nullptr is the canonical PES-path marker.
+    parserCtx.reset();
+    const bool needsParser = (info.extradata == nullptr) || (info.extradataSize <= 0);
+    if (needsParser) {
+        parserCtx.reset(av_parser_init(info.codecId));
+        if (!parserCtx) [[unlikely]] {
+            esyslog("vaapivideo/decoder: failed to create parser for %s", decoder->name);
+            return false;
+        }
     }
 
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoderCtx{avcodec_alloc_context3(decoder)};
@@ -604,15 +604,25 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
         return false;
     }
 
-    // DVB MPEG-2/HEVC streams are routinely marginally non-conforming; loosen the strict
-    // gates so the decoder accepts them instead of bailing on the whole packet.
+    // DVB streams are routinely marginally non-conforming; CAREFUL avoids hard failures on minor violations.
     decoderCtx->err_recognition = AV_EF_CAREFUL;
     decoderCtx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
+    // Mediaplayer path: container demuxers (mkv/mp4) store parameter sets in the track header,
+    // not in every AU like DVB. FFmpeg requires them here before avcodec_open2.
+    if (info.extradata && info.extradataSize > 0) {
+        const size_t padded = static_cast<size_t>(info.extradataSize) + AV_INPUT_BUFFER_PADDING_SIZE;
+        decoderCtx->extradata = static_cast<uint8_t *>(av_mallocz(padded));
+        if (!decoderCtx->extradata) [[unlikely]] {
+            esyslog("vaapivideo/decoder: extradata alloc failed (%d bytes)", info.extradataSize);
+            return false;
+        }
+        std::memcpy(decoderCtx->extradata, info.extradata, static_cast<size_t>(info.extradataSize));
+        decoderCtx->extradata_size = info.extradataSize;
+    }
+
     if (useHwDecode) {
-        // VAAPI decode is single-threaded by design -- the GPU parallelizes internally and
-        // FFmpeg's slice threading would just contend on the VA driver. SW decode (else
-        // branch) uses FFmpeg's default thread pool.
+        // GPU parallelizes decode internally; FFmpeg slice-threading would only contend on the VA driver.
         decoderCtx->thread_count = 1;
 
         decoderCtx->hw_device_ctx = av_buffer_ref(vaapiContext->hwDeviceRef);
@@ -621,8 +631,7 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
             return false;
         }
 
-        // get_format hook: pin output to VAAPI surfaces. FFmpeg falls back to SW frames
-        // here if we return NONE -- the explicit pick keeps decoding on the GPU.
+        // Pin output to VAAPI surfaces. Without this FFmpeg may silently fall back to SW frames.
         decoderCtx->get_format = [](AVCodecContext *, const AVPixelFormat *formats) -> AVPixelFormat {
             for (const AVPixelFormat *fmt = formats; *fmt != AV_PIX_FMT_NONE; ++fmt) {
                 if (*fmt == AV_PIX_FMT_VAAPI) {
@@ -632,8 +641,7 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
             return AV_PIX_FMT_NONE;
         };
     }
-    // SW decode: leave hw_device_ctx unset; InitFilterGraph() inserts hwupload + attaches
-    // hwDeviceRef on every filter node so VPP scaling still runs on the GPU.
+    // SW decode: hw_device_ctx left unset; filter chain inserts hwupload so VPP still runs on the GPU.
 
     if (const int ret = avcodec_open2(decoderCtx.get(), decoder, nullptr); ret < 0) [[unlikely]] {
         esyslog("vaapivideo/decoder: failed to open %s: %s", decoder->name, AvErr(ret).data());
@@ -641,20 +649,18 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
     }
 
     codecCtx = std::move(decoderCtx);
-    currentCodecId = codecId;
-    // avcodec_profile_name returns nullptr for FF_PROFILE_UNKNOWN (set before any header is
-    // parsed). The post-first-frame logs will fill in the profile once it's known.
-    const char *profileName = av_get_profile_name(decoder, codecCtx->profile);
-    isyslog("vaapivideo/decoder: opened %s (%s, profile=%s)", decoder->name, useHwDecode ? "hardware" : "software",
-            profileName ? profileName : "unknown");
+    currentCodecId = info.codecId;
+    // codecCtx->profile is AV_PROFILE_UNKNOWN until FFmpeg parses the first SPS/VPS.
+    // The authoritative value is logged in the first-frame block inside DecodeOnePacket.
+    isyslog("vaapivideo/decoder: opened %s (%s%s)", decoder->name, useHwDecode ? "hardware" : "software",
+            info.extradataSize > 0 ? ", extradata" : "");
 
     return true;
 }
 
 auto cVaapiDecoder::NotifyAudioChange() -> void {
-    // Audio codec / track switch: the audio clock is NOPTS for ~100-500 ms while the new
-    // pipeline primes. Arm the freerun window so the next frame surfaces immediately; catch-up
-    // mode inside SyncAndSubmitFrame absorbs the re-alignment once the new clock arrives.
+    // Audio clock is NOPTS for ~100--500 ms while the new pipeline primes.
+    // Freerun surfaces the next frame immediately; catch-up realigns once the clock re-anchors.
     freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
     syncLogPending.store(true, std::memory_order_relaxed);
 }
@@ -668,29 +674,28 @@ auto cVaapiDecoder::SetLiveMode(bool live) -> void { liveMode.store(live, std::m
 auto cVaapiDecoder::RequestTrickExit() -> void { trickExitPending.store(true, std::memory_order_release); }
 
 auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
-    // speed==0: normal. fast: FF/REW (>=6->2x, >=3->4x, else 8x). !fast: slow at 1/speed.
-    trickExitPending.store(false, std::memory_order_relaxed); // supersedes pending trick-exit
+    // speed=0: normal. fast: FF/REW (speed>=6->2x, >=3->4x, else 8x). !fast: slow at 1/speed hold.
+    trickExitPending.store(false, std::memory_order_relaxed); // supersedes any pending deferred trick-exit
 
-    // VDR skips DeviceClear() on trick entry; FF/REW/slow-reverse are non-contiguous so
-    // stale NALs would poison the parser. Slow-forward keeps warm state, no flush needed.
+    // VDR skips DeviceClear() on trick entry. FF/REW/slow-reverse are non-contiguous streams,
+    // so stale partial NALs would corrupt the parser. Slow-forward stays contiguous; no flush.
     const bool needsFlush = (speed > 0) && (fast || !forward);
     dsyslog("vaapivideo/decoder: SetTrickSpeed speed=%d forward=%d fast=%d needsFlush=%d", speed, forward, fast,
             needsFlush);
     {
-        // codecMutex pairs with EnqueueData's parse path.
-        const cMutexLock decodeLock(&codecMutex);
+        const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex (inside DrainQueue).
 
         if (needsFlush) {
             DrainQueue();
             {
-                // vaDriverMutex: flush_buffers + ResetFilterGraph make VA API calls that
-                // race the display thread's av_hwframe_map on the same VADisplay (iHD crash).
+                // vaDriverMutex: avcodec_flush_buffers + filterChain.Reset() make VA API calls
+                // that race av_hwframe_map on the same VADisplay (iHD driver crash).
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
                 if (codecCtx) {
                     avcodec_flush_buffers(codecCtx.get());
                 }
-                // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref.
-                ResetFilterGraph();
+                // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref and must be torn down.
+                filterChain.Reset();
                 if (decodedFrame) {
                     av_frame_unref(decodedFrame.get());
                 }
@@ -699,7 +704,8 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
                 }
             }
             // No parser flush API; recreate to discard stale partial NALs.
-            if (currentCodecId != AV_CODEC_ID_NONE) {
+            // Null parserCtx = mediaplayer path; must not introduce one mid-stream.
+            if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
             }
         }
@@ -737,9 +743,9 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
 }
 
 auto cVaapiDecoder::Shutdown() -> void {
-    // Idempotent. Postcondition: decode thread joined, packetQueue drained. Callers may
-    // then safely tear down anything the decoder was sharing with the display thread
-    // (codec context, hw_frames_ctx, VAAPI surfaces).
+    // Idempotent: stopping.exchange guards against double-entry.
+    // Postcondition: decode thread joined, packetQueue drained -- callers may then safely
+    // tear down codec context, hw_frames_ctx, and VAAPI surfaces.
     const bool wasStopping = stopping.exchange(true, std::memory_order_acq_rel);
     dsyslog("vaapivideo/decoder: shutting down (wasStopping=%d)", wasStopping);
     if (wasStopping) {
@@ -751,14 +757,13 @@ auto cVaapiDecoder::Shutdown() -> void {
         packetCondition.Broadcast();
     }
 
-    // VDR's cThread::Running() is unfenced (CLAUDE.md "Thread-Safety Pitfall"); read our
-    // own release/acquire hasExited instead.
+    // cThread::Running() is unfenced (see CLAUDE.md); use our own hasExited acquire-load.
     if (!hasExited.load(std::memory_order_acquire)) {
         Cancel(3);
     }
 
-    // Wait for the decode thread to publish hasExited so we have a real happens-before edge
-    // with the work it just finished -- Cancel() alone gives us a join, not a fence.
+    // Cancel() gives a join but not a happens-before fence. Spin on hasExited for the
+    // release/acquire edge with the thread's last stores (packet frees, counter updates).
     const cTimeMs timeout(SHUTDOWN_TIMEOUT_MS);
     while (!hasExited.load(std::memory_order_acquire) && !timeout.TimedOut()) {
         {
@@ -768,8 +773,8 @@ auto cVaapiDecoder::Shutdown() -> void {
         cCondWait::SleepMs(10);
     }
 
-    // Drain after the thread exits: any packet enqueued between hasExited and now would
-    // leak otherwise (std::queue<AVPacket*> does not own its contents).
+    // Drain after thread exits: packets enqueued after the thread checked stopping would
+    // leak otherwise (std::queue<AVPacket*> does not own its elements).
     DrainQueue();
 }
 
@@ -793,9 +798,8 @@ auto cVaapiDecoder::Action() -> void {
     while (!stopping.load(std::memory_order_acquire)) {
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
 
-        // 18 ms while draining a primed buffer so VSync backpressure paces the loop, not
-        // this timer. 10 ms otherwise. 18 ms (not 20 ms) avoids a beat against 50 Hz VSync
-        // that dropped 50p output to ~33 fps; re-verify on a 50p source before changing.
+        // 18 ms (not 20 ms): 20 ms beats against 50 Hz VSync and dropped 50p output to ~33 fps.
+        // 10 ms when jitterBuf is empty (no frames pending; deep sleep is fine).
         {
             const cMutexLock lock(&packetMutex);
             if (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
@@ -818,12 +822,12 @@ auto cVaapiDecoder::Action() -> void {
 
         if (queuedPacket) {
             av_packet_unref(workPacket.get());
-            // Ref-copy, then drop queuedPacket before the GPU submission to avoid holding
-            // packetMutex across the slow avcodec_send_packet() call.
+            // Copy into workPacket and release queuedPacket before GPU submission so we
+            // don't hold packetMutex across the potentially slow avcodec_send_packet().
             if (av_packet_ref(workPacket.get(), queuedPacket.get()) == 0) {
                 queuedPacket.reset();
 
-                // codecMutex is released before frame delivery so Clear() / SetTrickSpeed()
+                // codecMutex released before frame delivery so Clear() / SetTrickSpeed()
                 // on other threads don't stall behind a VSync-blocked SubmitFrame.
                 if (!stopping.load(std::memory_order_acquire)) {
                     const cMutexLock decodeLock(&codecMutex);
@@ -835,20 +839,19 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         // --- Still-picture codec drain ---
-        // Race: the decode thread may consume the packet before RequestCodecDrain sets
-        // the flag. Running the drain here catches both orderings.
+        // The decode thread may consume the packet before RequestCodecDrain sets the flag;
+        // checking here (after the decode step) catches both orderings.
         if (codecDrainPending.exchange(false, std::memory_order_acquire)) {
             const cMutexLock decodeLock(&codecMutex);
             DrainCodecAtEos(pendingFrames);
 
-            // EOS-flush the filter graph: temporal filters hold frames internally.
-            if (filterGraph && bufferSrcCtx) {
+            // Temporal filters (bwdif) hold frames internally; EOS-flush surfaces them.
+            if (filterChain.IsBuilt()) {
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
-                if (av_buffersrc_add_frame_flags(bufferSrcCtx, nullptr, 0) >= 0) {
+                if (filterChain.SendFrame(nullptr) >= 0) {
                     while (true) {
                         av_frame_unref(filteredFrame.get());
-                        const int filterRet = av_buffersink_get_frame(bufferSinkCtx, filteredFrame.get());
-                        if (filterRet < 0) {
+                        if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
                             break;
                         }
                         if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
@@ -856,16 +859,16 @@ auto cVaapiDecoder::Action() -> void {
                         }
                     }
                 }
-                ResetFilterGraph(); // graph is now in EOF state
+                filterChain.Reset(); // graph in EOF state after drain; rebuild on next packet.
             }
 
-            // Leave still mode: the next real packet rebuilds the graph with full filters.
+            // Exit still mode: next packet rebuilds the graph with full temporal filters.
             stillPictureMode.store(false, std::memory_order_release);
         }
 
         // --- Frame delivery ---
-        // Deferred Clear() flush: pendingFrames carries pre-Clear PTS; jitterBuf is owned by
-        // this thread so Clear() only arms the flag and we do the reset here.
+        // Deferred Clear(): jitterBuf and EMA are decode-thread-owned; Clear() only arms the flag.
+        // pendingFrames carries pre-Clear PTS and must be discarded here too.
         if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
             ResetSmoothedDelta();
             jitterBuf.clear();
@@ -875,10 +878,10 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         if (!liveMode.load(std::memory_order_relaxed)) {
-            // Replay: sleep-pace to the audio clock so a trick-exit backlog doesn't race ahead
-            // of wall (mirrors the live halfFrame due-gate). No-op at steady state.
+            // Replay: pace to audio clock so a trick-exit backlog doesn't race ahead of wall time.
+            // Mirrors the live halfFrame due-gate. No-op at steady state.
             auto *const ap = audioProcessor.load(std::memory_order_acquire);
-            constexpr int64_t HALF_TICKS_PER_MS = 45; // 90 kHz / 2
+            constexpr int64_t HALF_TICKS_PER_MS = 45; ///< 90 kHz / 2 = ticks per half-ms.
             for (auto &frame : pendingFrames) {
                 if (stopping.load(std::memory_order_relaxed)) [[unlikely]] {
                     break;
@@ -903,26 +906,25 @@ auto cVaapiDecoder::Action() -> void {
                 (void)SyncAndSubmitFrame(std::move(frame));
             }
         } else {
-            // Live TV due-based drain: head frame leaves jitterBuf only when its PTS
-            // matches the audio clock (within halfFrame). See AVSYNC.md.
+            // Live TV: push to jitterBuf and drain based on audio clock due-gate. See AVSYNC.md.
             auto *const ap = audioProcessor.load(std::memory_order_acquire);
             for (auto &frame : pendingFrames) {
                 jitterBuf.push_back(std::move(frame));
             }
 
-            // Bulk-dump catastrophically stale heads (post-seek, long stall).
+            // Bulk-drop catastrophically stale heads (post-seek, long decode stall).
             if (ap && !jitterBuf.empty()) {
                 SkipStaleJitterFrames(ap);
             }
 
-            // Freerun and pendingDrops (soft-behind burst) bypass the due check.
-            constexpr int64_t HALF_TICKS_PER_MS = 45; // 90 kHz / 2
+            // Freerun and pendingDrops (soft-behind burst) bypass the due-gate.
+            constexpr int64_t HALF_TICKS_PER_MS = 45; ///< 90 kHz / 2.
             while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
                 const bool consumingDrop = (pendingDrops > 0);
                 const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
 
                 if (!consumingDrop && !canFreerun) {
-                    // Normal path: submit only if head is due. No clock -> hold.
+                    // Normal path: hold until head PTS is due. No clock -> hold forever.
                     if (!ap) {
                         break;
                     }
@@ -968,15 +970,14 @@ auto cVaapiDecoder::Action() -> void {
 
     auto vaapiFrame = std::make_unique<VaapiFrame>();
 
-    // av_frame_clone() refs the VAAPI surface; it stays alive for VaapiFrame's lifetime.
-    // The display thread later releases it after the next pageflip retires the surface.
+    // av_frame_clone() increments the VAAPI surface refcount; surface stays alive until VaapiFrame is destroyed.
     vaapiFrame->avFrame = av_frame_clone(src);
     if (!vaapiFrame->avFrame) [[unlikely]] {
         return nullptr;
     }
 
-    // FFmpeg VAAPI ABI: data[3] holds the VASurfaceID itself, cast through uintptr_t -- it
-    // is NOT a pointer to memory, never dereference it. Surface ownership is via the AVFrame.
+    // FFmpeg VAAPI ABI: data[3] encodes the VASurfaceID directly as a uintptr_t, not a pointer.
+    // Never dereference it; surface lifetime is governed by the AVFrame refcount.
     vaapiFrame->vaSurfaceId =
         static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             vaapiFrame->avFrame->data[3]));
@@ -986,7 +987,7 @@ auto cVaapiDecoder::Action() -> void {
 }
 
 auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
-    // SD DVB streams omit color_description; default to BT.470BG (PAL).
+    // SD DVB streams routinely omit color_description; BT.470BG (PAL) prevents desaturation by scale_vaapi.
     if (decodedFrame->colorspace == AVCOL_SPC_UNSPECIFIED && decodedFrame->height <= 576) {
         decodedFrame->colorspace = AVCOL_SPC_BT470BG;
     }
@@ -995,30 +996,29 @@ auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<Vaap
     const size_t prevOutCount = outFrames.size();
     {
         const cMutexLock vaLock(&display->GetVaDriverMutex());
-        if (!filterGraph) {
+        if (!filterChain.IsBuilt()) {
             (void)InitFilterGraph(decodedFrame.get());
         }
 
-        if (filterGraph && bufferSrcCtx &&
-            av_buffersrc_add_frame_flags(bufferSrcCtx, decodedFrame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+        if (filterChain.IsBuilt() && filterChain.SendFrame(decodedFrame.get()) >= 0) {
             while (true) {
                 av_frame_unref(filteredFrame.get());
-                const int filterRet = av_buffersink_get_frame(bufferSinkCtx, filteredFrame.get());
-                if (filterRet < 0) {
+                if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
                     break;
                 }
                 if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
                     outFrames.push_back(std::move(vaapiFrame));
                 }
             }
-        } else if (!filterGraph) {
+        } else if (!filterChain.IsBuilt()) {
+            // Filter graph failed to build (rare: GPU OOM, driver bug); pass raw frame through unscaled.
             if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
                 outFrames.push_back(std::move(vaapiFrame));
             }
         }
     }
 
-    // rate=field doubles frame count; stamp extra fields at sourcePts + i*frameDur.
+    // bwdif rate=field doubles the frame count; stamp extra output fields at sourcePts + i*frameDur.
     const size_t newOutCount = outFrames.size() - prevOutCount;
     for (size_t i = 0; i < newOutCount; ++i) {
         outFrames.at(prevOutCount + i)->pts =
@@ -1032,8 +1032,8 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     if (!codecCtx) {
         return;
     }
-    // NULL-packet drain is the documented EOS idiom; flush_buffers re-arms the codec
-    // so the next real packet can be sent without a spurious EOF error.
+    // NULL-packet EOS idiom. avcodec_flush_buffers re-arms the codec so the next packet
+    // doesn't receive a spurious AVERROR_EOF.
     (void)avcodec_send_packet(codecCtx.get(), nullptr);
     while (true) {
         av_frame_unref(decodedFrame.get());
@@ -1046,6 +1046,8 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // vaDriverMutex: avcodec_flush_buffers touches the VA driver (VAAPI hwaccel
     // reset); without it the display thread's av_hwframe_map races on iHD.
     {
+        // vaDriverMutex: avcodec_flush_buffers touches the VA driver (VAAPI hwaccel reset);
+        // without it the display thread's av_hwframe_map races on iHD.
         const cMutexLock vaLock(&display->GetVaDriverMutex());
         avcodec_flush_buffers(codecCtx.get());
     }
@@ -1060,30 +1062,28 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     bool anyFrameDecoded = false;
     bool packetSent = false;
 
-    // MPEG-2: width/height arrive only with the sequence header. Drop until then -- the
-    // filter graph cannot be sized without dimensions.
+    // MPEG-2 width/height arrive with the sequence header; filter graph cannot be sized before then.
     if (codecCtx->codec_id == AV_CODEC_ID_MPEG2VIDEO && (codecCtx->width == 0 || codecCtx->height == 0)) {
         return false;
     }
 
-    // EAGAIN = VAAPI surface pool full; drain frames then retry. Single iteration normally.
+    // EAGAIN = VAAPI surface pool full; drain available frames then retry. Normally one iteration.
     while (!packetSent) {
         const int ret = avcodec_send_packet(codecCtx.get(), pkt);
         if (ret == AVERROR(EAGAIN)) {
-            // Fall through to drain; next iteration retries the send.
+            // Fall through to drain loop; next outer iteration retries the send.
         } else {
             if (ret < 0 && ret != AVERROR_EOF) [[unlikely]] {
-                // Hard failure (corrupt HEVC NAL etc.): flush and drop the filter graph
-                // so the next IDR can recover without stale VAAPI surfaces.
-                // vaDriverMutex: avcodec_flush_buffers touches the VA driver;
-                // without it the display thread's av_hwframe_map races on iHD.
+                // Hard failure (corrupt HEVC NAL etc.): flush + reset graph so the next IDR recovers cleanly.
+                // vaDriverMutex: avcodec_flush_buffers touches the VA driver; races av_hwframe_map on iHD.
                 dsyslog("vaapivideo/decoder: send_packet failed: %s -- flushing for recovery", AvErr(ret).data());
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
                 avcodec_flush_buffers(codecCtx.get());
-                ResetFilterGraph();
+                filterChain.Reset();
                 return anyFrameDecoded;
             }
             packetSent = true; // success or EOF; don't retry
+            NoteStarvationTick(pkt);
         }
 
         bool receivedThisIteration = false;
@@ -1103,8 +1103,16 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
                 const char *swFmtName = av_get_pix_fmt_name(ResolveSwPixFmt(decodedFrame.get()));
                 const HdrStreamInfo hdr = ExtractHdrInfo(decodedFrame.get());
-                isyslog("vaapivideo/decoder: first frame %dx%d %s (sw=%s)%s", decodedFrame->width, decodedFrame->height,
-                        fmtName ? fmtName : "unknown", swFmtName ? swFmtName : "unknown",
+                // codecCtx->profile is populated by FFmpeg during SPS/VPS parsing, which
+                // is guaranteed to have happened before the first frame surfaces. At
+                // OpenCodec() time this field is still AV_PROFILE_UNKNOWN and logging it
+                // there is meaningless -- the authoritative value lands here.
+                const AVCodec *openedDecoder = codecCtx ? codecCtx->codec : nullptr;
+                const char *profileName =
+                    openedDecoder ? av_get_profile_name(openedDecoder, codecCtx->profile) : nullptr;
+                isyslog("vaapivideo/decoder: first frame %dx%d %s (sw=%s, profile=%s)%s", decodedFrame->width,
+                        decodedFrame->height, fmtName ? fmtName : "unknown", swFmtName ? swFmtName : "unknown",
+                        profileName ? profileName : "unknown",
                         (decodedFrame->flags & AV_FRAME_FLAG_INTERLACED) ? " interlaced" : "");
                 isyslog("vaapivideo/decoder: colorimetry -- primaries=%d trc=%d space=%d range=%d kind=%s",
                         static_cast<int>(decodedFrame->color_primaries), static_cast<int>(decodedFrame->color_trc),
@@ -1148,27 +1156,26 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 }
             }
 
-            // Filter graph is built lazily on the first frame and after each Clear().
-            // vaDriverMutex serializes VAAPI access against the display thread's DRM export.
+            // vaDriverMutex serializes VAAPI access against the display thread's DRM PRIME export.
+            // Filter graph is built lazily on first frame and after each Clear().
             const int64_t sourcePts = decodedFrame->pts;
             const size_t prevOutCount = outFrames.size();
             {
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
 
-                if (!filterGraph) {
+                if (!filterChain.IsBuilt()) {
                     (void)InitFilterGraph(decodedFrame.get());
                 }
 
-                if (filterGraph) {
-                    if (av_buffersrc_add_frame_flags(bufferSrcCtx, decodedFrame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
-                        [[unlikely]] {
-                        ResetFilterGraph();
+                if (filterChain.IsBuilt()) {
+                    if (filterChain.SendFrame(decodedFrame.get()) < 0) [[unlikely]] {
+                        filterChain.Reset();
                         continue;
                     }
 
                     while (true) {
                         av_frame_unref(filteredFrame.get());
-                        const int filterRet = av_buffersink_get_frame(bufferSinkCtx, filteredFrame.get());
+                        const int filterRet = filterChain.ReceiveFrame(filteredFrame.get());
                         if (filterRet == AVERROR(EAGAIN) || filterRet == AVERROR_EOF) {
                             break;
                         }
@@ -1190,9 +1197,8 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 }
             }
 
-            // rate=field doubles frame count; assign monotonic PTS to the extra fields
-            // (source + i*frameDur). Restricted to [prevOutCount, end) to avoid re-stamping
-            // outputs from earlier receive iterations within the same packet.
+            // bwdif rate=field doubles frame count; assign monotonic PTS to extra fields (source + i*frameDur).
+            // Only stamp [prevOutCount, end) to avoid re-stamping outputs from earlier receive iterations.
             const size_t newOutCount = outFrames.size() - prevOutCount;
             for (size_t i = 0; i < newOutCount; ++i) {
                 outFrames.at(prevOutCount + i)->pts =
@@ -1201,8 +1207,8 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                         : sourcePts;
             }
 
-            // In trick mode, rate=field's first output blends temporally distant fields
-            // (visible green ghosting); drop it and keep the clean second field only.
+            // Trick mode: bwdif rate=field's first output blends temporally distant fields
+            // (visible green ghosting on FF/REW); drop it and keep only the clean second field.
             if (trickSpeed.load(std::memory_order_relaxed) != 0 &&
                 (isTrickFastForward.load(std::memory_order_relaxed) ||
                  isTrickReverse.load(std::memory_order_relaxed)) &&
@@ -1218,9 +1224,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
     }
 
-    // Reverse trick: drain the DPB after each field pair so non-IDR I-frames (broadcast
-    // H.264) produce immediate output instead of accumulating in the reorder buffer.
-    // PAFF: drain only after the second field (non-key) so the pair is complete.
+    // Reverse: drain DPB after each field pair so non-IDR I-frames (broadcast H.264) surface
+    // immediately instead of accumulating in the reorder buffer.
+    // PAFF: trigger only on second field (non-key) so the pair is complete before drain.
     if (trickSpeed.load(std::memory_order_relaxed) != 0 && isTrickReverse.load(std::memory_order_relaxed) &&
         !(pkt->flags & AV_PKT_FLAG_KEY)) {
         const size_t preDrainSize = outFrames.size();
@@ -1230,316 +1236,54 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
     }
 
-    // Do NOT reset the filter graph here: bob is spatial-only (no state leak), and
-    // destroying it would invalidate in-flight VPP surfaces (EIO on PRIME export).
-    // codecDrainPending (still-picture) is handled in Action(), not here -- the drain
-    // must run even when no packet was queued (race with RequestCodecDrain).
+    // Do NOT reset the filter graph here: bob is spatial-only (no temporal state), and
+    // destroying it invalidates in-flight VPP surfaces (EIO on DRM PRIME export).
+    // codecDrainPending is handled in Action() so the drain runs even when no packet was queued.
 
     return anyFrameDecoded;
 }
 
 [[nodiscard]] auto cVaapiDecoder::InitFilterGraph(AVFrame *firstFrame) -> bool {
-    if (filterGraph) {
-        return true;
-    }
-
-    // Previous graph (via ResetFilterGraph) stays alive until the next non-null overwrite
-    // so the display thread can finish mapping outstanding VPP surfaces.
-
+    // Fills BuildParams from decoder/display/config/caps and delegates to cVideoFilterChain::Build().
+    // The filter chain itself has no decoder/display dependencies, so a future mediaplayer
+    // orchestrator can reuse it by supplying different BuildParams.
     if (!display) [[unlikely]] {
         esyslog("vaapivideo/decoder: no display for filter setup");
         return false;
     }
-
     if (!codecCtx) [[unlikely]] {
         esyslog("vaapivideo/decoder: no codec context for filter setup");
         return false;
     }
 
-    const int srcWidth = firstFrame->width;
-    const int srcHeight = firstFrame->height;
-    const bool isInterlaced = (firstFrame->flags & AV_FRAME_FLAG_INTERLACED) != 0;
-    const auto srcPixFmt = static_cast<AVPixelFormat>(firstFrame->format);
-
-    // 1088 (not 1080) catches HD streams that pad height to a 16-pixel macroblock multiple.
-    const bool isUhd = (srcWidth > 1920 || srcHeight > 1088);
-    const bool isSoftwareDecode = (srcPixFmt != AV_PIX_FMT_VAAPI);
-
-    const uint32_t dstWidth = display->GetOutputWidth();
-    const uint32_t dstHeight = display->GetOutputHeight();
-
-    // DRM atomic planes have no HW scaler; compute DAR from SAR for letterbox/pillarbox.
-    const int sarNum = firstFrame->sample_aspect_ratio.num > 0 ? firstFrame->sample_aspect_ratio.num : 1;
-    const int sarDen = firstFrame->sample_aspect_ratio.den > 0 ? firstFrame->sample_aspect_ratio.den : 1;
-
-    const uint64_t darNum = static_cast<uint64_t>(srcWidth) * static_cast<uint64_t>(sarNum);
-    const uint64_t darDen = static_cast<uint64_t>(srcHeight) * static_cast<uint64_t>(sarDen);
-
-    uint32_t filterWidth = dstWidth;
-    uint32_t filterHeight = dstHeight;
-
-    // Integer cross-multiply (no FP): darNum/darDen vs dstWidth/dstHeight.
-    if (darNum * dstHeight > darDen * static_cast<uint64_t>(dstWidth)) {
-        // Source wider than display -> letterbox.
-        filterWidth = dstWidth;
-        filterHeight = static_cast<uint32_t>(static_cast<uint64_t>(dstWidth) * darDen / darNum);
-    } else if (darNum * dstHeight < darDen * static_cast<uint64_t>(dstWidth)) {
-        // Source narrower than display -> pillarbox.
-        filterHeight = dstHeight;
-        filterWidth = static_cast<uint32_t>(static_cast<uint64_t>(dstHeight) * darNum / darDen);
-    }
-
-    // NV12 chroma is 2x2-subsampled; dimensions must be even.
-    filterWidth = std::max(filterWidth & ~1U, 2U);
-    filterHeight = std::max(filterHeight & ~1U, 2U);
-
-    // Denoise/sharpen: off at UHD (GPU-bound), heavy for MPEG-2 SD, light for HD.
-    int denoiseLevel = 0;
-    int sharpnessLevel = 0;
-
-    if (!isUhd) {
-        if (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) {
-            denoiseLevel = 16;
-            sharpnessLevel = 36;
-        } else {
-            denoiseLevel = 6;
-            sharpnessLevel = 30;
-        }
-    }
-
-    const bool needsResize =
-        (filterWidth != static_cast<uint32_t>(srcWidth) || filterHeight != static_cast<uint32_t>(srcHeight));
-
-    // HDR passthrough gate: stream colorimetry + GPU probe + display caps + user HdrMode.
-    // On denied/SDR, stage an explicit SDR descriptor so the display clears any previously-
-    // applied HDR_OUTPUT_METADATA / Colorspace on the next atomic commit.
+    // Classify HDR and stage the passthrough decision on the display BEFORE building the chain
+    // so the next DRM atomic commit carries the correct HDR metadata (or clears it for SDR).
     const HdrStreamInfo hdrInfo = ExtractHdrInfo(firstFrame);
     const bool hdrPassthrough = ShouldUseHdrPassthrough(hdrInfo);
-    if (display) {
-        display->SetHdrOutputState(hdrPassthrough ? hdrInfo : HdrStreamInfo{});
-    }
-    // Output pixel format for every stage that would otherwise force NV12, and scale_vaapi's
-    // color directive. Passed without a leading separator so the call site can pick ':'
-    // (after w=/h=) or '=' (no-resize: "scale_vaapi=<args>").
-    const char *pixFmt = hdrPassthrough ? "p010le" : "nv12";
-    std::string scaleColorArgs;
-    if (hdrPassthrough) {
-        // Pin the output colorimetry; scale_vaapi's "preserve input" default is driver-dependent.
-        const char *transfer = (hdrInfo.kind == StreamHdrKind::Hlg) ? "arib-std-b67" : "smpte2084";
-        scaleColorArgs = std::format(
-            "format={}:out_color_matrix=bt2020nc:out_color_primaries=bt2020:out_color_transfer={}:out_range=tv", pixFmt,
-            transfer);
-    } else {
-        scaleColorArgs = std::format("format={}:out_color_matrix=bt709:out_range=tv", pixFmt);
-    }
+    display->SetHdrOutputState(hdrPassthrough ? hdrInfo : HdrStreamInfo{});
 
-    // VBR DVB streams may report framerate==0; default to 50 fps (DVB-S/T baseline, = 25i).
-    const int fpsNum = codecCtx->framerate.num > 0 ? codecCtx->framerate.num : 50;
-    const int fpsDen = codecCtx->framerate.den > 0 ? codecCtx->framerate.den : 1;
+    cVideoFilterChain::BuildParams params;
+    params.codecId = currentCodecId;
+    params.fpsNum = codecCtx->framerate.num;
+    params.fpsDen = codecCtx->framerate.den;
+    params.hwFramesCtx = codecCtx->hw_frames_ctx;
+    params.hwDeviceRef = vaapiContext->hwDeviceRef;
+    params.outputWidth = display->GetOutputWidth();
+    params.outputHeight = display->GetOutputHeight();
+    params.outputRefreshHz = display->GetOutputRefreshRate();
+    params.hdrPassthrough = hdrPassthrough;
+    params.hdrInfo = hdrInfo;
+    params.hasDenoise = vaapiContext->caps.vppDenoise;
+    params.hasSharpness = vaapiContext->caps.vppSharpness;
+    params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;
+    params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
+    params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
 
-    // rate=field doubles interlaced output (25i -> 50p). Progressive below display refresh
-    // is upconverted via fps (metadata-only, zero-copy). Never downconvert.
-    const int naturalOutputFps = (fpsNum / std::max(fpsDen, 1)) * (isInterlaced ? 2 : 1);
-    const int displayFps = static_cast<int>(display->GetOutputRefreshRate());
-    const bool upconvertProgressive =
-        (!isInterlaced && naturalOutputFps > 0 && displayFps > 0 && naturalOutputFps < displayFps);
-    const int outputFps = upconvertProgressive ? displayFps : naturalOutputFps;
-
-    // Filter chain (comma-joined). SDR path emits NV12 BT.709 TV-range; HDR path emits
-    // P010 BT.2020 with the stream's native PQ/HLG transfer preserved.
-    //   SW: [bwdif] -> [hqdn3d] -> format -> hwupload -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
-    //   HW: [deinterlace_vaapi] -> [denoise_vaapi] -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
-    std::vector<std::string> filters;
-
-    // Trick / still: minimal pipeline (no denoise/sharpen).
-    // Still: skip deinterlacer -- VAAPI VPP holds one frame for timestamp interpolation
-    // and never flushes on EOS, so a single I-frame would never emerge. Minor combing OK.
-    // Trick: bob (spatial-only); the steady cadence absorbs the one-frame delay.
-    const bool isTrickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
-    const bool isStill = stillPictureMode.load(std::memory_order_relaxed);
-    const bool useSimpleDeinterlace = isTrickMode || isStill;
-
-    if (isSoftwareDecode) {
-        if (isInterlaced && !isStill) {
-            if (useSimpleDeinterlace) {
-                // yadif: spatial-only, no temporal priming (bwdif would absorb first I-frame).
-                filters.emplace_back("yadif=mode=send_frame:parity=auto:deint=all");
-            } else {
-                // bwdif (w3fdif+yadif hybrid) beats VAAPI motion_adaptive on Mesa.
-                filters.emplace_back("bwdif=mode=send_field:parity=auto:deint=all");
-            }
-        }
-        if (!useSimpleDeinterlace && denoiseLevel > 0) {
-            // hqdn3d strength: 5 for MPEG-2 (temporal-heavy), 3 for HD (spatial-dominant).
-            const int hqdn3dStrength = (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) ? 5 : 3;
-            filters.push_back(std::format("hqdn3d={}", hqdn3dStrength));
-        }
-        filters.push_back(std::format("format={}", pixFmt));
-        filters.emplace_back("hwupload");
-    } else {
-        if (isInterlaced && !isStill && !vaapiContext->deinterlaceMode.empty()) {
-            if (isTrickMode) {
-                // bob: spatial-only, immediate output from a single input frame.
-                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame");
-            } else {
-                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", vaapiContext->deinterlaceMode));
-            }
-        }
-        if (!useSimpleDeinterlace && denoiseLevel > 0 && vaapiContext->hasDenoise) {
-            filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
-        }
-    }
-
-    // scale_vaapi unconditional: SDR path normalizes to NV12 BT.709 TV-range; HDR path
-    // preserves BT.2020 primaries and the stream's PQ/HLG transfer at 10-bit P010.
-    if (needsResize) {
-        const char *scaleMode = isUhd ? "" : ":mode=hq"; // hq (bicubic) too expensive at UHD
-        filters.push_back(
-            std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleMode, scaleColorArgs));
-    } else {
-        filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
-    }
-
-    if (!useSimpleDeinterlace && sharpnessLevel > 0 && vaapiContext->hasSharpness) {
-        filters.push_back(std::format("sharpness_vaapi=sharpness={}", sharpnessLevel));
-    }
-
-    if (!useSimpleDeinterlace && upconvertProgressive) {
-        // fps last: scale/sharpen run once per input frame; only metadata is duplicated.
-        filters.push_back(std::format("fps={}", displayFps));
-    }
-
-    std::string filterChain;
-    for (const auto &filter : filters) {
-        if (!filterChain.empty()) {
-            filterChain += ',';
-        }
-        filterChain += filter;
-    }
-
-    filterGraph.reset(avfilter_graph_alloc());
-    if (!filterGraph) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to allocate filter graph");
+    if (!filterChain.Build(firstFrame, params)) {
         return false;
     }
 
-    // Numeric pix_fmt: symbolic aliases vary across FFmpeg versions for HW formats.
-    const std::string bufferSrcArgs =
-        std::format("video_size={}x{}:pix_fmt={}:time_base=1/90000:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
-                    srcHeight, static_cast<int>(srcPixFmt), sarNum, sarDen, fpsNum, fpsDen);
-
-    dsyslog("vaapivideo/decoder: buffer source args='%s'", bufferSrcArgs.c_str());
-
-    // alloc_filter: hw_frames_ctx must be attached before init (FFmpeg 7.x rejects without).
-    bufferSrcCtx = avfilter_graph_alloc_filter(filterGraph.get(), avfilter_get_by_name("buffer"), "in");
-    if (!bufferSrcCtx) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to allocate buffer source filter");
-        ResetFilterGraph();
-        return false;
-    }
-
-    // HW decode: buffer source needs hw_frames_ctx to recognize VAAPI surfaces.
-    if (!isSoftwareDecode) {
-        AVBufferSrcParameters *hwFramesParams = av_buffersrc_parameters_alloc();
-        if (!hwFramesParams) [[unlikely]] {
-            esyslog("vaapivideo/decoder: failed to allocate buffer source parameters");
-            ResetFilterGraph();
-            return false;
-        }
-
-        hwFramesParams->hw_frames_ctx = av_buffer_ref(codecCtx->hw_frames_ctx);
-        if (!hwFramesParams->hw_frames_ctx) [[unlikely]] {
-            esyslog("vaapivideo/decoder: av_buffer_ref(hw_frames_ctx) failed");
-            av_free(hwFramesParams);
-            ResetFilterGraph();
-            return false;
-        }
-        if (const int setRet = av_buffersrc_parameters_set(bufferSrcCtx, hwFramesParams); setRet < 0) [[unlikely]] {
-            esyslog("vaapivideo/decoder: av_buffersrc_parameters_set failed: %s", AvErr(setRet).data());
-            av_free(hwFramesParams);
-            ResetFilterGraph();
-            return false;
-        }
-        // parameters_set transfers the hw_frames_ctx ref; only free the struct.
-        av_free(hwFramesParams);
-    }
-
-    int ret = avfilter_init_str(bufferSrcCtx, bufferSrcArgs.c_str());
-    if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to init buffer source '%s': %s", bufferSrcArgs.c_str(), AvErr(ret).data());
-        ResetFilterGraph();
-        return false;
-    }
-
-    ret = avfilter_graph_create_filter(&bufferSinkCtx, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr,
-                                       filterGraph.get());
-    if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to create buffer sink: %s", AvErr(ret).data());
-        ResetFilterGraph();
-        return false;
-    }
-
-    // FFmpeg I/O naming is from the graph string's POV: outputs -> src, inputs -> sink.
-    AVFilterInOut *graphInputs = avfilter_inout_alloc();
-    AVFilterInOut *graphOutputs = avfilter_inout_alloc();
-    if (!graphInputs || !graphOutputs) [[unlikely]] {
-        avfilter_inout_free(&graphInputs);
-        avfilter_inout_free(&graphOutputs);
-        ResetFilterGraph();
-        return false;
-    }
-
-    graphOutputs->name = av_strdup("in");
-    graphOutputs->filter_ctx = bufferSrcCtx;
-
-    graphInputs->name = av_strdup("out");
-    graphInputs->filter_ctx = bufferSinkCtx;
-
-    if (!graphOutputs->name || !graphInputs->name) [[unlikely]] {
-        avfilter_inout_free(&graphInputs);
-        avfilter_inout_free(&graphOutputs);
-        ResetFilterGraph();
-        return false;
-    }
-
-    ret = avfilter_graph_parse_ptr(filterGraph.get(), filterChain.c_str(), &graphInputs, &graphOutputs, nullptr);
-    avfilter_inout_free(&graphInputs);
-    avfilter_inout_free(&graphOutputs);
-
-    if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to parse filter chain '%s': %s", filterChain.c_str(), AvErr(ret).data());
-        ResetFilterGraph();
-        return false;
-    }
-
-    // SW decode: all nodes need hwDeviceRef, not just hwupload (scale/sharpen resolve via it).
-    if (isSoftwareDecode) {
-        for (unsigned int i = 0; i < filterGraph->nb_filters; ++i) {
-            filterGraph->filters[i]->hw_device_ctx = av_buffer_ref(vaapiContext->hwDeviceRef);
-            if (!filterGraph->filters[i]->hw_device_ctx) [[unlikely]] {
-                esyslog("vaapivideo/decoder: av_buffer_ref(hwDeviceRef) failed for filter %u", i);
-                ResetFilterGraph();
-                return false;
-            }
-        }
-    }
-
-    ret = avfilter_graph_config(filterGraph.get(), nullptr);
-    if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/decoder: failed to configure filter graph '%s': %s", filterChain.c_str(),
-                AvErr(ret).data());
-        ResetFilterGraph();
-        return false;
-    }
-
-    // Sync parameters: frame duration for the A/V controller.
-    outputFrameDurationMs = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20;
-
-    isyslog("vaapivideo/decoder: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
-            filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "",
-            upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "", pixFmt,
-            hdrPassthrough ? StreamHdrKindName(hdrInfo.kind) : "SDR");
-    dsyslog("vaapivideo/decoder: filter chain='%s'", filterChain.c_str());
+    outputFrameDurationMs = filterChain.GetOutputFrameDurationMs(); // drives pacing in SyncAndSubmitFrame.
     return true;
 }
 
@@ -1551,53 +1295,42 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     if (userMode == HdrMode::Off) {
         return false;
     }
-    // P010 VAAPI surfaces are the only GPU-side requirement: SW HEVC Main 10 decode is an
-    // accepted fallback via `format=p010le; hwupload` when the GPU lacks HW Main 10 decode.
-    if (!vaapiContext->hasP010 || !display) {
+    // vppP010 is the GPU-side minimum: SW HEVC Main10 decode uploads via `format=p010le; hwupload`.
+    if (!vaapiContext->caps.vppP010 || !display) {
         return false;
     }
-    // HdrMode::On skips the sink EDID gate but still refuses configurations that would
-    // produce partial HDR signalling (black screen). Auto adds the EDID EOTF check on top.
+    // On: skip EDID gate, but still refuse if CanDriveHdrPlane() would produce black (partial HDR signals).
+    // Auto: additionally checks EDID EOTF for the specific kind (PQ/HLG).
     return (userMode == HdrMode::On) ? display->CanDriveHdrPlane() : display->SupportsHdrPassthrough(info.kind);
-}
-
-auto cVaapiDecoder::ResetFilterGraph() -> void {
-    bufferSrcCtx = nullptr;
-    bufferSinkCtx = nullptr;
-    // Keep the old graph alive: its hw_frames_ctx keeps VPP output surfaces PRIME-exportable
-    // until the display thread finishes mapping them. Destroying now causes -EIO on iHD.
-    // Guard: double-reset (Clear -> drain -> EOS) must not null-out the saved graph.
-    if (filterGraph) {
-        previousFilterGraph = std::move(filterGraph);
-    }
 }
 
 [[nodiscard]] auto cVaapiDecoder::SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
     const int64_t pts = frame->pts;
     const int64_t prevPts = prevTrickPts.load(std::memory_order_relaxed);
 
-    // Reverse trick: GOPs arrive backward but frames within each GOP are in decode order.
-    // Show only the first (lowest-PTS) frame per GOP; drop the rest.
+    // Reverse: GOPs arrive backward; frames within a GOP are in decode (ascending PTS) order.
+    // Show only the first (lowest-PTS) frame per GOP; skip the rest.
     if (isTrickReverse.load(std::memory_order_relaxed) && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE &&
         pts > prevPts) {
         return true;
     }
 
-    // Deinterlaced field pairs share PTS; pace once per source frame, pass the second field.
+    // Deinterlaced field pairs share source PTS; pace once per source frame, pass both fields.
     if (pts != prevPts) {
         prevTrickPts.store(pts, std::memory_order_relaxed);
         if (pts != AV_NOPTS_VALUE) {
             lastPts.store(pts, std::memory_order_release);
         }
 
-        // Wait for the pacing deadline, then arm the next one.
+        // Block until pacing deadline, then arm the next one.
         const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
         while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
                trickSpeed.load(std::memory_order_relaxed) != 0) {
             cCondWait::SleepMs(10);
         }
 
-        // Fast: hold = ptsDelta/90/mult clamped to [10,2000] ms. Slow: precomputed trickHoldMs.
+        // Fast: hold = |ptsDelta| / 90 / mult, clamped to [10, 2000] ms.
+        // Slow: precomputed trickHoldMs = speed * TRICK_HOLD_MS.
         const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
         if (mult > 0 && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
             const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
@@ -1615,12 +1348,12 @@ auto cVaapiDecoder::ResetFilterGraph() -> void {
 auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta) -> void {
     dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio", static_cast<long long>(delta / 90));
 
-    // Hard cap: delta + 1 s headroom, max 5 s, so a dead audio path can't block forever.
+    // Cap = delta + 1 s headroom, max 5 s: prevents a dead audio path from blocking indefinitely.
     const int64_t maxWaitMs = std::min<int64_t>((delta / 90) + 1000, 5000LL);
     const cTimeMs deadline(static_cast<int>(maxWaitMs));
 
     while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
-        // Clear() / channel-switch arms freerunFrames; our held frame is now stale.
+        // A Clear() / channel-switch arms freerunFrames; bail so the new clock domain starts fresh.
         if (freerunFrames.load(std::memory_order_relaxed) > 0) {
             break;
         }
@@ -1637,9 +1370,9 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncLatency90k(const cAudioProcessor *ap) const noexcept -> int64_t {
-    // PCM vs passthrough latency knob + constant 2-frame tail (1 VSync pipeline + 1 HDMI
-    // link lag). The 2-frame model zeros the default bias; operators only need non-zero
-    // knobs for unusual TV input lag (gaming-mode: +ms; movie mode ~50 ms: -ms).
+    // User knob (PCM or passthrough) + 2-frame pipeline constant (decoder->scanout + HDMI link).
+    // The 2-frame model zeroes the default bias so knobs only need adjustment for unusual displays
+    // (gaming mode: positive; movie-mode ~50 ms input lag: negative).
     const int latencyMs = (ap && ap->IsPassthrough()) ? vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)
                                                       : vaapiConfig.pcmLatency.load(std::memory_order_relaxed);
     return (static_cast<int64_t>(latencyMs) + (2 * static_cast<int64_t>(outputFrameDurationMs))) * 90;
@@ -1660,11 +1393,10 @@ auto cVaapiDecoder::ResetSmoothedDelta() noexcept -> void {
 }
 
 auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
-    // Two-phase: warmup N-sample mean seeds the EMA (cuts deinterlaced-50p oscillation bias);
-    // then residual-accumulator EMA, alpha=1/EMA_SAMPLES.
-    // INVARIANT: call exactly once per output frame; a second call site alters reaction time.
-
-    // Feed the log-interval mean ("d=" in LogSyncStats).
+    // Phase 1: N-sample mean seeds the EMA. Cuts the oscillation bias from deinterlaced 50p
+    //          where alternating field timestamps skew early samples.
+    // Phase 2: residual-accumulator EMA, alpha=1/EMA_SAMPLES.
+    // INVARIANT: call exactly once per output frame; a second call site changes the reaction time.
     rawDeltaSumSinceLog90k += rawDelta90k;
     ++rawDeltaCountSinceLog;
 
@@ -1681,8 +1413,7 @@ auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
         emaResidual90k = 0;
         return;
     }
-    // Residual-accumulator EMA: accumulate into emaResidual90k and apply whole-tick steps
-    // when the residual crosses N; avoids integer truncation stall on small diffs.
+    // Residual accumulator: avoids integer truncation stall when |diff| < EMA_SAMPLES ticks.
     const int64_t diff = rawDelta90k - smoothedDelta90k;
     emaResidual90k += diff;
     const int64_t step = emaResidual90k / DECODER_SYNC_EMA_SAMPLES;
@@ -1691,17 +1422,16 @@ auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
 }
 
 auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const cAudioProcessor *ap) -> void {
-    // Suppress during warmup. Check BEFORE consuming syncLogPending: a Clear()-armed
-    // request must survive warmup so the first post-warmup line fires immediately
-    // even when the periodic timer hasn't yet expired.
+    // Suppress during EMA warmup. syncLogPending must be checked AFTER the warmup guard so
+    // a Clear()-armed request survives warmup and fires immediately on the first post-warmup frame.
     if (!smoothedDeltaValid) {
         return;
     }
     if (!(syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut())) {
         return;
     }
-    // d= interval mean (not point sample); lat= SyncLatency90k (2*frameDur + user knob).
-    // If bumping the knob doesn't move lat=, the stream uses the other path (PCM vs PT).
+    // d= interval mean (not point sample). lat= SyncLatency90k (2*frameDur + user knob).
+    // If bumping the knob leaves lat= unchanged, the stream is using the other path (PCM vs PT).
     const int64_t meanRawDelta90k =
         (rawDeltaCountSinceLog > 0) ? (rawDeltaSumSinceLog90k / rawDeltaCountSinceLog) : rawDelta90k;
     const auto meanTenths = static_cast<long long>(meanRawDelta90k * 10 / 90);
@@ -1720,13 +1450,13 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
 }
 
 auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
-    // Bulk-drop heads more than HARD_THRESHOLD behind the clock. Faster than SyncAndSubmitFrame's
-    // one-by-one path after backlogs (decode stall, USB audio re-sync). Keeps >= 1 frame.
+    // Bulk-drop heads more than HARD_THRESHOLD behind the clock; faster than SyncAndSubmitFrame's
+    // one-by-one path after a decode stall or USB audio re-sync. Always keeps >= 1 frame.
     const int64_t latency = SyncLatency90k(ap);
     int dropped = 0;
     int64_t firstDelta90k = 0;
-    // In catch-up mode: drop the whole buffer silently -- the summary line is emitted by
-    // SyncAndSubmitFrame on catch-up exit. Normal mode keeps >=1 frame so display isn't starved.
+    // During catch-up: drop the entire buffer silently (summary logged by SyncAndSubmitFrame on exit).
+    // Normal mode: keep >=1 frame to avoid starving the display.
     const bool silent = catchingUp;
     while ((silent ? !jitterBuf.empty() : jitterBuf.size() > 1) && !stopping.load(std::memory_order_relaxed)) {
         if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
@@ -1736,7 +1466,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         if (clock == AV_NOPTS_VALUE) {
             break;
         }
-        // Inside the hard window; soft corridor handles the residual.
+        // Stop dropping once inside the hard window; soft corridor handles the residual.
         const int64_t currentDelta = jitterBuf.front()->pts - clock - latency;
         if (currentDelta >= -DECODER_SYNC_HARD_THRESHOLD) {
             break;
@@ -1759,14 +1489,9 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
-    // A/V sync gate (audio-master). See AVSYNC.md. Four regimes:
-    //   bypass:   trick / freerun / NOPTS -> submit immediately
-    //   catch-up: raw < -2*HARD_THRESHOLD -> silent bulk drop until raw > -HARD_THRESHOLD
-    //   hard:     |raw| > HARD_THRESHOLD  -> behind: drop; ahead: replay block / live big sleep
-    //   soft:     |EMA| > CORRIDOR, cooldown OK, cap MAX_CORRECTION
-    //               behind -> drop round(ms/frameDur); ahead -> sleep(correctMs + frameDur)
-    // Soft adjusts EMA by *measured* effect (drop: +=frameDur*90; sleep: -=(elapsed-frameDur)*90).
-    // One event per COOLDOWN (5 s = 5 tau). MAX_CORRECTION = HARD_THRESHOLD so one event clears the corridor.
+    // Audio-master A/V sync gate. See AVSYNC.md for the full state diagram.
+    // Soft adjusts EMA by the *measured* effect (drop: +frameDur*90; sleep: -(elapsed-frameDur)*90).
+    // MAX_CORRECTION = HARD_THRESHOLD so a single event clears any in-corridor offset.
 
     if (!frame || !display) [[unlikely]] {
         return false;
@@ -1774,10 +1499,10 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
 
     const int64_t pts = frame->pts;
 
-    // --- Trick mode: SubmitTrickFrame() owns pacing; audio is muted. ---
+    // --- Trick mode ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
         if (trickExitPending.exchange(false, std::memory_order_acquire)) {
-            // Play()-without-TrickSpeed(0): clear flags, arm freerun while audio re-anchors.
+            // Play()-without-TrickSpeed(0): clear trick flags, arm freerun while audio re-anchors.
             trickSpeed.store(0, std::memory_order_relaxed);
             isTrickReverse.store(false, std::memory_order_relaxed);
             isTrickFastForward.store(false, std::memory_order_relaxed);
@@ -1789,7 +1514,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         }
     }
 
-    // Still picture: no audio to sync against; stale clock would drop/delay the frame.
+    // Still picture: no audio clock to sync against; sync logic would erroneously drop/delay it.
     if (stillPictureMode.load(std::memory_order_relaxed)) {
         if (pts != AV_NOPTS_VALUE) {
             lastPts.store(pts, std::memory_order_release);
@@ -1797,24 +1522,22 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Publish latest valid PTS for lock-free observers (still detection, position query).
+    // Publish PTS for lock-free readers (still detection, position query via GetLastPts).
     if (pts != AV_NOPTS_VALUE) {
         lastPts.store(pts, std::memory_order_release);
     }
 
-    // Freerun: no audio processor, no PTS, or inside post-Clear/trick-exit window.
+    // Freerun bypass: no audio processor, no PTS, or inside the post-Clear / trick-exit window.
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
     if (!ap || pts == AV_NOPTS_VALUE) {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
-        // Neutralize any pre-freerun transient state: pendingDrops, pending "first spike" or
-        // an in-flight catch-up pass from before the Clear() / NotifyAudioChange() /
-        // trick-exit event must not bleed into the first post-freerun sample. Without the
-        // pendingDrops reset a soft-behind burst in flight from the old clock domain would
-        // drop the first fresh-era frame before rawDelta can be reevaluated (the due-gate
-        // bypasses on pendingDrops, so the normal "no clock" cleanup never fires here).
+        // Reset pre-freerun transient state so it doesn't bleed into the new clock domain.
+        // Without the pendingDrops reset, a soft-behind burst from the old domain would drop the
+        // first fresh-era frame before rawDelta can be re-evaluated (due-gate bypasses on pendingDrops,
+        // so the "no clock" path below never fires when pendingDrops > 0).
         pendingDrops = 0;
         hardAheadStreak = 0;
         hardBehindStreak = 0;
@@ -1823,13 +1546,12 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Snapshot latency once; a mid-frame PCM<->passthrough flip must not change it.
+    // Snapshot latency once per frame; a mid-frame PCM<->passthrough flip must not change it.
     const int64_t latency = SyncLatency90k(ap);
     const int64_t clock = ap->GetClock();
     if (clock == AV_NOPTS_VALUE) {
-        // No clock yet (stall / codec swap / device reset): freerun, discard all pre-loss
-        // transient state. ALSA resets and discontinuous external sources that bypass
-        // Clear()/NotifyAudioChange() rely on this path to re-zero the controller.
+        // No clock: ALSA reset, codec swap, or device reset. Freerun and zero controller state.
+        // Discontinuous external sources that skip Clear()/NotifyAudioChange() rely on this path.
         pendingDrops = 0;
         hardAheadStreak = 0;
         hardBehindStreak = 0;
@@ -1842,8 +1564,8 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     }
 
-    // Prior correction burst: one drop per call; pts advances by frameDur, clock steady.
-    // No per-residual dsyslog -- the triggering soft-behind line already reports the burst count.
+    // Consume one pending drop from a previous soft-behind burst; PTS advances, clock doesn't.
+    // No extra log line: the triggering soft-behind entry already reported the burst count.
     if (pendingDrops > 0) {
         --pendingDrops;
         smoothedDelta90k += static_cast<int64_t>(outputFrameDurationMs) * 90;
@@ -1851,22 +1573,16 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         return true;
     }
 
-    // rawDelta: instantaneous A/V error (>0 = video ahead); EMA filters jitter for soft corridor.
+    // rawDelta > 0 = video ahead of audio. EMA is updated only outside catch-up regime
+    // so spike-driven drops don't poison the smoother (see AVSYNC.md).
     const int64_t rawDelta = pts - clock - latency;
 
-    // Catch-up mode: catastrophic backlog (startup with slow decode prime, post-seek, long stall,
-    // or a hardware-limited decoder whose audio side suddenly publishes a large forward clock
-    // jump -- e.g. 4K HEVC on a CPU-constrained box). Drop silently without per-event log /
-    // EMA churn / cooldown reset until delta returns to inside the soft corridor. Entry at
-    // 2x HARD_THRESHOLD so a single-sample spike can't trip it; exit at -CORRIDOR so the
-    // residual is already within the soft corridor -- no post-catch-up soft correction needed
-    // and no cooldown wait for one. Earlier designs exited at -HARD_THRESHOLD, which left a
-    // ~180 ms residual that persisted for the full COOLDOWN (5 s) because soft was still
-    // gated by cooldown+warmup; the tighter exit costs ~8 additional silent drops and buys
-    // us clean state on re-entry. Hysteresis: entry=400 ms, exit=40 ms -> 360 ms gap, well
-    // above any credible single-sample clock jitter.
-    // Gate the EMA/log feed below so catch-up spikes never pollute either: AVSYNC.md requires
-    // the controller to treat catch-up as a separate regime.
+    // Catch-up: filter-bypass bulk drop until delta returns inside the soft corridor.
+    //   Spike entry:    rawDelta < -2*HARD_THRESHOLD (~-400 ms). 2x guards against a lone outlier.
+    //   Sustained entry: smoothedDelta < -2*CORRIDOR (~-60 ms): replay queue lag that soft-behind's
+    //     cooldown-gated +20 ms/event can't clear as fast as VDR refills. EMA + warmup gate this trip.
+    //   Exit: rawDelta > -CORRIDOR. Hysteresis: -60 ms entry vs -30 ms exit; ResetSmoothedDelta
+    //   forces ~1 s EMA warmup before re-entry, preventing ping-pong across the gap.
     if (catchingUp) {
         if (rawDelta > -DECODER_SYNC_CORRIDOR) {
             dsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms", catchUpDrops,
@@ -1874,11 +1590,8 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                     static_cast<long long>(rawDelta / 90));
             catchingUp = false;
             catchUpDrops = 0;
-            ResetSmoothedDelta();
+            ResetSmoothedDelta(); // warmup alone gates soft until EMA reseeds; no follow-up event needed.
             pendingDrops = 0;
-            // No syncCooldown.Set(): residual is inside the corridor, so soft cannot fire
-            // anyway; warmup (~1 s) alone keeps soft quiescent while the EMA reseeds.
-            // Fall through: this frame is now in-range, submit it normally.
         } else {
             ++catchUpDrops;
             ++syncDropSinceLog;
@@ -1889,18 +1602,25 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpStartMs = cTimeMs::Now();
         catchUpDrops = 1;
         ++syncDropSinceLog;
-        dsyslog("vaapivideo/decoder: catch-up entered raw=%+lldms", static_cast<long long>(rawDelta / 90));
+        dsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms", static_cast<long long>(rawDelta / 90));
+        return true;
+    } else if (smoothedDeltaValid && smoothedDelta90k < -2 * DECODER_SYNC_CORRIDOR) {
+        catchingUp = true;
+        catchUpStartMs = cTimeMs::Now();
+        catchUpDrops = 1;
+        ++syncDropSinceLog;
+        dsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
+                static_cast<long long>(smoothedDelta90k / 90), static_cast<long long>(rawDelta / 90));
         return true;
     }
 
     UpdateSmoothedDelta(rawDelta);
     LogSyncStats(rawDelta, latency, ap);
 
-    // Hard-behind (stream gap): batch-drop to close the gap, reset EMA. Debounced so a lone
-    // GetClock / snd_pcm_delay outlier can't wipe ~1 s of EMA. Batch (vs one frameDur) because
-    // a single drop leaves ~HARD_THRESHOLD residual pinned for the 5 s soft cooldown; instead
-    // pendingDrops + warmup serialize further events, and warmup reseeds inside the corridor
-    // so soft is a no-op.
+    // Hard-behind: batch-drop to close the gap; reset EMA. 2-sample debounce guards against lone
+    // GetClock/snd_pcm_delay outliers that would wipe ~1 s of EMA. Batch (vs single frameDur) because
+    // a single drop leaves ~HARD_THRESHOLD residual pinned for the 5 s cooldown; pendingDrops + warmup
+    // serialize follow-up events and warmup reseeds inside the corridor so soft stays a no-op.
     if (rawDelta < -DECODER_SYNC_HARD_THRESHOLD) [[unlikely]] {
         if (++hardBehindStreak < 2) {
             return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
@@ -1918,11 +1638,10 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     }
     hardBehindStreak = 0;
 
-    // Pre-sleep timestamp for the post-submit EMA adjustment; 0 = no sleep happened.
-    uint64_t preSleepMs = 0;
+    uint64_t preSleepMs = 0; // non-zero if a sleep occurred; used for post-submit EMA correction.
 
-    // Hard-ahead: replay blocks on audio (WaitForAudioCatchUp); live sleeps <= HARD_AHEAD_MAX_MS.
-    // Debounced like hard-behind -- avoids a 500 ms freeze on a lone snd_pcm_delay outlier.
+    // Hard-ahead: replay blocks via WaitForAudioCatchUp; live sleeps <= HARD_AHEAD_MAX_MS.
+    // 2-sample debounce same as hard-behind: avoids a 500 ms freeze on a lone snd_pcm_delay spike.
     if (rawDelta > DECODER_SYNC_HARD_THRESHOLD) {
         if (++hardAheadStreak < 2) {
             return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
@@ -1950,9 +1669,9 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         hardAheadStreak = 0;
     }
 
-    // Soft corridor: proportional correction capped at MAX_CORRECTION, rate-limited by cooldown.
-    // Ahead sleeps (correctMs + frameDur): the extra frameDur compensates for the normal
-    // iteration period so the net shift equals correctMs. Measured post-hoc via elapsed.
+    // Soft corridor: proportional correction, capped at MAX_CORRECTION, rate-limited by cooldown.
+    // Ahead sleeps (correctMs + frameDur): extra frameDur compensates for the normal iteration period
+    // so the net shift equals correctMs. Measured post-hoc via elapsed for EMA feedback.
     if (syncCooldown.TimedOut() && smoothedDeltaValid) {
         const int64_t absDelta90k = smoothedDelta90k < 0 ? -smoothedDelta90k : smoothedDelta90k;
         if (absDelta90k > DECODER_SYNC_CORRIDOR) {
@@ -1963,7 +1682,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                 // Behind: drop N frames (round-to-nearest); one now, rest via pendingDrops.
                 const int totalDrops = std::max(1, (correctMs + (outputFrameDurationMs / 2)) / outputFrameDurationMs);
                 pendingDrops = totalDrops - 1;
-                // Snapshot before pre-compensation so the log shows the value that tripped the corridor.
+                // Log the pre-correction EMA so the "avg=" field shows what tripped the corridor.
                 const auto triggerAvgMs = static_cast<long long>(smoothedDelta90k / 90);
                 smoothedDelta90k += static_cast<int64_t>(outputFrameDurationMs) * 90;
                 ++syncDropSinceLog;
@@ -1973,7 +1692,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                         totalDrops);
                 return true;
             }
-            // Ahead: sleep once; EMA updated from measured elapsed after SubmitFrame.
+            // Ahead: sleep once; EMA feedback applied from measured elapsed after SubmitFrame.
             preSleepMs = cTimeMs::Now();
             cCondWait::SleepMs(correctMs + outputFrameDurationMs);
             ++syncSkipSinceLog;
@@ -1985,7 +1704,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
 
     const bool submitted = display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
     if (preSleepMs != 0) {
-        // Effective shift = elapsed - frameDur; std::max guards unsigned underflow.
+        // EMA feedback: subtract measured shift (elapsed - frameDur); std::max guards underflow.
         const auto elapsedMs = static_cast<int>(cTimeMs::Now() - preSleepMs);
         const int extraMs = std::max(0, elapsedMs - outputFrameDurationMs);
         smoothedDelta90k -= static_cast<int64_t>(extraMs) * 90;

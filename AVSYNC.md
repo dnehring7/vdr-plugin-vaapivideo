@@ -87,7 +87,7 @@ fire, catch-up exit and `WaitForAudioCatchUp`.
 Symmetric: every regime has a behind and an ahead path. Hard transients
 bypass the cooldown.
 
-### Soft corridor — `|smoothed| > CORRIDOR (40 ms)`, cooldown elapsed
+### Soft corridor — `|smoothed| > CORRIDOR (30 ms)`, cooldown elapsed
 
 Let `correctMs = min(|smoothed|/90, MAX_CORRECTION_MS = 200)`.
 
@@ -108,11 +108,12 @@ post-correction `d ≈ 0` reliably reproducible.
 
 `MAX_CORRECTION_MS = HARD_THRESHOLD = 200` so a single soft event can
 fully close the corridor; no sub-corridor residual is left for the
-controller to refuse-fire on. `CORRIDOR = 40` sits above the IEC61937
-EMA noise envelope (snd_pcm_delay quantises AC-3 in 1536-sample bursts
-≈ 32 ms) and below the human perceptual threshold (~80 ms). A narrower
-corridor would re-fire on quantization noise; a wider one would let
-genuine drift accumulate.
+controller to refuse-fire on. `CORRIDOR = 30 ms` sits above the
+EMA-smoothed envelope of `snd_pcm_delay`'s IEC61937 quantization noise
+(raw AC-3 bursts of 1536 samples ≈ 32 ms, heavily attenuated by the
+50-sample EMA in steady state) and below the human perceptual threshold
+(~80 ms). A narrower corridor would re-fire on residual quantization
+noise; a wider one would let genuine drift accumulate.
 
 ### Cooldown
 
@@ -159,7 +160,7 @@ vaapivideo/decoder: catch-up entered raw=-2738ms
 vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms
 ```
 
-Hysteresis is entry −400 ms vs exit −40 ms (360 ms gap), well above any
+Hysteresis is entry −400 ms vs exit −30 ms (370 ms gap), well above any
 single-sample clock jitter. The exit at `-CORRIDOR` (rather than
 `-HARD_THRESHOLD`) places the residual inside the soft corridor so no
 follow-up soft event is required; a tighter exit avoids a visible
@@ -321,18 +322,18 @@ Sync constants live at file scope in [src/decoder.cpp](src/decoder.cpp);
 the cushion floor sits in [src/audio.cpp](src/audio.cpp). Each carries a
 `///<` comment with purpose and unit.
 
-| Constant                         | Value | Purpose                                                                |
-| -------------------------------- | ----- | ---------------------------------------------------------------------- |
+| Constant                         | Value | Purpose                                                                 |
+| -------------------------------- | ----- | ----------------------------------------------------------------------- |
 | `AUDIO_ALSA_BUFFER_MS`           | 400   | ALSA ring size (ms); lagged audio clock pulls video buf to ~MS/frameDur |
-| `DECODER_SYNC_HARD_THRESHOLD`    | 200   | Raw-delta threshold for hard transients (ms); 2× = catch-up entry      |
-| `DECODER_SYNC_CORRIDOR`          | 40    | Soft corridor half-width (ms); above AC-3 EMA noise envelope           |
-| `DECODER_SYNC_MAX_CORRECTION_MS` | 200   | Soft-event cap (= HARD_THRESHOLD) so one event fully closes corridor   |
-| `HARD_AHEAD_MAX_MS` *(local)*    | 500   | Live hard-ahead sleep cap (ms)                                         |
-| `DECODER_SYNC_COOLDOWN_MS`       | 5000  | Min interval between soft corrections (= 5 EMA time constants)         |
-| `DECODER_SYNC_EMA_SAMPLES`       | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence  |
-| `DECODER_SYNC_WARMUP_SAMPLES`    | 50    | Samples averaged before EMA seed (~1 s @ 50 fps)                       |
-| `DECODER_SYNC_FREERUN_FRAMES`    | 1     | Unpaced frames after sync-disrupting events                            |
-| `DECODER_SYNC_LOG_INTERVAL_MS`   | 2000  | Periodic sync diagnostic interval (ms)                                 |
-| `DECODER_QUEUE_CAPACITY`         | 200   | Video packet queue depth (~4 s @ 50 fps)                               |
-| `AUDIO_CLOCK_STALE_MS`           | 1000  | `GetClock()` extrapolation timeout before returning NOPTS              |
-| `AUDIO_QUEUE_CAPACITY`           | 300   | Audio packet queue depth (~10 s AC-3); sized for slow-start decoders   |
+| `DECODER_SYNC_HARD_THRESHOLD`    | 200   | Raw-delta threshold for hard transients (ms); 2× = catch-up entry       |
+| `DECODER_SYNC_CORRIDOR`          | 30    | Soft corridor half-width (ms); above EMA-smoothed IEC61937 quantization |
+| `DECODER_SYNC_MAX_CORRECTION_MS` | 200   | Soft-event cap (= HARD_THRESHOLD) so one event fully closes corridor    |
+| `HARD_AHEAD_MAX_MS` *(local)*    | 500   | Live hard-ahead sleep cap (ms)                                          |
+| `DECODER_SYNC_COOLDOWN_MS`       | 5000  | Min interval between soft corrections (= 5 EMA time constants)          |
+| `DECODER_SYNC_EMA_SAMPLES`       | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence   |
+| `DECODER_SYNC_WARMUP_SAMPLES`    | 50    | Samples averaged before EMA seed (~1 s @ 50 fps)                        |
+| `DECODER_SYNC_FREERUN_FRAMES`    | 1     | Unpaced frames after sync-disrupting events                             |
+| `DECODER_SYNC_LOG_INTERVAL_MS`   | 2000  | Periodic sync diagnostic interval (ms)                                  |
+| `DECODER_QUEUE_CAPACITY`         | 200   | Video packet queue depth (~4 s @ 50 fps)                                |
+| `AUDIO_CLOCK_STALE_MS`           | 1000  | `GetClock()` extrapolation timeout before returning NOPTS               |
+| `AUDIO_QUEUE_CAPACITY`           | 300   | Audio packet queue depth (~10 s AC-3); sized for slow-start decoders    |

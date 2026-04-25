@@ -2,13 +2,7 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file config.cpp
- * @brief Plugin configuration: resolution parsing + setup.conf load/store.
- *
- * The global `vaapiConfig` is shared across the VDR main thread (setup menu),
- * the audio thread, and the device thread. Mutable fields (`pcmLatency`,
- * `passthroughLatency`) are `std::atomic<int>` with relaxed ordering -- they
- * are scalar tunables read on slow paths, so no acquire/release pairing is
- * needed and we deliberately avoid a mutex here.
+ * @brief DisplayConfig and VaapiConfig: resolution parsing and setup.conf load/store.
  */
 
 #include "config.h"
@@ -155,7 +149,12 @@ namespace {
         return false;
     }
 
-    dsyslog("vaapivideo/config: %s updated from %d to %d ms", key, target.load(std::memory_order_relaxed), parsed);
+    // Log only on a real change; setup.conf reload at startup calls SetupParse() for
+    // every key, so logging unconditionally floods the journal with "X to X" lines.
+    const int previous = target.load(std::memory_order_relaxed);
+    if (previous != parsed) {
+        dsyslog("vaapivideo/config: %s updated from %d to %d ms", key, previous, parsed);
+    }
     target.store(parsed, std::memory_order_relaxed);
     return true;
 }
@@ -189,8 +188,10 @@ namespace {
         }
         const auto mode = static_cast<PassthroughMode>(parsed);
         const auto previous = passthroughMode.exchange(mode, std::memory_order_relaxed);
-        dsyslog("vaapivideo/config: PassthroughMode updated from %s to %s", PassthroughModeName(previous),
-                PassthroughModeName(mode));
+        if (previous != mode) {
+            dsyslog("vaapivideo/config: PassthroughMode updated from %s to %s", PassthroughModeName(previous),
+                    PassthroughModeName(mode));
+        }
         return true;
     }
     if (key == "HdrMode") {
@@ -206,7 +207,9 @@ namespace {
         }
         const auto mode = static_cast<HdrMode>(parsed);
         const auto previous = hdrMode.exchange(mode, std::memory_order_relaxed);
-        dsyslog("vaapivideo/config: HdrMode updated from %s to %s", HdrModeName(previous), HdrModeName(mode));
+        if (previous != mode) {
+            dsyslog("vaapivideo/config: HdrMode updated from %s to %s", HdrModeName(previous), HdrModeName(mode));
+        }
         return true;
     }
     if (key == "ClearOnChannelSwitch") {
@@ -223,16 +226,17 @@ namespace {
         }
         const bool previous = clearOnChannelSwitch.load(std::memory_order_relaxed);
         clearOnChannelSwitch.store(parsed, std::memory_order_relaxed);
-        dsyslog("vaapivideo/config: ClearOnChannelSwitch updated from %d to %d", previous ? 1 : 0, parsed ? 1 : 0);
+        if (previous != parsed) {
+            dsyslog("vaapivideo/config: ClearOnChannelSwitch updated from %d to %d", previous ? 1 : 0, parsed ? 1 : 0);
+        }
         return true;
     }
 
-    return false; // Unknown key: ignore so older/newer setup.conf entries don't break load.
+    return false; // Unknown key: silently ignore so older/newer setup.conf entries don't break load.
 }
 
-// ----------------------------------------------------------------------------
+// ============================================================================
+// === GLOBAL INSTANCE ===
+// ============================================================================
 
-// Process-wide singleton (declared extern in config.h). Display fields are written once
-// during plugin init; latency atomics may be re-written from the VDR main thread whenever
-// the user edits the setup menu, hence the std::atomic types.
-VaapiConfig vaapiConfig;
+VaapiConfig vaapiConfig; // process-wide singleton declared extern in config.h

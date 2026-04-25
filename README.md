@@ -17,7 +17,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 
 | Component | Capabilities                                                                                       |
 |-----------|----------------------------------------------------------------------------------------------------|
-| Decode    | H.264, HEVC, MPEG-2 — hardware (VAAPI) with automatic per-codec software fallback                  |
+| Decode    | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10) — hardware (VAAPI) with per-profile software fallback; AV1 Main / Main 10 recognised for future mediaplayer path |
 | Filters   | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
 | Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, DTS-HD, TrueHD, AC-4, MPEG-H 3D)   |
 | Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
@@ -59,17 +59,20 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
 
 ### Source layout
 
-| File              | Responsibility                                              |
-|-------------------|-------------------------------------------------------------|
-| `vaapivideo.cpp`  | Plugin entry point, VDR lifecycle, setup menu, SVDRP        |
-| `src/device.cpp`  | VDR device integration, PES routing, hardware init/teardown |
-| `src/decoder.cpp` | VAAPI decode, FFmpeg filter graph, A/V sync controller      |
-| `src/display.cpp` | DRM atomic modesetting, PRIME import, page-flip thread      |
-| `src/audio.cpp`   | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe      |
-| `src/osd.cpp`     | DRM dumb-buffer OSD overlay (ARGB8888 plane)                |
-| `src/pes.cpp`     | PES header parsing, video/audio codec detection             |
-| `src/config.cpp`  | Resolution parsing, `setup.conf` storage                    |
-| `src/common.h`    | RAII deleters, `AvErr()` helper, version/API guards         |
+| File              | Responsibility                                                                        |
+|-------------------|---------------------------------------------------------------------------------------|
+| `vaapivideo.cpp`  | Plugin entry point, VDR lifecycle, setup menu, SVDRP                                  |
+| `src/device.cpp`  | VDR device integration, PES routing, hardware init/teardown                           |
+| `src/decoder.cpp` | VAAPI decode + A/V sync controller                                                    |
+| `src/filter.cpp`  | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
+| `src/display.cpp` | DRM atomic modesetting, PRIME import, page-flip thread                                |
+| `src/audio.cpp`   | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe                                |
+| `src/osd.cpp`     | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
+| `src/stream.cpp`  | Shared codec/profile data model, H.264/HEVC SPS probe                                 |
+| `src/pes.cpp`     | PES header parsing                                                                    |
+| `src/caps.cpp`    | One-shot GPU/display/sink capability probes (GpuCaps, DisplayCaps, AudioSinkCaps)     |
+| `src/config.cpp`  | Resolution parsing, `setup.conf` storage                                              |
+| `src/common.h`    | RAII deleters, `AvErr()` helper, version/API guards                                   |
 
 The A/V sync controller is documented separately in [AVSYNC.md](AVSYNC.md).
 The coding conventions enforced across all sources are listed in
@@ -78,12 +81,12 @@ The coding conventions enforced across all sources are listed in
 
 ## Requirements
 
-| Dependency   | Minimum | Notes                                                                      |
-|--------------|---------|----------------------------------------------------------------------------|
-| Linux kernel | 6.8+    | Atomic async page-flip cap, universal planes, COLOR_ENCODING / COLOR_RANGE |
-| VDR          | 2.6.0+  | `APIVERSNUM >= 20600`                                                      |
-| FFmpeg       | 7.0+    | `libavcodec >= 61.3.100`, built with `--enable-vaapi`                      |
-| C++ compiler | C++20   | GCC 12+ or Clang 16+                                                       |
+| Dependency   | Minimum | Notes                                                                                   |
+|--------------|---------|-----------------------------------------------------------------------------------------|
+| Linux kernel | 5.15+   | DRM atomic modeset, universal planes, COLOR_ENCODING / COLOR_RANGE, HDR_OUTPUT_METADATA |
+| VDR          | 2.6.0+  | `APIVERSNUM >= 20600`                                                                   |
+| FFmpeg       | 7.0+    | `libavcodec >= 61.3.100`, built with `--enable-vaapi`                                   |
+| C++ compiler | C++20   | GCC 12+ or Clang 16+                                                                    |
 
 ### Supported VAAPI drivers
 
@@ -241,12 +244,10 @@ is installed (step 4) and that the user has access to the render node (step 3).
 
 #### vaapivideo-probe
 
-A standalone diagnostic tool (not part of the plugin build) that probes decode
-profiles, VPP filters, surface formats, and HDR tone mapping:
+A standalone diagnostic tool that probes decode profiles, VPP filters, surface
+formats, and HDR tone mapping. Built on demand — it is not part of `make`:
 
-    g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva libva-drm) \
-        -o vaapivideo-probe vaapivideo-probe.cpp
-
+    make probe
     ./vaapivideo-probe                     # uses /dev/dri/card0
     ./vaapivideo-probe /dev/dri/card1      # explicit device
 
@@ -292,12 +293,13 @@ that start VDR before a user session claims the console.
 
     Setup → Plugins → vaapivideo
 
-| Setting                          | Range             | Description                                                       |
-|----------------------------------|-------------------|-------------------------------------------------------------------|
-| `PCM Audio Latency (ms)`         | −200 … 200        | A/V offset applied when audio is decoded to PCM by the plugin     |
-| `Passthrough Audio Latency (ms)` | −200 … 200        | A/V offset applied when audio is forwarded as IEC61937 to an AVR  |
-| `Audio Passthrough`              | auto / on / off   | IEC61937 passthrough policy (see below)                           |
-| `Clear display on channel switch`| off / on          | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
+| Setting                          | Range            | Description                                                                                          |
+|----------------------------------|------------------|------------------------------------------------------------------------------------------------------|
+| `PCM Audio Latency (ms)`         | −200 … 200       | A/V offset applied when audio is decoded to PCM by the plugin                                        |
+| `Passthrough Audio Latency (ms)` | −200 … 200       | A/V offset applied when audio is forwarded as IEC61937 to an AVR                                     |
+| `Audio Passthrough`              | auto / on / off  | IEC61937 passthrough policy (see below)                                                              |
+| `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
+| `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -339,11 +341,11 @@ leaving the setup menu to activate the new mode.
 
 ### SVDRP commands
 
-| Command                  | Description                                              |
-|--------------------------|----------------------------------------------------------|
-| `PLUG vaapivideo STAT`   | Device status, active resolution, refresh rate           |
-| `PLUG vaapivideo CONFIG` | Current configuration summary                            |
-| `PLUG vaapivideo DETA`   | Detach from DRM/VAAPI hardware (release for other apps)  |
+| Command                  | Description                                                |
+|--------------------------|------------------------------------------------------------|
+| `PLUG vaapivideo STAT`   | Device status, active resolution, refresh rate             |
+| `PLUG vaapivideo CONFIG` | Current configuration summary                              |
+| `PLUG vaapivideo DETA`   | Detach from DRM/VAAPI hardware (release for other apps)    |
 | `PLUG vaapivideo ATTA`   | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 
 DETA hands the display to another application (an external player, a
@@ -354,93 +356,44 @@ pipeline.
 
 ### Automatic console restore after DETA
 
-For the text console (`fbcon`) to reclaim the display after DETA, the
-plugin does a VT bounce through `/dev/tty0`. Only `/dev/tty0` is touched
-— `VT_ACTIVATE` takes the target VT number as an ioctl argument, not a
-file descriptor, so `/dev/tty1`, `/dev/tty2`, … do not need to be
-accessible.
+After `DETA` the plugin bounces the active VT through `/dev/tty0` so
+that `fbcon` reclaims the screen. Without the three bits of plumbing
+below the GPU is still released correctly, but the screen stays black
+until someone presses `Alt+F1`. The plugin logs the missing prerequisite
+(`open-EACCES`, `ioctl-EPERM`, …) and the SVDRP reply names it too.
 
-Three things must be in place. If any are missing, `DETA` still releases
-the GPU correctly but the screen stays black until you press `Alt+F1` —
-the plugin logs a targeted error and the SVDRP reply spells out the
-remediation. Once all three are done, DETA restores the console
-automatically.
+1. **udev rule — widen `/dev/tty0` to group `tty`.** Default distros
+   ship it as `0600 root:root`, which no daemon can open.
 
-**1. Widen `/dev/tty0` to mode `0660`.** Current mainstream distros
-(Debian, Fedora, …) ship it as `crw------- root:tty` (mode `0600`), so
-even members of the `tty` group cannot open it. Drop a udev rule:
+        # /etc/udev/rules.d/90-vdr-tty0.rules
+        KERNEL=="tty0", GROUP="tty", MODE="0660"
 
-```
-# /etc/udev/rules.d/90-vdr-tty0.rules
-KERNEL=="tty0", GROUP="tty", MODE="0660"
-```
+        sudo udevadm control --reload
+        sudo udevadm trigger --sysname-match=tty0
 
-Apply without rebooting:
+2. **systemd drop-in — run vdr as `vdr:video` with `tty` supplementary
+   and `CAP_SYS_TTY_CONFIG` ambient.** Let systemd switch user *before*
+   applying the capability: ambient caps are wiped on any `setuid()`
+   from root, so a `runvdr -u vdr` wrapper would otherwise strip the
+   bit before the plugin ever needs it.
 
-```sh
-sudo udevadm control --reload
-sudo udevadm trigger --sysname-match=tty0
-```
+        sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
+        sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
+        [Service]
+        User=vdr
+        Group=video
+        SupplementaryGroups=tty
+        AmbientCapabilities=CAP_SYS_TTY_CONFIG
+        EOF
+        sudo systemctl daemon-reload
+        sudo systemctl restart vdr.service
 
-`ls -l /dev/tty0` should now show `crw-rw---- root:tty`.
+Do **not** set `CapabilityBoundingSet=` — shrinking it would strip
+`CAP_CHOWN` from VDR's `ExecStartPre=vdr-check-setup`. Verify the cap
+landed in the running process:
 
-**2. Put the vdr service user in the `tty` group** — `usermod -aG tty
-vdr`, or (preferred, scoped to the unit) add `SupplementaryGroups=tty`
-to the drop-in below.
-
-**3. Give vdr `CAP_SYS_TTY_CONFIG`, but do so on the already-unprivileged
-process.** This is the subtle part. The kernel's VT ioctl handler
-(`drivers/tty/vt/vt_ioctl.c`) requires either a matching controlling tty
-(a daemon has none) or this capability. Ordinarily `AmbientCapabilities=`
-in the systemd unit is the right answer — but most VDR packages use a
-`runvdr` wrapper and pass `-u vdr` on the vdr command line, which makes
-vdr call `setuid(root → vdr)` inside its own process. The kernel clears
-the ambient capability set on any 0 → non-0 UID change, so an ambient
-cap set by systemd on the root process is wiped before it reaches our
-code. The cure is to let **systemd** switch to the `vdr` user *before*
-applying the capability; vdr then starts already as `vdr`, and its own
-`-u vdr` becomes a no-op. One drop-in covers all of this:
-
-```sh
-sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
-
-sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
-[Service]
-User=vdr
-Group=video
-SupplementaryGroups=tty
-AmbientCapabilities=CAP_SYS_TTY_CONFIG
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart vdr.service
-```
-
-`Group=video` (not `Group=vdr`) matches the primary group that VDR
-packages typically install files under — required for access to
-`/dev/dri/*` and ALSA. If your distro uses a different primary group for
-the vdr user, substitute it here (check with `id vdr`).
-
-Verify the cap actually made it into the running process:
-
-```sh
-grep -E '^(Uid|Groups|CapAmb)' /proc/$(pidof vdr)/status
-# Uid    should be <vdr_uid> <vdr_uid> <vdr_uid> <vdr_uid>
-# Groups should include 5 (the tty group)
-# CapAmb should include bit 26 (CAP_SYS_TTY_CONFIG) = 0x0000000004000000
-```
-
-Do **not** add `CapabilityBoundingSet=CAP_SYS_TTY_CONFIG` — it would
-tighten the bounding set to that one capability, breaking VDR's
-`ExecStartPre=vdr-check-setup` (which needs `CAP_CHOWN` for initial
-file-ownership fixup). Leaving `CapabilityBoundingSet=` unset keeps the
-default full bounding set, which is the correct behavior here.
-
-Steps 1 and 2 get `open(/dev/tty0)` to succeed; step 3 gets `VT_ACTIVATE`
-to succeed. If any step is missing, DETA still releases the GPU but the
-screen stays black. The plugin logs a targeted error naming the missing
-prerequisite when this happens (open-EACCES, ioctl-EPERM, …) so the
-remediation is clear from the log.
+        grep -E '^(Uid|Groups|CapAmb)' /proc/$(pidof vdr)/status
+        # CapAmb must include bit 26 (CAP_SYS_TTY_CONFIG) = 0x0000000004000000
 
 ### Inter-plugin service API
 
@@ -560,9 +513,16 @@ PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
 
 ## Roadmap
 
-- Expose filter controls (denoise strength, sharpen level) in the VDR setup menu
-- Dynamic resolution switching on SD / HD / UHD channel changes
-- GPU memory and ALSA underrun counters in `STAT` output
+- Mediaplayer: libavformat-based local file / network playback (MP4, MKV,
+  HLS, RTSP) plugged into the existing `IMediaSource` seam.
+- Dynamic resolution switching on SD / HD / UHD channel changes.
+- AV1 live decode path: OBU sequence-header probe + Main / Main 10 backend
+  routing, closing the AV1 branch already stubbed in `kVideoBackendTable`.
+- Dolby Vision Profile 5 / 8 passthrough on displays that advertise DV EDID
+  metadata (RPU forwarding, no tone-mapping).
+- Variable refresh rate (HDMI VRR / FreeSync) for judder-free 24p and 25p
+  film playback: tie the DRM page-flip cadence to the decoded stream's
+  frame rate instead of the panel's fixed refresh.
 
 
 ## Credits

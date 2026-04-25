@@ -2,22 +2,23 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file display.cpp
- * @brief DRM atomic-modeset display: VAAPI->PRIME import + page-flip pacing.
+ * @brief DRM atomic-modeset display: VAAPI->PRIME import and page-flip pacing.
  *
- * Threading:
- *   - Producer (decoder thread): SubmitFrame() under bufferMutex; one-slot pendingFrame.
- *   - Consumer (this cThread Action()): map -> commit -> waits for page-flip event.
- *   - Stream-switch (Clear() on the main thread): BeginStreamSwitch() takes importMutex
- *     so the consumer cannot start a new av_hwframe_map() while the codec is being torn down.
- *   - OSD updates (any thread): SetOsd() under osdMutex; consumer bundles OSD changes into
- *     the next video commit to share a single vblank.
+ * Threading model:
+ *   Producer (decoder):    SubmitFrame() under bufferMutex; one-slot pendingFrame.
+ *   Consumer (Action()):   map -> commit -> drain page-flip event.
+ *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down;
+ *                          consumer cannot start av_hwframe_map() concurrently.
+ *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
- * Lock order: importMutex BEFORE bufferMutex BEFORE osdMutex. WaitForPageFlip() must run
- * BEFORE acquiring importMutex (BeginStreamSwitch) -- otherwise the consumer can't drain
- * DRM events to clear isFlipPending and we deadlock.
+ * Lock order: importMutex -> bufferMutex -> osdMutex.
+ * WaitForPageFlip() MUST complete before BeginStreamSwitch() takes importMutex;
+ * reversing that order deadlocks because the consumer cannot drain DRM events while
+ * importMutex is held by the main thread.
  */
 
 #include "display.h"
+#include "caps.h"
 #include "common.h"
 #include "decoder.h"
 
@@ -71,8 +72,9 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
-constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblank periods @ 50 Hz: covers one missed flip + retry
-constexpr int MAX_DRAIN_ITERATIONS = 10;         ///< Bound on post-shutdown DRM-event drain loops (defensive)
+constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
+constexpr int MAX_DRAIN_ITERATIONS =
+    10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
 
 // ============================================================================
 // === HELPER FUNCTIONS ===
@@ -93,19 +95,22 @@ constexpr int MAX_DRAIN_ITERATIONS = 10;         ///< Bound on post-shutdown DRM
 
 namespace {
 
-// CTA-861-G decode constants. EOTF bits are in HDR SMDB byte 2; BT.2020 flags in
-// Colorimetry Data Block byte 2. Bit 0 (SDR) / bit 1 (HDR gamma) are implicit.
+// CTA-861-G sec.7.5.13 HDR Static Metadata Data Block (extended tag 0x06):
+//   byte 1 = supported EOTFs bitmap: bit 0=SDR, bit 1=HDR gamma, bit 2=PQ, bit 3=HLG.
+// CTA-861-G sec.7.5.6 Colorimetry Data Block (extended tag 0x05):
+//   byte 1 = colorimetry flags: bit 6=BT.2020 YCC.
 constexpr uint8_t EDID_EOTF_PQ = 1U << 2;
 constexpr uint8_t EDID_EOTF_HLG = 1U << 3;
 constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6;
-constexpr size_t EDID_BLOCK_SIZE = 128;
-constexpr size_t EDID_CHECKSUM_OFFSET = 127;
-constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;
+constexpr size_t EDID_BLOCK_SIZE = 128;             ///< Every EDID block is exactly 128 bytes
+constexpr size_t EDID_CHECKSUM_OFFSET = 127;        ///< Byte 127 is the block checksum (not a data block)
+constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126; ///< Byte 126 of base block: number of extension blocks
 
-/// Parse one 128-byte CTA-861 extension block for HDR EOTF + BT.2020 YCC advertisement.
-/// Per CTA-861-G section 7.3, a DTD offset of 0 means "no DTDs"; data blocks then fill [4, 127)
-/// (byte 127 is the checksum). Malformed blocks are tolerated silently.
-auto ParseCtaExtension(std::span<const uint8_t> ext, cVaapiDisplay::SinkHdrCaps &caps) -> void {
+/// Parse one 128-byte CTA-861 extension block (tag byte 0x02) for HDR EOTF and BT.2020 YCC.
+/// Per CTA-861-G sec.7.3, a DTD offset of 0 means "no DTDs"; data blocks span [4, checksum).
+/// Malformed blocks are silently ignored. Results are OR'd into @p caps so multiple extension
+/// blocks accumulate rather than overwrite.
+auto ParseCtaExtension(std::span<const uint8_t> ext, DisplayCaps &caps) -> void {
     // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
     if (ext.size() < 4 || ext[0] != 0x02) {
         return;
@@ -124,19 +129,16 @@ auto ParseCtaExtension(std::span<const uint8_t> ext, cVaapiDisplay::SinkHdrCaps 
             break;
         }
         const std::span<const uint8_t> payload = ext.subspan(offset + 1, payloadLen);
-        // Tag 7 = "Use Extended Tag Code"; payload[0] carries the extended tag.
+        // CTA-861-G sec.7.5: blockTag==7 = "Extended Tag" block; payload[0] is the extended tag.
         if (blockTag == 7 && !payload.empty()) {
             const uint8_t extTag = payload[0];
             if (extTag == 0x06 && payload.size() >= 3) {
-                // HDR Static Metadata Data Block. payload[1] = supported EOTFs bitmap.
-                // OR across extension blocks -- a second block must not erase support
-                // discovered in an earlier one.
-                caps.hdr10 = caps.hdr10 || (payload[1] & EDID_EOTF_PQ) != 0;
-                caps.hlg = caps.hlg || (payload[1] & EDID_EOTF_HLG) != 0;
+                // HDR Static Metadata Data Block (sec.7.5.13): payload[1] = EOTF bitmap.
+                caps.sinkHdr10Pq = caps.sinkHdr10Pq || (payload[1] & EDID_EOTF_PQ) != 0;
+                caps.sinkHlg = caps.sinkHlg || (payload[1] & EDID_EOTF_HLG) != 0;
             } else if (extTag == 0x05 && payload.size() >= 2) {
-                // Colorimetry Data Block. payload[1] carries the BT.2020 flags. Same
-                // accumulation rule as the HDR SMDB above.
-                caps.bt2020Ycc = caps.bt2020Ycc || (payload[1] & EDID_COLORIMETRY_BT2020_YCC) != 0;
+                // Colorimetry Data Block (sec.7.5.6): payload[1] = colorimetry bitmap.
+                caps.sinkBt2020Ycc = caps.sinkBt2020Ycc || (payload[1] & EDID_COLORIMETRY_BT2020_YCC) != 0;
             }
         }
         offset += 1 + payloadLen;
@@ -144,12 +146,12 @@ auto ParseCtaExtension(std::span<const uint8_t> ext, cVaapiDisplay::SinkHdrCaps 
     // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
-/// Walk every CTA-861 extension block in a raw EDID blob and OR the results into `caps`.
-auto ParseEdidHdrCaps(std::span<const uint8_t> edid) -> cVaapiDisplay::SinkHdrCaps {
-    cVaapiDisplay::SinkHdrCaps caps{};
+/// Walk every CTA-861 extension block in a raw EDID blob and OR the sink HDR bits into @p caps.
+auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) -> void {
     if (edid.size() < EDID_BLOCK_SIZE) {
-        return caps;
+        return;
     }
+    // Bounded by edid.size() >= EDID_BLOCK_SIZE (128) check above; the offset is < 128.
     const size_t extCount =
         edid[EDID_EXTENSION_COUNT_OFFSET]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     for (size_t i = 0; i < extCount; ++i) {
@@ -159,7 +161,6 @@ auto ParseEdidHdrCaps(std::span<const uint8_t> edid) -> cVaapiDisplay::SinkHdrCa
         }
         ParseCtaExtension(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
     }
-    return caps;
 }
 
 } // namespace
@@ -177,8 +178,7 @@ AtomicRequest::~AtomicRequest() noexcept {
 }
 
 AtomicRequest::AtomicRequest(AtomicRequest &&other) noexcept : propCount(other.propCount), request(other.request) {
-    // Null the source so its destructor is a no-op.
-    other.request = nullptr;
+    other.request = nullptr; // prevents double-free in moved-from destructor
     other.propCount = 0;
 }
 
@@ -200,9 +200,8 @@ auto AtomicRequest::operator=(AtomicRequest &&other) noexcept -> AtomicRequest &
 // ============================================================================
 
 auto AtomicRequest::AddProperty(uint32_t objId, uint32_t propId, uint64_t value) -> void {
-    // propId==0 means the optional property wasn't found during BindDrmPlane discovery
-    // (e.g. zpos, blend mode, COLOR_RANGE on older drivers). Silently skipping lets callers
-    // unconditionally enqueue every property without per-driver branching at every call site.
+    // propId==0 means the driver doesn't expose this optional property (e.g. zpos, blend mode,
+    // COLOR_RANGE on older kernels). Skipping silently avoids per-driver branches at every caller.
     if (!request || propId == 0) {
         return;
     }
@@ -222,19 +221,17 @@ auto AtomicRequest::AddProperty(uint32_t objId, uint32_t propId, uint64_t value)
 cVaapiDisplay::DrmFramebuffer::DrmFramebuffer(DrmFramebuffer &&other) noexcept
     : drmFd(other.drmFd), fbId(other.fbId), frame(other.frame), gemHandle(other.gemHandle), height(other.height),
       modifier(other.modifier), width(other.width) {
-    // Hand over ownership; null source so its destructor releases nothing.
-    other.drmFd = -1;
+    other.drmFd = -1; // prevents double-release in moved-from destructor
     other.fbId = 0;
     other.gemHandle = 0;
     other.frame = nullptr;
 }
 
 cVaapiDisplay::DrmFramebuffer::~DrmFramebuffer() noexcept {
-    // STRICT release order -- reversing any of these is a kernel use-after-free:
-    //   1. AVFrame: drops the VA surface ref, which is what backs the DMA-BUF fd.
-    //   2. KMS FB:  CRTC stops scanning, kernel drops its DMA-BUF ref.
-    //   3. GEM:     the imported BO is finally freed by the DRM driver.
-    // Doing (2)/(3) before (1) would free a surface the CRTC is still scanning out.
+    // Release order matters: (1) AVFrame drops the VA surface ref that backs the DMA-BUF;
+    // (2) drmModeRmFB tells the CRTC to stop scanning and releases the kernel DMA-BUF ref;
+    // (3) DRM_IOCTL_GEM_CLOSE frees the imported BO. Reversing (1)/(2) causes the kernel to
+    // read freed GPU memory on the next scanout.
     if (frame) {
         av_frame_free(&frame);
     }
@@ -279,9 +276,8 @@ auto cVaapiDisplay::DrmFramebuffer::operator=(DrmFramebuffer &&other) noexcept -
 // ============================================================================
 
 cVaapiDisplay::cVaapiDisplay()
-    // Only the v1 page-flip handler is wired; nulling the others is intentional so libdrm
-    // doesn't dispatch through stale pointers if the kernel queues an event type we don't
-    // expect (vblank, sequence, page_flip2).
+    // Only page_flip_handler (v1) is wired; other slots are null so libdrm doesn't dispatch
+    // to stale pointers on unexpected event types (vblank, sequence, page_flip2).
     : eventContext{.version = DRM_EVENT_CONTEXT_VERSION,
                    .vblank_handler = nullptr,
                    .page_flip_handler = OnPageFlipEvent,
@@ -306,7 +302,9 @@ auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
         return;
     }
 
-    // Wait for PresentBuffer() to clear osdDirty AND advance currentOsd off this fbId.
+    // Poll until PresentBuffer() clears osdDirty AND advances currentOsd past this fbId.
+    // 100 ms is generous: a page flip at 25 Hz takes 40 ms; the OSD is committed on the
+    // next video frame, which must arrive before the VDR OSD destructor returns.
     const cTimeMs deadline(100);
     while (!deadline.TimedOut()) {
         {
@@ -321,35 +319,32 @@ auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
 }
 
 auto cVaapiDisplay::BeginStreamSwitch() -> void {
-    // Step 1: signal the consumer to stop accepting new frames. Must come first so the
-    // consumer hits the isClearing idle branch promptly and doesn't start one more import.
+    // (1) Gate the consumer first so it exits the import block promptly.
     isClearing.store(true, std::memory_order_release);
 
-    // Step 2: drop any queued frame. Otherwise SubmitFrame() callers blocked on the slot
-    // would wait until their timeout, stalling the decoder during the switch.
+    // (2) Drop any queued frame so SubmitFrame() callers blocked on the slot unblock
+    // immediately rather than waiting for their full timeout.
     {
         const cMutexLock lock(&bufferMutex);
         pendingFrame.reset();
         frameSlotCond.Broadcast();
     }
 
-    // Step 3: wait for the in-flight page-flip BEFORE taking importMutex. Reversing the
-    // order deadlocks: importMutex held here would prevent the consumer from running
-    // DrainDrmEvents() to clear isFlipPending.
+    // (3) Drain the in-flight flip BEFORE taking importMutex. Reversed order deadlocks:
+    // with importMutex held here, the consumer can't run DrainDrmEvents() to clear isFlipPending.
     WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS);
 
-    // Step 4: lock importMutex so the consumer cannot start a new av_hwframe_map() while
-    // the codec is being destroyed. By this point the consumer is either spinning in the
-    // isClearing idle branch or about to re-check isClearing under importMutex -- both safe.
-    // We deliberately KEEP the displayed/pendingBuffer alive: the last decoded picture
-    // stays on screen during the switch instead of flashing to black.
+    // (4) Hold importMutex while the caller tears down the codec. The consumer is either
+    // in the isClearing idle branch or about to see isClearing under the lock -- both safe.
+    // displayedBuffer/pendingBuffer are intentionally kept alive so the last frame stays
+    // on screen during the switch rather than flashing to black.
     importMutex.Lock();
 }
 
 auto cVaapiDisplay::EndStreamSwitch() -> void {
-    // Codec is destroyed; release the import gate. Clearing isClearing AFTER the unlock is
-    // safe because the consumer re-checks isClearing under importMutex before touching any
-    // surface, so it can't observe a stale "false" mid-teardown.
+    // Unlock first, then clear isClearing. The consumer re-checks isClearing under importMutex
+    // before touching any surface, so clearing after the unlock is safe: it can't observe
+    // a stale "false" while the codec is still mid-teardown.
     importMutex.Unlock();
     isClearing.store(false, std::memory_order_release);
 }
@@ -370,10 +365,9 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     activeMode = displayMode;
     outputWidth = displayMode.hdisplay;
     outputHeight = displayMode.vdisplay;
-    // Some EDIDs report vrefresh==0 for non-CEA modes; default to 50 Hz so downstream
-    // A/V sync math never divides by zero. The 50 Hz figure is the DVB baseline and is
-    // intentionally consistent with decoder.cpp's framerate fallback in InitFilterGraph()
-    // -- changing one without the other will desync the controllers, so update both.
+    // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
+    // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
+    // are coupled; changing one without the other desyncs the A/V controllers.
     refreshRate = displayMode.vrefresh > 0 ? displayMode.vrefresh : 50;
     aspectRatio = static_cast<double>(outputWidth) / static_cast<double>(outputHeight);
 
@@ -383,12 +377,13 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         return false;
     }
 
-    // Init order matters:
-    //   1. property IDs -- every subsequent atomic commit needs them
-    //   2. video plane (NV12) -- mandatory
-    //   3. OSD plane (ARGB8888) -- optional, ignored on hardware that lacks a second plane
-    //   4. display mode -- one ALLOW_MODESET commit
-    //   5. ready=true + Start() -- only now is the consumer thread allowed to run
+    // Init order is load-bearing: each step depends on the previous one.
+    //   1. LoadDrmProperties: every atomic commit needs CRTC/connector prop IDs.
+    //   2. BindDrmPlane(NV12): mandatory; also populates IN_FORMATS for step 4.
+    //   3. BindDrmPlane(ARGB): optional OSD plane; playback continues without it.
+    //   4. ProbeHdrCapabilities: needs videoPlaneId (set in step 2) for P010 check.
+    //   5. ApplyDisplayMode: ALLOW_MODESET commit; also initialises SDR connector state.
+    //   6. ready=true + Start(): consumer thread must not run before step 5 completes.
     if (!LoadDrmProperties()) {
         esyslog("vaapivideo/display: failed to cache DRM properties");
         return false;
@@ -399,13 +394,9 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         return false;
     }
 
-    // OSD is best-effort: a missing ARGB plane only loses on-screen overlays, not playback.
-    (void)BindDrmPlane(0, DRM_FORMAT_ARGB8888);
+    (void)BindDrmPlane(0, DRM_FORMAT_ARGB8888); // best-effort: no OSD plane -> no overlays, playback unaffected
 
-    // HDR capability probe runs AFTER the video plane is bound -- planeSupportsP010 needs
-    // videoPlaneId to query the plane's IN_FORMATS blob. The probe is best-effort: logs
-    // the discovered sink + connector capabilities so operators can see why HDR is (or
-    // isn't) available, but never blocks SDR output.
+    // Must run after BindDrmPlane(NV12): needs videoPlaneId to check IN_FORMATS for P010.
     ProbeHdrCapabilities();
 
     if (!ApplyDisplayMode(displayMode)) {
@@ -452,10 +443,10 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
         dsyslog("vaapivideo/display: OSD hide - fbId=%u", currentOsd.fbId);
     }
 
-    // Mark dirty unconditionally, even for an identical (fbId, geometry) pair: VDR may
-    // have repainted into the same dumb buffer in place, and on Intel/AMD the kernel
-    // only invalidates FBC (Framebuffer Compression) and PSR tile caches when a commit
-    // touches the plane. Without the dirty flag the screen would show stale OSD pixels.
+    // Always mark dirty, even for an unchanged (fbId, geometry) pair. VDR may repaint
+    // into the same dumb buffer in-place; on Intel/AMD, FBC/PSR tile caches are only
+    // invalidated when the plane is touched by an atomic commit. Without this, stale
+    // compressed pixels remain on screen.
     currentOsd = osd;
     osdDirty = true;
 }
@@ -469,16 +460,13 @@ auto cVaapiDisplay::Shutdown() -> void {
         return;
     }
 
-    // Order: isClearing BEFORE stopping. isClearing alone gates new imports; stopping
-    // alone tells the loop to exit. If we set stopping first, the consumer could observe
-    // (stopping=false, isClearing=false) on its next iteration and start one more import
-    // before noticing the exit signal.
+    // isClearing before stopping: if reversed, the consumer could observe (stopping=false,
+    // isClearing=false) and start one more import between the two stores.
     isClearing.store(true, std::memory_order_release);
     stopping.store(true, std::memory_order_release);
 
-    // Force-clear the flip-pending flag: if the CRTC was disabled externally or the
-    // display disconnected, the page-flip event will never arrive and the consumer
-    // would otherwise spin forever in DrainDrmEvents(5).
+    // Force-clear isFlipPending: if the CRTC was disabled externally (display disconnect,
+    // TTY switch), the page-flip event never arrives and the consumer would spin forever.
     isFlipPending.store(false, std::memory_order_release);
 
     frameSlotCond.Broadcast();
@@ -505,17 +493,17 @@ auto cVaapiDisplay::Shutdown() -> void {
         esyslog("vaapivideo/display: thread did not exit - may cause resource leak");
     }
 
-    // Drain page-flip events that landed after the consumer exited. Without this, the
-    // kernel keeps the events pending on the fd and the next process to open the device
-    // would inherit them.
+    // Drain residual page-flip events: without this the kernel keeps them pending on the fd
+    // and the next process to open the DRM device inherits stale events.
     for (int i = 0; i < MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
     }
 
-    // Detach planes + deactivate CRTC so fbcon (or the next DRM client) can take over.
+    // Blank planes, reset HDR state, and deactivate the CRTC so fbcon or the next DRM client
+    // can take over cleanly. All in one atomic to avoid a half-disabled CRTC state.
     if (drmFd >= 0) {
         AtomicRequest req;
-        // Reset connector HDR properties to SDR defaults in the same atomic that disables
-        // the CRTC, otherwise the next DRM client inherits our BT.2020 / 10 bpc settings.
+        // Include HDR reset in the same ALLOW_MODESET commit that disables the CRTC;
+        // a separate commit would leave BT.2020/10bpc active for the next DRM client.
         if (hdrProps.hdrOutputMetadata != 0) {
             req.AddProperty(connectorId, hdrProps.hdrOutputMetadata, 0);
         }
@@ -534,8 +522,6 @@ auto cVaapiDisplay::Shutdown() -> void {
             req.AddProperty(osdPlaneId, osdProps.fbId, 0);
             req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
         }
-        // CRTC teardown: ACTIVE=0, MODE_ID=0, and unbind the connector. All three in one
-        // atomic commit so the kernel never observes a half-disabled CRTC state.
         if (modesetProps.isValid) {
             req.AddProperty(crtcId, modesetProps.crtcActive, 0);
             req.AddProperty(crtcId, modesetProps.crtcModeId, 0);
@@ -551,9 +537,8 @@ auto cVaapiDisplay::Shutdown() -> void {
         pendingBuffer = DrmFramebuffer{};
     }
 
-    // Free VAAPI hw context + KMS mode blob. The mode blob is only safe to destroy AFTER
-    // the CRTC has been disabled above (kernel still references it otherwise). Both fields
-    // are nulled so a second Shutdown() is a true no-op even past the wasInitialized guard.
+    // The mode blob must be destroyed AFTER the CRTC is disabled: the kernel holds an
+    // internal reference to it while ACTIVE=1.
     if (hwDeviceRef) {
         av_buffer_unref(&hwDeviceRef);
     }
@@ -561,9 +546,7 @@ auto cVaapiDisplay::Shutdown() -> void {
         drmModeDestroyPropertyBlob(drmFd, modeBlobId);
         modeBlobId = 0;
     }
-    // HDR property blobs: same rationale as modeBlobId -- the CRTC has already been
-    // disabled, so the kernel is no longer referencing either of these. Not freeing them
-    // here would leak kernel memory for the plugin-unload duration.
+    // HDR blobs: same constraint -- CRTC must already be disabled before freeing.
     if (appliedHdrBlobId != 0 && drmFd >= 0) {
         if (drmModeDestroyPropertyBlob(drmFd, appliedHdrBlobId) != 0) [[unlikely]] {
             esyslog("vaapivideo/display: failed to destroy applied HDR blob: %s", strerror(errno));
@@ -582,27 +565,27 @@ auto cVaapiDisplay::Shutdown() -> void {
 }
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
-    // Cheap relaxed pre-checks; bufferMutex below provides the real synchronization.
+    // Relaxed pre-checks (cheap); bufferMutex below provides the actual memory ordering.
     if (!frame || !ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
     const cMutexLock lock(&bufferMutex);
 
-    // pendingFrame is a single slot. The decoder calls this with timeoutMs > 0 to block on
-    // VSync backpressure -- that's how the decoder paces itself to vrefresh.
+    // pendingFrame is a one-slot queue. The decoder blocks here (timeoutMs > 0) for VSync
+    // backpressure -- this is how it paces itself to the display refresh rate.
     if (pendingFrame) {
         if (timeoutMs == 0) {
             return false;
         }
 
-        // Negative ("infinite") timeout is clamped to 1 s slices so a stream switch never
-        // sleeps past the isClearing transition below.
+        // Infinite timeout (-1) is sliced into 1 s windows so a stream switch is not
+        // blocked for the full duration waiting for the slot to clear.
         const int waitMs = (timeoutMs < 0) ? 1000 : timeoutMs;
         const cTimeMs deadline(waitMs);
         while (pendingFrame && ready.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
-            // Bail on stream switch -- BeginStreamSwitch() also takes bufferMutex to drain
-            // pendingFrame, so continuing to wait would deadlock the switch on us.
+            // BeginStreamSwitch() takes bufferMutex to drain pendingFrame; continuing to
+            // wait here with the lock held would deadlock that path.
             if (isClearing.load(std::memory_order_relaxed)) {
                 return false;
             }
@@ -626,34 +609,32 @@ auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
     while (!stopping.load(std::memory_order_relaxed) && ready.load(std::memory_order_relaxed)) {
-        // Drain any queued DRM events first so isFlipPending reflects reality before we
-        // make decisions on it. Non-blocking; just consumes whatever poll() already has.
+        // Non-blocking drain so isFlipPending is up-to-date before the gate check below.
         while (DrainDrmEvents(0)) {
         }
 
-        // VSync gate: wait for the previous flip's event before queuing the next one.
-        // 5 ms is short enough that the page_flip_handler latency is the bottleneck, not us.
+        // VSync gate: don't queue a new flip until the previous one's event has arrived.
+        // 5 ms poll avoids busy-spinning; page_flip_handler latency is the real bottleneck.
         if (isFlipPending.load(std::memory_order_relaxed)) {
             (void)DrainDrmEvents(5);
             continue;
         }
 
-        // Stream switch in progress: yield so BeginStreamSwitch() can take importMutex
-        // (which we'd otherwise hold across the entire map/commit block below).
+        // Yield so BeginStreamSwitch() can acquire importMutex; we'd otherwise hold it
+        // across map+commit and block the switch for an entire frame period.
         if (isClearing.load(std::memory_order_relaxed)) {
             cCondWait::SleepMs(5);
             continue;
         }
 
-        // importMutex is held across map AND commit. Releasing between them would let
-        // BeginStreamSwitch() race in, free the codec context, and leave us committing
-        // a freed VAAPI surface.
+        // importMutex spans both map AND commit: releasing between them lets BeginStreamSwitch()
+        // free the codec while we hold a pointer to its surface.
         bool frameCommitted = false;
         {
             const cMutexLock importLock(&importMutex);
 
-            // Re-check under the lock: BeginStreamSwitch() may have flipped isClearing
-            // between the unlocked check above and now.
+            // Re-check under the lock: isClearing may have been set between the unlocked
+            // check above and acquiring importMutex.
             if (!isClearing.load(std::memory_order_acquire) && !stopping.load(std::memory_order_acquire) &&
                 ready.load(std::memory_order_acquire)) {
                 std::unique_ptr<VaapiFrame> frameToShow;
@@ -668,14 +649,14 @@ auto cVaapiDisplay::Action() -> void {
                 if (frameToShow && !isClearing.load(std::memory_order_acquire)) {
                     DrmFramebuffer newFb = MapVaapiFrame(std::move(frameToShow));
 
-                    // MapVaapiFrame is the slow step (PRIME export + GEM import + AddFB2);
-                    // re-check isClearing one more time before committing.
+                    // MapVaapiFrame is the slow path (PRIME export + GEM import + AddFB2);
+                    // re-check isClearing one more time before committing the result.
                     if (newFb.IsValid() && !isClearing.load(std::memory_order_acquire)) {
                         const cMutexLock lock(&bufferMutex);
                         if (PresentBuffer(newFb)) {
-                            // Buffer chain (displayed <- pending <- new) advances ONLY on a
-                            // successful commit. A failed commit must not destroy the currently-
-                            // scanned FB or the kernel reads freed memory on next scanout.
+                            // Buffer chain advances only on a successful commit. On failure,
+                            // displayedBuffer must NOT be released while the CRTC is still
+                            // scanning it (kernel use-after-free on next scanout).
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
                             frameCommitted = true;
@@ -685,18 +666,16 @@ auto cVaapiDisplay::Action() -> void {
             }
         }
 
-        // No new frame arrived this iteration: re-present the previous buffer. Two reasons:
-        //   1. Keeps the page-flip cadence going so OSD geometry changes (which piggyback
-        //      on the video commit in PresentBuffer) don't stall waiting for the next
-        //      decoded frame -- otherwise OSD updates would freeze on a paused stream.
-        //   2. Maintains continuous vsync timing for the decoder's backpressure on us.
+        // No new frame: re-present the previous buffer.
+        // (a) Keeps the flip cadence alive so OSD changes committed via PresentBuffer don't
+        //     stall on a paused stream waiting for the next decoded frame.
+        // (b) Maintains continuous VSync timing for the decoder's backpressure mechanism.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
             } else {
-                // Pre-first-frame: nothing to present, don't spin.
-                cCondWait::SleepMs(5);
+                cCondWait::SleepMs(5); // pre-first-frame: nothing to present
             }
         }
     }
@@ -723,8 +702,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return;
     }
 
-    // KMS atomic-check rejects commits where CRTC_X+CRTC_W exceeds the CRTC width (and
-    // similarly for Y). Clipping here is cheaper than letting the whole commit fail.
+    // KMS rejects a commit where CRTC_X+CRTC_W > CRTC width (similarly for Y).
+    // Clip here so the entire atomic commit doesn't fail over a slightly oversized OSD.
     const auto clippedW = std::min(osd.width, outputWidth - static_cast<uint32_t>(osd.x));
     const auto clippedH = std::min(osd.height, outputHeight - static_cast<uint32_t>(osd.y));
 
@@ -744,19 +723,15 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(osdPlaneId, osdProps.crtcW, clippedW);
     req.AddProperty(osdPlaneId, osdProps.crtcH, clippedH);
 
-    // VDR's tColor stores straight (non-premultiplied) ARGB. Pick "Coverage" blending
-    // (enum value 1) rather than "Pre-multiplied" (0) to avoid double-multiplied alpha,
-    // which produces visibly darker OSD edges and ringing on translucent backgrounds.
+    // VDR stores straight (non-premultiplied) ARGB via tColor. "Coverage" blending (enum 1)
+    // applies alpha correctly; "Pre-multiplied" (enum 0) would double-apply it and produce
+    // darker edges with ringing on translucent backgrounds.
     if (osdProps.pixelBlendMode != 0) {
         req.AddProperty(osdPlaneId, osdProps.pixelBlendMode, 1);
     }
-    // zpos is intentionally NOT written. Observed behavior:
-    //   * On at least one tested Intel i915 stack, writing zpos here caused the entire
-    //     atomic commit to fail (the property is immutable on its overlay planes).
-    //   * On the AMD/amdgpu stacks tested, the plane stacking the driver picks already
-    //     puts our OSD plane above the video plane, so an override isn't needed.
-    // This is empirical, not derived from a stable spec, so re-test on new hardware
-    // before re-introducing a zpos write.
+    // zpos is NOT written: on tested i915 it causes the commit to fail (the property is
+    // immutable on overlay planes). On amdgpu the driver's default z-order already places
+    // the OSD above the video plane. Empirical -- re-verify on new hardware before adding.
 }
 
 [[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool {
@@ -764,14 +739,13 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true; // empty commit -- nothing to do, treat as success
     }
 
-    // Page-flip path uses NONBLOCK + PAGE_FLIP_EVENT so the kernel queues the work and
-    // delivers a completion event we drain in Action(). Modeset path (ALLOW_MODESET) is
-    // synchronous and event-less because mode programming must be sequenced against the
-    // initial CRTC enable.
-    //
-    // We do NOT use DRM_MODE_ATOMIC_ASYNC: that flag requires linear (untiled) buffer
-    // modifiers, but VAAPI scanout surfaces are tiled (Y/X-tiled or compressed CCS) and
-    // the kernel rejects async commits on them with -EINVAL.
+    // Page-flip: NONBLOCK + PAGE_FLIP_EVENT -- kernel queues the work and delivers a
+    // completion event that Action() drains via DrainDrmEvents().
+    // Modeset: synchronous and event-less -- mode programming must complete before the
+    // next page-flip is submitted.
+    // DRM_MODE_ATOMIC_ASYNC is intentionally not used: it requires linear (untiled) buffers,
+    // but VAAPI surfaces are always tiled (Y/X-tile or CCS compressed); the kernel rejects
+    // async commits on tiled BOs with EINVAL.
     uint32_t commitFlags = flags;
     if ((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
         commitFlags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
@@ -785,9 +759,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true;
     }
 
-    // EBUSY = the previous flip's event has not been consumed yet. The Action() loop
-    // retries on the next iteration after DrainDrmEvents() catches up, so it's not worth
-    // logging on the hot path.
+    // EBUSY: previous flip event not yet consumed; Action() retries after DrainDrmEvents().
+    // Not worth logging -- it's expected on the hot path when the consumer runs slightly ahead.
     if (errno != EBUSY) {
         esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", strerror(errno), commitFlags);
     }
@@ -796,8 +769,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
 [[nodiscard]] auto cVaapiDisplay::ApplyDisplayMode(const drmModeModeInfo &mode) -> bool {
     dsyslog("vaapivideo/display: setting display mode %ux%u@%uHz", mode.hdisplay, mode.vdisplay, mode.vrefresh);
-    // KMS takes the mode as a property blob (kernel-side). Destroy the previous blob to
-    // release the kernel allocation -- libdrm has no GC for these.
+    // KMS stores the mode as a property blob. Destroy the old one explicitly -- libdrm has no GC.
     if (modeBlobId != 0) {
         drmModeDestroyPropertyBlob(drmFd, modeBlobId);
         modeBlobId = 0;
@@ -812,12 +784,11 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     req.AddProperty(crtcId, modesetProps.crtcActive, 1);
     req.AddProperty(crtcId, modesetProps.crtcModeId, modeBlobId);
     req.AddProperty(connectorId, modesetProps.connectorCrtcId, crtcId);
-    // Fold the SDR baseline for HDR connector properties into the modeset atomic so no
-    // second ALLOW_MODESET commit is needed later to clear state left by a previous DRM
-    // client. Doing it here keeps the single HDMI link retrain that ApplyDisplayMode
-    // already forces -- a second retrain after the audio sink has locked onto an IEC61937
-    // bitstream causes the sink to fall out of passthrough and treat subsequent payload
-    // as raw PCM (i.e. noise).
+    // Include the SDR baseline for HDR connector properties in this same ALLOW_MODESET commit
+    // to clear any state left by a previous DRM client (e.g. BT.2020 / 10 bpc from HDR
+    // playback). A second ALLOW_MODESET later would cause a second HDMI link retrain;
+    // if the AVR is locked onto an IEC61937 bitstream at that point it drops out of passthrough
+    // and treats the subsequent payload as raw PCM noise.
     if (hdrProps.hdrOutputMetadata != 0) {
         req.AddProperty(connectorId, hdrProps.hdrOutputMetadata, 0);
     }
@@ -835,20 +806,19 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     }
 
     activeMode = mode;
-    // SDR baseline is now programmed; subsequent page flips suppress the HDR property
-    // write while staged == applied (both Sdr), so the PresentBuffer() path runs without
-    // ALLOW_MODESET and the AVR never sees a stray retrain while holding an IEC61937 lock.
+    // Mark applied state as Sdr so MaybeAppendHdrOutputState() skips the first frame's
+    // HDR write (staged==applied), keeping subsequent page flips in the non-ALLOW_MODESET
+    // fast path and preventing spurious AVR retrains during IEC61937 lock-in.
     appliedHdrState = HdrStreamInfo{};
     appliedHdrBlobId = 0;
     return true;
 }
 
 [[nodiscard]] auto cVaapiDisplay::BindDrmPlane(int planeIndex, uint32_t format) -> bool {
-    // Find the planeIndex'th plane that supports the given fourcc on our CRTC, cache its
-    // atomic property IDs, and assign it as either the video or OSD plane (whichever is
-    // still unbound). Format support is read from the IN_FORMATS blob (the modern modifier-
-    // aware list); the legacy plane->formats array doesn't include tiling info, which we
-    // need because VAAPI surfaces are always tiled.
+    // Find the planeIndex-th plane supporting @p format on our CRTC, cache its atomic prop IDs,
+    // and assign it as the video or OSD plane (whichever is still unbound). Format support is
+    // checked via the IN_FORMATS blob -- the legacy plane->formats array has no modifier
+    // information and VAAPI surfaces are always tiled.
     auto planeRes = std::unique_ptr<drmModePlaneRes, decltype(&drmModeFreePlaneResources)>(
         drmModeGetPlaneResources(drmFd), drmModeFreePlaneResources);
     auto res =
@@ -858,8 +828,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return false;
     }
 
-    // possible_crtcs is a bitmask indexed by *position* in res->crtcs, NOT by CRTC object
-    // id. Resolve our crtcId to its array index before testing the mask below.
+    // possible_crtcs is a position bitmask into res->crtcs[], not a CRTC object-ID bitmask.
     int crtcIndex = -1;
     for (int i = 0; i < res->count_crtcs; ++i) {
         if (res->crtcs[i] == crtcId) {
@@ -873,11 +842,10 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
     dsyslog("vaapivideo/display: searching for plane %d (format 0x%08x)", planeIndex, format);
 
-    // Video-plane discovery (first NV12 call) prefers a plane that also supports the HDR
-    // triad (P010 + BT.2020 + BT.709 COLOR_ENCODING). Some GPUs expose the first NV12
-    // plane as SDR-only and put P010 on a later one; falling for the first-match would
-    // disable HDR unnecessarily. We keep the first SDR-only candidate as a fallback for
-    // the case where no HDR-capable plane exists.
+    // For the NV12 video plane, prefer an HDR-capable plane (P010 + both COLOR_ENCODING enums).
+    // Some GPUs put P010 on a later plane and list a SDR-only plane first; taking the first
+    // match would silently disable HDR. Fall back to the first SDR-only plane if no HDR
+    // capable plane exists.
     const bool preferHdrCapable = (videoPlaneId == 0 && planeIndex == 0 && format == DRM_FORMAT_NV12);
     int found = 0;
     uint32_t fallbackPlaneId = 0;
@@ -890,7 +858,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             continue;
         }
 
-        // Skip the video plane on the second pass (we're then looking for the OSD plane).
+        // On the OSD pass (videoPlaneId already set), skip the already-claimed video plane.
         if (videoPlaneId != 0 && plane->plane_id == videoPlaneId) {
             continue;
         }
@@ -905,9 +873,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             continue;
         }
 
-        // One sweep over the plane's properties: format support (via IN_FORMATS blob),
-        // plane type, and every atomic prop id we'll later need to write to. Doing it in
-        // one pass avoids re-querying drm_mode_obj_get_props per property.
+        // Single sweep over all plane properties: format support, plane type, and every
+        // atomic prop ID needed later. One pass avoids re-querying per-property.
         bool hasFormatSupport = false;
         uint32_t planeType = DRM_PLANE_TYPE_OVERLAY;
         DrmPlaneProps tempProps{};
@@ -921,12 +888,10 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
             const char *name = prop->name;
 
-            // IN_FORMATS blob lists (format, modifier) pairs the plane accepts. We confirm
-            // the requested format and, in the same sweep, record whether the plane can
-            // also scan out DRM_FORMAT_P010 -- the HDR passthrough path needs that and
-            // otherwise we'd re-iterate the whole blob from ProbeHdrCapabilities just to
-            // answer the same question. The (format, modifier) pair is validated at commit
-            // time by KMS; scanning for the fourcc alone is sufficient here.
+            // IN_FORMATS blob lists (format, modifier) pairs the plane accepts. Check the
+            // requested format and also record P010 support in one pass -- ProbeHdrCapabilities
+            // would otherwise have to re-parse the same blob. The modifier is validated by
+            // KMS at commit time; matching the fourcc alone is sufficient here.
             if (!hasFormatSupport && strcmp(name, "IN_FORMATS") == 0) {
                 const auto blobId = static_cast<uint32_t>(planeProps->prop_values[j]);
                 if (blobId != 0) {
@@ -935,6 +900,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                     if (blob && blob->data) {
                         const auto *modBlob = static_cast<const drm_format_modifier_blob *>(blob->data);
                         const auto *base = static_cast<const uint8_t *>(blob->data);
+                        // drm_format_modifier_blob: formats_offset is a byte offset into the same
+                        // buffer where the uint32_t format[] array begins (DRM ABI, not a pointer).
                         const auto *formats =
                             reinterpret_cast<const uint32_t *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
                                 base + modBlob->formats_offset);
@@ -1069,9 +1036,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::DrainDrmEvents(int timeoutMs) -> bool {
-    // Single-consumer in steady state (the Action thread). Shutdown() also calls this
-    // from the main thread to drain residual events post-Cancel(), but only AFTER the
-    // Action thread has set hasExited, so there is no overlap.
+    // Single-consumer in steady state. Shutdown() also calls this from the main thread,
+    // but only after hasExited is set, so there is never concurrent access.
     pollfd pfd{.fd = drmFd, .events = POLLIN, .revents = 0};
     const int ret = poll(&pfd, 1, timeoutMs);
 
@@ -1082,28 +1048,13 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
-    // Both client caps must be opted into per-fd: UNIVERSAL_PLANES exposes overlay planes
-    // (without it the kernel only reports primary/cursor), ATOMIC switches us to the atomic
-    // modeset uAPI we use for everything.
+    // UNIVERSAL_PLANES: exposes overlay and cursor planes (default: only primary/cursor).
+    // ATOMIC: switches the fd to the atomic modesetting uAPI used everywhere below.
+    // Both are per-fd opt-ins; no-ops on already-set caps.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1);
 
-    // Proxy capability gate. We do NOT actually use async flips (see AtomicCommit -- they
-    // require linear modifiers, our surfaces are tiled), but DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
-    // is reliably present on the kernels we've tested against and serves as a single
-    // "kernel new enough for our atomic-modeset assumptions" check.
-    // CAUTION: do not infer a precise kernel version from the presence of this cap.
-    //   Replace with an explicit drmGetVersion() check if a future kernel ships atomic
-    //   modeset without this cap, OR if any of our other atomic assumptions need their
-    //   own version gate.
-    uint64_t asyncCap = 0;
-    if (drmGetCap(drmFd, DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &asyncCap) != 0 || asyncCap == 0) {
-        esyslog("vaapivideo/display: required DRM atomic capability missing "
-                "(DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP) -- kernel too old or driver lacks atomic support");
-        return false;
-    }
-
-    // CRTC ACTIVE / MODE_ID -- needed by every modeset commit.
+    // CRTC ACTIVE / MODE_ID: needed by every modeset commit.
     auto crtcProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
         drmModeObjectGetProperties(drmFd, crtcId, DRM_MODE_OBJECT_CRTC), drmModeFreeObjectProperties);
 
@@ -1122,7 +1073,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         }
     }
 
-    // Connector CRTC_ID -- needed to (un)bind the connector during enable/disable.
+    // Connector CRTC_ID: needed to bind/unbind the connector during enable/disable.
     auto connProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
         drmModeObjectGetProperties(drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR), drmModeFreeObjectProperties);
 
@@ -1145,7 +1096,12 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
-    // Optional connector properties: a missing id just disables HDR, never breaks SDR.
+    // Populates hdrProps (prop IDs used in every commit) and displayCaps (capability bits
+    // consumed by CanDriveHdrPlane / SupportsHdrPassthrough) from the same connector/EDID walk.
+    // Clear first: a re-probe after hotplug must not inherit bits from the previous sink.
+    hdrProps = HdrConnectorProps{};
+    displayCaps = DisplayCaps{};
+
     auto connProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
         drmModeObjectGetProperties(drmFd, connectorId, DRM_MODE_OBJECT_CONNECTOR), drmModeFreeObjectProperties);
 
@@ -1173,13 +1129,13 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
                         haveDefault = true;
                     }
                 }
-                // Refuse drivers that map BT2020_YCC and Default to the same numeric value --
-                // SDR and HDR commits would be indistinguishable.
+                // Guard: if BT2020_YCC and Default map to the same value, SDR and HDR
+                // commits would be indistinguishable and we'd never actually change colorspace.
                 hdrProps.colorspaceValid =
                     haveBt2020Ycc && haveDefault && hdrProps.colorspaceBt2020Ycc != hdrProps.colorspaceDefault;
             } else if (strcmp(name, "max bpc") == 0 && prop->count_values >= 2) {
-                // Range property: [min, max]. Skipping entries without both bounds keeps the
-                // commit path from requesting clamp(10, 0, 0) == 0 bpc, which the kernel rejects.
+                // Range property [min, max]: require both bounds so the commit path can't
+                // produce clamp(10, 0, 0) == 0 bpc, which the kernel rejects.
                 hdrProps.maxBpc = prop->prop_id;
                 hdrProps.maxBpcMin = prop->values[0];
                 hdrProps.maxBpcMax = prop->values[1];
@@ -1198,40 +1154,40 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
     }
 
     if (!edidBlob.empty()) {
-        sinkHdrCaps = ParseEdidHdrCaps(std::span<const uint8_t>{edidBlob});
+        ParseEdidHdrCaps(std::span<const uint8_t>{edidBlob}, displayCaps);
     }
-    // BindDrmPlane(NV12) already sniffed the video plane's IN_FORMATS blob for P010.
-    planeSupportsP010 = (videoPlaneId != 0) && videoProps.supportsP010;
+    // P010 and COLOR_ENCODING flags were already sniffed by BindDrmPlane(NV12); copy here.
+    displayCaps.planeSupportsP010 = (videoPlaneId != 0) && videoProps.supportsP010;
+    displayCaps.planeColorEncodingValid = videoProps.colorEncodingValid;
+    displayCaps.planeColorEncodingBt2020 = videoProps.colorEncodingBt2020Valid;
+    displayCaps.hasHdrOutputMetadata = (hdrProps.hdrOutputMetadata != 0);
+    displayCaps.hasColorspaceEnum = hdrProps.colorspaceValid;
+    displayCaps.colorspaceBt2020Ycc = hdrProps.colorspaceValid; // distinct from Default (validated above)
+    displayCaps.hasMaxBpc = (hdrProps.maxBpc != 0);
+    displayCaps.maxBpcSupported = static_cast<uint8_t>(std::clamp<uint64_t>(hdrProps.maxBpcMax, 8U, 16U));
 
     isyslog("vaapivideo/display: HDR caps -- connector: metadata=%s colorspace=%s max_bpc=%s[%lu..%lu]; "
             "sink: pq=%s hlg=%s bt2020ycc=%s; plane: p010=%s bt2020enc=%s",
             hdrProps.hdrOutputMetadata ? "yes" : "no", hdrProps.colorspaceValid ? "yes" : "no",
             hdrProps.maxBpc ? "yes" : "no", static_cast<unsigned long>(hdrProps.maxBpcMin),
-            static_cast<unsigned long>(hdrProps.maxBpcMax), sinkHdrCaps.hdr10 ? "yes" : "no",
-            sinkHdrCaps.hlg ? "yes" : "no", sinkHdrCaps.bt2020Ycc ? "yes" : "no", planeSupportsP010 ? "yes" : "no",
-            videoProps.colorEncodingBt2020Valid ? "yes" : "no");
+            static_cast<unsigned long>(hdrProps.maxBpcMax), displayCaps.sinkHdr10Pq ? "yes" : "no",
+            displayCaps.sinkHlg ? "yes" : "no", displayCaps.sinkBt2020Ycc ? "yes" : "no",
+            displayCaps.planeSupportsP010 ? "yes" : "no", displayCaps.planeColorEncodingBt2020 ? "yes" : "no");
 }
 
-[[nodiscard]] auto cVaapiDisplay::CanDriveHdrPlane() const noexcept -> bool {
-    // Every property PresentBuffer() writes on an HDR transition must be present; HdrMode::On
-    // skips only the sink EDID gate (some TVs lie), never these commit-path prerequisites.
-    return planeSupportsP010 && videoProps.colorEncodingValid && videoProps.colorEncodingBt2020Valid &&
-           hdrProps.hdrOutputMetadata != 0 && hdrProps.colorspaceValid && hdrProps.maxBpc != 0 &&
-           hdrProps.maxBpcMax >= 10;
-}
+[[nodiscard]] auto cVaapiDisplay::CanDriveHdrPlane() const noexcept -> bool { return displayCaps.CanDriveHdrPlane(); }
 
 auto cVaapiDisplay::SetHdrOutputState(const HdrStreamInfo &info) -> void {
-    // Mutexed so the display thread reads a torn-write-free snapshot of the AVMasteringDisplay
-    // / AVContentLight multi-word fields on the next PresentBuffer().
+    // hdrStateMutex ensures the display thread reads a torn-write-free snapshot of the
+    // multi-word AVMasteringDisplayMetadata / AVContentLightMetadata fields.
     const cMutexLock lock(&hdrStateMutex);
     stagedHdrState = info;
 }
 
 namespace {
 
-/// Round a non-negative double to uint16_t with clamping. std::lround rounds half-away-from-
-/// zero for both signs, whereas naive `cast(d + 0.5)` produces wrong results when d is very
-/// small negative -- we never pass negatives here, but prefer the correct primitive anyway.
+/// Round a non-negative double to uint16_t with clamping.
+/// std::lround is correct for all signs; (d + 0.5) cast fails for small negative d (NaN-safe too).
 [[nodiscard]] auto RoundU16(double d) noexcept -> uint16_t {
     if (!(d > 0.0)) { // covers NaN too
         return 0;
@@ -1321,7 +1277,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
             // primary order; FFmpeg's HEVC decoder already translates the SEI's native
             // (g, b, r) layout, so no further reordering is needed here.
             for (int i = 0; i < 3; ++i) {
-                // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
+                // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index) -- FFmpeg ABI fixed [3][2] array
                 m.display_primaries[i].x = EncodePrimary(info.mastering.display_primaries[i][0]);
                 m.display_primaries[i].y = EncodePrimary(info.mastering.display_primaries[i][1]);
                 // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
@@ -1404,19 +1360,14 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 }
 
 [[nodiscard]] auto cVaapiDisplay::SupportsHdrPassthrough(StreamHdrKind kind) const noexcept -> bool {
-    if (kind == StreamHdrKind::Sdr || !CanDriveHdrPlane()) {
+    // Delegates to DisplayCaps::SupportsHdrKind which combines CanDriveHdrPlane()
+    // with the sink-side EDID gate. Sdr always returns true inside the delegate
+    // when the plane is drivable; Auto-mode callers that want Sdr treated as "no
+    // passthrough required" must check kind == Sdr before calling.
+    if (kind == StreamHdrKind::Sdr) {
         return false;
     }
-    // Auto mode adds the sink-side EDID gate on top of CanDriveHdrPlane().
-    switch (kind) {
-        case StreamHdrKind::Hdr10:
-            return sinkHdrCaps.hdr10 && sinkHdrCaps.bt2020Ycc;
-        case StreamHdrKind::Hlg:
-            return sinkHdrCaps.hlg && sinkHdrCaps.bt2020Ycc;
-        case StreamHdrKind::Sdr:
-            return false;
-    }
-    return false;
+    return displayCaps.SupportsHdrKind(kind);
 }
 
 [[nodiscard]] auto cVaapiDisplay::MapVaapiFrame(std::unique_ptr<VaapiFrame> vaapiFrame) const -> DrmFramebuffer {
@@ -1457,6 +1408,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
         return {};
     }
 
+    // FFmpeg ABI: an AV_PIX_FMT_DRM_PRIME frame's data[0] is the AVDRMFrameDescriptor pointer.
     const auto *desc =
         reinterpret_cast<const AVDRMFrameDescriptor *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             mappedFrame->data[0]);

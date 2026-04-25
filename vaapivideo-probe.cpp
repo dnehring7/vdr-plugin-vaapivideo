@@ -1,17 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// Compile:
-//   g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva-drm) -o vaapivideo-probe vaapivideo-probe.cpp
-//
-// Lint:
-//   clang-tidy vaapivideo-probe.cpp -- -std=c++20 $(pkg-config --cflags libdrm libva-drm)
-//
-// Standalone VAAPI capability prober for DVB-S2 decode pipelines.
-// Probes decode profiles, VPP filters, HDR tone mapping, and deinterlacing.
-//
-// Usage: ./vaapivideo-probe [/dev/dri/cardN]   (default: /dev/dri/card0)
+/**
+ * @file vaapivideo-probe.cpp
+ * @brief Standalone VAAPI capability prober for vdr-plugin-vaapivideo.
+ *
+ * Mirrors the probe matrix of the plugin runtime (src/caps.cpp ProbeGpuCaps +
+ * src/stream.h kVideoBackendTable) so an operator can predict which
+ * codec/profile/bit-depth combinations will hardware-decode on a given GPU.
+ *
+ * Probed codecs:
+ *   MPEG-2  (Simple, Main)                          -- SD broadcast
+ *   H.264   (Constrained Baseline, Main, High, High 10) -- HD broadcast
+ *   HEVC    (Main 8-bit, Main10 10-bit)             -- UHD + HDR
+ *   AV1     (Profile 0, 8-bit + 10-bit)             -- streaming / mediaplayer
+ *
+ * Each profile is tested against the exact surface format it requires
+ * (YUV420 for 8-bit, YUV420_10 for 10-bit). VPP filters, HDR tone mapping,
+ * and deinterlacing modes are also reported.
+ *
+ * Usage:   ./vaapivideo-probe [/dev/dri/cardN]   (default: /dev/dri/card0)
+ * Compile: g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva-drm) -o vaapivideo-probe vaapivideo-probe.cpp
+ * Lint:    clang-tidy vaapivideo-probe.cpp -- -std=c++20 $(pkg-config --cflags libdrm libva-drm)
+ */
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -20,7 +32,6 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -32,7 +43,8 @@
 
 #include <xf86drm.h>
 
-// Minimal surface size for probing driver capabilities without wasting memory.
+// Small enough to avoid wasting VRAM; large enough that no driver rejects it as
+// below its minimum surface alignment (typically 16 px).
 constexpr int kProbeSurfaceSize = 64;
 
 namespace {
@@ -41,23 +53,50 @@ struct DrmDeviceDeleter {
 };
 } // namespace
 
-// DVB-S2 decode profiles: MPEG-2 Main (SD), H.264 Main/High (HD), HEVC Main 10 (UHD).
-static constexpr struct {
+// Every (profile, required RT surface format) combination worth reporting.
+// Plugin-consumed rows mirror kVideoBackendTable (src/stream.h) and
+// ProbeGpuCaps (src/caps.cpp) so the output predicts runtime behaviour exactly.
+// Informational rows cover profiles modern iGPUs advertise but the plugin does
+// not decode: VP9, HEVC range extensions (12-bit, 4:2:2, 4:4:4), and JPEG.
+namespace {
+struct DecodeProbe {
     VAProfile profile;
+    unsigned int rtFormat;
     const char *name;
-} kDecodeProfiles[] = {
-    {.profile = VAProfileMPEG2Main, .name = "MPEG-2 Main"},
-    {.profile = VAProfileH264Main, .name = "H.264 Main"},
-    {.profile = VAProfileH264High, .name = "H.264 High"},
-    {.profile = VAProfileHEVCMain10, .name = "HEVC Main 10"},
+};
+} // namespace
+static constexpr DecodeProbe kDecodeProbes[] = {
+    // --- Consumed by the plugin (must match kVideoBackendTable) ---
+    {.profile = VAProfileMPEG2Simple, .rtFormat = VA_RT_FORMAT_YUV420, .name = "MPEG-2 Simple"},
+    {.profile = VAProfileMPEG2Main, .rtFormat = VA_RT_FORMAT_YUV420, .name = "MPEG-2 Main"},
+    {.profile = VAProfileH264ConstrainedBaseline,
+     .rtFormat = VA_RT_FORMAT_YUV420,
+     .name = "H.264 Constrained Baseline"},
+    {.profile = VAProfileH264Main, .rtFormat = VA_RT_FORMAT_YUV420, .name = "H.264 Main"},
+    {.profile = VAProfileH264High, .rtFormat = VA_RT_FORMAT_YUV420, .name = "H.264 High"},
+    {.profile = VAProfileH264High10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "H.264 High 10"},
+    {.profile = VAProfileHEVCMain, .rtFormat = VA_RT_FORMAT_YUV420, .name = "HEVC Main"},
+    {.profile = VAProfileHEVCMain10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "HEVC Main 10"},
+    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420, .name = "AV1 Profile 0 (8-bit)"},
+    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "AV1 Profile 0 (10-bit)"},
+    // --- Informational: iGPU can decode, plugin does not consume today ---
+    {.profile = VAProfileHEVCMain12, .rtFormat = VA_RT_FORMAT_YUV420_12, .name = "HEVC Main 12"},
+    {.profile = VAProfileHEVCMain422_10, .rtFormat = VA_RT_FORMAT_YUV422_10, .name = "HEVC Main 4:2:2 10"},
+    {.profile = VAProfileHEVCMain422_12, .rtFormat = VA_RT_FORMAT_YUV422_12, .name = "HEVC Main 4:2:2 12"},
+    {.profile = VAProfileHEVCMain444, .rtFormat = VA_RT_FORMAT_YUV444, .name = "HEVC Main 4:4:4"},
+    {.profile = VAProfileHEVCMain444_10, .rtFormat = VA_RT_FORMAT_YUV444_10, .name = "HEVC Main 4:4:4 10"},
+    {.profile = VAProfileVP9Profile0, .rtFormat = VA_RT_FORMAT_YUV420, .name = "VP9 Profile 0"},
+    {.profile = VAProfileVP9Profile2, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "VP9 Profile 2"},
+    {.profile = VAProfileJPEGBaseline, .rtFormat = VA_RT_FORMAT_YUV420, .name = "JPEG Baseline"},
 };
 
-// VPP filter types (deinterlacing and HDR are probed separately).
+// General VPP filter types. Deinterlacing and HDR tone mapping are probed
+// separately because they require capability structs beyond a simple yes/no.
 static constexpr struct {
     VAProcFilterType type;
     const char *name;
 } kVppFilterTypes[] = {
-    {.type = VAProcFilterNoiseReduction, .name = "Noise Reduction (Denoise)"},
+    {.type = VAProcFilterNoiseReduction, .name = "Noise Reduction  (Denoise)"},
     {.type = VAProcFilterSharpening, .name = "Sharpening"},
     {.type = VAProcFilterColorBalance, .name = "Color Balance"},
     {.type = VAProcFilterSkinToneEnhancement, .name = "Skin Tone Enhancement"},
@@ -65,16 +104,17 @@ static constexpr struct {
     {.type = VAProcFilterHVSNoiseReduction, .name = "HVS Noise Reduction"},
 };
 
+// Directions relevant to a broadcast playback pipeline.
+// SDR->HDR is deliberately excluded: no broadcast source requires it.
 static constexpr struct {
     uint16_t flag;
     const char *name;
 } kToneMappingFlags[] = {
     {.flag = VA_TONE_MAPPING_HDR_TO_HDR, .name = "HDR->HDR"},
     {.flag = VA_TONE_MAPPING_HDR_TO_SDR, .name = "HDR->SDR"},
-    {.flag = VA_TONE_MAPPING_SDR_TO_HDR, .name = "SDR->HDR"},
 };
 
-// Ordered from highest quality (motion compensated) to lowest (bob).
+// Listed highest-quality first so the first supported entry is the preferred choice.
 static constexpr struct {
     VAProcDeinterlacingType type;
     const char *name;
@@ -97,34 +137,20 @@ static constexpr struct {
         return false;
     }
 
-    // Clamp to buffer capacity to guard against bogus driver-reported counts.
-    const auto validCount = (entrypointCount > 0)
-                                ? std::min(static_cast<size_t>(entrypointCount), entrypoints.size())
-                                : size_t{0};
+    // Some drivers report a count larger than the allocated buffer; clamp defensively.
+    const auto validCount =
+        (entrypointCount > 0) ? std::min(static_cast<size_t>(entrypointCount), entrypoints.size()) : size_t{0};
     const std::span<const VAEntrypoint> valid{entrypoints.data(), validCount};
     return std::ranges::find(valid, VAEntrypointVLD) != valid.end();
 }
 
-[[nodiscard]] static auto SupportsYuv420RtFormat(VADisplay display, VAProfile profile) -> bool {
+[[nodiscard]] static auto SupportsRtFormat(VADisplay display, VAProfile profile, unsigned int rtFormat) -> bool {
     VAConfigAttrib attrib{};
     attrib.type = VAConfigAttribRTFormat;
     if (vaGetConfigAttributes(display, profile, VAEntrypointVLD, &attrib, 1) != VA_STATUS_SUCCESS) {
         return false;
     }
-    return (attrib.value & VA_RT_FORMAT_YUV420) != 0;
-}
-
-[[nodiscard]] static auto QueryMaxDecodeResolution(VADisplay display, VAProfile profile)
-    -> std::pair<unsigned int, unsigned int> {
-    VAConfigAttrib attribs[2]{};
-    attribs[0].type = VAConfigAttribMaxPictureWidth;
-    attribs[1].type = VAConfigAttribMaxPictureHeight;
-    if (vaGetConfigAttributes(display, profile, VAEntrypointVLD, attribs, std::size(attribs)) != VA_STATUS_SUCCESS) {
-        return {0, 0};
-    }
-    const unsigned int w = (attribs[0].value != VA_ATTRIB_NOT_SUPPORTED) ? attribs[0].value : 0;
-    const unsigned int h = (attribs[1].value != VA_ATTRIB_NOT_SUPPORTED) ? attribs[1].value : 0;
-    return {w, h};
+    return (attrib.value & rtFormat) != 0;
 }
 
 [[nodiscard]] static auto ResolveRenderNode(int drmFd) -> std::string {
@@ -141,7 +167,42 @@ static constexpr struct {
 }
 
 static auto PrintCapability(const char *label, bool supported) -> void {
-    std::printf("  %-34s %s\n", label, supported ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
+    std::printf("  %-44s %s\n", label, supported ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
+}
+
+// Human-readable label for each VA_RT_FORMAT class, used to annotate probe
+// rows with the surface layout required by each codec/profile.
+[[nodiscard]] static auto RtFormatLabel(unsigned int rtFormat) -> const char * {
+    switch (rtFormat) {
+        case VA_RT_FORMAT_YUV420:
+            return "8-bit  4:2:0";
+        case VA_RT_FORMAT_YUV420_10:
+            return "10-bit 4:2:0";
+        case VA_RT_FORMAT_YUV420_12:
+            return "12-bit 4:2:0";
+        case VA_RT_FORMAT_YUV422:
+            return "8-bit  4:2:2";
+        case VA_RT_FORMAT_YUV422_10:
+            return "10-bit 4:2:2";
+        case VA_RT_FORMAT_YUV422_12:
+            return "12-bit 4:2:2";
+        case VA_RT_FORMAT_YUV444:
+            return "8-bit  4:4:4";
+        case VA_RT_FORMAT_YUV444_10:
+            return "10-bit 4:4:4";
+        case VA_RT_FORMAT_YUV444_12:
+            return "12-bit 4:4:4";
+        default:
+            return "?";
+    }
+}
+
+// Build a fixed-width "Name  (N-bit 4:X:X)" label for one probe row.
+// Thread-local buffer avoids heap allocation inside the probe loop.
+[[nodiscard]] static auto FormatProbeLabel(const DecodeProbe &row) -> const char * {
+    static thread_local std::array<char, 64> buf{};
+    (void)std::snprintf(buf.data(), buf.size(), "%-28s (%s)", row.name, RtFormatLabel(row.rtFormat));
+    return buf.data();
 }
 
 [[nodiscard]] static auto CanCreateSurface(VADisplay display, unsigned int rtFormat) -> bool {
@@ -154,21 +215,53 @@ static auto PrintCapability(const char *label, bool supported) -> void {
     return true;
 }
 
+// Probe a specific FourCC, not just an RT_FORMAT class.  VA_RT_FORMAT_YUV420
+// covers any 8-bit 4:2:0 layout (NV12, YV12, IYUV, ...); a class-only probe can
+// succeed while the driver allocates a FourCC the pipeline cannot consume.
+// The plugin's VPP (scale_vaapi) output and the DRM video plane both require
+// NV12 for 8-bit and P010 for 10-bit.  Some older Intel drivers accept the
+// class but reject the explicit FourCC -- this catches that regression.
+[[nodiscard]] static auto CanCreateSurfaceFourcc(VADisplay display, unsigned int rtFormat, uint32_t fourcc) -> bool {
+    // NOLINTBEGIN(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
+    // VAGenericValue has no zero-valued enumerator, so brace-init triggers a
+    // clang-tidy warning; the union access is mandated by the libva ABI.
+    VASurfaceAttrib attrib{};
+    attrib.type = VASurfaceAttribPixelFormat;
+    attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrib.value.type = VAGenericValueTypeInteger;
+    attrib.value.value.i = static_cast<int>(fourcc);
+    // NOLINTEND(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
+
+    VASurfaceID surface = VA_INVALID_SURFACE;
+    if (vaCreateSurfaces(display, rtFormat, kProbeSurfaceSize, kProbeSurfaceSize, &surface, 1, &attrib, 1) !=
+        VA_STATUS_SUCCESS) {
+        return false;
+    }
+    vaDestroySurfaces(display, &surface, 1);
+    return true;
+}
+
 namespace {
+// Mirrors GpuCaps (src/caps.h): one flag per codec/bit-depth the plugin uses.
+// Populated by ProbeDecodeProfiles; consumed by PrintColorConversions.
 struct DecodeSupport {
-    bool mpeg2 = false;
-    bool h264 = false;
-    bool hevc = false;
+    bool mpeg2 = false;      ///< MPEG-2 Simple or Main (8-bit)
+    bool h264 = false;       ///< H.264 CBP / Main / High (8-bit)
+    bool h264High10 = false; ///< H.264 High 10 (10-bit)
+    bool hevc = false;       ///< HEVC Main (8-bit)
+    bool hevcMain10 = false; ///< HEVC Main 10 (10-bit)
+    bool av1 = false;        ///< AV1 Profile 0 (8-bit)
+    bool av1Main10 = false;  ///< AV1 Profile 0 (10-bit)
 };
 } // namespace
 
 [[nodiscard]] static auto ProbeDecodeProfiles(VADisplay display) -> DecodeSupport {
-    std::printf("\n--- Hardware Decode (VLD + YUV420) ---\n");
+    std::printf("\n--- Hardware Decode (VLD + required RT format) ---\n");
 
     const int maxProfiles = vaMaxNumProfiles(display);
     if (maxProfiles <= 0) {
-        for (const auto &[profile, name] : kDecodeProfiles) {
-            PrintCapability(name, false);
+        for (const auto &row : kDecodeProbes) {
+            PrintCapability(row.name, false);
         }
         return {};
     }
@@ -176,92 +269,98 @@ struct DecodeSupport {
     std::vector<VAProfile> profileBuf(static_cast<size_t>(maxProfiles));
     int profileCount = 0;
     const bool queryOk = vaQueryConfigProfiles(display, profileBuf.data(), &profileCount) == VA_STATUS_SUCCESS;
-    // Clamp to buffer capacity to guard against bogus driver-reported counts.
-    const auto validCount = (queryOk && profileCount > 0)
-                                ? std::min(static_cast<size_t>(profileCount), profileBuf.size())
-                                : size_t{0};
+    // Some drivers report a count larger than the allocated buffer; clamp defensively.
+    const auto validCount =
+        (queryOk && profileCount > 0) ? std::min(static_cast<size_t>(profileCount), profileBuf.size()) : size_t{0};
     const std::span<const VAProfile> profiles{profileBuf.data(), validCount};
 
     DecodeSupport result;
-    for (const auto &[profile, name] : kDecodeProfiles) {
-        const bool hasProfile = std::ranges::find(profiles, profile) != profiles.end();
-        const bool hasVld = hasProfile && SupportsVldEntrypoint(display, profile);
-        const bool supported = hasVld && SupportsYuv420RtFormat(display, profile);
+    for (const auto &row : kDecodeProbes) {
+        const bool hasProfile = std::ranges::find(profiles, row.profile) != profiles.end();
+        const bool hasVld = hasProfile && SupportsVldEntrypoint(display, row.profile);
+        const bool hasRt = hasVld && SupportsRtFormat(display, row.profile, row.rtFormat);
 
-        PrintCapability(name, supported);
+        PrintCapability(FormatProbeLabel(row), hasRt);
 
-        if (supported) {
-            if (profile == VAProfileMPEG2Main) {
-                result.mpeg2 = true;
-            } else if (profile == VAProfileH264Main || profile == VAProfileH264High) {
-                result.h264 = true;
-            } else if (profile == VAProfileHEVCMain10) {
-                result.hevc = true;
+        if (hasRt) {
+            // Mirrors GpuCaps flag-setting in ProbeGpuCaps (src/caps.cpp).
+            // Profiles not in this switch (VP9, HEVC RExt, JPEG) are informational.
+            switch (row.profile) {
+                case VAProfileMPEG2Simple:
+                case VAProfileMPEG2Main:
+                    result.mpeg2 = true;
+                    break;
+                case VAProfileH264ConstrainedBaseline:
+                case VAProfileH264Main:
+                case VAProfileH264High:
+                    result.h264 = true;
+                    break;
+                case VAProfileH264High10:
+                    result.h264High10 = true;
+                    // A High10-capable VLD typically also decodes 8-bit streams, but only
+                    // when the driver advertises YUV420 on the High10 profile itself.  This
+                    // keeps h264 in sync with GpuCaps::hwH264 on drivers that list High10
+                    // without separately listing Main/High (mirrors ProbeGpuCaps).
+                    if (SupportsRtFormat(display, row.profile, VA_RT_FORMAT_YUV420)) {
+                        result.h264 = true;
+                    }
+                    break;
+                case VAProfileHEVCMain:
+                    result.hevc = true;
+                    break;
+                case VAProfileHEVCMain10:
+                    result.hevcMain10 = true;
+                    // Same fallback as H264High10: Main10 VLDs often handle 8-bit too.
+                    if (SupportsRtFormat(display, row.profile, VA_RT_FORMAT_YUV420)) {
+                        result.hevc = true;
+                    }
+                    break;
+                case VAProfileAV1Profile0:
+                    if (row.rtFormat == VA_RT_FORMAT_YUV420_10) {
+                        result.av1Main10 = true;
+                    } else {
+                        result.av1 = true;
+                    }
+                    break;
+                default:
+                    break;
             }
-
-            const auto [maxW, maxH] = QueryMaxDecodeResolution(display, profile);
-            if (maxW > 0 && maxH > 0) {
-                std::printf("  %-34s (max %ux%u)\n", "", maxW, maxH);
-            }
-        } else if (hasProfile) {
-            if (!hasVld) {
-                std::printf("  %-34s (profile present but no VLD entrypoint)\n", "");
-            } else {
-                std::printf("  %-34s (VLD present but no YUV420 RT format)\n", "");
-            }
+        } else if (hasProfile && !hasVld) {
+            std::printf("  %-44s (profile present but no VLD entrypoint)\n", "");
         }
+        // hasProfile && hasVld && !hasRt: the top-level "no" is sufficient;
+        // a second diagnostic line would add noise without actionable info.
     }
     return result;
 }
 
-[[nodiscard]] static auto ProbeHdrToneMapping(VADisplay display, VAContextID vppContext,
-                                              std::span<const VAProcFilterType> filters) -> bool {
+// Returns true if the driver supports tone mapping in at least one direction the
+// plugin uses (HDR->HDR or HDR->SDR).  Does not print directly; the result is
+// surfaced through PrintColorConversions so the operator sees it alongside the
+// codec/surface context that makes it actionable.  The VPP filter list already
+// shows whether VAProcFilterHighDynamicRangeToneMapping is advertised at all.
+[[nodiscard]] static auto HasHdrToneMapping(VADisplay display, VAContextID vppContext,
+                                            std::span<const VAProcFilterType> filters) -> bool {
     if (std::ranges::find(filters, VAProcFilterHighDynamicRangeToneMapping) == filters.end()) {
-        PrintCapability("HDR Tone Mapping", false);
         return false;
     }
 
     VAProcFilterCapHighDynamicRange hdrCaps[VAProcHighDynamicRangeMetadataTypeCount];
     auto hdrCapCount = static_cast<unsigned int>(VAProcHighDynamicRangeMetadataTypeCount);
     if (vaQueryVideoProcFilterCaps(display, vppContext, VAProcFilterHighDynamicRangeToneMapping, hdrCaps,
-                                   &hdrCapCount) != VA_STATUS_SUCCESS ||
-        hdrCapCount == 0) {
-        std::printf("  %-34s \033[33mlisted but no usable caps\033[0m\n", "HDR Tone Mapping");
+                                   &hdrCapCount) != VA_STATUS_SUCCESS) {
         return false;
     }
 
-    bool hasUsableCaps = false;
+    // Skip the None metadata row; require at least one direction the plugin uses.
+    constexpr uint16_t kUsableMask = VA_TONE_MAPPING_HDR_TO_HDR | VA_TONE_MAPPING_HDR_TO_SDR;
     for (unsigned int i = 0; i < hdrCapCount; ++i) {
-        if (hdrCaps[i].metadata_type == VAProcHighDynamicRangeMetadataNone) {
-            continue;
-        }
-        if (hdrCaps[i].caps_flag != 0) {
-            hasUsableCaps = true;
-        }
-
-        const char *hdrLabel = (hdrCaps[i].metadata_type == VAProcHighDynamicRangeMetadataHDR10)
-                                   ? "HDR Tone Mapping (HDR10)"
-                                   : "HDR Tone Mapping (unknown)";
-
-        if (hdrCaps[i].caps_flag == 0) {
-            std::printf("  %-34s \033[31mno usable flags\033[0m\n", hdrLabel);
-        } else {
-            std::printf("  %-34s ", hdrLabel);
-            bool first = true;
-            for (const auto &[flag, flagName] : kToneMappingFlags) {
-                if (hdrCaps[i].caps_flag & flag) {
-                    std::printf("%s%s", first ? "" : ", ", flagName);
-                    first = false;
-                }
-            }
-            std::printf("\n");
+        if (hdrCaps[i].metadata_type != VAProcHighDynamicRangeMetadataNone &&
+            (hdrCaps[i].caps_flag & kUsableMask) != 0) {
+            return true;
         }
     }
-
-    if (!hasUsableCaps) {
-        std::printf("  %-34s \033[33mlisted but no usable caps\033[0m\n", "HDR Tone Mapping");
-    }
-    return hasUsableCaps;
+    return false;
 }
 
 static auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
@@ -282,28 +381,26 @@ static auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> voi
     }
 }
 
-// Only called when VPP is available -- VPP implies colorspace conversion support.
-static auto PrintColorConversions(bool hasMpeg2, bool hasH264, bool hasHevc, bool hasP010, bool hasNV12,
-                                  bool hasHdrToneMapping) -> void {
-    std::printf("\n--- DVB-S2 Color Conversion Paths ---\n");
+static auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12, bool hasHdrToneMapping)
+    -> void {
+    std::printf("\n--- Color Conversion Paths ---\n");
 
-    // MPEG-2 SD PAL to HD/UHD display (VPP colorspace conversion).
-    PrintCapability("BT.601 -> BT.709  (MPEG-2 SD)", hasMpeg2);
+    const bool any10Bit = dec.hevcMain10 || dec.h264High10 || dec.av1Main10;
+    // Both surfaces are needed: P010 for the decoded frame, NV12 for VPP output.
+    const bool tenToEight = any10Bit && hasP010 && hasNV12;
 
-    // H.264 HD -- passthrough, no VPP needed.
-    PrintCapability("BT.709 passthrough (H.264 HD)", hasH264);
-
-    // HEVC UHD wide color gamut to SDR.
-    PrintCapability("BT.2020 -> BT.709  (HEVC UHD)", hasHevc && hasP010);
-
-    // HEVC Main 10 decode to 8-bit output.
-    PrintCapability("P010 -> NV12      (10->8 bit)", hasHevc && hasP010 && hasNV12);
-
-    // HLG is backward-compatible, no tone mapping needed.
-    PrintCapability("HLG -> SDR   (no TM required)", hasHevc);
-
-    // Requires VPP tone mapping with HDR->SDR support.
-    PrintCapability("PQ/HDR10 -> SDR    (tone map)", hasHevc && hasHdrToneMapping);
+    // BT.601 SD broadcast upscaled to BT.709 HD/UHD display via VPP.
+    PrintCapability("BT.601 -> BT.709   (MPEG-2 SD)", dec.mpeg2);
+    // BT.709 8-bit: passthrough, no colorspace conversion required.
+    PrintCapability("BT.709 passthrough  (8-bit HD)", dec.h264 || dec.hevc || dec.av1);
+    // BT.2020 10-bit HDR decode surface allocation.
+    PrintCapability("BT.2020/P010      (HDR decode)", any10Bit && hasP010);
+    // VPP P010->NV12 downconvert for SDR display.
+    PrintCapability("P010 -> NV12       (10->8 bit)", tenToEight);
+    // HLG is backward-compatible with BT.709 -- display handles it without VPP TM.
+    PrintCapability("HLG -> SDR    (no TM required)", any10Bit);
+    // PQ/HDR10: requires VAProcFilterHighDynamicRangeToneMapping with HDR->SDR.
+    PrintCapability("PQ/HDR10 -> SDR     (tone map)", any10Bit && hasHdrToneMapping);
 }
 
 auto main(int argc, char *argv[]) -> int {
@@ -314,11 +411,11 @@ auto main(int argc, char *argv[]) -> int {
 
     const char *devicePath = (argc > 1) ? argv[1] : "/dev/dri/card0";
 
-    std::printf("VAAPI Capability Prober (DVB-S2 / YUV420-NV12)\n"
-                "==============================================\n");
+    std::printf("VAAPI Capability Prober (vdr-plugin-vaapivideo)\n"
+                "================================================\n");
 
     // --- Open DRM device ---
-    const int drmFd = open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    const int drmFd = open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
     if (drmFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open '%s': %s\n", devicePath, std::strerror(errno));
         (void)std::fprintf(stderr, "       Ensure user is in 'video' or 'render' group.\n");
@@ -337,7 +434,7 @@ auto main(int argc, char *argv[]) -> int {
     std::printf("Render node: %s\n", renderNode.c_str());
 
     // --- Open render node and initialize VAAPI ---
-    const int renderFd = open(renderNode.c_str(), O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    const int renderFd = open(renderNode.c_str(), O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
     if (renderFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open render node '%s': %s\n", renderNode.c_str(),
                            std::strerror(errno));
@@ -373,7 +470,7 @@ auto main(int argc, char *argv[]) -> int {
         vaCreateConfig(vaDisplay, VAProfileNone, VAEntrypointVideoProc, nullptr, 0, &vppConfig) == VA_STATUS_SUCCESS;
 
     PrintCapability("General (VideoProc)", vppAvailable);
-    PrintCapability("Scaling", vppAvailable); // Scaling is implicit in any VPP pipeline.
+    PrintCapability("Scaling", vppAvailable); // Implicit in any VPP context; no separate capability bit.
 
     if (!vppAvailable) {
         std::printf("\n  VPP unavailable -- remaining queries skipped.\n");
@@ -382,20 +479,34 @@ auto main(int argc, char *argv[]) -> int {
         return EXIT_SUCCESS;
     }
 
-    const bool hasP010 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420_10);
-    const bool hasNV12 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420);
+    // VA_RT_FORMAT_YUV420/YUV420_10 are format classes, not specific layouts.
+    // The RT-format probe answers "does the driver support this bit depth?";
+    // the FourCC probe answers "can the plugin pipeline actually consume it?"
+    // (NV12 for 8-bit, P010 for 10-bit -- both required by scale_vaapi and DRM plane).
+    const bool hasRtNV12 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420);
+    const bool hasRtP010 = CanCreateSurface(vaDisplay, VA_RT_FORMAT_YUV420_10);
+    const bool hasNV12 = CanCreateSurfaceFourcc(vaDisplay, VA_RT_FORMAT_YUV420, VA_FOURCC_NV12);
+    const bool hasP010 = CanCreateSurfaceFourcc(vaDisplay, VA_RT_FORMAT_YUV420_10, VA_FOURCC_P010);
 
-    PrintCapability("P010 (10-bit) surfaces", hasP010);
-    PrintCapability("NV12 (8-bit) surfaces", hasNV12);
-    PrintCapability("10-bit -> 8-bit conversion", hasP010 && hasNV12);
+    PrintCapability("YUV420    class  (any 8-bit  4:2:0)", hasRtNV12);
+    PrintCapability("YUV420_10 class  (any 10-bit 4:2:0)", hasRtP010);
+    PrintCapability("NV12 FourCC      (plugin 8-bit path)", hasNV12);
+    PrintCapability("P010 FourCC      (plugin 10-bit path)", hasP010);
+    if (hasRtNV12 && !hasNV12) {
+        std::printf("  %-44s \033[33mYUV420 class works but NV12 FourCC rejected -- buggy driver\033[0m\n", "");
+    }
+    if (hasRtP010 && !hasP010) {
+        std::printf("  %-44s \033[33mYUV420_10 class works but P010 FourCC rejected -- buggy driver\033[0m\n", "");
+    }
+    PrintCapability("P010 -> NV12     (VPP 10->8 bit)", hasP010 && hasNV12);
 
-    // VPP filter queries require a valid context backed by a real surface.
+    // vaQueryVideoProcFilterCaps requires a context; the context requires at least
+    // one surface.  Minimal 64x64 YUV420 surface satisfies the driver constraint.
     VASurfaceID probeSurface = VA_INVALID_SURFACE;
     if (const VAStatus st = vaCreateSurfaces(vaDisplay, VA_RT_FORMAT_YUV420, kProbeSurfaceSize, kProbeSurfaceSize,
                                              &probeSurface, 1, nullptr, 0);
         st != VA_STATUS_SUCCESS) [[unlikely]] {
-        (void)std::fprintf(stderr, "  WARNING: vaCreateSurfaces failed (%s) -- cannot query filters\n",
-                           vaErrorStr(st));
+        (void)std::fprintf(stderr, "  WARNING: vaCreateSurfaces failed (%s) -- cannot query filters\n", vaErrorStr(st));
         vaDestroyConfig(vaDisplay, vppConfig);
         vaTerminate(vaDisplay);
         close(renderFd);
@@ -406,8 +517,7 @@ auto main(int argc, char *argv[]) -> int {
     if (const VAStatus st = vaCreateContext(vaDisplay, vppConfig, kProbeSurfaceSize, kProbeSurfaceSize, 0,
                                             &probeSurface, 1, &vppContext);
         st != VA_STATUS_SUCCESS) [[unlikely]] {
-        (void)std::fprintf(stderr, "  WARNING: vaCreateContext failed (%s) -- cannot query filters\n",
-                           vaErrorStr(st));
+        (void)std::fprintf(stderr, "  WARNING: vaCreateContext failed (%s) -- cannot query filters\n", vaErrorStr(st));
         vaDestroySurfaces(vaDisplay, &probeSurface, 1);
         vaDestroyConfig(vaDisplay, vppConfig);
         vaTerminate(vaDisplay);
@@ -427,10 +537,9 @@ auto main(int argc, char *argv[]) -> int {
         PrintCapability(filterName, std::ranges::find(filters, filterType) != filters.end());
     }
 
-    const bool hasHdrToneMapping = ProbeHdrToneMapping(vaDisplay, vppContext, filters);
+    const bool hasHdrToneMapping = HasHdrToneMapping(vaDisplay, vppContext, filters);
 
-    PrintColorConversions(decodeSupport.mpeg2, decodeSupport.h264, decodeSupport.hevc, hasP010, hasNV12,
-                          hasHdrToneMapping);
+    PrintColorConversions(decodeSupport, hasP010, hasNV12, hasHdrToneMapping);
     ProbeDeinterlacing(vaDisplay, vppContext);
 
     vaDestroyContext(vaDisplay, vppContext);

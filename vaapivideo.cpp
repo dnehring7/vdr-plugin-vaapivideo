@@ -2,19 +2,16 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file vaapivideo.cpp
- * @brief VDR plugin entry point and lifecycle management
+ * @brief VDR plugin entry point: argument parsing, device lifecycle, and setup-menu registration.
  *
- * VDR plugin lifecycle call order (relevant to this file):
- *   1. Constructor      -- object created, no hardware touched yet
- *   2. ProcessArgs()    -- command-line args parsed, stored for later use
- *   3. Initialize()     -- cVaapiDevice created; hardware opens immediately unless
- *                          --detached is set (then deferred to first attach)
- *   4. Start()          -- startup finalized: attached mode confirms primary,
- *                          detached mode releases the deferred-attach gate
- *   5. Housekeeping()   -- called periodically by VDR's main loop (empty here)
- *   6. Stop()           -- hardware released; VDR still owns cVaapiDevice
- *   7. Destructor       -- trivial; VDR destroys cVaapiDevice separately via
- * cDevice::Shutdown()
+ * Plugin lifecycle (VDR call order):
+ *   1. Constructor    -- no hardware touched
+ *   2. ProcessArgs()  -- args stored; hardware untouched
+ *   3. Initialize()   -- cVaapiDevice created; hardware opened unless --detached
+ *   4. Start()        -- attached: confirm primary; detached: release attach gate
+ *   5. Housekeeping() -- periodic VDR main-loop tick (empty)
+ *   6. Stop()         -- plugin cleanup; VDR still owns cVaapiDevice
+ *   7. Destructor     -- trivial; VDR destroys cVaapiDevice via cDevice::Shutdown()
  */
 
 #include "src/common.h"
@@ -23,7 +20,7 @@
 #include "src/osd.h"
 
 // POSIX
-#include <getopt.h> // NOLINT(misc-include-cleaner)
+#include <getopt.h> // NOLINT(misc-include-cleaner) -- clang-tidy cannot map getopt_long/option/optind/optarg back to this header
 #include <strings.h>
 #include <unistd.h>
 
@@ -64,8 +61,8 @@ namespace {
 // === cMenuSetupVaapi ===
 // ============================================================================
 
-/// VDR setup page for the VAAPI plugin. Edits are applied to a local copy and
-/// only written back to the global config when the user confirms with Store().
+/// VDR setup page. All edits are staged in local int copies and written back to
+/// vaapiConfig atomics only when the user confirms via Store().
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
     cMenuSetupVaapi()
@@ -78,9 +75,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                          0, kPassthroughModeCount - 1)),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
-        // Two independent A/V offsets: one used while audio is decoded to PCM, the other while audio
-        // is forwarded as IEC61937 passthrough. Bounds come from config.h so the menu and the
-        // setup.conf parser share a single source of truth.
+        // Separate A/V offsets for PCM and IEC61937 passthrough paths; bounds from config.h
+        // keep the menu and setup.conf parser in sync.
         Add(new cMenuEditIntItem(tr("PCM Audio Latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
                                  CONFIG_AUDIO_LATENCY_MAX_MS));
         Add(new cMenuEditIntItem(tr("Passthrough Audio Latency (ms)"), &editPassthroughLatency,
@@ -88,7 +84,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         Add(new cMenuEditStraItem(tr("Audio Passthrough"), &editPassthroughMode, kPassthroughModeCount,
                                   kPassthroughModeLabels.data()));
         Add(new cMenuEditStraItem(tr("HDR Passthrough"), &editHdrMode, kHdrModeCount, kHdrModeLabels.data()));
-        // Override the default "no"/"yes" so both boolean-style items in this page read "off"/"on".
+        // Use "off"/"on" labels to match the string-select items above; default is "no"/"yes".
         Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, tr("off"),
                                   tr("on")));
     }
@@ -108,9 +104,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     }
 
   private:
-    // Labels for cMenuEditStraItem, derived from PassthroughModeName() so the enum, the
-    // setup.conf log output, and the setup-menu display can never drift apart. Order must
-    // match the enum's numeric values: cMenuEditStraItem stores the selected index and we
+    // Labels derived from PassthroughModeName() -- keeps enum, setup.conf, and menu in sync.
+    // Order must match enum numeric values; cMenuEditStraItem stores the index and we
     // round-trip it through setup.conf as PassthroughMode(int).
     static constexpr std::array kPassthroughModeLabels{
         PassthroughModeName(PassthroughMode::Auto),
@@ -119,7 +114,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
 
-    // HdrMode menu labels -- same pattern, rooted in HdrModeName() for single-source-of-truth.
+    // Same pattern as kPassthroughModeLabels; rooted in HdrModeName().
     static constexpr std::array kHdrModeLabels{
         HdrModeName(HdrMode::Auto),
         HdrModeName(HdrMode::On),
@@ -138,9 +133,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 // === cVaapiVideoPlugin ===
 // ============================================================================
 
-/// Top-level VDR plugin class. Responsible for command-line argument parsing,
-/// plugin lifecycle (Initialize / Start / Stop), the setup menu, the SVDRP
-/// interface, and the inter-plugin service API.
+/// Top-level VDR plugin: arg parsing, lifecycle, setup menu, SVDRP, and service API.
 class cVaapiVideoPlugin : public cPlugin {
   public:
     cVaapiVideoPlugin();
@@ -150,7 +143,7 @@ class cVaapiVideoPlugin : public cPlugin {
     auto operator=(const cVaapiVideoPlugin &) -> cVaapiVideoPlugin & = delete;
     auto operator=(cVaapiVideoPlugin &&) -> cVaapiVideoPlugin & = delete;
 
-    // VDR plugin API -- called by VDR in the order described in the file-level comment
+    // VDR plugin API -- called in the order documented at the top of this file
     [[nodiscard]] auto CommandLineHelp() -> const char * override;
     [[nodiscard]] auto Description() -> const char * override { return PLUGIN_DESCRIPTION; }
     auto Housekeeping() -> void override;
@@ -166,24 +159,18 @@ class cVaapiVideoPlugin : public cPlugin {
     [[nodiscard]] auto Version() -> const char * override { return PLUGIN_VERSION; }
 
   private:
-    /// Returns the DRM device path to use: the user-supplied value, or the best
-    /// candidate found by probing /dev/dri/card0 first and then falling back to
-    /// libdrm enumeration.
+    /// Resolves the DRM device path: explicit arg > /dev/dri/card0 > libdrm enumeration.
+    /// Returns an empty cString and logs errors on failure.
     [[nodiscard]] auto ResolveDrmDevice() const -> cString;
 
-    cString audioDevice;       ///< ALSA device passed via -a / --audio; defaults to
-                               ///< "default".
-    cString connectorName;     ///< DRM connector name passed via -c / --connector;
-                               ///< empty means first connected output.
-    cString drmPath;           ///< DRM device path passed via -d / --drm; empty means
-                               ///< auto-detect.
-    bool startDetached{false}; ///< -D / --detached: skip DRM/VAAPI/ALSA init until an
-                               ///< explicit attach (primary-device switch or SVDRP ATTA).
+    cString audioDevice;       ///< ALSA device (-a / --audio); defaults to "default".
+    cString connectorName;     ///< DRM connector (-c / --connector); empty = first connected.
+    cString drmPath;           ///< DRM device path (-d / --drm); empty = auto-detect.
+    bool startDetached{false}; ///< -D / --detached: defer all hardware init until SVDRP ATTA or
+                               ///<   primary-device switch.
 
-    /// Non-owning pointer to the active output device.
-    /// All cDevice instances self-register with VDR in their constructor and
-    /// are destroyed by cDevice::Shutdown() (called from main()) -- never delete
-    /// this pointer manually.
+    /// Non-owning pointer. cDevice self-registers with VDR on construction; VDR destroys it
+    /// via cDevice::Shutdown() after all Stop() calls. Never delete this pointer.
     cVaapiDevice *vaapiDevice{nullptr};
 };
 
@@ -205,8 +192,8 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
         return drmPath;
     }
 
-    // No device specified -- try /dev/dri/card0 first (covers the vast majority of single-GPU setups),
-    // then fall back to full libdrm enumeration when that node is absent or inaccessible.
+    // /dev/dri/card0 covers the vast majority of single-GPU setups; fall back to libdrm
+    // enumeration only when that node is absent or inaccessible.
     if (access("/dev/dri/card0", R_OK | W_OK) == 0) {
         isyslog("vaapivideo: auto-detected /dev/dri/card0 (primary GPU)");
         return "/dev/dri/card0";
@@ -240,7 +227,7 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
 // ============================================================================
 
 auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
-    // Static storage: VDR keeps a pointer to the returned string for the process lifetime.
+    // VDR stores the returned pointer for the process lifetime; must be static.
     static const std::string kHelp =
         std::format("  -d DEV, --drm=DEV           Use DRM device DEV "
                     "(default: auto-detect)\n"
@@ -261,12 +248,12 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
 auto cVaapiVideoPlugin::Housekeeping() -> void {}
 
 auto cVaapiVideoPlugin::Initialize() -> bool {
-    // FFmpeg's PPS/SPS parse errors during initial stream acquisition flood the log; only fatal errors matter here.
+    // PPS/SPS parse errors during initial stream acquisition flood the log; only fatal FFmpeg errors are relevant.
     av_log_set_level(AV_LOG_FATAL);
 
-    // Device must be created in Initialize(), not Start(): VDR's startup is all Initialize() -> set primary device ->
-    // all Start(). Skin plugins call cOsdProvider::SupportsTrueColor() in their Start(), which requires our OSD
-    // provider (installed via MakePrimaryDevice()). Deferring to Start() would miss the primary device window.
+    // Must create cVaapiDevice in Initialize(), not Start(): VDR calls all Initialize() first, then sets the primary
+    // device, then calls all Start(). Skin plugins query cOsdProvider::SupportsTrueColor() in their Start(), which
+    // requires our OSD provider registered via MakePrimaryDevice() -- deferring to Start() misses that window.
 
     const cString resolvedDrm = ResolveDrmDevice();
     if (isempty(*resolvedDrm)) {
@@ -275,11 +262,9 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
     isyslog("vaapivideo: using audio device: %s", *audioDevice);
 
-    // cVaapiDevice self-registers with VDR's device list in its cDevice constructor; ownership transfers to VDR
-    // immediately and cDevice::Shutdown() (called from main()) will delete it. Never delete vaapiDevice manually.
     dsyslog("vaapivideo: creating cVaapiDevice (DRM=%s, audio=%s, detached=%d)", *resolvedDrm, *audioDevice,
             startDetached ? 1 : 0);
-    vaapiDevice = new cVaapiDevice();
+    vaapiDevice = new cVaapiDevice(); // ownership immediately transferred to VDR's device registry
 
     if (!vaapiDevice->Initialize(*resolvedDrm, *audioDevice,
                                  isempty(*connectorName) ? std::string_view{} : std::string_view{*connectorName},
@@ -290,7 +275,7 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
         esyslog("vaapivideo: VDR will continue with DVB devices only");
         esyslog("vaapivideo: see error messages above for details");
         esyslog("vaapivideo: ========================================");
-        vaapiDevice = nullptr; // clear our pointer; VDR will still destroy the instance
+        vaapiDevice = nullptr; // VDR still destroys the instance; just relinquish our pointer
         return false;
     }
 
@@ -299,22 +284,22 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 }
 
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
-    // NOLINTNEXTLINE(misc-include-cleaner)
+    // NOLINTBEGIN(misc-include-cleaner) -- getopt symbols (option, getopt_long, optind, optarg,
+    // required_argument, no_argument) come from <getopt.h>, but clang-tidy's IWYU doesn't track them.
     static constexpr std::array<option, 6> kLongOptions = {
-        {{.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'}, // NOLINT(misc-include-cleaner)
+        {{.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'},
          {.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
          {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
-         {.name = "detached", .has_arg = no_argument, .flag = nullptr, .val = 'D'}, // NOLINT(misc-include-cleaner)
+         {.name = "detached", .has_arg = no_argument, .flag = nullptr, .val = 'D'},
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
-    optind = 1; // Reset global getopt state; VDR may call ProcessArgs() more than once. // NOLINT(misc-include-cleaner)
+    optind = 1; // getopt state is global; reset so re-invocation by VDR parses cleanly.
     int opt{};
-    // NOLINTNEXTLINE(misc-include-cleaner)
     while ((opt = getopt_long(argc, argv, "d:a:c:r:D", kLongOptions.data(), nullptr)) != -1) {
         switch (opt) {
             case 'd':
-                if (optarg == nullptr || *optarg == '\0') { // NOLINT(misc-include-cleaner)
+                if (optarg == nullptr || *optarg == '\0') {
                     esyslog("vaapivideo: empty DRM device argument");
                     return false;
                 }
@@ -359,16 +344,13 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
         }
     }
     return true;
+    // NOLINTEND(misc-include-cleaner)
 }
 
-// Inter-plugin service API.
-//
-// Service IDs and data contracts:
-//   "VaapiVideo-Available-v1.0"  -- bool*    -- true if hardware decoder is ready
-//   "VaapiVideo-IsReady-v1.0"    -- bool*    -- true if device is fully initialized
-//   "VaapiVideo-DeviceType-v1.0" -- cString* -- human-readable device type string
-//
-// data==nullptr is a pure capability probe ("does this service exist?").
+// Inter-plugin service API. data==nullptr is a capability probe; non-null fills the typed result.
+//   "VaapiVideo-Available-v1.0"  -- bool*    -- hardware decoder is ready
+//   "VaapiVideo-IsReady-v1.0"    -- bool*    -- device fully initialized (not detached)
+//   "VaapiVideo-DeviceType-v1.0" -- cString* -- human-readable GPU/driver string
 auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
     if (serviceId == nullptr) {
         return false;
@@ -395,7 +377,7 @@ auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
         return true;
     }
 
-    return false; // unknown service ID -- let VDR try other plugins
+    return false; // unknown ID -- VDR will try other plugins
 }
 
 auto cVaapiVideoPlugin::SetupMenu() -> cMenuSetupPage * { return new cMenuSetupVaapi(); }
@@ -412,29 +394,25 @@ auto cVaapiVideoPlugin::Start() -> bool {
         return false;
     }
 
-    // Detached startup: hardware is deliberately not open yet. Stay loaded and wait for an
-    // explicit attach (primary-device switch fires MakePrimaryDevice() or SVDRP ATTA).
-    // MarkStartupComplete() below releases the MakePrimaryDevice() deferred-attach gate so
-    // post-startup primary switches will attach -- but setup.conf-driven promotion during
-    // bring-up (which has already run by now) does not.
+    // Detached startup: hardware is not open yet. MarkStartupComplete() arms the
+    // MakePrimaryDevice() gate so post-startup primary switches will trigger Attach() --
+    // but the setup.conf-driven promotion that already ran will not.
     if (!vaapiDevice->IsReady()) {
         isyslog("vaapivideo: started detached -- hardware init deferred until attach");
         vaapiDevice->MarkStartupComplete();
         return true;
     }
 
-    // By this point VDR has processed setup.conf and called MakePrimaryDevice() on the stored primary device.
-    // The fallback below handles first-run or misconfigured setups where VDR did not select our device.
+    // VDR has processed setup.conf and called MakePrimaryDevice() for the stored primary.
+    // If our device was not promoted (first-run or misconfigured setup), force it now.
     if (!vaapiDevice->IsPrimaryDevice()) {
         const int primaryIndex = vaapiDevice->DeviceNumber() + 1;
         if (cDevice::SetPrimaryDevice(primaryIndex)) {
             isyslog("vaapivideo: set as primary device %d", primaryIndex);
         } else {
-            // SetPrimaryDevice() can fail if called too early in VDR's startup; SetPrimary() is the
-            // direct instance-level fallback that bypasses the global device-index lookup.
-            esyslog("vaapivideo: SetPrimaryDevice(%d) failed, falling back to "
-                    "SetPrimary",
-                    primaryIndex);
+            // SetPrimaryDevice() uses the global index table; SetPrimary() is the direct
+            // fallback when that lookup fails (e.g. device registered late).
+            esyslog("vaapivideo: SetPrimaryDevice(%d) failed, falling back to SetPrimary", primaryIndex);
             vaapiDevice->SetPrimary(true);
         }
     }
@@ -450,17 +428,15 @@ auto cVaapiVideoPlugin::Start() -> bool {
 }
 
 auto cVaapiVideoPlugin::Stop() -> void {
-    // Do not delete vaapiDevice: VDR's device registry owns it; cDevice::Shutdown() (called from main() after all
-    // Stop() invocations) destroys it. Deleting here would cause a double-free.
-
+    // Do not delete vaapiDevice: cDevice::Shutdown() (called from main() after all Stop()s) owns it.
     if (vaapiDevice) {
-        // The OSD provider holds a raw pointer to cVaapiDisplay. Detach it before VDR tears down cVaapiDevice
-        // to prevent a dangling-pointer dereference when the display destructor runs.
+        // cVaapiOsdProvider holds a raw pointer to cVaapiDisplay; detach before VDR destroys
+        // cVaapiDevice to prevent a dangling-pointer dereference in the display destructor.
         if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
             provider->DetachDisplay();
             dsyslog("vaapivideo: OSD provider detached from display");
         }
-        vaapiDevice = nullptr; // Relinquish non-owning pointer; VDR destroys the object via cDevice::Shutdown().
+        vaapiDevice = nullptr;
     }
 
     isyslog("vaapivideo: plugin stopped");
@@ -468,7 +444,7 @@ auto cVaapiVideoPlugin::Stop() -> void {
 
 auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const char *option, int &replyCode)
     -> cString {
-    // VDR SVDRP reply codes: 900=success, 550=action not taken, 500=unknown command.
+    // SVDRP reply codes: 900=success, 550=action not taken, 500=unknown command.
 
     if (strcasecmp(command, "DETA") == 0) {
         if (!vaapiDevice) [[unlikely]] {
@@ -484,9 +460,7 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
         if (consoleRestored) {
             return "VAAPI device detached from hardware";
         }
-        // Hardware is released; fbcon couldn't be auto-restored (missing /dev/tty0 perms
-        // or CAP_SYS_TTY_CONFIG on the vdr service). Tell the operator what to do now so
-        // they don't stare at a black screen wondering -- log already has the details.
+        // fbcon restore failed: missing /dev/tty0 perms or CAP_SYS_TTY_CONFIG. Log has details.
         return "VAAPI device detached -- press Alt+F1 to restore the console "
                "(see README: tty group + udev + CAP_SYS_TTY_CONFIG)";
     }
@@ -504,9 +478,8 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "VAAPI device attach failed - check logs for details";
         }
-        // Only restart channel delivery when this device actually owns PrimaryDevice().
-        // With --detached, ATTA is also valid for a non-primary device; retuning whatever
-        // device happens to be primary in that case would interrupt unrelated playback.
+        // Only retune if we are the primary device. With --detached, ATTA is valid for
+        // non-primary devices too; retuning the current primary would interrupt other playback.
         if (vaapiDevice->IsPrimaryDevice()) {
             LOCK_CHANNELS_READ;
             if (const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel())) {
@@ -557,6 +530,8 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.", "CONFIG\n    Display current configuration settings.",
         nullptr};
+    // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
+    // both pointee levels are read-only at the call site, so stripping the inner const is safe.
     return const_cast<const char **>(kHelpPages); // NOLINT(cppcoreguidelines-pro-type-const-cast)
 }
 

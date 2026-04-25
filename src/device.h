@@ -8,6 +8,7 @@
 #ifndef VDR_VAAPIVIDEO_DEVICE_H
 #define VDR_VAAPIVIDEO_DEVICE_H
 
+#include "caps.h"
 #include "common.h"
 
 class cAudioProcessor;
@@ -19,19 +20,12 @@ class cVaapiDisplay;
 // ============================================================================
 
 /// Shared VAAPI hardware context passed to decoder and display subsystems.
-/// Decode profile flags and VPP filter capabilities are probed once at device
-/// init by ProbeVppCapabilities() and cached here for the decoder's filter graph.
+/// Decode profile flags and VPP filter capabilities live on @ref caps (populated
+/// once by ProbeGpuCaps() at device init).
 struct VaapiContext {
-    AVBufferRef *hwDeviceRef{};  ///< VAAPI hardware device (owned, freed via av_buffer_unref())
-    int drmFd{-1};               ///< DRM file descriptor (borrowed -- owned by cVaapiDevice)
-    bool hasDenoise{};           ///< VAProcFilterNoiseReduction supported
-    bool hasP010{};              ///< GPU VPP accepts P010 (YUV420_10) surfaces -- HDR passthrough prerequisite
-    bool hasSharpness{};         ///< VAProcFilterSharpening supported
-    bool hwH264{};               ///< GPU supports VAAPI hardware H.264 decode (VLD + YUV420)
-    bool hwHevc{};               ///< GPU supports VAAPI hardware HEVC decode (VLD + YUV420)
-    bool hwHevcMain10{};         ///< GPU supports VAAPI HEVC Main 10 decode (VLD + YUV420_10) -- HDR prerequisite
-    bool hwMpeg2{};              ///< GPU supports VAAPI hardware MPEG-2 decode (VLD + YUV420)
-    std::string deinterlaceMode; ///< Best deinterlace mode name (empty = none)
+    AVBufferRef *hwDeviceRef{}; ///< VAAPI hardware device (owned, freed via av_buffer_unref())
+    int drmFd{-1};              ///< DRM file descriptor (borrowed -- owned by cVaapiDevice)
+    GpuCaps caps{};             ///< GPU decode + VPP capability snapshot (see caps.h)
 };
 
 // ============================================================================
@@ -155,9 +149,11 @@ class cVaapiDevice : public cDevice {
     auto SetAudioTrackDevice(eTrackType Type)
         -> void override; ///< Reset audio codec state and flush on track switch (live TV path)
     auto SetDigitalAudioDevice(bool On)
-        -> void override; ///< Notification fired by cDevice::SetCurrentAudioTrack() in BOTH live and replay; the
-                          ///< only audio-track-change hook that reaches the device during replay (the live TV path
-                          ///< also routes through SetAudioTrackDevice). Used here to log the new track.
+        -> void override; ///< Audio-track-change hook fired by cDevice::SetCurrentAudioTrack() in BOTH live and
+                          ///< replay; it is the only hook that fires during replay. On=true signals a dolby-track
+                          ///< switch, but fires BEFORE currentAudioTrack is assigned (VDR vdr/device.c:1172-1180),
+                          ///< so GetCurrentAudioTrack() would return the stale old track. HandleAudioTrackChange()
+                          ///< has a dedicated dolby walk-around for this; see its implementation.
     [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
         -> bool override;                              ///< Reset state machine and flush on mode transitions
     auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
@@ -174,7 +170,7 @@ class cVaapiDevice : public cDevice {
         -> void; ///< Log + run full audio re-detection on track change. @p enteringDolby is set when called from
                  ///< SetDigitalAudioDevice(true), where VDR fires the hook BEFORE assigning currentAudioTrack and
                  ///< the read would otherwise return the OLD (stale) selection.
-    [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI device context, log codec support
+    [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI hw device context, find render node
     [[nodiscard]] auto ProbeVppCapabilities(std::string_view renderNode)
         -> bool;                         ///< Query VAAPI decode profiles and VPP filter capabilities
     auto ReleaseHardware() -> void;      ///< Close VAAPI device reference and DRM file descriptor
@@ -208,10 +204,10 @@ class cVaapiDevice : public cDevice {
     int osdWidth{};                           ///< Cached display width for OSD allocation (pixels)
     AVCodecID audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate audio codec pending confirmation
     int audioCodecCandidateCount{};                  ///< Consecutive detections of candidate audio codec
-    eTrackType lastHandledAudioTrack{ttNone};        ///< Last (type, PID) seen by HandleAudioTrackChange(); used for
-    uint16_t lastHandledAudioPid{};                  ///< deduplication so VDR's repeat SetCurrentAudioTrack() calls
-                                                     ///< during channel setup do not trigger redundant resets / logs
-    std::atomic<bool> paused;                        ///< True while playback is frozen via Freeze()
+    std::atomic<uint64_t> lastClearMs{0};     ///< Timestamp of last Clear() for diagnostic delta logging; 0 = never
+    eTrackType lastHandledAudioTrack{ttNone}; ///< Dedup pair (with lastHandledAudioPid): skip track change if
+    uint16_t lastHandledAudioPid{};           ///<   both (type, PID) match; suppresses resets during PMT churn
+    std::atomic<bool> paused;                 ///< True while playback is frozen via Freeze()
     AVCodecID previousAudioCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
     bool inStillPicture{false};                      ///< Re-entry guard: true while cDevice::StillPicture re-enters

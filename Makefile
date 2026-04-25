@@ -41,7 +41,7 @@ APIVERSION = $(call PKGCFG,apiversion)
 # ------------------------------------------------------------
 # Dependencies (pkg-config)
 # ------------------------------------------------------------
-REQUIRED_LIBS = alsa libavcodec libavfilter libavformat libavutil libdrm libva-drm
+REQUIRED_LIBS = alsa libavcodec libavfilter libavformat libavutil libdrm libswresample libva-drm
 
 # Library Validation Function
 define check_lib
@@ -110,12 +110,15 @@ LDLIBS = $(shell $(PKG_CONFIG) --libs $(REQUIRED_LIBS)) -pthread
 # ------------------------------------------------------------
 SOURCES = $(PLUGIN).cpp \
           src/audio.cpp \
+          src/caps.cpp \
           src/config.cpp \
           src/decoder.cpp \
 	  	  src/device.cpp \
           src/display.cpp \
+          src/filter.cpp \
           src/osd.cpp \
-          src/pes.cpp
+          src/pes.cpp \
+          src/stream.cpp
 
 # Build Artifacts
 OBJECTS = $(SOURCES:.cpp=.o)
@@ -123,7 +126,7 @@ SOFILE = libvdr-$(PLUGIN).so
 HEADERS = $(wildcard src/*.h)
 
 # Build Targets
-.PHONY: all clean install dist indent lint docs
+.PHONY: all clean install dist indent lint docs probe
 
 all: $(SOFILE)
 
@@ -132,6 +135,19 @@ $(SOFILE): $(OBJECTS)
 
 %.o: %.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Standalone VAAPI capability prober. Links only libdrm + libva-drm — keep this
+# rule separate from the plugin build so the probe binary does not accrue the
+# plugin's full dependency closure (ffmpeg, alsa, ...).
+PROBE_BIN = vaapivideo-probe
+PROBE_SRC = vaapivideo-probe.cpp
+PROBE_PKGS = libdrm libva-drm
+
+probe: $(PROBE_BIN)
+
+$(PROBE_BIN): $(PROBE_SRC)
+	$(CXX) $(CXXFLAGS) $(shell $(PKG_CONFIG) --cflags $(PROBE_PKGS)) \
+		$< $(shell $(PKG_CONFIG) --libs $(PROBE_PKGS)) -o $@
 
 .deps: $(SOURCES) $(HEADERS)
 	$(CXX) -MM $(CXXFLAGS) $(SOURCES) > $@
@@ -152,7 +168,7 @@ indent:
     fi
 
 clean:
-	@-rm -f $(OBJECTS) $(SOFILE) .deps compile_commands.json
+	@-rm -f $(OBJECTS) $(SOFILE) $(PROBE_BIN) .deps compile_commands.json
 	@-rm -f *.so *.tgz core* *~ src/*~
 	@-rm -rf docs
 
