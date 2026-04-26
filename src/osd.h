@@ -45,7 +45,11 @@ class cVaapiOsdProvider : public cOsdProvider {
     // === PUBLIC API ===
     // ========================================================================
     auto AttachDisplay(cVaapiDisplay *display) noexcept -> void; ///< Swap in a new display after SVDRP ATTA
-    auto DetachDisplay() noexcept -> void;                       ///< Null the display ref; Flush() becomes a no-op
+    /// Alpha-blend the cVaapiOsd whose framebuffer matches @p fbId onto a tightly-packed RGB24
+    /// buffer (size @p width x @p height, row pitch @p stride bytes). No-op when @p fbId is 0
+    /// or no matching OSD is allocated. Used by GrabImage to include the visible OSD in screen captures.
+    auto CompositeOntoRgb24(uint8_t *rgb24, int width, int height, int stride, uint32_t fbId) -> void;
+    auto DetachDisplay() noexcept -> void; ///< Null the display ref; Flush() becomes a no-op
     auto ReleaseAllOsdResources() -> void; ///< Force-free DRM buffers of all live OSDs before drmDropMaster
 
   protected:

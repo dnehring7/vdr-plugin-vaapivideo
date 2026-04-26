@@ -35,10 +35,12 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -61,11 +63,19 @@
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavcodec/codec.h>
 #include <libavcodec/codec_id.h>
+#include <libavcodec/packet.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/mem.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 }
 #pragma GCC diagnostic pop
@@ -461,6 +471,286 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
     }
 }
 
+// ----------------------------------------------------------------------------
+// GrabImage helpers (anonymous namespace -- used only here)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+/// One-shot filter graph: feed @p in, pull a single frame whose pixel format is enforced
+/// by appending `,format=<outFmt>` to @p chainPrefix. Caller-supplied chain stages
+/// (e.g. "scale=W:H") run before that terminal format conversion. @p srcColorspace and
+/// @p srcColorRange become buffersrc options; zscale reads them from the link, not the
+/// frame, so for HDR sources they MUST be passed here even if also stamped on the AVFrame.
+[[nodiscard]] auto RunGrabFilter(AVFrame *in, std::string_view chainPrefix, AVPixelFormat outFmt,
+                                 AVColorSpace srcColorspace = AVCOL_SPC_UNSPECIFIED,
+                                 AVColorRange srcColorRange = AVCOL_RANGE_UNSPECIFIED)
+    -> std::unique_ptr<AVFrame, FreeAVFrame> {
+    if (!in || in->width <= 0 || in->height <= 0) [[unlikely]] {
+        return nullptr;
+    }
+
+    const std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> graph{avfilter_graph_alloc()};
+    if (!graph) [[unlikely]] {
+        return nullptr;
+    }
+
+    // Numeric pix_fmt / colorspace / range: HW format aliases differ across FFmpeg versions;
+    // integer values are stable.
+    std::string srcArgs =
+        std::format("video_size={}x{}:pix_fmt={}:time_base=1/1:pixel_aspect=1/1", in->width, in->height, in->format);
+    if (srcColorspace != AVCOL_SPC_UNSPECIFIED) {
+        srcArgs += std::format(":colorspace={}", static_cast<int>(srcColorspace));
+    }
+    if (srcColorRange != AVCOL_RANGE_UNSPECIFIED) {
+        srcArgs += std::format(":range={}", static_cast<int>(srcColorRange));
+    }
+
+    AVFilterContext *src = nullptr;
+    if (const int ret = avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"), "in", srcArgs.c_str(),
+                                                     nullptr, graph.get());
+        ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab buffer source: %s", AvErr(ret).data());
+        return nullptr;
+    }
+
+    AVFilterContext *sink = nullptr;
+    if (const int ret = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr,
+                                                     graph.get());
+        ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab buffer sink: %s", AvErr(ret).data());
+        return nullptr;
+    }
+
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+    if (!outputs || !inputs) [[unlikely]] {
+        avfilter_inout_free(&outputs);
+        avfilter_inout_free(&inputs);
+        return nullptr;
+    }
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = src;
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = sink;
+    if (!outputs->name || !inputs->name) [[unlikely]] {
+        avfilter_inout_free(&outputs);
+        avfilter_inout_free(&inputs);
+        return nullptr;
+    }
+
+    // The trailing `format=` is what guarantees the output pixfmt; sink itself accepts anything.
+    const std::string chain = chainPrefix.empty()
+                                  ? std::format("format={}", av_get_pix_fmt_name(outFmt))
+                                  : std::format("{},format={}", chainPrefix, av_get_pix_fmt_name(outFmt));
+
+    const int parseRet = avfilter_graph_parse_ptr(graph.get(), chain.c_str(), &inputs, &outputs, nullptr);
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (parseRet < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab parse '%s': %s", chain.c_str(), AvErr(parseRet).data());
+        return nullptr;
+    }
+
+    if (const int ret = avfilter_graph_config(graph.get(), nullptr); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab config '%s': %s", chain.c_str(), AvErr(ret).data());
+        return nullptr;
+    }
+
+    if (const int ret = av_buffersrc_add_frame_flags(src, in, AV_BUFFERSRC_FLAG_KEEP_REF); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab send: %s", AvErr(ret).data());
+        return nullptr;
+    }
+    // Flush so buffersink emits the frame even though the chain is finite. EOS-flush errors
+    // are not actionable here (sink may still have a buffered frame), but FFmpeg marks the
+    // function nodiscard so capture the result explicitly.
+    [[maybe_unused]] const int eosRet = av_buffersrc_add_frame_flags(src, nullptr, 0);
+
+    std::unique_ptr<AVFrame, FreeAVFrame> out{av_frame_alloc()};
+    if (!out) [[unlikely]] {
+        return nullptr;
+    }
+    if (const int ret = av_buffersink_get_frame(sink, out.get()); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: grab recv: %s", AvErr(ret).data());
+        return nullptr;
+    }
+    return out;
+}
+
+/// Serialise an RGB24 AVFrame as a P6 PNM byte stream into a malloc()'d buffer.
+/// PNM = trivial text header + raw RGB; no codec required.
+[[nodiscard]] auto MakePnm(const AVFrame *rgb24, int &outSize) -> uchar * {
+    const std::string header = std::format("P6\n{} {}\n255\n", rgb24->width, rgb24->height);
+    const size_t rowBytes = static_cast<size_t>(rgb24->width) * 3;
+    const size_t pixelBytes = rowBytes * static_cast<size_t>(rgb24->height);
+    const size_t total = header.size() + pixelBytes;
+
+    // VDR's SVDRP code free()s the returned pointer, so malloc -- not new[].
+    auto *buf = static_cast<uchar *>(std::malloc(total)); // NOLINT(cppcoreguidelines-no-malloc)
+    if (!buf) [[unlikely]] {
+        return nullptr;
+    }
+
+    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- header is a sized blob, not a C string
+    std::memcpy(buf, header.data(), header.size());
+    uchar *dst = buf + header.size();
+    const uint8_t *src = rgb24->data[0];
+    for (int y = 0; y < rgb24->height; ++y) {
+        std::memcpy(dst, src, rowBytes); // skip linesize padding
+        dst += rowBytes;
+        src += rgb24->linesize[0];
+    }
+
+    outSize = static_cast<int>(total);
+    return buf;
+}
+
+/// Encode a single YUV420P AVFrame as a JFIF JPEG via libavcodec MJPEG into a malloc()'d buffer.
+/// @p quality is 1..100 (higher = better); -1 maps to 95.
+[[nodiscard]] auto EncodeMjpeg(AVFrame *yuv420p, int quality, int &outSize) -> uchar * {
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!codec) [[unlikely]] {
+        esyslog("vaapivideo/device: MJPEG encoder unavailable in this FFmpeg build");
+        return nullptr;
+    }
+
+    std::unique_ptr<AVCodecContext, FreeAVCodecContext> ctx{avcodec_alloc_context3(codec)};
+    if (!ctx) [[unlikely]] {
+        return nullptr;
+    }
+
+    // Modern FFmpeg deprecates YUVJ formats; emit yuv420p with color_range=JPEG so the MJPEG
+    // encoder writes a JFIF full-range stream without warnings.
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->width = yuv420p->width;
+    ctx->height = yuv420p->height;
+    ctx->time_base = {.num = 1, .den = 25}; // arbitrary; MJPEG is stateless
+    ctx->color_range = AVCOL_RANGE_JPEG;
+
+    // FFmpeg's quality scale: smaller global_quality = better. Map 1..100 -> [FF_QP2LAMBDA*100 .. FF_QP2LAMBDA*1].
+    const int q = (quality > 0) ? std::clamp(quality, 1, 100) : 95;
+    ctx->global_quality = FF_QP2LAMBDA * (101 - q);
+    ctx->flags |= AV_CODEC_FLAG_QSCALE;
+
+    if (const int ret = avcodec_open2(ctx.get(), codec, nullptr); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: MJPEG open: %s", AvErr(ret).data());
+        return nullptr;
+    }
+
+    if (const int ret = avcodec_send_frame(ctx.get(), yuv420p); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: MJPEG send_frame: %s", AvErr(ret).data());
+        return nullptr;
+    }
+
+    std::unique_ptr<AVPacket, FreeAVPacket> pkt{av_packet_alloc()};
+    if (!pkt) [[unlikely]] {
+        return nullptr;
+    }
+    if (const int ret = avcodec_receive_packet(ctx.get(), pkt.get()); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/device: MJPEG receive_packet: %s", AvErr(ret).data());
+        return nullptr;
+    }
+
+    auto *buf =
+        static_cast<uchar *>(std::malloc(static_cast<size_t>(pkt->size))); // NOLINT(cppcoreguidelines-no-malloc)
+    if (!buf) [[unlikely]] {
+        return nullptr;
+    }
+    std::memcpy(buf, pkt->data, static_cast<size_t>(pkt->size));
+    outSize = pkt->size;
+    return buf;
+}
+
+} // namespace
+
+[[nodiscard]] auto cVaapiDevice::GrabImage(int &Size, bool Jpeg, int Quality, int SizeX, int SizeY) -> uchar * {
+    if (!Ready() || !display) [[unlikely]] {
+        esyslog("vaapivideo/device: GrabImage - device not ready");
+        return nullptr;
+    }
+
+    // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010).
+    auto srcFrame = display->GrabDisplayedFrame();
+    if (!srcFrame) [[unlikely]] {
+        esyslog("vaapivideo/device: GrabImage - no displayed frame yet");
+        return nullptr;
+    }
+
+    // 2. Drive the HDR branch from the display's cached state, NOT srcFrame->color_trc:
+    // av_hwframe_transfer_data strips all color metadata on download. We re-stamp colorimetry
+    // for zscale/tonemap (per-frame) AND pass colorspace+range as buffersrc options below
+    // (zscale reads those from the filter LINK, not the frame).
+    const StreamHdrKind hdrKind = display->GetActiveHdrKind();
+    const bool isHdr = (hdrKind != StreamHdrKind::Sdr);
+    if (isHdr) {
+        srcFrame->color_primaries = AVCOL_PRI_BT2020;
+        srcFrame->color_trc = (hdrKind == StreamHdrKind::Hlg) ? AVCOL_TRC_ARIB_STD_B67 : AVCOL_TRC_SMPTE2084;
+        srcFrame->colorspace = AVCOL_SPC_BT2020_NCL;
+        srcFrame->color_range = AVCOL_RANGE_MPEG;
+    }
+    // HDR-to-SDR tonemap (canonical FFmpeg wiki shape; requires libzimg for zscale):
+    //   PQ/HLG -> linear (npl=200, ~ BT.2408 graphics white) -> gbrpf32le (linearization needs
+    //   RGB; YUV matrix is undefined for linear samples) -> BT.2020->BT.709 gamut -> hable
+    //   tonemap -> BT.709 gamma/matrix, PC range -> yuv420p (RunGrabFilter appends rgb24).
+    // Tuning:
+    //   peak=1.0 must be EXPLICIT. The filter's default peak=0 means "auto-detect from MaxCLL /
+    //     mastering metadata", which we forward from the source frame -- for typical 1000-nit
+    //     mastered HDR10 that derives peak~5 and produces visibly grey whites. peak=1.0 forces
+    //     anything >= npl (200 nits) to clip to pure white; aggressive, but the right call for
+    //     an SDR screen grab where preserving HDR specular detail isn't worth dim mid-tones.
+    //   r=pc (not r=tv) avoids the swscale TV->PC expansion clamping max RGB near Y=235.
+    //   desat=1 is the mid-ground; the filter default of 2 over-desaturates toward white.
+    const std::string_view videoChain = isHdr ? "zscale=t=linear:npl=200,format=gbrpf32le,zscale=p=bt709,"
+                                                "tonemap=hable:desat=1:peak=1.0,"
+                                                "zscale=t=bt709:m=bt709:r=pc,format=yuv420p"
+                                              : std::string_view{};
+    auto rgb24 = RunGrabFilter(srcFrame.get(), videoChain, AV_PIX_FMT_RGB24,
+                               isHdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_UNSPECIFIED,
+                               isHdr ? AVCOL_RANGE_MPEG : AVCOL_RANGE_UNSPECIFIED);
+    if (!rgb24) [[unlikely]] {
+        return nullptr;
+    }
+
+    // 3. Composite the visible OSD on top at native display res, before any user-requested
+    // resize -- OSD geometry is screen-space and would misalign if the video was scaled first.
+    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+        provider->CompositeOntoRgb24(rgb24->data[0], rgb24->width, rgb24->height, rgb24->linesize[0],
+                                     display->GetActiveOsdFbId());
+    }
+
+    // 4. Encode. SizeX/SizeY <= 0 = native display resolution.
+    const int outW = (SizeX > 0) ? SizeX : rgb24->width;
+    const int outH = (SizeY > 0) ? SizeY : rgb24->height;
+    const bool needScale = (outW != rgb24->width) || (outH != rgb24->height);
+
+    // The rgb24 frame from filter graph #1 is tagged csp=gbr range=pc; the second graph's
+    // buffersrc must declare the same or libavfilter logs "Changing video frame properties on
+    // the fly" and falls back through swscale.
+    constexpr AVColorSpace kRgbSrcColorspace = AVCOL_SPC_RGB;
+    constexpr AVColorRange kRgbSrcColorRange = AVCOL_RANGE_JPEG;
+
+    if (Jpeg) {
+        // yuv420p + AVCOL_RANGE_JPEG on the encoder context yields JFIF full-range without the
+        // deprecated YUVJ pixfmts. scale fused into this pass to skip an intermediate frame.
+        const std::string chain = needScale ? std::format("scale={}:{}", outW, outH) : std::string{};
+        auto yuv = RunGrabFilter(rgb24.get(), chain, AV_PIX_FMT_YUV420P, kRgbSrcColorspace, kRgbSrcColorRange);
+        if (!yuv) [[unlikely]] {
+            return nullptr;
+        }
+        return EncodeMjpeg(yuv.get(), Quality, Size);
+    }
+
+    if (needScale) {
+        auto scaled = RunGrabFilter(rgb24.get(), std::format("scale={}:{}", outW, outH), AV_PIX_FMT_RGB24,
+                                    kRgbSrcColorspace, kRgbSrcColorRange);
+        if (!scaled) [[unlikely]] {
+            return nullptr;
+        }
+        rgb24 = std::move(scaled);
+    }
+    return MakePnm(rgb24.get(), Size);
+}
+
 [[nodiscard]] auto cVaapiDevice::HasDecoder() const -> bool { return decoder && decoder->IsReady(); }
 
 [[nodiscard]] auto cVaapiDevice::HasIBPTrickSpeed() -> bool { return true; }
@@ -468,14 +758,11 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
 auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
     dsyslog("vaapivideo/device: MakePrimaryDevice(%s) called", On ? "true" : "false");
 
-    // Deferred-init trigger: after VDR startup finishes, promote-to-primary opens hardware
-    // if still detached. startupComplete gate prevents setup.conf-driven primary restore
-    // during VDR bring-up from defeating --detached (normal path skips this, state is 2).
-    //
-    // Failure is NOT a veto: VDR assigns primaryDevice before calling this hook
-    // (vdr/device.c:201-202). Returning early would strand us as a non-functional primary.
-    // Log and fall through so the device lands in the recoverable "detached primary" state;
-    // SVDRP ATTA can retry.
+    // Deferred-init for --detached: open hardware on first post-startup primary promotion.
+    // The startupComplete gate keeps a setup.conf-driven primary restore during VDR bring-up
+    // from defeating --detached. On failure, fall through (do NOT return early) -- VDR has
+    // already assigned primaryDevice (vdr/device.c:201-202), so bailing leaves the slot
+    // non-functional. The device lands in "detached primary" state, recoverable via SVDRP ATTA.
     if (On && initState.load(std::memory_order_acquire) == 0 && !drmPath.empty() &&
         startupComplete.load(std::memory_order_acquire)) {
         isyslog("vaapivideo/device: primary activation after detached -- attaching hardware");
@@ -488,15 +775,15 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
     cDevice::MakePrimaryDevice(On);
 
     if (On) {
-        // CheckDecoder=false: during --detached the decoder is not yet open; the default
+        // CheckDecoder=false: under --detached the decoder isn't open yet; the default
         // HasDecoder() gate would misreport us as non-primary.
         if (IsPrimaryDevice(/*CheckDecoder=*/false)) {
             isyslog("vaapivideo/device: activated as primary device");
-            // OSD provider lifecycle is owned by VDR (cOsdProvider::Shutdown()): create once,
-            // reattach thereafter. Must register even when detached so skins see TrueColor
-            // support during Start() -- cOsdProvider::SupportsTrueColor() logs an error if
-            // no provider is registered. Pixel-path methods are display-null-safe; a later
-            // AttachDisplay() wires up the live display pointer.
+            // VDR owns the OSD provider's lifetime (frees it via cOsdProvider::Shutdown() at
+            // process exit), so create once + reattach thereafter. Must register even when
+            // display==nullptr so skins probing cOsdProvider::SupportsTrueColor() during
+            // Start() find a provider; pixel-path methods tolerate a null display until
+            // AttachDisplay() wires one in.
             if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
                 if (display) {
                     provider->AttachDisplay(display.get());
@@ -511,8 +798,7 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
         }
     } else {
         isyslog("vaapivideo/device: deactivated as primary device");
-        // OSD provider intentionally NOT torn down: VDR calls cOsdProvider::Shutdown()
-        // globally during process exit, after all devices are stopped.
+        // OSD provider not torn down here: VDR's cOsdProvider::Shutdown() handles it at exit.
     }
 }
 
@@ -527,10 +813,9 @@ auto cVaapiDevice::Mute() -> void {
 auto cVaapiDevice::Play() -> void {
     cDevice::Play();
 
-    // VDR calls Play() for genuine resume AND as a transition inside REW->PLAY->REW.
-    // Request trick exit and let the decoder confirm: if TrickSpeed() follows within one
-    // frame period the request is canceled; otherwise the decoder exits trick mode on the
-    // next frame.
+    // VDR fires Play() both for genuine resume AND as the middle leg of REW->PLAY->REW. Request
+    // trick exit and let the decoder confirm: a TrickSpeed() within one frame period cancels
+    // the request; otherwise the decoder leaves trick mode on the next frame.
     if (trickSpeed.exchange(0, std::memory_order_release) != 0) {
         if (decoder) [[likely]] {
             decoder->RequestTrickExit();

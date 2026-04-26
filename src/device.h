@@ -102,7 +102,10 @@ class cVaapiDevice : public cDevice {
         -> void override;                            ///< Return display framebuffer dimensions for OSD allocation
     [[nodiscard]] auto GetSTC() -> int64_t override; ///< Return presentation clock in VDR 90 kHz ticks
     auto GetVideoSize(int &Width, int &Height, double &VideoAspect)
-        -> void override;                                   ///< Return active video stream resolution
+        -> void override; ///< Return active video stream resolution
+    [[nodiscard]] auto GrabImage(int &Size, bool Jpeg = true, int Quality = -1, int SizeX = -1, int SizeY = -1)
+        -> uchar * override; ///< SVDRP GRAB: snapshot the displayed video + OSD as PNM (Jpeg=false) or JPEG.
+                             ///< Returns malloc()'d buffer of @p Size bytes; caller (VDR core) free()s.
     [[nodiscard]] auto HasDecoder() const -> bool override; ///< True when a VAAPI codec context is open and ready
     [[nodiscard]] auto HasIBPTrickSpeed()
         -> bool override; ///< Always true: all I/B/P frame types are submitted in trick mode

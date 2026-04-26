@@ -415,6 +415,49 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     return ready.load(std::memory_order_acquire);
 }
 
+[[nodiscard]] auto cVaapiDisplay::GetActiveHdrKind() const noexcept -> StreamHdrKind {
+    const cMutexLock lock(&hdrStateMutex);
+    return appliedHdrState.kind;
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetActiveOsdFbId() const noexcept -> uint32_t {
+    const cMutexLock lock(&osdMutex);
+    return currentOsd.fbId;
+}
+
+[[nodiscard]] auto cVaapiDisplay::GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame> {
+    if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
+        return nullptr;
+    }
+
+    // Clone under bufferMutex so the displayed AVFrame's VA-surface ref stays alive past unlock;
+    // hold the mutex only across the cheap ref bump, never across the GPU download below.
+    std::unique_ptr<AVFrame, FreeAVFrame> source;
+    {
+        const cMutexLock lock(&bufferMutex);
+        if (!displayedBuffer.frame) [[unlikely]] {
+            return nullptr;
+        }
+        source.reset(av_frame_clone(displayedBuffer.frame));
+    }
+    if (!source) [[unlikely]] {
+        return nullptr;
+    }
+
+    std::unique_ptr<AVFrame, FreeAVFrame> dest{av_frame_alloc()};
+    if (!dest) [[unlikely]] {
+        return nullptr;
+    }
+
+    // Serialise with VPP: iHD's VEBOX deadlocks if download races with concurrent filter execution.
+    const cMutexLock vaLock(&vaDriverMutex);
+    if (const int ret = av_hwframe_transfer_data(dest.get(), source.get(), 0); ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/display: grab transfer failed: %s", AvErr(ret).data());
+        return nullptr;
+    }
+    return dest;
+}
+
 auto cVaapiDisplay::ClearOsdIfActive(uint32_t fbId) -> void {
     if (fbId == 0) {
         return;

@@ -107,6 +107,68 @@ auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
     display_ = nullptr;
 }
 
+auto cVaapiOsdProvider::CompositeOntoRgb24(uint8_t *rgb24, const int width, const int height, const int stride,
+                                           const uint32_t fbId) -> void {
+    if (!rgb24 || fbId == 0 || width <= 0 || height <= 0) [[unlikely]] {
+        return;
+    }
+
+    const cMutexLock lock(&osdListMutex_);
+    for (auto *osd : activeOsds_) {
+        // Match the framebuffer that's actually being scanned out; ignore background OSDs whose
+        // dumb buffers are still allocated but not visible. pixels_ is null for OSDs whose buffer
+        // was force-released by ReleaseAllOsdResources() during a SVDRP DETA -- skip those too.
+        if (osd->framebufferId_ != fbId || !osd->pixels_) {
+            continue;
+        }
+
+        const int osdLeft = osd->Left();
+        const int osdTop = osd->Top();
+        const int osdW = static_cast<int>(osd->width_);
+        const int osdH = static_cast<int>(osd->height_);
+        const uint32_t srcStride = osd->stride_;
+        const uint8_t *srcBase = osd->pixels_;
+
+        // Clip OSD rectangle against the destination canvas; OSDs may extend past the visible area
+        // (origin negative, or smaller capture than the screen).
+        const int x0 = std::max(osdLeft, 0);
+        const int y0 = std::max(osdTop, 0);
+        const int x1 = std::min(osdLeft + osdW, width);
+        const int y1 = std::min(osdTop + osdH, height);
+        if (x0 >= x1 || y0 >= y1) {
+            continue;
+        }
+
+        for (int y = y0; y < y1; ++y) {
+            // DRM_FORMAT_ARGB8888 is little-endian: byte order in memory is B, G, R, A.
+            const uint8_t *src =
+                srcBase + (static_cast<size_t>(y - osdTop) * srcStride) + (static_cast<size_t>(x0 - osdLeft) * 4);
+            uint8_t *dst =
+                rgb24 + (static_cast<size_t>(y) * static_cast<size_t>(stride)) + (static_cast<size_t>(x0) * 3);
+            for (int x = x0; x < x1; ++x) {
+                const uint8_t a = src[3];
+                if (a == 0) {
+                    // fully transparent -- leave video pixel untouched
+                } else if (a == 255) {
+                    dst[0] = src[2]; ///< R
+                    dst[1] = src[1]; ///< G
+                    dst[2] = src[0]; ///< B
+                } else {
+                    // Straight ARGB (not premultiplied): VDR's pixmaps are non-premultiplied,
+                    // and the OSD plane is configured with pixel blend mode "Coverage".
+                    const uint16_t na = 255U - a;
+                    dst[0] = static_cast<uint8_t>(((src[2] * a) + (dst[0] * na) + 127) / 255);
+                    dst[1] = static_cast<uint8_t>(((src[1] * a) + (dst[1] * na) + 127) / 255);
+                    dst[2] = static_cast<uint8_t>(((src[0] * a) + (dst[2] * na) + 127) / 255);
+                }
+                src += 4;
+                dst += 3;
+            }
+        }
+        return; // exactly one OSD matches fbId
+    }
+}
+
 auto cVaapiOsdProvider::ReleaseAllOsdResources() -> void {
     // Called from cVaapiDevice::Detach() before drmDropMaster. Dumb buffer GEM handles hold
     // kernel refs that block the fd close; force-free them in place. The cVaapiOsd objects

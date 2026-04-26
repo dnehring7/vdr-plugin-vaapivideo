@@ -100,8 +100,18 @@ class cVaapiDisplay : public cThread {
     auto BeginStreamSwitch() -> void;
     /// Release importMutex and resume frame delivery after a channel switch.
     auto EndStreamSwitch() -> void;
+    /// HDR classification of the stream currently programmed for scanout. Used by GrabImage to
+    /// drive HDR-aware tonemapping; reading the AVFrame's color_trc isn't reliable because
+    /// av_hwframe_transfer_data strips the transfer-characteristic metadata on download.
+    [[nodiscard]] auto GetActiveHdrKind() const noexcept -> StreamHdrKind;
+    /// FbId of the OSD overlay currently programmed for scanout, or 0 when no OSD is on screen.
+    /// Used by GrabImage to composite only the visible OSD (multiple OSDs may be allocated).
+    [[nodiscard]] auto GetActiveOsdFbId() const noexcept -> uint32_t;
     [[nodiscard]] auto GetAspectRatio() const noexcept -> double { return aspectRatio; }
     [[nodiscard]] auto GetDrmFd() const noexcept -> int { return drmFd; }
+    /// Snapshot the most recently displayed VAAPI surface as a host-side AVFrame (NV12 or P010).
+    /// Returns nullptr if no frame has been displayed yet or the GPU download fails. Used by GrabImage.
+    [[nodiscard]] auto GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame>;
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t { return outputHeight; }
     [[nodiscard]] auto GetOutputRefreshRate() const noexcept -> uint32_t { return refreshRate; }
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t { return outputWidth; }
@@ -322,7 +332,7 @@ class cVaapiDisplay : public cThread {
                                         ///< staged vs applied to decide whether a new commit is needed
     DisplayCaps displayCaps{};          ///< KMS + EDID capability snapshot; set by ProbeHdrCapabilities()
     HdrConnectorProps hdrProps{};       ///< Connector HDR prop IDs (HDR_OUTPUT_METADATA, Colorspace, max bpc)
-    cMutex hdrStateMutex;               ///< Guards stagedHdrState (written by decoder, read by display thread)
+    mutable cMutex hdrStateMutex;       ///< Guards stagedHdrState (written by decoder, read by display thread)
     uint32_t pendingDestroyHdrBlobId{}; ///< Previous blob ID to destroy on the next successful flip
     HdrStreamInfo stagedHdrState{}; ///< HDR state staged by SetHdrOutputState(); consumed by MaybeAppendHdrOutputState
 };

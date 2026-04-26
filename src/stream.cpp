@@ -541,7 +541,7 @@ class BitReader {
     // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     const std::vector<uint8_t> rbsp = StripEmulationPreventionBytes(sps.subspan(3));
-    BitReader br{rbsp};
+    BitReader br{std::span<const uint8_t>{rbsp.data(), rbsp.size()}};
 
     (void)br.ReadUe(); // seq_parameter_set_id
     if (br.Overran()) [[unlikely]] {
@@ -581,7 +581,7 @@ class BitReader {
         return info;
     }
     const std::vector<uint8_t> rbsp = StripEmulationPreventionBytes(sps);
-    BitReader br{rbsp};
+    BitReader br{std::span<const uint8_t>{rbsp.data(), rbsp.size()}};
 
     br.Skip(4); // sps_video_parameter_set_id
     const uint32_t maxSubLayersMinus1 = br.ReadBits(3);
