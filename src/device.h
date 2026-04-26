@@ -94,6 +94,8 @@ class cVaapiDevice : public cDevice {
     // === VDR DEVICE INTERFACE (public in cDevice) ===
     // ========================================================================
     auto Clear() -> void override; ///< Flush decoder and audio queues without releasing hardware
+    [[nodiscard]] auto DeviceName() const
+        -> cString override; ///< Descriptive name (DRM path + connector) for SVDRP PRIM/LSTD replies
     [[nodiscard]] auto DeviceType() const -> cString override; ///< Returns "VAAPI"
     [[nodiscard]] auto Flush(int TimeoutMs = 0)
         -> bool override;           ///< Wait until packet queue drains; returns true when empty

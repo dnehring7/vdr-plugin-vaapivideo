@@ -377,6 +377,20 @@ auto cVaapiDevice::Clear() -> void {
     }
 }
 
+[[nodiscard]] auto cVaapiDevice::DeviceName() const -> cString {
+    // SVDRP PRIM (no-arg) and LSTD render this. drmPath is latched by Initialize();
+    // connectorName is either user-supplied (-c) or populated by SelectDrmConnector()
+    // on first attach. Before either runs (e.g. between ctor and ProcessArgs, or
+    // --detached before the first attach), fall back to whatever is available.
+    if (drmPath.empty()) {
+        return "vaapivideo";
+    }
+    if (connectorName.empty()) {
+        return cString::sprintf("vaapivideo %s", drmPath.c_str());
+    }
+    return cString::sprintf("vaapivideo %s %s", drmPath.c_str(), connectorName.c_str());
+}
+
 [[nodiscard]] auto cVaapiDevice::DeviceType() const -> cString { return "VAAPI"; }
 
 [[nodiscard]] auto cVaapiDevice::Flush(int TimeoutMs) -> bool {
@@ -1606,14 +1620,14 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
             continue;
         }
 
-        // Build the kernel-style name (e.g. "HDMI-A-1", "DP-2") and filter if requested.
-        if (!connectorName.empty()) {
-            const char *typeName = drmModeGetConnectorTypeName(connector->connector_type);
-            const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
-            if (name != connectorName) {
-                dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
-                continue;
-            }
+        // Build the kernel-style name (e.g. "HDMI-A-1", "DP-2"). Always computed -- used
+        // both for the user-supplied filter (when set) and to populate connectorName below
+        // for SVDRP DeviceName() / sticky re-selection across DETA/ATTA cycles.
+        const char *typeName = drmModeGetConnectorTypeName(connector->connector_type);
+        const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
+        if (!connectorName.empty() && name != connectorName) {
+            dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
+            continue;
         }
 
         bool modeFound = false;
@@ -1660,8 +1674,14 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
 
         if (crtcId != 0) {
             connectorId = connector->connector_id;
-            isyslog("vaapivideo/device: display %ux%u@%uHz (connector %u, CRTC %u)", activeMode.hdisplay,
-                    activeMode.vdisplay, activeMode.vrefresh, connectorId, crtcId);
+            // Latch the chosen connector once. Sticky on subsequent re-attaches (operator
+            // expectation: a DETA/ATTA cycle keeps the same output). Also surfaces in
+            // SVDRP PRIM/LSTD via DeviceName().
+            if (connectorName.empty()) {
+                connectorName = name;
+            }
+            isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
+                    activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
             return true;
         }
     }
