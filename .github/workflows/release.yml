@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Build Fedora RPMs and Debian DEBs, attach them to the GitHub Release, and
-# publish DNF / APT repositories via GitHub Pages.
+# Build & sign RPMs (Fedora) and DEBs (Debian + Ubuntu), attach to the
+# GitHub Release, and publish DNF / APT repos via GitHub Pages.
 #
-# Triggers
-#   release: published        automatic on Release publication
-#   workflow_dispatch         manual; inputs: tag, publish (default false)
-#
-# Prerequisites
-#   Enable GitHub Pages (Settings → Pages → Deploy from branch → gh-pages)
-#   Repository secret: GPG_PRIVATE_KEY (armored, unencrypted private key)
+# Prereqs:
+#   Repo secret: GPG_PRIVATE_KEY (armored, unencrypted)
 
 name: Build & Publish Packages
 
@@ -18,17 +13,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Git tag to build (e.g. v1.5.0)'
+        description: 'Git tag (vX.Y.Z)'
         required: true
         type: string
       publish:
-        description: 'Upload to GitHub Release and gh-pages'
-        required: false
+        description: 'Upload to release & deploy Pages'
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: read   # publish overrides to write for action-gh-release
 
 concurrency:
   group: ${{ github.workflow }}
@@ -37,39 +31,29 @@ concurrency:
 env:
   TAG: ${{ inputs.tag || github.event.release.tag_name }}
   PUBLISH: ${{ github.event_name == 'release' || inputs.publish }}
-  # VDR plugin short name; package / file names derive from this:
-  # vdr-plugin-${PLUGIN} (deb), vdr-${PLUGIN} (rpm).
   PLUGIN: vaapivideo
-  # Keep in sync with the hardcoded jobs.<id>.container.image values below;
-  # GitHub Actions does not expose env context to container.image.
   FEDORA_REL: '44'
-  DEBIAN_REL: trixie
-  GPG_SIGN: gpg --batch --yes --pinentry-mode loopback
 
 jobs:
   # ================================================================
-  # Fedora – RPM
+  # rpm – build + sign RPMs, assemble the dnf repo (Fedora)
   # ================================================================
-  fedora:
+  rpm:
+    name: rpm (fedora 44)
     runs-on: ubuntu-latest
-    container:
-      image: fedora:44
+    container: fedora:44
     outputs:
       version: ${{ steps.prep.outputs.version }}
 
     steps:
-      - name: Install prerequisites
+      - name: Install build prerequisites
         run: |
-          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${{ env.FEDORA_REL }}.noarch.rpm
+          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_REL}.noarch.rpm
           dnf -y update
           dnf install -y \
-            git gnupg2 \
-            rpm-build rpm-sign rpmdevtools \
-            createrepo_c dnf-plugins-core
+            git gnupg2 rpm-build rpm-sign rpmdevtools createrepo_c dnf-plugins-core
 
-      # First checkout into _meta so the composite action stays on disk after
-      # the subsequent tag checkout replaces $GITHUB_WORKSPACE root.
-      - name: Checkout workflow ref (meta)
+      - name: Checkout meta (workflow ref)
         uses: actions/checkout@v6
         with:
           path: _meta
@@ -79,110 +63,120 @@ jobs:
         uses: ./_meta/.github/actions/prepare-build
         with:
           tag: ${{ env.TAG }}
-          private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-          rpmmacros: 'true'
+
+      - name: Import GPG key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Configure rpm signing
+        env:
+          KEYFP: ${{ steps.gpg.outputs.fingerprint }}
+        run: |
+          cat > ~/.rpmmacros <<EOF
+          %_gpg_name ${KEYFP}
+          %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback
+          EOF
 
       - name: Checkout tag source
         uses: actions/checkout@v6
         with:
           ref: ${{ env.TAG }}
 
-      - name: Patch spec version
+      - name: Patch spec & install build deps
         run: |
           sed -i "s/^Version:.*/Version:        ${V}/" "vdr-${PLUGIN}.spec"
+          dnf builddep -y "vdr-${PLUGIN}.spec"
 
-      - name: Install build dependencies
-        run: dnf builddep -y "vdr-${PLUGIN}.spec"
-
-      - name: Build RPMs
+      - name: Build, sign & assemble repo
+        env:
+          KEYFP: ${{ steps.gpg.outputs.fingerprint }}
         run: |
+          git config --global --add safe.directory '*'
           rpmdev-setuptree
-          git archive --format=tar.gz \
-            --prefix="vdr-plugin-${PLUGIN}-${V}/" HEAD \
+          git archive --format=tar.gz --prefix="vdr-plugin-${PLUGIN}-${V}/" HEAD \
             -o "${HOME}/rpmbuild/SOURCES/vdr-${PLUGIN}-${V}.tar.gz"
           cp "vdr-${PLUGIN}.spec" "${HOME}/rpmbuild/SPECS/"
-          # debug_package=%{nil} suppresses the -debuginfo / -debugsource
-          # subpackages that rpmbuild would otherwise emit automatically.
-          rpmbuild -ba --define 'debug_package %{nil}' \
-            "${HOME}/rpmbuild/SPECS/vdr-${PLUGIN}.spec"
-          rpm --addsign "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm \
-                        "${HOME}"/rpmbuild/SRPMS/*.rpm
-
-      - name: Assemble artifacts and repository
-        run: |
-          RPM_DIR="${HOME}/rpmbuild/RPMS/x86_64"
-          SRPM_DIR="${HOME}/rpmbuild/SRPMS"
+          # debug_package=%{nil} suppresses the auto -debuginfo / -debugsource subpackages.
+          rpmbuild -ba --define 'debug_package %{nil}' "${HOME}/rpmbuild/SPECS/vdr-${PLUGIN}.spec"
+          rpm --addsign "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm
+          # Repo layout matches the URL the .repo file will hand to dnf:
+          #   <pages>/fedora/<rel>/x86_64/{*.rpm, repodata/}
           REPO_DIR="repo/${FEDORA_REL}/x86_64"
-          mkdir -p release-artifacts "${REPO_DIR}"
-          cp "${RPM_DIR}"/*.rpm  release-artifacts/
-          cp "${SRPM_DIR}"/*.rpm release-artifacts/
-          cp "${RPM_DIR}"/*.rpm  "${REPO_DIR}/"
+          mkdir -p "${REPO_DIR}"
+          cp "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${REPO_DIR}/"
           createrepo_c "${REPO_DIR}/"
-          ${GPG_SIGN} --local-user "${KEY_FP}" \
+          gpg --batch --yes --pinentry-mode loopback --local-user "${KEYFP}" \
             --detach-sign --armor "${REPO_DIR}/repodata/repomd.xml"
+          # Stage release-only artifacts (binary + source RPMs) outside the repo dir.
+          mkdir -p pkgs
+          cp "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm pkgs/
 
-      - name: Upload repository artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: fedora-repo
-          path: repo/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: fedora-packages
-          path: release-artifacts/
-
-      - name: Upload RPMs to release
-        if: env.PUBLISH == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.TAG }}
-          files: release-artifacts/*.rpm
+          name: rpm
+          path: |
+            repo/
+            pkgs/
 
   # ================================================================
-  # Debian – DEB
+  # deb – build .deb only (matrix: Debian 13 + Ubuntu 26.04 LTS)
   # ================================================================
-  debian:
+  # Pure dpkg-buildpackage; no GPG, no repo metadata. The publish job
+  # collates both legs' .debs into per-distro signed apt repos.
+  deb:
+    name: deb (${{ matrix.distro }} ${{ matrix.version }})
     runs-on: ubuntu-latest
-    container:
-      image: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            version: '13'
+            codename: trixie
+            image: debian:13
+          - distro: ubuntu
+            version: '26.04'
+            codename: resolute
+            image: ubuntu:26.04
+    container: ${{ matrix.image }}
 
     steps:
-      - name: Install prerequisites
+      - name: Install build prerequisites
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates gpg gpg-agent \
-            build-essential debhelper fakeroot dpkg-dev apt-utils \
-            pkg-config \
-            vdr-dev \
+            git ca-certificates \
+            build-essential debhelper fakeroot dpkg-dev pkg-config \
+            vdr-dev libdrm-dev libva-dev libasound2-dev \
             libavcodec-dev libavfilter-dev libavformat-dev \
-            libavutil-dev libswresample-dev \
-            libdrm-dev libva-dev libasound2-dev
+            libavutil-dev libswresample-dev
 
-      - name: Checkout workflow ref (meta)
+      - name: Checkout meta (workflow ref)
         uses: actions/checkout@v6
         with:
           path: _meta
 
       - name: Prepare build
-        id: prep
         uses: ./_meta/.github/actions/prepare-build
         with:
           tag: ${{ env.TAG }}
-          private-key: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Checkout tag source
         uses: actions/checkout@v6
         with:
           ref: ${{ env.TAG }}
 
-      - name: Build packages
+      - name: Build .deb
+        env:
+          CODENAME: ${{ matrix.codename }}
         run: |
+          git config --global --add safe.directory '*'
           MAINTAINER=$(git log -1 --format='%an <%ae>' HEAD)
           cat > debian/changelog <<EOF
-          vdr-plugin-${PLUGIN} (${V}) ${DEBIAN_REL}; urgency=medium
+          vdr-plugin-${PLUGIN} (${V}+${CODENAME}1) ${CODENAME}; urgency=medium
 
             * Release ${V}
 
@@ -190,74 +184,90 @@ jobs:
           EOF
           chmod +x debian/rules
           DEB_BUILD_OPTIONS=noautodbgsym dpkg-buildpackage -us -uc -b
+          mkdir -p _out && mv ../*.deb _out/
 
-      - name: Assemble repository metadata
-        run: |
-          mkdir -p repo
-          cp ../*.deb repo/
-          cd repo
-          dpkg-scanpackages --arch amd64 . > Packages
-          gzip -k Packages
-          apt-ftparchive \
-            -o APT::FTPArchive::Release::Origin="vdr-plugin-${PLUGIN}" \
-            -o APT::FTPArchive::Release::Label="vdr-plugin-${PLUGIN}" \
-            -o APT::FTPArchive::Release::Suite="${DEBIAN_REL}" \
-            -o APT::FTPArchive::Release::Codename="${DEBIAN_REL}" \
-            -o APT::FTPArchive::Release::Architectures="amd64" \
-            release . > Release
-          ${GPG_SIGN} --local-user "${KEY_FP}" \
-            --detach-sign --armor -o Release.gpg Release
-          ${GPG_SIGN} --local-user "${KEY_FP}" \
-            --clearsign -o InRelease Release
-
-      - name: Upload repository artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: debian-repo
-          path: repo/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: debian-packages
-          path: repo/*.deb
-
-      - name: Upload DEBs to release
-        if: env.PUBLISH == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.TAG }}
-          files: repo/*.deb
+          # Encoding the codename in the artifact name lets the publish job
+          # derive it without a second copy of the matrix.
+          name: deb-${{ matrix.distro }}-${{ matrix.codename }}
+          path: _out/*.deb
 
   # ================================================================
-  # Publish package repositories to GitHub Pages
+  # publish – sign apt repos, upload to release, deploy Pages
   # ================================================================
   publish:
-    needs: [fedora, debian]
-    if: needs.fedora.result == 'success' && needs.debian.result == 'success'
+    name: publish
+    needs: [rpm, deb]
+    if: needs.rpm.result == 'success' && needs.deb.result == 'success'
       && (github.event_name == 'release' || inputs.publish)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # softprops/action-gh-release
+      pages: write      # actions/deploy-pages
+      id-token: write   # actions/deploy-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      VERSION: ${{ needs.rpm.outputs.version }}
+      OWNER: ${{ github.repository_owner }}
+      PKG: ${{ github.event.repository.name }}
+      PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
 
     steps:
-      - name: Download Fedora repository
+      - name: Import GPG key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          name: fedora-repo
-          path: site/fedora/
+          path: _artifacts/
 
-      - name: Download Debian repository
-        uses: actions/download-artifact@v8
-        with:
-          name: debian-repo
-          path: site/debian/
-
-      - name: Generate repo config and landing page
-        env:
-          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
-          VERSION: ${{ needs.fedora.outputs.version }}
-          OWNER: ${{ github.repository_owner }}
-          PKG: ${{ github.event.repository.name }}
+      - name: Stage Fedora repo
         run: |
+          mkdir -p site
+          cp -a _artifacts/rpm/repo/. site/fedora/
+
+      - name: Build & sign apt repos
+        env:
+          KEYFP: ${{ steps.gpg.outputs.fingerprint }}
+        run: |
+          # apt-utils (apt-ftparchive), dpkg-dev (dpkg-scanpackages) and gpg
+          # are pre-installed on ubuntu-latest. The artifact name encodes
+          # both fields: deb-<distro>-<codename>, one .deb each.
+          for dir in _artifacts/deb-*; do
+            base=$(basename "${dir}")
+            tmp=${base#deb-}                # <distro>-<codename>
+            distro=${tmp%-*}; codename=${tmp##*-}
+            REPO_DIR="site/${distro}"
+            mkdir -p "${REPO_DIR}"
+            cp "${dir}"/*.deb "${REPO_DIR}/"
+            (
+              cd "${REPO_DIR}"
+              dpkg-scanpackages --arch amd64 . > Packages
+              gzip -k Packages
+              apt-ftparchive \
+                -o APT::FTPArchive::Release::Origin="vdr-plugin-${PLUGIN}" \
+                -o APT::FTPArchive::Release::Label="vdr-plugin-${PLUGIN}" \
+                -o APT::FTPArchive::Release::Suite="${codename}" \
+                -o APT::FTPArchive::Release::Codename="${codename}" \
+                -o APT::FTPArchive::Release::Architectures="amd64" \
+                release . > Release
+              gpg --batch --yes --pinentry-mode loopback --local-user "${KEYFP}" \
+                --detach-sign --armor -o Release.gpg Release
+              gpg --batch --yes --pinentry-mode loopback --local-user "${KEYFP}" \
+                --clearsign -o InRelease Release
+            )
+          done
+
+      - name: Generate repo configs and landing page
+        run: |
+          # DNF repo file: dnf fetches gpgkey on first install.
           cat > "site/fedora/${FEDORA_REL}/vdr-${PLUGIN}.repo" <<REPO
           [vdr-${PLUGIN}]
           name=${PKG} packages for Fedora ${FEDORA_REL}
@@ -267,22 +277,24 @@ jobs:
           gpgkey=https://github.com/${OWNER}.gpg
           repo_gpgcheck=1
           REPO
-
-          # Modern DEB822 sources with inline Signed-By: users curl one file,
-          # the trust anchor travels with it. Each line of the armored key is
-          # prefixed with a space; blank lines become ` .` per the DEB822 spec.
-          cat > "site/debian/vdr-${PLUGIN}.sources" <<SOURCES
+          # DEB822 sources with inline Signed-By: the trust anchor travels
+          # with the file. Each armored line is space-prefixed; blank lines
+          # become " ." per the DEB822 spec. Distro list is derived from the
+          # artifact directory names (same source as the repo-signing step).
+          for dir in _artifacts/deb-*; do
+            d=${dir##*/deb-}; d=${d%-*}
+            cat > "site/${d}/vdr-${PLUGIN}.sources" <<SOURCES
           Types: deb
-          URIs: ${PAGES_URL}/debian/
+          URIs: ${PAGES_URL}/${d}/
           Suites: ./
           Architectures: amd64
           Signed-By:
           SOURCES
-          curl -fsSL "https://github.com/${OWNER}.gpg" \
-            | sed -e 's/^$/./' -e 's/^/ /' \
-            >> "site/debian/vdr-${PLUGIN}.sources"
-          printf '\n' >> "site/debian/vdr-${PLUGIN}.sources"
-
+            curl -fsSL "https://github.com/${OWNER}.gpg" \
+              | sed -e 's/^$/./' -e 's/^/ /' \
+              >> "site/${d}/vdr-${PLUGIN}.sources"
+            printf '\n' >> "site/${d}/vdr-${PLUGIN}.sources"
+          done
           cat > site/index.html <<HTML
           <!DOCTYPE html>
           <html lang="en">
@@ -297,9 +309,17 @@ jobs:
           sudo dnf install vdr-${PLUGIN}
           </pre>
 
-          <h2>Debian ${DEBIAN_REL} (amd64)</h2>
+          <h2>Debian 13 / Trixie (amd64)</h2>
           <pre>
           sudo curl -fsSL ${PAGES_URL}/debian/vdr-${PLUGIN}.sources \\
+            -o /etc/apt/sources.list.d/vdr-${PLUGIN}.sources
+          sudo apt update
+          sudo apt install ${PKG}
+          </pre>
+
+          <h2>Ubuntu 26.04 LTS / Resolute Raccoon (amd64)</h2>
+          <pre>
+          sudo curl -fsSL ${PAGES_URL}/ubuntu/vdr-${PLUGIN}.sources \\
             -o /etc/apt/sources.list.d/vdr-${PLUGIN}.sources
           sudo apt update
           sudo apt install ${PKG}
@@ -308,16 +328,24 @@ jobs:
           </html>
           HTML
 
-      - name: Deploy to gh-pages
-        env:
-          VERSION: ${{ needs.fedora.outputs.version }}
-        run: |
-          cd site
-          git init -b gh-pages
-          git add .
-          git -c user.name='github-actions[bot]' \
-              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m "Update packages for v${VERSION}"
-          git push --force \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
-            gh-pages
+      - name: Upload packages to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            _artifacts/rpm/pkgs/*.rpm
+            _artifacts/deb-*/*.deb
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

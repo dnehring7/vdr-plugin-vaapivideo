@@ -1,27 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Shared build prep: validate tag, import unencrypted GPG key with loopback
-# pinentry, export V and KEY_FP to $GITHUB_ENV, optionally write rpmmacros.
-# The caller must run actions/checkout before using this action and is
-# responsible for the tag source checkout.
+# Validate vX.Y.Z tag and export V (= tag without leading "v") to
+# $GITHUB_ENV/$GITHUB_OUTPUT. GPG handling is done by the standard
+# crazy-max/ghaction-import-gpg action in the workflow itself.
 
 name: Prepare build
-description: Validate tag, import GPG key, derive version
+description: Validate vX.Y.Z tag and export the version
 
 inputs:
   tag:
-    description: 'Git tag to build (e.g. v1.5.0)'
+    description: 'Git tag (vX.Y.Z)'
     required: true
-  private-key:
-    description: 'Armored, unencrypted GPG private key (no passphrase)'
-    required: true
-  rpmmacros:
-    description: "If 'true', write %_gpg_name and %_gpg_sign_cmd_extra_args to ~/.rpmmacros"
-    required: false
-    default: 'false'
 
 outputs:
   version:
-    description: 'Version without the leading "v" (X.Y.Z)'
+    description: 'Version without leading "v"'
     value: ${{ steps.init.outputs.V }}
 
 runs:
@@ -34,31 +26,4 @@ runs:
       run: |
         [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
           || { echo "::error::Tag '${TAG}' does not match vX.Y.Z"; exit 1; }
-        git config --global --add safe.directory '*'
-        V="${TAG#v}"
-        echo "V=${V}" | tee -a "${GITHUB_OUTPUT}" "${GITHUB_ENV}" >/dev/null
-
-    - shell: bash
-      env:
-        GPG_PRIVATE_KEY: ${{ inputs.private-key }}
-        RPMMACROS: ${{ inputs.rpmmacros }}
-      run: |
-        export GNUPGHOME="${HOME}/.gnupg"
-        mkdir -p -m 700 "${GNUPGHOME}"
-        printf 'allow-loopback-pinentry\n' > "${GNUPGHOME}/gpg-agent.conf"
-        printf 'pinentry-mode loopback\n'  > "${GNUPGHOME}/gpg.conf"
-        gpgconf --kill gpg-agent
-        echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
-        KEY_FP=$(gpg --batch --list-secret-keys --with-colons \
-                 | awk -F: '/^fpr:/{print $10; exit}')
-        KEY_ID=$(gpg --batch --list-secret-keys --with-colons \
-                 | awk -F: '/^sec:/{print $5; exit}')
-        test -n "${KEY_FP}" \
-          || { echo "::error::GPG_PRIVATE_KEY did not import a secret key"; exit 1; }
-        echo "KEY_FP=${KEY_FP}" >> "${GITHUB_ENV}"
-        if [[ "${RPMMACROS}" == "true" ]]; then
-          cat >> ~/.rpmmacros <<MACROS
-        %_gpg_name ${KEY_ID}
-        %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback
-        MACROS
-        fi
+        echo "V=${TAG#v}" | tee -a "${GITHUB_OUTPUT}" "${GITHUB_ENV}" >/dev/null

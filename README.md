@@ -103,11 +103,12 @@ not implement the Video Processing Pipeline (VPP) that this plugin requires.
 
 ### Pre-built packages
 
-Signed Fedora 44 and Debian 13 package repositories are published on every
+Signed Fedora 44, Debian 13, and Ubuntu 26.04 LTS package repositories are
+published on every
 [GitHub release](https://github.com/dnehring7/vdr-plugin-vaapivideo/releases)
-and served via GitHub Pages. Both configs reference the signing key at
+and served via GitHub Pages. All configs reference the signing key at
 <https://github.com/dnehring7.gpg> — DNF fetches it on first install; the
-Debian `.sources` file ships the key inline (modern DEB822 `Signed-By:`).
+APT `.sources` files ship the key inline (modern DEB822 `Signed-By:`).
 
 <details>
 <summary>Fedora 44 (x86_64)</summary>
@@ -129,6 +130,22 @@ sudo curl -fsSL https://dnehring7.github.io/vdr-plugin-vaapivideo/debian/vdr-vaa
 sudo apt update
 sudo apt install vdr-plugin-vaapivideo
 ```
+
+</details>
+
+<details>
+<summary>Ubuntu 26.04 LTS / Resolute Raccoon (amd64)</summary>
+
+```sh
+sudo curl -fsSL https://dnehring7.github.io/vdr-plugin-vaapivideo/ubuntu/vdr-vaapivideo.sources \
+  -o /etc/apt/sources.list.d/vdr-vaapivideo.sources
+sudo apt update
+sudo apt install vdr-plugin-vaapivideo
+```
+
+The Ubuntu build links against FFmpeg 8 (libavcodec62) and Ubuntu's
+`vdr-dev` 2.6.9, and is a separate ABI from the Debian Trixie build —
+install one or the other, not both.
 
 </details>
 
