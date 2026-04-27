@@ -78,7 +78,8 @@ class cVaapiDecoder : public cThread {
     auto FlushParser()
         -> void; ///< Force-drain the parser's held-back AU. Required for still-picture (single I-frame delivery).
     [[nodiscard]] auto GetLastPts() const noexcept
-        -> int64_t; ///< PTS of the most recently submitted frame in 90 kHz ticks, or AV_NOPTS_VALUE.
+        -> int64_t; ///< PTS of the most recently decoded frame in 90 kHz ticks, or AV_NOPTS_VALUE.
+                    ///< Includes catch-up-dropped frames (see PublishLastPts site in DecodeOnePacket).
     [[nodiscard]] auto GetQueueSize() const -> size_t;    ///< Packets waiting in the decode queue.
     [[nodiscard]] auto GetStreamAspect() const -> double; ///< Stream DAR (width x SAR), or 0.0 when closed.
     [[nodiscard]] auto GetStreamHeight() const -> int;    ///< Coded stream height, or 0 when closed.
@@ -151,6 +152,8 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Bulk-pop heads > HARD_THRESHOLD behind clock; keeps >=1 frame.
     auto WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta)
         -> void; ///< Replay hard-ahead: block until audio clock reaches video PTS. Capped at delta/90 + 1 s, max 5 s.
+    auto PublishLastPts(int64_t pts) noexcept
+        -> void; ///< Decode thread only. Stores pts iff iterationEpoch matches clearEpoch (Clear-race guard).
 
     // ========================================================================
     // === SYNCHRONIZATION ===
@@ -194,7 +197,7 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     std::atomic<bool> codecDrainPending;   ///< Decode thread drains codec (NULL packet) then clears this.
     std::atomic<bool> stillPictureMode;    ///< Selects spatial-only (bob) deinterlace; cleared after drain.
-    std::atomic<bool> hasExited;           ///< Set by decode thread just before return. Checked by Shutdown().
+    std::atomic<bool> hasExited{true};     ///< False only while Action() is running; checked by Shutdown().
     std::atomic<bool> hasLoggedFirstFrame; ///< One-time first-frame info log guard; reset only in OpenCodecWithInfo().
     std::atomic<bool> starvationWarned;    ///< One-time "no frame 3 s after open" warning; reset per codec open.
     std::atomic<bool>
@@ -203,10 +206,12 @@ class cVaapiDecoder : public cThread {
     std::atomic<size_t> packetsSinceOpen;  ///< avcodec_send_packet calls since last open; starvation counters.
     std::atomic<size_t> keyPacketsSinceOpen; ///< Subset with AV_PKT_FLAG_KEY; distinguishes silent feed vs HW stall.
     std::atomic<int64_t> lastPts{
-        AV_NOPTS_VALUE};         ///< Last submitted PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
-    std::atomic<bool> liveMode;  ///< Live TV -> jitter-buffer drain; replay -> sleep-pace to audio clock.
-    std::atomic<bool> ready;     ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
-    std::atomic<int> trickSpeed; ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
+        AV_NOPTS_VALUE};                 ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
+    std::atomic<uint64_t> clearEpoch{0}; ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
+    uint64_t iterationEpoch{0};          ///< Decode thread only. Snapshot of clearEpoch at each Action() iter top.
+    std::atomic<bool> liveMode;          ///< Live TV -> jitter-buffer drain; replay -> sleep-pace to audio clock.
+    std::atomic<bool> ready{false};      ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
+    std::atomic<int> trickSpeed;         ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
 
     // ========================================================================
     // === TRICK MODE ===
