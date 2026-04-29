@@ -858,6 +858,37 @@ auto cVaapiDecoder::Action() -> void {
                 (void)DecodeOnePacket(queuedPacket.get(), pendingFrames);
             }
         }
+        // Trick reverse: H.264 holds IDRs in the reorder buffer until later inputs push them
+        // out. With reverse-ordered isolated IDRs the buffer never fills usefully, pendingFrames
+        // stays empty, SubmitTrickFrame (the only nextTrickFrameDue updater) never runs, and
+        // dvbplayer race-feeds past the recording boundary. Force-drain to surface the held
+        // IDR; flush_buffers rebuilds hw_frames_ctx so the filter graph must reset too. Fallback
+        // pace covers the no-frame case (corrupt packet) so VDR's gate still throttles.
+        if (queuedPacket && trickSpeed.load(std::memory_order_relaxed) != 0 && pendingFrames.empty()) {
+            const cMutexLock decodeLock(&codecMutex);
+            const cMutexLock vaLock(&display->GetVaDriverMutex());
+            if (codecCtx) {
+                DrainCodecAtEos(pendingFrames);
+                if (filterChain.IsBuilt()) {
+                    if (filterChain.SendFrame(nullptr) >= 0) {
+                        while (true) {
+                            av_frame_unref(filteredFrame.get());
+                            if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
+                                break;
+                            }
+                            if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
+                                pendingFrames.push_back(std::move(vaapiFrame));
+                            }
+                        }
+                    }
+                    filterChain.Reset();
+                }
+            }
+            if (pendingFrames.empty()) {
+                const uint64_t holdMs = trickHoldMs.load(std::memory_order_relaxed);
+                nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
+            }
+        }
 
         // --- Still-picture codec drain ---
         // The decode thread may consume the packet before RequestCodecDrain sets the flag;

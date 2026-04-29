@@ -104,8 +104,8 @@ class cAudioProcessor : public cThread {
     auto CloseDecoder() -> void; ///< Spins until in-flight DecodeToPcm() callers finish, then frees decoder + parser
     auto DrainPacketQueue() -> void;   ///< Pops and frees every queued packet. Caller must hold mutex.
     auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
-    auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts, pcmQueueEndPts
-                                       ///< under the seqlock. Caller must hold mutex (single-writer invariant).
+    auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
+                                       ///< Caller must hold mutex (single-writer invariant).
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
     [[nodiscard]] auto ConfigureAlsaParams(snd_pcm_t *handle, snd_pcm_format_t format, unsigned channels, unsigned rate,
@@ -203,7 +203,6 @@ class cAudioProcessor : public cThread {
         0};                             ///< cTimeMs::Now() at the last playbackPts publish; 0 = never written
                                         ///< (GetClock() returns AV_NOPTS_VALUE when age exceeds AUDIO_CLOCK_STALE_MS)
     int64_t pcmNextPts{AV_NOPTS_VALUE}; ///< DVB-anchored 90 kHz PTS for the next ALSA write; updated by Action()
-    int64_t pcmQueueEndPts{AV_NOPTS_VALUE}; ///< 90 kHz PTS of the last sample queued into the ALSA ring buffer
     std::atomic<int64_t> playbackPts{
         AV_NOPTS_VALUE}; ///< Estimated PTS at DAC output (endPts minus snd_pcm_delay); published by WritePcmToAlsa()
 

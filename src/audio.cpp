@@ -497,9 +497,9 @@ auto cAudioProcessor::DrainPacketQueue() -> void {
 
 auto cAudioProcessor::ResetPlaybackClock() -> void {
     // lastClockUpdateMs == 0 is GetClock()'s "no clock yet" sentinel.
-    // Clears pcmNextPts / pcmQueueEndPts so the next ALSA write re-anchors on the new
-    // timeline. Brackets the pair with clockSequence bumps so GetClock()'s seqlock
-    // retries past the transient odd sequence.
+    // Clears pcmNextPts so the next ALSA write re-anchors on the new timeline.
+    // Brackets the pair with clockSequence bumps so GetClock()'s seqlock retries
+    // past the transient odd sequence.
     //
     // Caller MUST hold `mutex` (Clear(), SetStreamParams(), CloseDevice(), Action()'s
     // 5-s jump all do). The mutex serializes this writer against WritePcmToAlsa(),
@@ -509,7 +509,6 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
     lastClockUpdateMs.store(0, std::memory_order_relaxed);
     clockSequence.fetch_add(1, std::memory_order_release);
     pcmNextPts = AV_NOPTS_VALUE;
-    pcmQueueEndPts = AV_NOPTS_VALUE;
 }
 
 // ============================================================================
@@ -578,7 +577,18 @@ auto cAudioProcessor::Action() -> void {
             if (!burst.empty()) {
                 const size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
                 const unsigned burstFrames = (bpf > 0) ? static_cast<unsigned>(burst.size() / bpf) : 0;
-                (void)WritePcmToAlsa(burst, pcmNextPts, burstFrames, generationAtDequeue);
+                const int64_t startPts90k = pcmNextPts;
+                const bool writeOk = WritePcmToAlsa(burst, startPts90k, burstFrames, generationAtDequeue);
+                // Multi-frame PES: parser tags only the first AU with PTS; subsequent NOPTS
+                // bursts must inherit pcmNextPts + duration or playbackPts regresses (-32 ms
+                // per extra AC-3 frame). writeOk gate skips advance after a hard ALSA error
+                // that already ran ResetPlaybackClock().
+                if (writeOk && startPts90k != AV_NOPTS_VALUE && burstFrames > 0U && alsaSampleRate > 0U &&
+                    clearGeneration.load(std::memory_order_acquire) == generationAtDequeue) {
+                    const auto added90k =
+                        static_cast<int64_t>((static_cast<uint64_t>(burstFrames) * 90000ULL) / alsaSampleRate);
+                    pcmNextPts = startPts90k + added90k;
+                }
             }
         } else {
             (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), pts, generationAtDequeue);
@@ -1474,7 +1484,6 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     }
 
     const int64_t endPts = startPts90k + static_cast<int64_t>((static_cast<uint64_t>(frames) * 90000ULL) / rate);
-    pcmQueueEndPts = endPts;
 
     // Acquire mutex around snd_pcm_delay + seqlock publish for three reasons:
     //   1. ResetPlaybackClock() also brackets the pair with clockSequence bumps under
