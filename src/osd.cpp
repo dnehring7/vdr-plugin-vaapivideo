@@ -21,6 +21,7 @@
 
 // C++ Standard Library
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -72,16 +73,16 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
     // display_ is null under --detached: skins probe ProvidesTrueColor() during VDR Start()
     // before hardware is ready. AttachDisplay() wires the real display later. All pixel-path
     // methods guard on display_ before use.
-    if (display_) {
-        dsyslog("vaapivideo/osd: provider created %ux%u (TrueColor only)", display_->GetOutputWidth(),
-                display_->GetOutputHeight());
+    if (auto *currentDisplay = GetDisplay()) {
+        dsyslog("vaapivideo/osd: provider created %ux%u (TrueColor only)", currentDisplay->GetOutputWidth(),
+                currentDisplay->GetOutputHeight());
     } else {
         dsyslog("vaapivideo/osd: provider created detached (no display yet, TrueColor only)");
     }
 }
 
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
-    dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(display_));
+    dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(GetDisplay()));
 
     // A fast restart installs the new provider before VDR destroys the old one; only null
     // the global if it still points at us.
@@ -97,14 +98,14 @@ cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
 // ============================================================================
 
 auto cVaapiOsdProvider::AttachDisplay(cVaapiDisplay *display) noexcept -> void {
+    auto *oldDisplay = display_.exchange(display, std::memory_order_acq_rel);
     dsyslog("vaapivideo/osd: attaching display %p (was %p)", static_cast<void *>(display),
-            static_cast<void *>(display_));
-    display_ = display;
+            static_cast<void *>(oldDisplay));
 }
 
 auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
-    dsyslog("vaapivideo/osd: detaching display (was %p)", static_cast<void *>(display_));
-    display_ = nullptr;
+    auto *oldDisplay = display_.exchange(nullptr, std::memory_order_acq_rel);
+    dsyslog("vaapivideo/osd: detaching display (was %p)", static_cast<void *>(oldDisplay));
 }
 
 auto cVaapiOsdProvider::CompositeOntoRgb24(uint8_t *rgb24, const int width, const int height, const int stride,
@@ -190,26 +191,29 @@ auto cVaapiOsdProvider::UntrackOsd(cVaapiOsd *osd) -> void {
     std::erase(activeOsds_, osd);
 }
 
-[[nodiscard]] auto cVaapiOsdProvider::GetDisplay() const noexcept -> cVaapiDisplay * { return display_; }
+[[nodiscard]] auto cVaapiOsdProvider::GetDisplay() const noexcept -> cVaapiDisplay * {
+    return display_.load(std::memory_order_acquire);
+}
 
 auto cVaapiOsdProvider::HideOsd(const uint32_t fbId) -> void {
-    if (display_) [[likely]] {
+    if (auto *display = GetDisplay()) [[likely]] {
         // VDR can have multiple cVaapiOsds alive (e.g. menu over playback); only the
         // topmost is scanned out. Guard so destroying a background OSD doesn't blank the plane.
-        display_->ClearOsdIfActive(fbId);
+        display->ClearOsdIfActive(fbId);
     }
 }
 
 auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
-    if (!display_) [[unlikely]] {
+    auto *display = GetDisplay();
+    if (!display) [[unlikely]] {
         return;
     }
 
-    display_->SetOsd({.fbId = osd.GetFramebufferId(),
-                      .height = static_cast<uint32_t>(osd.Height()),
-                      .width = static_cast<uint32_t>(osd.Width()),
-                      .x = osd.Left(),
-                      .y = osd.Top()});
+    display->SetOsd({.fbId = osd.GetFramebufferId(),
+                     .height = static_cast<uint32_t>(osd.Height()),
+                     .width = static_cast<uint32_t>(osd.Width()),
+                     .x = osd.Left(),
+                     .y = osd.Top()});
 }
 
 // ============================================================================
@@ -221,12 +225,13 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
     // provider is registered; with a provider installed it passes nullptr straight to the
     // caller. On any failure return cVaapiDummyOsd -- the same kind of no-op VDR uses
     // as its own internal fallback.
-    if (!display_ || !display_->IsInitialized()) [[unlikely]] {
+    auto *display = GetDisplay();
+    if (!display || !display->IsInitialized()) [[unlikely]] {
         dsyslog("vaapivideo/osd: CreateOsd while detached -- returning dummy cOsd");
         return new cVaapiDummyOsd(left, top, level);
     }
 
-    const int drmFd = display_->GetDrmFd();
+    const int drmFd = display->GetDrmFd();
     if (drmFd < 0) [[unlikely]] {
         esyslog("vaapivideo/osd: CreateOsd - invalid DRM fd, returning dummy cOsd");
         return new cVaapiDummyOsd(left, top, level);
@@ -234,8 +239,8 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
 
     // VDR's cOsd API has no width/height negotiation at construction, so size the FB from
     // (left, top) to the screen corner. Flush() clips any pixmap that overflows this rect.
-    const auto screenWidth = static_cast<int>(display_->GetOutputWidth());
-    const auto screenHeight = static_cast<int>(display_->GetOutputHeight());
+    const auto screenWidth = static_cast<int>(display->GetOutputWidth());
+    const auto screenHeight = static_cast<int>(display->GetOutputHeight());
     const int osdWidth = screenWidth - left;
     const int osdHeight = screenHeight - top;
 

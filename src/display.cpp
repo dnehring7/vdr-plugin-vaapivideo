@@ -603,8 +603,14 @@ auto cVaapiDisplay::Shutdown() -> void {
         pendingDestroyHdrBlobId = 0;
     }
     // Reset tracked HDR state so a re-Initialize() starts from a known SDR baseline.
-    appliedHdrState = {};
-    stagedHdrState = {};
+    // Held under hdrStateMutex so a concurrent GetActiveHdrKind() / SetHdrOutputState()
+    // observes consistent state -- SVDRP can in theory still reach this device while
+    // the destructor walks Shutdown().
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        appliedHdrState = {};
+        stagedHdrState = {};
+    }
 }
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
@@ -1348,11 +1354,9 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 
 [[nodiscard]] auto cVaapiDisplay::MaybeAppendHdrOutputState(AtomicRequest &req, bool &failed) -> bool {
     failed = false;
-    HdrStreamInfo staged;
-    {
-        const cMutexLock lock(&hdrStateMutex);
-        staged = stagedHdrState;
-    }
+    // Held across staged-read and appliedHdrState write so GetActiveHdrKind() never sees a torn snapshot.
+    const cMutexLock lock(&hdrStateMutex);
+    const HdrStreamInfo staged = stagedHdrState;
     if (HdrOutputStateEqual(staged, appliedHdrState)) {
         return false; // ApplyDisplayMode() pre-programmed the SDR baseline, so the first
                       // real frame with staged == Sdr legitimately skips the write here.
@@ -1392,6 +1396,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     }
 
     // Optimistically promote the new blob; PresentBuffer() rolls back on commit failure.
+    // Blob IDs (uint32_t) are display-thread-only, no SVDRP reader, so the lock above is
+    // strictly for appliedHdrState.
     pendingDestroyHdrBlobId = appliedHdrBlobId;
     appliedHdrBlobId = newBlobId;
     appliedHdrState = staged;
@@ -1670,7 +1676,12 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
             }
             appliedHdrBlobId = previousHdrBlobId;
             pendingDestroyHdrBlobId = 0;
-            appliedHdrState = previousHdrState;
+            // Rollback under hdrStateMutex so GetActiveHdrKind() observes the restored state
+            // atomically with the same lock it acquires for reads.
+            {
+                const cMutexLock lock(&hdrStateMutex);
+                appliedHdrState = previousHdrState;
+            }
             esyslog("vaapivideo/display: atomic commit failed during HDR transition -- will retry next frame");
         }
     }

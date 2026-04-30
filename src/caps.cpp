@@ -198,10 +198,35 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
         return std::nullopt;
     }
 
+    // fd-only RAII guard; released to ProbeVaDisplay below once vaInitialize succeeds.
+    struct FdGuard {
+        int fd;
+        explicit FdGuard(int f) noexcept : fd{f} {}
+        ~FdGuard() noexcept {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+        FdGuard(const FdGuard &) = delete;
+        FdGuard(FdGuard &&) = delete;
+        auto operator=(const FdGuard &) -> FdGuard & = delete;
+        auto operator=(FdGuard &&) -> FdGuard & = delete;
+        [[nodiscard]] auto Release() noexcept -> int {
+            const int r = fd;
+            fd = -1;
+            return r;
+        }
+    };
+    FdGuard fdGuard{renderFd};
+
+    // -Wanalyzer-fd-leak false positive on libva calls; FdGuard above is the real guard.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
     VADisplay vaDisplay = vaGetDisplayDRM(renderFd);
     if (!vaDisplay) [[unlikely]] {
         esyslog("vaapivideo/caps: VPP probe failed -- vaGetDisplayDRM error");
-        close(renderFd);
         return std::nullopt;
     }
 
@@ -209,11 +234,14 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
     int vaMinor = 0;
     if (vaInitialize(vaDisplay, &vaMajor, &vaMinor) != VA_STATUS_SUCCESS) [[unlikely]] {
         esyslog("vaapivideo/caps: VPP probe failed -- vaInitialize error");
-        close(renderFd);
         return std::nullopt;
     }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
-    const ProbeVaDisplay vaRaii{vaDisplay, renderFd}; // vaTerminate + close on every exit path
+    // Transfer ownership: ProbeVaDisplay now closes fd in vaTerminate-then-close order.
+    const ProbeVaDisplay vaRaii{vaDisplay, fdGuard.Release()};
 
     if (const char *vendorStr = vaQueryVendorString(vaDisplay); vendorStr != nullptr) {
         caps.vendorName = vendorStr;

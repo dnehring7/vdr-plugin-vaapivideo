@@ -20,6 +20,7 @@
 #include "display.h"
 
 // C++ Standard Library
+#include <atomic>
 #include <vector>
 
 class cVaapiOsd;
@@ -74,9 +75,12 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    std::vector<cVaapiOsd *> activeOsds_; ///< Live OSDs holding DRM resources; guarded by osdListMutex_
-    cVaapiDisplay *display_;              ///< Borrowed; nulled on Detach -- never outlives the device
-    cMutex osdListMutex_;                 ///< Guards activeOsds_ (SVDRP thread vs. VDR main thread)
+    std::vector<cVaapiOsd *> activeOsds_;  ///< Live OSDs holding DRM resources; guarded by osdListMutex_
+    std::atomic<cVaapiDisplay *> display_; ///< Borrowed; nulled on Detach -- never outlives the device.
+                                           ///< Atomic: SVDRP thread writes via Attach/Detach, VDR main thread
+                                           ///< reads from CreateOsd/Flush/destructor. Lifetime is guaranteed
+                                           ///< separately (display outlives the provider while attached).
+    cMutex osdListMutex_;                  ///< Guards activeOsds_ (SVDRP thread vs. VDR main thread)
 };
 
 // ============================================================================

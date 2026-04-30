@@ -1436,6 +1436,10 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
     }
 
+    // Clear-race guard: pacing wait above may have been raced by SetTrickSpeed(0) / Clear().
+    if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
+        return true;
+    }
     return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }
 
@@ -1598,14 +1602,21 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
 
 [[nodiscard]] auto cVaapiDecoder::SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame) -> bool {
     // Audio-master A/V sync gate. See AVSYNC.md for the full state diagram.
-    // Soft adjusts EMA by the *measured* effect (drop: +frameDur*90; sleep: -(elapsed-frameDur)*90).
-    // MAX_CORRECTION = HARD_THRESHOLD so a single event clears any in-corridor offset.
 
     if (!frame || !display) [[unlikely]] {
         return false;
     }
 
     const int64_t pts = frame->pts;
+
+    // Clear-race guard for paths that sleep before submit; stale-epoch frames are dropped
+    // silently (returning true so callers don't count it as a submit failure).
+    auto submitIfCurrent = [this](std::unique_ptr<VaapiFrame> submitFrame) -> bool {
+        if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
+            return true;
+        }
+        return display->SubmitFrame(std::move(submitFrame), DECODER_SUBMIT_TIMEOUT_MS);
+    };
 
     // --- Trick mode ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
@@ -1627,7 +1638,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         if (pts != AV_NOPTS_VALUE) {
             PublishLastPts(pts);
         }
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        return submitIfCurrent(std::move(frame));
     }
 
     // Publish PTS for lock-free readers (still detection, position query via GetLastPts).
@@ -1638,7 +1649,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // Freerun bypass: no audio processor, no PTS, or inside the post-Clear / trick-exit window.
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
     if (!ap || pts == AV_NOPTS_VALUE) {
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        return submitIfCurrent(std::move(frame));
     }
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
@@ -1646,7 +1657,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // old clock domain doesn't bleed into the new one.
         pendingDrops = 0;
         ResetSmoothedDelta();
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        return submitIfCurrent(std::move(frame));
     }
 
     // Snapshot latency once per frame; a mid-frame PCM<->passthrough flip must not change it.
@@ -1662,7 +1673,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
         }
-        return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+        return submitIfCurrent(std::move(frame));
     }
 
     // Consume one pending drop from a previous soft-behind burst; PTS advances, clock doesn't.
@@ -1724,7 +1735,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // serialize follow-up events and warmup reseeds inside the corridor so soft stays a no-op.
     if (rawDelta < -DECODER_SYNC_HARD_THRESHOLD) [[unlikely]] {
         if (++hardBehindStreak < 2) {
-            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+            return submitIfCurrent(std::move(frame));
         }
         hardBehindStreak = 0;
         const int correctMs = static_cast<int>(-rawDelta / 90);
@@ -1745,7 +1756,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // 2-sample debounce same as hard-behind: avoids a 500 ms freeze on a lone snd_pcm_delay spike.
     if (rawDelta > DECODER_SYNC_HARD_THRESHOLD) {
         if (++hardAheadStreak < 2) {
-            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+            return submitIfCurrent(std::move(frame));
         }
         hardAheadStreak = 0;
         if (!liveMode.load(std::memory_order_relaxed)) {
@@ -1755,7 +1766,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                     static_cast<long long>(pts), static_cast<long long>(rawDelta / 90));
             pendingDrops = 0;
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
-            return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+            return submitIfCurrent(std::move(frame));
         }
         constexpr int HARD_AHEAD_MAX_MS = 500;
         const int bigSleepMs = std::min(static_cast<int>(rawDelta / 90), HARD_AHEAD_MAX_MS);
@@ -1803,7 +1814,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         }
     }
 
-    const bool submitted = display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
+    const bool submitted = submitIfCurrent(std::move(frame));
     if (preSleepMs != 0) {
         // EMA feedback: subtract measured shift (elapsed - frameDur); std::max guards underflow.
         const auto elapsedMs = static_cast<int>(cTimeMs::Now() - preSleepMs);

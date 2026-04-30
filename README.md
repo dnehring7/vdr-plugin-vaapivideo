@@ -473,7 +473,7 @@ function, `[[nodiscard]]` on value-returning functions, RAII for every C-API
 resource, `std::format`/`std::span` over their C equivalents, and VDR
 threading primitives (`cThread`, `cMutex`, `cCondVar`) over `std::thread` /
 `std::mutex`. The full rules and rationale are in
-[CLAUDE.md](CLAUDE.md) / `.github/copilot-instructions.md`.
+`.github/copilot-instructions.md`.
 
 ### Verbose logging
 

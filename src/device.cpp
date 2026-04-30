@@ -879,20 +879,21 @@ auto cVaapiDevice::Play() -> void {
         // tsToPesAudio. That stale PES arrives here first and would detect the wrong codec.
         // Depth=2 suffices: tsToPesAudio.Reset() fires on every PUSI, so at most one stale
         // PES can sneak through. Cost: ~24-32 ms extra latency on codec open.
-        if (detectedCodec == audioCodecCandidate) {
-            ++audioCodecCandidateCount;
+        if (detectedCodec == audioCodecCandidate.load(std::memory_order_relaxed)) {
+            audioCodecCandidateCount.fetch_add(1, std::memory_order_relaxed);
         } else {
-            audioCodecCandidate = detectedCodec;
-            audioCodecCandidateCount = 1;
+            audioCodecCandidate.store(detectedCodec, std::memory_order_relaxed);
+            audioCodecCandidateCount.store(1, std::memory_order_relaxed);
         }
-        if (audioCodecCandidateCount < 2) {
+        const int candidateCount = audioCodecCandidateCount.load(std::memory_order_relaxed);
+        if (candidateCount < 2) {
             dsyslog("vaapivideo/device: audio codec %s -- awaiting confirmation (%d/2)",
-                    avcodec_get_name(detectedCodec), audioCodecCandidateCount);
+                    avcodec_get_name(detectedCodec), candidateCount);
             return Length;
         }
 
-        audioCodecCandidate = AV_CODEC_ID_NONE;
-        audioCodecCandidateCount = 0;
+        audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        audioCodecCandidateCount.store(0, std::memory_order_relaxed);
 
         if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
@@ -906,8 +907,8 @@ auto cVaapiDevice::Play() -> void {
 
     // Radio detection: 3 s grace set by SetPlayMode(pmAudioVideo) with no video arriving;
     // paint black to clear the previous channel's residual scanout picture.
-    if (radioBlackPending && radioBlackTimer.TimedOut()) [[unlikely]] {
-        radioBlackPending = false;
+    if (radioBlackPending.load(std::memory_order_relaxed) && radioBlackTimer.TimedOut()) [[unlikely]] {
+        radioBlackPending.store(false, std::memory_order_relaxed);
         if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
             isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
             SubmitBlackFrame();
@@ -937,7 +938,7 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
-    radioBlackPending = false;
+    radioBlackPending.store(false, std::memory_order_relaxed);
 
     const auto pes = ParsePes({Data, static_cast<size_t>(Length)});
     if (!pes.isVideo || pes.payloadSize == 0) [[unlikely]] {
@@ -962,24 +963,26 @@ auto cVaapiDevice::Play() -> void {
         // Stale-PES guard only when codec matches previous channel: prevents ring-buffer
         // residue from reopening the old decoder. Narrower than audio's unconditional guard
         // because video has no audi-N race (no out-of-band track switch at this layer).
-        if (detectedCodec == previousVideoCodec && previousVideoCodec != AV_CODEC_ID_NONE) [[unlikely]] {
-            if (detectedCodec == videoCodecCandidate) {
-                ++videoCodecCandidateCount;
+        const AVCodecID prevVideo = previousVideoCodec.load(std::memory_order_relaxed);
+        if (detectedCodec == prevVideo && prevVideo != AV_CODEC_ID_NONE) [[unlikely]] {
+            if (detectedCodec == videoCodecCandidate.load(std::memory_order_relaxed)) {
+                videoCodecCandidateCount.fetch_add(1, std::memory_order_relaxed);
             } else {
-                videoCodecCandidate = detectedCodec;
-                videoCodecCandidateCount = 1;
+                videoCodecCandidate.store(detectedCodec, std::memory_order_relaxed);
+                videoCodecCandidateCount.store(1, std::memory_order_relaxed);
             }
-            if (videoCodecCandidateCount < 2) {
+            const int candidateCount = videoCodecCandidateCount.load(std::memory_order_relaxed);
+            if (candidateCount < 2) {
                 dsyslog("vaapivideo/device: video codec %s same as previous -- awaiting confirmation (%d/2)",
-                        avcodec_get_name(detectedCodec), videoCodecCandidateCount);
+                        avcodec_get_name(detectedCodec), candidateCount);
                 return Length;
             }
             dsyslog("vaapivideo/device: video codec %s confirmed after %d detections", avcodec_get_name(detectedCodec),
-                    videoCodecCandidateCount);
+                    candidateCount);
         }
 
-        videoCodecCandidate = AV_CODEC_ID_NONE;
-        videoCodecCandidateCount = 0;
+        videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        videoCodecCandidateCount.store(0, std::memory_order_relaxed);
 
         // Wait for an SPS before opening H.264/HEVC: backend selection (8-bit vs High10/
         // Main10) keys on bit-depth/profile from the SPS. Opening without it would hit the
@@ -1087,12 +1090,12 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
 
     switch (PlayMode) {
         case pmNone:
-            // Capture previous codec ids BEFORE clearing: PlayVideo/PlayAudio 2-of-2 guards
-            // use them to reject stale TS-buffer bytes after the switch.
-            // Audio codec reset is deferred to Clear() -> ResetAudioCodecState().
-            radioBlackPending = false;
-            previousVideoCodec = videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-            previousAudioCodec = audioCodecId.load(std::memory_order_relaxed);
+            // Capture previous video codec BEFORE clearing: PlayVideo's 2-of-2 guard uses it
+            // to reject stale TS-buffer bytes after the switch. Audio path runs the guard
+            // unconditionally so it doesn't need a previous-codec capture.
+            radioBlackPending.store(false, std::memory_order_relaxed);
+            previousVideoCodec.store(videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed),
+                                     std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
@@ -1100,8 +1103,8 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
                 decoder->SetLiveMode(false);
                 decoder->RequestCodecReopen();
             }
-            videoCodecCandidate = AV_CODEC_ID_NONE;
-            videoCodecCandidateCount = 0;
+            videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+            videoCodecCandidateCount.store(0, std::memory_order_relaxed);
             // Reset dedup so the new channel's first audio-track hook re-detects.
             lastHandledAudioTrack = ttNone;
             lastHandledAudioPid = 0;
@@ -1115,7 +1118,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
         case pmAudioOnly:
         case pmAudioOnlyBlack:
             // Radio: paint black so DRM scanout doesn't hold the previous channel's picture.
-            radioBlackPending = false;
+            radioBlackPending.store(false, std::memory_order_relaxed);
             Clear();
             SubmitBlackFrame();
             break;
@@ -1126,7 +1129,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             Clear();
             // 3 s grace: if no video arrives, PlayAudio() paints black (radio channel).
             radioBlackTimer.Set(3000);
-            radioBlackPending = true;
+            radioBlackPending.store(true, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -1285,10 +1288,9 @@ auto cVaapiDevice::Detach() -> bool {
 
     // Reset all playback state so a subsequent Attach() re-detects codecs from scratch.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    previousVideoCodec = AV_CODEC_ID_NONE;
-    previousAudioCodec = AV_CODEC_ID_NONE;
-    videoCodecCandidate = AV_CODEC_ID_NONE;
-    videoCodecCandidateCount = 0;
+    previousVideoCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    videoCodecCandidateCount.store(0, std::memory_order_relaxed);
     ResetAudioCodecState();
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
@@ -1580,8 +1582,8 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     // Clears candidate fields too: a stale partial 2-of-2 count would otherwise let one
     // detection confirm against the previous cycle's codec and reopen the wrong decoder.
     audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    audioCodecCandidate = AV_CODEC_ID_NONE;
-    audioCodecCandidateCount = 0;
+    audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    audioCodecCandidateCount.store(0, std::memory_order_relaxed);
 }
 
 [[nodiscard]] auto cVaapiDevice::SelectDrmConnector() -> bool {

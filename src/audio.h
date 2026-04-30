@@ -143,68 +143,51 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === ALSA DEVICE ===
     // ========================================================================
-    int alsaCardId{-1};                 ///< ALSA card number resolved from the device name; cached by ProbeSinkCaps()
-    unsigned alsaChannels{0};           ///< Hardware channel count negotiated with ALSA
-    std::string alsaDeviceName;         ///< ALSA PCM device name (e.g. "plughw:0,3")
-    std::atomic<int> alsaErrorCount{0}; ///< Consecutive snd_pcm_writei failures since the last successful write
-    std::atomic<size_t> alsaFrameBytes{0}; ///< Bytes per interleaved frame (channels x sample_size); atomic so
-                                           ///<   WriteToAlsa() can read it lock-free from the Action thread
-    snd_pcm_t *alsaHandle{nullptr};        ///< Open PCM device handle; nullptr when closed
-    unsigned alsaIec958CtlIndex{0};        ///< "IEC958 Playback Default" control index for this HDMI port
-    std::atomic<bool> alsaPassthroughActive{
-        false};                 ///< True when open in IEC61937 passthrough mode.
-                                ///< Atomic because IsPassthrough() is called lock-free from the
-                                ///< video decoder thread on every frame; writes happen under `mutex`.
-    unsigned alsaSampleRate{0}; ///< Hardware sample rate negotiated with ALSA (Hz)
+    int alsaCardId{-1};                             ///< ALSA card number; cached by ProbeSinkCaps()
+    std::atomic<unsigned> alsaChannels{0};          ///< Negotiated channel count
+    std::string alsaDeviceName;                     ///< ALSA PCM device name (e.g. "plughw:0,3")
+    std::atomic<int> alsaErrorCount{0};             ///< Consecutive snd_pcm_writei failures
+    std::atomic<size_t> alsaFrameBytes{0};          ///< Bytes per interleaved frame
+    snd_pcm_t *alsaHandle{nullptr};                 ///< Open PCM device handle; nullptr when closed
+    unsigned alsaIec958CtlIndex{0};                 ///< "IEC958 Playback Default" control index
+    std::atomic<bool> alsaPassthroughActive{false}; ///< True in IEC61937 passthrough mode
+    std::atomic<unsigned> alsaSampleRate{0};        ///< Negotiated sample rate (Hz)
 
     // ========================================================================
     // === IEC61937 SPDIF MUXER ===
     // ========================================================================
-    AVFormatContext *spdifMuxCtx{nullptr}; ///< FFmpeg spdif output context; owned, freed by CloseSpdifMuxer()
-    std::vector<uint8_t>
-        spdifOutputBuf; ///< Accumulates IEC61937 burst bytes via SpdifWriteCallback; valid until next WrapIec61937()
+    AVFormatContext *spdifMuxCtx{nullptr}; ///< FFmpeg spdif output context
+    std::vector<uint8_t> spdifOutputBuf;   ///< IEC61937 burst bytes; valid until next WrapIec61937()
 
     // ========================================================================
     // === DECODER ===
     // ========================================================================
-    int consecutiveDecodeErrors{}; ///< avcodec_send_packet failures since last successful decode
-    std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder{
-        nullptr};                        ///< FFmpeg decoder context; nullptr when closed
-    int decoderGracePackets{0};          ///< Remaining packets to silently discard after decoder (re)init
-    std::atomic<int> decoderRefCount{0}; ///< In-flight DecodeToPcm() callers; CloseDecoder() spins until zero
-    std::atomic<bool> needsFlush{
-        false}; ///< Set by Clear(); consumed by DecodeToPcm() to flush the decoder before the next packet
-    std::atomic<bool> parserNeedsReset{
-        false}; ///< Set by Action() on INVALIDDATA cascade; consumed by Decode() on the
-                ///< producer thread (which holds the mutex) to recreate parserCtx.
-                ///< Cannot be done in Action() directly: decoderRefCount > 0 would deadlock CloseDecoder().
-    std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
-        parserCtx;               ///< FFmpeg bitstream parser for access-unit framing; owned by the producer thread
-    int swrChannels{};           ///< Channel count swrCtx was last initialized for
-    SwrContext *swrCtx{nullptr}; ///< libswresample context for format/channel conversion to S16LE
-    AVSampleFormat swrFormat{AV_SAMPLE_FMT_NONE}; ///< Sample format swrCtx was last initialized for
+    int consecutiveDecodeErrors{};                                 ///< avcodec_send_packet failure streak
+    std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder{}; ///< FFmpeg decoder context
+    int decoderGracePackets{0};                                    ///< Packets to silently discard after (re)init
+    std::atomic<int> decoderRefCount{0};                           ///< In-flight DecodeToPcm() callers
+    std::atomic<bool> needsFlush{false};                           ///< Set by Clear(), consumed by DecodeToPcm()
+    std::atomic<bool> parserNeedsReset{false}; ///< Action() flags INVALIDDATA cascade; Decode() recreates parserCtx
+                                               ///< (cannot be done in Action() -- would deadlock CloseDecoder()).
+    std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx; ///< AU-framing parser
+    int swrChannels{};                                                         ///< swrCtx channel count
+    SwrContext *swrCtx{nullptr};                                               ///< Conversion context to S16LE
+    AVSampleFormat swrFormat{AV_SAMPLE_FMT_NONE};                              ///< swrCtx sample format
 
     // ========================================================================
     // === PACKET QUEUE ===
     // ========================================================================
-    cCondVar packetCondition;           ///< Wakes Action() when a packet is enqueued
-    std::queue<AVPacket *> packetQueue; ///< Compressed audio packets awaiting decode; ownership transferred on dequeue
+    cCondVar packetCondition;           ///< Wakes Action() on enqueue
+    std::queue<AVPacket *> packetQueue; ///< Compressed packets awaiting decode
 
     // ========================================================================
     // === PCM CLOCK ===
     // ========================================================================
-    std::atomic<uint32_t> clearGeneration{0}; ///< Bumped on every Clear()/codec swap; DecodeToPcm() compares against
-                                              ///< the value captured at dequeue to detect and drop stale-era packets
-    std::atomic<uint32_t> clockSequence{0};   ///< Seqlock sequence counter protecting (playbackPts, lastClockUpdateMs).
-                                              ///< Single-writer invariant: bumps only under `mutex` (WritePcmToAlsa()
-                                              ///< acquires it; ResetPlaybackClock() requires callers to hold it).
-                                              ///< GetClock() retries until two even-sequence loads match.
-    std::atomic<uint64_t> lastClockUpdateMs{
-        0};                             ///< cTimeMs::Now() at the last playbackPts publish; 0 = never written
-                                        ///< (GetClock() returns AV_NOPTS_VALUE when age exceeds AUDIO_CLOCK_STALE_MS)
-    int64_t pcmNextPts{AV_NOPTS_VALUE}; ///< DVB-anchored 90 kHz PTS for the next ALSA write; updated by Action()
-    std::atomic<int64_t> playbackPts{
-        AV_NOPTS_VALUE}; ///< Estimated PTS at DAC output (endPts minus snd_pcm_delay); published by WritePcmToAlsa()
+    std::atomic<uint32_t> clearGeneration{0};         ///< Bumped on Clear()/codec swap; tags packet era
+    std::atomic<uint32_t> clockSequence{0};           ///< Seqlock for (playbackPts, lastClockUpdateMs); single-writer
+    std::atomic<uint64_t> lastClockUpdateMs{0};       ///< cTimeMs::Now() at last publish; 0 = never written
+    std::atomic<int64_t> pcmNextPts{AV_NOPTS_VALUE};  ///< DVB-anchored 90 kHz PTS for next ALSA write
+    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< Estimated PTS at DAC output
 
     // ========================================================================
     // === SINK CAPABILITIES ===

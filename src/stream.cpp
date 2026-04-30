@@ -383,9 +383,12 @@ class BitReader {
                 return 0;
             }
             const size_t byteIdx = bitPos_ / 8;
-            const int bitInByte = 7 - static_cast<int>(bitPos_ % 8);
+            const unsigned bitInByte = 7U - static_cast<unsigned>(bitPos_ % 8);
+            // Promote the byte to unsigned BEFORE the shift so the result type stays unsigned;
+            // the implicit int-promotion path triggers -Wsign-conversion when ANDed with 0x01U.
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bitPos_ just checked
-            value = (value << 1) | ((data_[byteIdx] >> bitInByte) & 0x01U);
+            const uint32_t byteVal = data_[byteIdx];
+            value = (value << 1U) | ((byteVal >> bitInByte) & 0x01U);
             ++bitPos_;
         }
         return value;

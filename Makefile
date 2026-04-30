@@ -69,7 +69,7 @@ CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 # Runtime options (copy into shell before starting VDR):
 #   export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:symbolize=1:fast_unwind_on_malloc=0:strict_init_order=1:check_initialization_order=1:detect_stack_use_after_return=1"
 #   export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
-#   export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$(gcc -print-file-name=libubsan.so)"
+#   export LD_PRELOAD="/usr/lib64/libasan.so.8:/usr/lib64/libubsan.so.1"
 
 # Debugging Flags for ThreadSanitizer
 # (uncomment for development builds — mutually exclusive with AddressSanitizer)
@@ -78,7 +78,7 @@ CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 #           -ftrivial-auto-var-init=zero
 # Runtime options (copy into shell before starting VDR):
 #   export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:detect_deadlocks=1:report_thread_leaks=1:history_size=7:symbolize=1"
-#   export LD_PRELOAD="$(gcc -print-file-name=libtsan.so)"
+#   export LD_PRELOAD="/usr/lib64/libtsan.so.2"
 
 # Development Flags (uncomment for development builds)
 #CXXFLAGS += -pedantic-errors -Wall -Wextra
@@ -188,8 +188,8 @@ docs:
 	@doxygen && echo "Doxygen documentation written to docs/html/index.html"
 
 # Static Code Analysis using clang-tidy (checks configured in .clang-tidy)
-# Filter out GCC-specific flags that clang doesn't understand
-CLANG_CXXFLAGS = $(filter-out -Wno-complain-wrong-lang -specs=% -grecord-gcc-switches,$(CXXFLAGS))
+# Filter out GCC-specific flags that clang doesn't understand.
+CLANG_CXXFLAGS = $(filter-out -Wno-complain-wrong-lang -specs=% -grecord-gcc-switches -fanalyzer,$(CXXFLAGS))
 
 lint:
 	@echo "Running clang-tidy analysis..."

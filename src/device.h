@@ -189,40 +189,37 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    drmModeModeInfo activeMode{};                          ///< DRM display mode selected by SelectDrmConnector()
-    std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE}; ///< Codec active for the current audio stream
-    std::string audioDevice;                               ///< ALSA device name (e.g. "default", "hw:0,3")
-    std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
-    uint32_t connectorId{};                                ///< DRM connector ID chosen by SelectDrmConnector()
-    std::string connectorName;                             ///< User-requested connector (e.g. "HDMI-A-1"); empty = auto
-    uint32_t crtcId{};                                     ///< DRM CRTC ID associated with the selected connector
-    std::unique_ptr<cVaapiDecoder> decoder;                ///< Threaded VAAPI packet decoder
-    std::unique_ptr<cVaapiDisplay> display;                ///< DRM atomic page-flip display manager
-    int drmFd{-1};                                         ///< Open file descriptor for the DRM primary node
-    std::string drmPath;                      ///< Path to the DRM primary device node (e.g. "/dev/dri/card0")
-    std::atomic<int> initState;               ///< Init state machine: 0=detached/uninit, 1=pending, 2=ready
-    std::atomic<bool> startupComplete{false}; ///< True after plugin Start() returns; gates the MakePrimaryDevice()
-                                              ///< deferred-attach hook so setup.conf-driven primary promotion at
-                                              ///< VDR bring-up cannot defeat --detached
-    std::atomic<bool> liveMode;               ///< True in Transfer Mode (live TV); false during replay
-    int osdHeight{};                          ///< Cached display height for OSD allocation (pixels)
-    int osdWidth{};                           ///< Cached display width for OSD allocation (pixels)
-    AVCodecID audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate audio codec pending confirmation
-    int audioCodecCandidateCount{};                  ///< Consecutive detections of candidate audio codec
-    std::atomic<uint64_t> lastClearMs{0};     ///< Timestamp of last Clear() for diagnostic delta logging; 0 = never
-    eTrackType lastHandledAudioTrack{ttNone}; ///< Dedup pair (with lastHandledAudioPid): skip track change if
-    uint16_t lastHandledAudioPid{};           ///<   both (type, PID) match; suppresses resets during PMT churn
-    std::atomic<bool> paused;                 ///< True while playback is frozen via Freeze()
-    AVCodecID previousAudioCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
-    AVCodecID previousVideoCodec{AV_CODEC_ID_NONE};  ///< Codec from previous channel (stale-data guard)
-    bool inStillPicture{false};                      ///< Re-entry guard: true while cDevice::StillPicture re-enters
-    bool radioBlackPending{false};                   ///< True while waiting to detect radio-only channel
-    cTimeMs radioBlackTimer;                         ///< Timeout for radio-mode detection (no video -> black frame)
-    std::atomic<int> trickSpeed;                     ///< Active VDR trick speed index; 0 = normal playback
-    VaapiContext vaapi{};                            ///< Shared VAAPI context (hwDeviceRef + drmFd borrow)
-    AVCodecID videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Candidate video codec pending confirmation
-    int videoCodecCandidateCount{};                  ///< Consecutive detections of candidate video codec
-    std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE}; ///< Codec active for the current video stream
+    drmModeModeInfo activeMode{};                                 ///< Selected DRM display mode
+    std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE};        ///< Active audio codec
+    std::string audioDevice;                                      ///< ALSA device name
+    std::unique_ptr<cAudioProcessor> audioProcessor;              ///< Threaded ALSA renderer
+    uint32_t connectorId{};                                       ///< DRM connector ID
+    std::string connectorName;                                    ///< User-requested connector; empty = auto
+    uint32_t crtcId{};                                            ///< DRM CRTC ID
+    std::unique_ptr<cVaapiDecoder> decoder;                       ///< Threaded VAAPI decoder
+    std::unique_ptr<cVaapiDisplay> display;                       ///< DRM page-flip display manager
+    int drmFd{-1};                                                ///< DRM primary node fd
+    std::string drmPath;                                          ///< DRM primary device path
+    std::atomic<int> initState;                                   ///< 0=detached, 1=pending, 2=ready
+    std::atomic<bool> startupComplete{false};                     ///< Gates deferred-attach against --detached
+    std::atomic<bool> liveMode;                                   ///< True in Transfer Mode (live TV)
+    int osdHeight{};                                              ///< Cached display height (px)
+    int osdWidth{};                                               ///< Cached display width (px)
+    std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
+    std::atomic<int> audioCodecCandidateCount{};                  ///< Confirmation count for audioCodecCandidate
+    std::atomic<uint64_t> lastClearMs{0};                         ///< Last Clear() timestamp (diagnostic)
+    eTrackType lastHandledAudioTrack{ttNone};                     ///< (with lastHandledAudioPid) dedup track-change
+    uint16_t lastHandledAudioPid{};                               ///<   hooks during PMT churn
+    std::atomic<bool> paused;                                     ///< True while frozen via Freeze()
+    std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE};  ///< Previous channel's video codec (stale guard)
+    bool inStillPicture{false};                                   ///< Re-entry guard for cDevice::StillPicture
+    std::atomic<bool> radioBlackPending{false};                   ///< Awaiting radio-only channel detection
+    cTimeMs radioBlackTimer;                                      ///< Radio-mode detection timeout
+    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};                                         ///< Shared VAAPI context
+    std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
+    std::atomic<int> videoCodecCandidateCount{};                  ///< Confirmation count for videoCodecCandidate
+    std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
 };
 
 #endif // VDR_VAAPIVIDEO_DEVICE_H
