@@ -798,6 +798,7 @@ auto cVaapiDecoder::Action() -> void {
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
     uint64_t lastDrainMs{0};
+    int trickEmptyDecodes{0}; ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
 
     while (!stopping.load(std::memory_order_acquire)) {
         // Snapshot for this iteration. Drain loops and PublishLastPts() abort on mismatch with
@@ -864,7 +865,18 @@ auto cVaapiDecoder::Action() -> void {
         // dvbplayer race-feeds past the recording boundary. Force-drain to surface the held
         // IDR; flush_buffers rebuilds hw_frames_ctx so the filter graph must reset too. Fallback
         // pace covers the no-frame case (corrupt packet) so VDR's gate still throttles.
-        if (queuedPacket && trickSpeed.load(std::memory_order_relaxed) != 0 && pendingFrames.empty()) {
+        // Reverse-only: forward trick has a normal B-frame pipeline where 1 packet -> 0 frames
+        // is routine, and tearing the filter graph down on every such packet thrashes VAAPI.
+        // Require two consecutive empty decodes: PAFF interlaced reverse buffers field 1 (no output)
+        // and produces a frame on field 2; force-draining after field 1 would discard the pair.
+        const bool reverseTrick =
+            trickSpeed.load(std::memory_order_relaxed) != 0 && isTrickReverse.load(std::memory_order_relaxed);
+        if (queuedPacket && reverseTrick) {
+            trickEmptyDecodes = pendingFrames.empty() ? trickEmptyDecodes + 1 : 0;
+        } else {
+            trickEmptyDecodes = 0;
+        }
+        if (queuedPacket && reverseTrick && pendingFrames.empty() && trickEmptyDecodes >= 2) {
             const cMutexLock decodeLock(&codecMutex);
             const cMutexLock vaLock(&display->GetVaDriverMutex());
             if (codecCtx) {
@@ -888,6 +900,7 @@ auto cVaapiDecoder::Action() -> void {
                 const uint64_t holdMs = trickHoldMs.load(std::memory_order_relaxed);
                 nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
             }
+            trickEmptyDecodes = 0; // codec was just flushed; restart the empty-streak counter
         }
 
         // --- Still-picture codec drain ---
