@@ -50,6 +50,8 @@
 #include <linux/vt.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 // DRM/KMS
@@ -100,72 +102,69 @@ extern "C" {
 /// gaps and derail A/V sync long after the drop event.
 static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
 
-/// VT bounce to hand the framebuffer back to fbcon after dropping DRM master.
-/// fbcon does not auto-reclaim when another DRM client still holds the device open;
-/// VT_ACTIVATE to a different VT and back forces the kernel to reprogram the CRTC.
-/// Returns true iff the bounce completed; on failure the caller surfaces the error in
-/// the SVDRP reply (user can press Alt+F1 manually).
-///
-/// VT_ACTIVATE takes a VT number, not an fd; only /dev/tty0 needs to be readable.
-///
-/// Three prerequisites must ALL hold (see README "SVDRP commands"):
-///   1. /dev/tty0 mode 0660  (distros ship 0600; fix via udev KERNEL=="tty0",MODE="0660")
-///   2. The vdr user in the 'tty' supplementary group.
-///   3. CAP_SYS_TTY_CONFIG in the vdr process's ambient set. Critical subtlety: VDR's
-///      '-u vdr' does setuid(0->vdr) inside the process and the kernel clears ambient
-///      caps on any 0->non-0 UID change. AmbientCapabilities= alone is NOT enough when
-///      vdr starts as root. The systemd unit must do the UID switch itself:
-///          [Service]
-///          User=vdr
-///          Group=video
-///          SupplementaryGroups=tty
-///          AmbientCapabilities=CAP_SYS_TTY_CONFIG
-///      Then vdr starts already as the vdr user, '-u vdr' is a no-op, and the cap survives.
-[[nodiscard]] static auto RestoreConsole() -> bool {
-    const int ttyFd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
-    if (ttyFd < 0) {
-        esyslog("vaapivideo/device: console restore FAILED -- cannot open /dev/tty0: %s", strerror(errno));
-        esyslog("vaapivideo/device: add 'vdr' to the 'tty' group and widen /dev/tty0 to 0660 via udev "
-                "(KERNEL==\"tty0\", GROUP=\"tty\", MODE=\"0660\")");
-        return false;
+// === VT helpers =============================================================
+// Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
+// to VDR's KBD. DETA: yield to tty1 so the user lands on getty. Needs the
+// systemd drop-in (TTYPath=/dev/ttyN + AmbientCapabilities=CAP_SYS_TTY_CONFIG);
+// failures log once at INFO and fall back to manual Ctrl+Alt+F<n>. See README.
+//
+// VT_ACTIVATE/VT_WAITACTIVE work on any VT fd, so we use STDIN_FILENO directly
+// (set up by TTYPath=) and avoid touching /dev/tty0 -- no udev rule needed.
+
+static std::atomic<bool> capWarned{false}, noVtHinted{false};
+
+[[nodiscard]] static auto OwnVt() -> int {
+    // TTY major=4, minor=N for /dev/ttyN (N=1..63); minor 0 is the current-VT alias.
+    struct stat st{};
+    if (fstat(STDIN_FILENO, &st) != 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != 4) {
+        return 0;
     }
+    const auto vt = static_cast<int>(minor(st.st_rdev));
+    return (vt >= 1 && vt <= 63) ? vt : 0;
+}
 
-    struct vt_stat vtState{};
-    if (ioctl(ttyFd, VT_GETSTATE, &vtState) != 0) {
-        esyslog("vaapivideo/device: console restore FAILED -- VT_GETSTATE: %s", strerror(errno));
-        close(ttyFd);
-        return false;
-    }
-
-    const auto currentVt = static_cast<int>(vtState.v_active);
-
-    // VT_ACTIVATE to the current VT is a no-op in the kernel; pick any other VT to force a
-    // real switch (and therefore a CRTC reprogram).
-    const int tempVt = (currentVt == 1) ? 2 : 1;
-
-    // VT_ACTIVATE/VT_WAITACTIVE are gated by CAP_SYS_TTY_CONFIG for processes without a
-    // matching controlling tty. EPERM here means /dev/tty0 perms are fine but the daemon
-    // lacks the capability -- log once, abort the bounce cleanly.
-    if (ioctl(ttyFd, VT_ACTIVATE, tempVt) != 0) {
-        const int savedErrno = errno;
-        esyslog("vaapivideo/device: console restore FAILED -- VT_ACTIVATE(%d): %s", tempVt, strerror(savedErrno));
-        if (savedErrno == EPERM) {
-            esyslog("vaapivideo/device: vdr lacks CAP_SYS_TTY_CONFIG -- systemd must switch user itself "
-                    "(drop-in: User=vdr, Group=video, SupplementaryGroups=tty, "
-                    "AmbientCapabilities=CAP_SYS_TTY_CONFIG) so the ambient cap survives; setting "
-                    "AmbientCapabilities alone is cleared by vdr's internal -u vdr setuid");
+[[nodiscard]] static auto SwitchToVt(int vt) -> bool {
+    if (ioctl(STDIN_FILENO, VT_ACTIVATE, vt) != 0) {
+        const int err = errno;
+        if (bool expected = false; capWarned.compare_exchange_strong(expected, true)) {
+            isyslog("vaapivideo/device: VT_ACTIVATE(%d) denied (%s) -- VT auto-management disabled, "
+                    "use Ctrl+Alt+F<n>; see README 'Console and keyboard integration'",
+                    vt, strerror(err));
+        } else {
+            dsyslog("vaapivideo/device: VT_ACTIVATE(%d) denied (%s)", vt, strerror(err));
         }
-        close(ttyFd);
         return false;
     }
-    ioctl(ttyFd, VT_WAITACTIVE, tempVt);
+    (void)ioctl(STDIN_FILENO, VT_WAITACTIVE, vt);
+    return true;
+}
 
-    if (ioctl(ttyFd, VT_ACTIVATE, currentVt) == 0) {
-        ioctl(ttyFd, VT_WAITACTIVE, currentVt);
+[[nodiscard]] static auto ActivateOwnVt() -> bool {
+    const int vt = OwnVt();
+    if (vt == 0) {
+        if (bool expected = false; noVtHinted.compare_exchange_strong(expected, true)) {
+            isyslog("vaapivideo/device: stdin is not a VT -- KBD remote and VT auto-management "
+                    "disabled; see README 'Console and keyboard integration'");
+        }
+        return true;
     }
+    if (!SwitchToVt(vt)) {
+        return false;
+    }
+    isyslog("vaapivideo/device: console VT%d activated for keyboard input", vt);
+    return true;
+}
 
-    close(ttyFd);
-    isyslog("vaapivideo/device: console VT%d restored", currentVt);
+[[nodiscard]] static auto LeaveOwnVt() -> bool {
+    const int ownVt = OwnVt();
+    if (ownVt == 0) {
+        return true;
+    }
+    const int targetVt = (ownVt == 1) ? 2 : 1;
+    if (!SwitchToVt(targetVt)) {
+        return false;
+    }
+    isyslog("vaapivideo/device: yielded VT%d -> VT%d for text console (DETA)", ownVt, targetVt);
     return true;
 }
 
@@ -709,7 +708,7 @@ namespace {
     // Tuning:
     //   peak=1.0 must be EXPLICIT. The filter's default peak=0 means "auto-detect from MaxCLL /
     //     mastering metadata", which we forward from the source frame -- for typical 1000-nit
-    //     mastered HDR10 that derives peak~5 and produces visibly grey whites. peak=1.0 forces
+    //     mastered HDR10 that derives peak~5 and produces visibly gray whites. peak=1.0 forces
     //     anything >= npl (200 nits) to clip to pure white; aggressive, but the right call for
     //     an SDR screen grab where preserving HDR specular detail isn't worth dim mid-tones.
     //   r=pc (not r=tv) avoids the swscale TV->PC expansion clamping max RGB near Y=235.
@@ -1249,7 +1248,7 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
 }
 
 auto cVaapiDevice::Detach() -> bool {
-    // Idempotent: skip teardown if never attached, avoiding a spurious VT bounce.
+    // Idempotent: skip teardown if never attached, avoiding a spurious VT yield.
     if (initState.load(std::memory_order_acquire) == 0) [[unlikely]] {
         dsyslog("vaapivideo/device: detach requested but hardware is not attached (no-op)");
         return true;
@@ -1284,7 +1283,7 @@ auto cVaapiDevice::Detach() -> bool {
     }
 
     ReleaseHardware();
-    const bool consoleRestored = RestoreConsole();
+    const bool vtYielded = LeaveOwnVt();
 
     // Reset all playback state so a subsequent Attach() re-detects codecs from scratch.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -1301,7 +1300,7 @@ auto cVaapiDevice::Detach() -> bool {
     osdHeight = 0;
     initState.store(0, std::memory_order_release);
     isyslog("vaapivideo/device: detached");
-    return consoleRestored;
+    return vtYielded;
 }
 
 [[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
@@ -1399,6 +1398,9 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
 
     initState.store(2, std::memory_order_release);
     isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
+
+    // Foreground VDR's VT so KBD receives keys after startup / SVDRP ATTA. Non-fatal.
+    (void)ActivateOwnVt();
 
     return true;
 }

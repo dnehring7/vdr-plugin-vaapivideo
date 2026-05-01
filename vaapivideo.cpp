@@ -455,14 +455,14 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "VAAPI device is already detached";
         }
-        const bool consoleRestored = vaapiDevice->Detach();
+        const bool vtYielded = vaapiDevice->Detach();
         replyCode = 900;
-        if (consoleRestored) {
+        if (vtYielded) {
             return "VAAPI device detached from hardware";
         }
-        // fbcon restore failed: missing /dev/tty0 perms or CAP_SYS_TTY_CONFIG. Log has details.
-        return "VAAPI device detached -- press Alt+F1 to restore the console "
-               "(see README: tty group + udev + CAP_SYS_TTY_CONFIG)";
+        // VT yield failed: CAP_SYS_TTY_CONFIG missing or stdin not a VT. Log has details.
+        return "VAAPI device detached -- press Alt+F<n> to restore the console "
+               "(see README: console and keyboard integration)";
     }
 
     if (strcasecmp(command, "ATTA") == 0) {

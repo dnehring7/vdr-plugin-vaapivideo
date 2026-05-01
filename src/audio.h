@@ -162,11 +162,11 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === DECODER ===
     // ========================================================================
-    int consecutiveDecodeErrors{};                                 ///< avcodec_send_packet failure streak
-    std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder{}; ///< FFmpeg decoder context
-    int decoderGracePackets{0};                                    ///< Packets to silently discard after (re)init
-    std::atomic<int> decoderRefCount{0};                           ///< In-flight DecodeToPcm() callers
-    std::atomic<bool> needsFlush{false};                           ///< Set by Clear(), consumed by DecodeToPcm()
+    int consecutiveDecodeErrors{};                               ///< avcodec_send_packet failure streak
+    std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder; ///< FFmpeg decoder context
+    int decoderGracePackets{0};                                  ///< Packets to silently discard after (re)init
+    std::atomic<int> decoderRefCount{0};                         ///< In-flight DecodeToPcm() callers
+    std::atomic<bool> needsFlush{false};                         ///< Set by Clear(), consumed by DecodeToPcm()
     std::atomic<bool> parserNeedsReset{false}; ///< Action() flags INVALIDDATA cascade; Decode() recreates parserCtx
                                                ///< (cannot be done in Action() -- would deadlock CloseDecoder()).
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx; ///< AU-framing parser

@@ -141,7 +141,7 @@ class cVaapiDisplay : public cThread {
     /// COLOR_ENCODING has BT.2020 and BT.709 enums, connector exposes HDR_OUTPUT_METADATA,
     /// Colorspace, and max bpc. HdrMode::On uses this to bypass the sink EDID gate.
     [[nodiscard]] auto CanDriveHdrPlane() const noexcept -> bool;
-    /// Stage HDR signalling for the next atomic commit. Thread-safe (hdrStateMutex).
+    /// Stage HDR signaling for the next atomic commit. Thread-safe (hdrStateMutex).
     auto SetHdrOutputState(const HdrStreamInfo &info) -> void;
     /// True iff both the KMS stack AND sink EDID advertise support for @p kind.
     /// HdrMode::Auto calls this; always returns false for Sdr (caller must check).
@@ -232,7 +232,7 @@ class cVaapiDisplay : public cThread {
         bool isValid{};             ///< True once all three IDs are resolved
     };
 
-    /// Connector property IDs and enum values for HDR output signalling.
+    /// Connector property IDs and enum values for HDR output signaling.
     /// Populated by ProbeHdrCapabilities(); a zero ID means the driver lacks that feature
     /// and the corresponding property is silently skipped at commit time (SDR still works).
     struct HdrConnectorProps {

@@ -17,7 +17,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 
 | Component | Capabilities                                                                                       |
 |-----------|----------------------------------------------------------------------------------------------------|
-| Decode    | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10) — hardware (VAAPI) with per-profile software fallback; AV1 Main / Main 10 recognised for future mediaplayer path |
+| Decode    | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10) — hardware (VAAPI) with per-profile software fallback; AV1 Main / Main 10 recognized for future mediaplayer path |
 | Filters   | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
 | Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, DTS-HD, TrueHD, AC-4, MPEG-H 3D)   |
 | Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
@@ -371,46 +371,58 @@ VAAPI device is the current primary device, ATTA also forces a channel
 re-tune so data flows through the freshly initialized decoder/display
 pipeline.
 
-### Automatic console restore after DETA
+### Console and keyboard integration
 
-After `DETA` the plugin bounces the active VT through `/dev/tty0` so
-that `fbcon` reclaims the screen. Without the three bits of plumbing
-below the GPU is still released correctly, but the screen stays black
-until someone presses `Alt+F1`. The plugin logs the missing prerequisite
-(`open-EACCES`, `ioctl-EPERM`, …) and the SVDRP reply names it too.
+The plugin uses the Linux console for two things:
 
-1. **udev rule — widen `/dev/tty0` to group `tty`.** Default distros
-   ship it as `0600 root:root`, which no daemon can open.
+1. **KBD remote** — VDR reads keypresses from `stdin`; needs `stdin` bound to a VT.
+2. **VT auto-management** — startup and `ATTA` pull VDR's VT to the foreground;
+   `DETA` yields to `tty1` so the user lands on getty. Needs
+   `CAP_SYS_TTY_CONFIG`.
 
-        # /etc/udev/rules.d/90-vdr-tty0.rules
-        KERNEL=="tty0", GROUP="tty", MODE="0660"
-
-        sudo udevadm control --reload
-        sudo udevadm trigger --sysname-match=tty0
-
-2. **systemd drop-in — run vdr as `vdr:video` with `tty` supplementary
-   and `CAP_SYS_TTY_CONFIG` ambient.** Let systemd switch user *before*
-   applying the capability: ambient caps are wiped on any `setuid()`
-   from root, so a `runvdr -u vdr` wrapper would otherwise strip the
-   bit before the plugin ever needs it.
+A single systemd drop-in covers both. `tty7` is conventional and keeps
+`getty@tty1.service` running on `tty1` for a login shell:
 
         sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
         sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
         [Service]
         User=vdr
         Group=video
-        SupplementaryGroups=tty
         AmbientCapabilities=CAP_SYS_TTY_CONFIG
+        StandardInput=tty
+        TTYPath=/dev/tty7
+        TTYReset=yes
+        TTYVHangup=yes
         EOF
         sudo systemctl daemon-reload
         sudo systemctl restart vdr.service
 
-Do **not** set `CapabilityBoundingSet=` — shrinking it would strip
-`CAP_CHOWN` from VDR's `ExecStartPre=vdr-check-setup`. Verify the cap
-landed in the running process:
+`User=vdr` makes systemd switch user *before* applying the ambient capability —
+the kernel clears ambient caps on any `setuid()` from root, so a `runvdr -u vdr`
+wrapper would strip `CAP_SYS_TTY_CONFIG` before the plugin can use it.
 
-        grep -E '^(Uid|Groups|CapAmb)' /proc/$(pidof vdr)/status
-        # CapAmb must include bit 26 (CAP_SYS_TTY_CONFIG) = 0x0000000004000000
+Verify:
+
+        journalctl -u vdr -b | grep -E 'kbd|console VT'
+        # KBD remote control thread started
+        # console VT7 activated for keyboard input
+
+Switch to VDR with `Ctrl+Alt+F7`; back to a login shell with `Ctrl+Alt+F1`.
+
+#### Behaviour during `DETA` / `ATTA`
+
+`DETA` releases DRM and switches the foreground to `tty1` so the user lands on
+the getty login (and `fbcon` takes over the screen). KBD keeps reading from
+`stdin`; the kernel only delivers keypresses to the foreground VT, so KBD
+pauses while you are on `tty1` and resumes on the next `ATTA` (which pulls
+VDR's VT, e.g. `tty7`, back to the foreground) or a manual `Ctrl+Alt+F7`.
+
+Diagnostics — the plugin logs once at INFO when the configuration is incomplete:
+
+- `stdin is not a VT` — drop-in missing; **KBD does not start** and VT
+  switches are manual.
+- `VT_ACTIVATE denied` — `CAP_SYS_TTY_CONFIG` missing; KBD works, only VT
+  switches are manual.
 
 ### Inter-plugin service API
 
@@ -483,7 +495,7 @@ threading primitives (`cThread`, `cMutex`, `cCondVar`) over `std::thread` /
 ## HDR passthrough
 
 HDR10 (BT.2020 + SMPTE ST 2084 / PQ) and HLG (BT.2020 + ARIB STD-B67) streams
-are detected on the first decoded frame from the AVFrame colour metadata and
+are detected on the first decoded frame from the AVFrame color metadata and
 the frame's bit depth (10-bit minimum). Detection is codec-agnostic — HEVC
 Main 10 is the common case, but any FFmpeg decoder that produces BT.2020 + PQ/HLG
 10-bit frames will engage passthrough.
@@ -502,7 +514,7 @@ HDR→SDR, SDR→HDR, and HDR10↔HLG transitions are handled atomically in a si
 KMS commit per channel switch. SDR streams bypass this path entirely and run
 the BT.709 NV12 TV-range pipeline unchanged; any previously programmed HDR
 connector state is explicitly reset to SDR defaults before the next frame
-lands, so a stream change never leaves stale BT.2020 signalling on the wire.
+lands, so a stream change never leaves stale BT.2020 signaling on the wire.
 
 Three gates must all pass for HDR to engage in `auto` mode:
 1. **Stream** — ≥10-bit samples, BT.2020 primaries, PQ or HLG transfer.

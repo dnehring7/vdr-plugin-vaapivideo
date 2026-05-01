@@ -126,10 +126,11 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     [[nodiscard]] auto Attach() -> bool; ///< Open DRM/VAAPI hardware and start decoder/display/audio threads; used
                                          ///< for the first attach after a detached startup and to resume after Detach()
-    auto Detach() -> bool; ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume. Returns
-                           ///< true iff the VT bounce restored the text console; false means the hardware IS
-                           ///< released but fbcon did not reclaim the display (user needs to press Alt+F1, or
-                           ///< add the 'tty' group + CAP_SYS_TTY_CONFIG + the /dev/tty0 udev rule -- see README)
+    auto Detach() -> bool;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume.
+                           ///< Returns true iff VDR's VT was yielded so fbcon owns the text console; false
+                           ///< means the hardware IS released but fbcon did not reclaim the display (user
+                           ///< needs to press Alt+F<n>, or add CAP_SYS_TTY_CONFIG to the systemd drop-in --
+                           ///< see README)
     [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
                                   std::string_view connectorNameFilter = {}, bool deferred = false)
         -> bool; ///< Latch device arguments and, unless @p deferred is true, immediately open hardware and start
@@ -206,7 +207,7 @@ class cVaapiDevice : public cDevice {
     int osdHeight{};                                              ///< Cached display height (px)
     int osdWidth{};                                               ///< Cached display width (px)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
-    std::atomic<int> audioCodecCandidateCount{};                  ///< Confirmation count for audioCodecCandidate
+    std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
     std::atomic<uint64_t> lastClearMs{0};                         ///< Last Clear() timestamp (diagnostic)
     eTrackType lastHandledAudioTrack{ttNone};                     ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};                               ///<   hooks during PMT churn
@@ -218,7 +219,7 @@ class cVaapiDevice : public cDevice {
     std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
     VaapiContext vaapi{};                                         ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
-    std::atomic<int> videoCodecCandidateCount{};                  ///< Confirmation count for videoCodecCandidate
+    std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
 };
 

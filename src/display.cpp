@@ -1591,7 +1591,7 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
     req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
 
-    // HDR connector signalling is written only on state transitions, and must precede the
+    // HDR connector signaling is written only on state transitions, and must precede the
     // per-frame COLOR_ENCODING below so the kernel sees a coherent HDR picture in one atomic.
     // Snapshot the previous applied state for rollback: MaybeAppendHdrOutputState updates
     // appliedHdrState/appliedHdrBlobId optimistically even though the kernel only observes

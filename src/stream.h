@@ -50,8 +50,8 @@ struct VideoStreamInfo {
     AVCodecID codecId{AV_CODEC_ID_NONE};                           ///< FFmpeg codec id
     int codedHeight{0};                                            ///< Coded picture height (luma samples)
     int codedWidth{0};                                             ///< Coded picture width (luma samples)
-    AVColorPrimaries primaries{AVCOL_PRI_UNSPECIFIED};             ///< VUI colour primaries
-    AVColorRange range{AVCOL_RANGE_UNSPECIFIED};                   ///< VUI colour range (Limited / Full)
+    AVColorPrimaries primaries{AVCOL_PRI_UNSPECIFIED};             ///< VUI color primaries
+    AVColorRange range{AVCOL_RANGE_UNSPECIFIED};                   ///< VUI color range (Limited / Full)
     AVColorSpace colorSpace{AVCOL_SPC_UNSPECIFIED};                ///< VUI matrix coefficients
     AVColorTransferCharacteristic transfer{AVCOL_TRC_UNSPECIFIED}; ///< VUI transfer function
     const uint8_t *extradata{nullptr}; ///< Non-owning init data (SPS/PPS/VPS concat); nullptr on PES path
@@ -140,7 +140,7 @@ static_assert(std::ranges::all_of(kVideoBackendTable,
 
 /// Identify an audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2/TrueHD).
 /// Linear sync-word scan; first decisive match wins. Returns AV_CODEC_ID_NONE if
-/// nothing is recognised.
+/// nothing is recognized.
 [[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID;
 
 /// Identify a video codec from ES bytes (HEVC/H.264/MPEG-2). Weighted multi-codec
@@ -152,7 +152,7 @@ static_assert(std::ranges::all_of(kVideoBackendTable,
 ///   H.264  (NAL type 7):  profile / level / bit-depth / chroma
 ///   HEVC   (NAL type 33): profile / level / bit-depth / chroma / coded size
 ///   MPEG-2 (start 0xB3):  coded size only
-/// VUI colour metadata is not parsed. AV1 is not parsed (DVB does not carry it
+/// VUI color metadata is not parsed. AV1 is not parsed (DVB does not carry it
 /// in-band; the mediaplayer path gets profile/bit-depth from AVCodecParameters).
 /// Returns hasSps=false on error or unsupported codec; callers should wait for
 /// an access unit with parameter sets rather than committing to an 8-bit guess.

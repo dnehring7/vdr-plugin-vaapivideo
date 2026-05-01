@@ -9,7 +9,7 @@
  * VaapiContext. A keep-alive slot holds the previous graph until the display thread
  * finishes DMA-BUF mapping its VPP output surfaces (destroying earlier causes -EIO on iHD).
  * HDR classification helpers (ClassifyStream, ExtractHdrInfo, ...) are co-located here
- * because they operate on decoded AVFrames and drive the scale_vaapi colour directives.
+ * because they operate on decoded AVFrames and drive the scale_vaapi color directives.
  */
 
 #ifndef VDR_VAAPIVIDEO_FILTER_H
@@ -34,7 +34,7 @@
 
 /// Classify HDR kind from color_primaries + color_trc + bit depth. Codec profile is not
 /// a gate: HEVC Main10 can carry BT.709 SDR, and ad-insertion frames inside an HDR
-/// programme correctly fall back to Sdr.
+/// program correctly fall back to Sdr.
 [[nodiscard]] auto ClassifyStream(const AVFrame *frame) noexcept -> StreamHdrKind;
 
 /// Extract HDR10 static metadata (mastering display + content light level) from
@@ -79,7 +79,7 @@ class cVideoFilterChain {
         uint32_t outputRefreshHz{0}; ///< Used to decide whether to insert an fps upconvert filter
 
         // --- HDR decisions (resolved by caller before Build) ---
-        bool hdrPassthrough{false}; ///< true -> emit P010 + BT.2020 colour directives; false -> NV12 BT.709
+        bool hdrPassthrough{false}; ///< true -> emit P010 + BT.2020 color directives; false -> NV12 BT.709
         HdrStreamInfo hdrInfo{};    ///< Determines PQ vs. HLG transfer function in scale_vaapi args
 
         // --- GPU capabilities (queried from GpuCaps by caller) ---

@@ -55,7 +55,7 @@ struct DrmDeviceDeleter {
 
 // Every (profile, required RT surface format) combination worth reporting.
 // Plugin-consumed rows mirror kVideoBackendTable (src/stream.h) and
-// ProbeGpuCaps (src/caps.cpp) so the output predicts runtime behaviour exactly.
+// ProbeGpuCaps (src/caps.cpp) so the output predicts runtime behavior exactly.
 // Informational rows cover profiles modern iGPUs advertise but the plugin does
 // not decode: VP9, HEVC range extensions (12-bit, 4:2:2, 4:4:4), and JPEG.
 namespace {
