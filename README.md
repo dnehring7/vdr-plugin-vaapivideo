@@ -19,7 +19,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 |-----------|----------------------------------------------------------------------------------------------------|
 | Decode    | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10) — hardware (VAAPI) with per-profile software fallback; AV1 Main / Main 10 recognized for future mediaplayer path |
 | Filters   | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
-| Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, DTS-HD, TrueHD, AC-4, MPEG-H 3D)   |
+| Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D)           |
 | Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
 | OSD       | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | A/V sync  | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
@@ -40,9 +40,9 @@ VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
                                     │                         │
                                     └────────────┬────────────┘
                                                  ▼
-                                   scale_vaapi
-                                   + sharpness_vaapi
-                                   (SDR: BT.709 NV12; HDR: BT.2020 P010)
+                                            scale_vaapi
+                                        + sharpness_vaapi
+                               (SDR: BT.709 NV12; HDR: BT.2020 P010)
                                                  │
                                                  ▼
                                      DRM PRIME (zero-copy)

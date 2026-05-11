@@ -129,9 +129,9 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
         if (bool expected = false; capWarned.compare_exchange_strong(expected, true)) {
             isyslog("vaapivideo/device: VT_ACTIVATE(%d) denied (%s) -- VT auto-management disabled, "
                     "use Ctrl+Alt+F<n>; see README 'Console and keyboard integration'",
-                    vt, strerror(err));
+                    vt, std::strerror(err));
         } else {
-            dsyslog("vaapivideo/device: VT_ACTIVATE(%d) denied (%s)", vt, strerror(err));
+            dsyslog("vaapivideo/device: VT_ACTIVATE(%d) denied (%s)", vt, std::strerror(err));
         }
         return false;
     }
@@ -199,7 +199,7 @@ DrmDevices::~DrmDevices() noexcept {
         dsyslog("vaapivideo/device: found %d DRM device(s)", result);
     } else {
         if (result < 0) {
-            esyslog("vaapivideo/device: drmGetDevices2 failed (%s)", strerror(-result));
+            esyslog("vaapivideo/device: drmGetDevices2 failed (%s)", std::strerror(-result));
         } else {
             dsyslog("vaapivideo/device: no DRM devices found");
         }
@@ -1490,14 +1490,14 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     // R+W required: resource query ioctls need R, KMS atomic modesetting needs W.
     // Missing group membership ('video' or 'render') is the common failure mode.
     if (access(drmPath.c_str(), R_OK | W_OK) != 0) [[unlikely]] {
-        esyslog("vaapivideo/device: DRM device '%s' not accessible -- %s", drmPath.c_str(), strerror(errno));
+        esyslog("vaapivideo/device: DRM device '%s' not accessible -- %s", drmPath.c_str(), std::strerror(errno));
         esyslog("vaapivideo/device: ensure user is in 'video' or 'render' group");
         return false;
     }
 
     drmFd = open(drmPath.c_str(), O_RDWR | O_CLOEXEC);
     if (drmFd < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: failed to open '%s' - %s", drmPath.c_str(), strerror(errno));
+        esyslog("vaapivideo/device: failed to open '%s' - %s", drmPath.c_str(), std::strerror(errno));
         return false;
     }
     dsyslog("vaapivideo/device: opened DRM fd=%d", drmFd);

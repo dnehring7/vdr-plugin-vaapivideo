@@ -45,6 +45,7 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/remux.h> // PTSTICKS
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
@@ -330,9 +331,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     }
 
     // Use numeric pix_fmt: symbolic aliases for HW formats differ across FFmpeg versions.
+    // time_base = 1/PTSTICKS matches the 90 kHz domain that stream.cpp rescales every packet into.
     const std::string bufferSrcArgs =
-        std::format("video_size={}x{}:pix_fmt={}:time_base=1/90000:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
-                    srcHeight, static_cast<int>(srcPixFmt), sarNum, sarDen, fpsNum, fpsDen);
+        std::format("video_size={}x{}:pix_fmt={}:time_base=1/{}:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
+                    srcHeight, static_cast<int>(srcPixFmt), PTSTICKS, sarNum, sarDen, fpsNum, fpsDen);
 
     dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
 

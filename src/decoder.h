@@ -190,6 +190,8 @@ class cVaapiDecoder : public cThread {
     // === PACKET QUEUE ===
     // ========================================================================
     std::queue<AVPacket *> packetQueue; ///< FIFO of parsed packets awaiting HW decode. Owned by packetMutex.
+    cTimeMs lastTrickDropWarn;          ///< Rate-limits the trick-enqueue drop log. Held under packetMutex.
+    size_t trickDropsSinceWarn{0};      ///< Drops accumulated since the last emitted trick-drop log line.
     std::atomic<bool> stopping; ///< Shutdown signal. Set by Shutdown(); read by encode thread and enqueue paths.
 
     // ========================================================================
@@ -209,7 +211,7 @@ class cVaapiDecoder : public cThread {
         AV_NOPTS_VALUE};                 ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
     std::atomic<uint64_t> clearEpoch{0}; ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
     uint64_t iterationEpoch{0};          ///< Decode thread only. Snapshot of clearEpoch at each Action() iter top.
-    std::atomic<bool> liveMode;          ///< Live TV -> jitter-buffer drain; replay -> sleep-pace to audio clock.
+    std::atomic<bool> liveMode;          ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
     std::atomic<bool> ready{false};      ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
     std::atomic<int> trickSpeed;         ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
 
@@ -255,7 +257,7 @@ class cVaapiDecoder : public cThread {
     cTimeMs syncCooldown;             ///< Rate-limits soft corrections to once per DECODER_SYNC_COOLDOWN_MS.
 
     // ========================================================================
-    // === JITTER BUFFER (live TV only) ===
+    // === JITTER BUFFER ===
     // ========================================================================
     std::deque<std::unique_ptr<VaapiFrame>>
         jitterBuf;                 ///< Decoded frames pending display. Decode thread only; see AVSYNC.md.

@@ -169,7 +169,7 @@ auto AudioSinkCaps::Supports(AVCodecID codec) const noexcept -> bool {
         case AV_CODEC_ID_EAC3:
             return eac3;
         case AV_CODEC_ID_DTS:
-            return dts || dtshd; // DTS-HD decoder handles core DTS streams too
+            return dts || dtshd; // DTS-HD-capable sinks are valid for DTS core
         case AV_CODEC_ID_TRUEHD:
             return truehd;
         case AV_CODEC_ID_AC4:

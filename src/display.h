@@ -12,6 +12,8 @@
 #include "common.h"
 #include "config.h"
 
+#include <deque>
+
 struct VaapiFrame;
 
 // ============================================================================
@@ -127,6 +129,10 @@ class cVaapiDisplay : public cThread {
     auto SetOsd(const OsdOverlay &osd) -> void;
     /// Stop display thread, blank both planes, deactivate CRTC, release all resources. Idempotent.
     auto Shutdown() -> void;
+    /// Tell the display thread that the decoder is intentionally pacing slow (trick play).
+    /// While set, the starve detector ignores re-presents -- they reflect trick pacing, not a stall.
+    /// Cleared by the decoder when trick mode ends.
+    auto SetTrickActive(bool active) noexcept -> void { trickActive.store(active, std::memory_order_relaxed); }
     /// Hand a decoded frame to the display thread (single-slot queue).
     /// timeoutMs: -1 = block indefinitely (decoder's VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
@@ -290,14 +296,14 @@ class cVaapiDisplay : public cThread {
 
     drmModeModeInfo activeMode{};                     ///< Currently programmed display mode
     double aspectRatio{DISPLAY_DEFAULT_ASPECT_RATIO}; ///< Output pixel aspect ratio (width/height)
-    mutable cMutex bufferMutex;                       ///< Guards pendingFrame, pendingBuffer, displayedBuffer
+    mutable cMutex bufferMutex;                       ///< Guards pendingFrames, pendingBuffer, displayedBuffer
     uint32_t connectorId{};                           ///< DRM connector object ID
     uint32_t crtcId{};                                ///< DRM CRTC object ID
     OsdOverlay currentOsd{};                          ///< OSD staged for the next commit (guarded by osdMutex)
     DrmFramebuffer displayedBuffer; ///< Front buffer currently being scanned out; kept alive until flip completes
     int drmFd{-1};                  ///< Borrowed DRM fd; lifetime owned by cVaapiDevice
     drmEventContext eventContext{}; ///< libdrm event dispatch table; only page_flip_handler is wired
-    cCondVar frameSlotCond;         ///< Signalled when pendingFrame slot is consumed (under bufferMutex)
+    cCondVar frameSlotCond;         ///< Signalled when a pendingFrames slot opens up (under bufferMutex)
     std::atomic<bool> hasExited;    ///< Set by Action() just before return; Shutdown() polls this
     AVBufferRef *hwDeviceRef{};     ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
     mutable cMutex importMutex;     ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
@@ -308,18 +314,22 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> isFlipPending; ///< True between commit and page-flip event; Action() waits on this
     std::atomic<bool> ready;         ///< True after Initialize() succeeds; cleared first in Shutdown()
     std::atomic<bool> stopping;      ///< Tells Action() to exit; set after isClearing to avoid import/exit race
-    std::atomic<uint64_t> lastVSyncTimeMs{0}; ///< Wall-clock ms of the most recent page-flip event
-    uint32_t modeBlobId{};                    ///< KMS MODE_ID blob; must outlive CRTC enable, freed in Shutdown()
-    ModesetProps modesetProps{};              ///< Cached CRTC + connector prop IDs for modeset commits
-    mutable cMutex osdMutex;                  ///< Guards currentOsd and osdDirty
-    bool osdDirty{};                          ///< True from SetOsd() until PresentBuffer() commits it
-    uint32_t osdPlaneId{};                    ///< DRM plane object ID for OSD (0 = no overlay plane on this hardware)
-    DrmPlaneProps osdProps{};                 ///< Cached atomic prop IDs for the OSD plane
+    std::atomic<bool> trickActive{
+        false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses starve log
+    std::atomic<uint64_t> lastFrameCommitMs{0}; ///< Wall-clock ms of the most recent fresh-frame commit;
+                                                ///< 0 = inactive (post-Clear). Gates the starve tracker.
+    std::atomic<uint64_t> lastVSyncTimeMs{0};   ///< Wall-clock ms of the most recent page-flip event
+    uint32_t modeBlobId{};                      ///< KMS MODE_ID blob; must outlive CRTC enable, freed in Shutdown()
+    ModesetProps modesetProps{};                ///< Cached CRTC + connector prop IDs for modeset commits
+    mutable cMutex osdMutex;                    ///< Guards currentOsd and osdDirty
+    bool osdDirty{};                            ///< True from SetOsd() until PresentBuffer() commits it
+    uint32_t osdPlaneId{};                      ///< DRM plane object ID for OSD (0 = no overlay plane on this hardware)
+    DrmPlaneProps osdProps{};                   ///< Cached atomic prop IDs for the OSD plane
     uint32_t outputHeight{DISPLAY_DEFAULT_HEIGHT}; ///< Active display height in pixels
     uint32_t outputWidth{DISPLAY_DEFAULT_WIDTH};   ///< Active display width in pixels
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
-    std::unique_ptr<VaapiFrame>
-        pendingFrame; ///< One-slot queue: decoded frame waiting for MapVaapiFrame (guarded by bufferMutex)
+    std::deque<std::unique_ptr<VaapiFrame>>
+        pendingFrames; ///< Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
     uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active refresh rate in Hz; defaults to 50 if EDID reports 0
     uint32_t videoPlaneId{};                            ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{};                         ///< Cached atomic prop IDs for the video plane

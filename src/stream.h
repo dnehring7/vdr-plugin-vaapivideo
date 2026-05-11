@@ -112,8 +112,9 @@ inline constexpr std::array<VideoBackendCap, 7> kVideoBackendTable{{
 /// Dereference with caps.*(result). Returns nullptr if no table row matches.
 [[nodiscard]] auto SelectVideoBackendCap(const VideoStreamInfo &info) noexcept -> bool GpuCaps::*;
 
-/// Codecs the S/PDIF muxer can IEC61937-wrap. Sink availability (ELD check)
-/// is separate; use AudioSinkCaps::Supports (caps.h) for that.
+/// Codecs this passthrough path can IEC61937-wrap. DTS-HD is intentionally absent:
+/// the ELD probe records it only as a sink capability for accepting DTS core.
+/// Sink availability (ELD check) is separate; use AudioSinkCaps::Supports (caps.h).
 inline constexpr std::array<AVCodecID, 6> kAudioPassthroughTable{{
     AV_CODEC_ID_AC3,
     AV_CODEC_ID_EAC3,

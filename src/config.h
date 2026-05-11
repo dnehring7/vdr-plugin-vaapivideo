@@ -9,6 +9,7 @@
 #define VDR_VAAPIVIDEO_CONFIG_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -16,11 +17,17 @@
 // === CONSTANTS ===
 // ============================================================================
 
+inline constexpr int64_t PTS_TICKS_PER_MS =
+    90; ///< DVB PTS clock: 90 ticks per ms. Equals VDR's PTSTICKS / 1000 (remux.h); a static_assert
+        ///< in audio.cpp pins the relationship. Kept literal here so config.h stays free of vdr/remux.h.
 inline constexpr double DISPLAY_DEFAULT_ASPECT_RATIO =
     16.0 / 9.0;                                              ///< Fallback aspect ratio when display height is zero
 inline constexpr uint32_t DISPLAY_DEFAULT_HEIGHT = 1080;     ///< Default display height before a mode is selected (px)
 inline constexpr uint32_t DISPLAY_DEFAULT_WIDTH = 1920;      ///< Default display width before a mode is selected (px)
 inline constexpr uint32_t DISPLAY_DEFAULT_REFRESH_RATE = 50; ///< Default refresh rate before a mode is selected (Hz)
+inline constexpr size_t DISPLAY_PRERENDER_SLOTS =
+    3; ///< Decoder->display handoff queue depth. Lets the decoder stay ahead so an occasional VPP spike
+       ///< drains a slot instead of missing the next VSync. SubmitFrame blocks when all slots are full.
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===
@@ -49,7 +56,7 @@ struct DisplayConfig {
 
 /// User policy for IEC61937 audio passthrough. Numeric values are part of the setup.conf
 /// wire format -- do not renumber. See README for the full user-facing description.
-enum class PassthroughMode : std::uint8_t {
+enum class PassthroughMode : uint8_t {
     Auto = 0, ///< Passthrough iff the sink advertises support in the ELD
     On = 1,   ///< Force passthrough for every IEC61937-wrappable codec; ignore the ELD
     Off = 2,  ///< Never passthrough; always decode to PCM
@@ -75,7 +82,7 @@ enum class PassthroughMode : std::uint8_t {
 
 /// User policy for HDR10 / HLG output passthrough. Numeric values are part of the
 /// setup.conf wire format -- do not renumber. See README for the full description.
-enum class HdrMode : std::uint8_t {
+enum class HdrMode : uint8_t {
     Auto = 0, ///< Passthrough iff stream is HDR AND GPU and sink both advertise HDR support
     On = 1,   ///< Force HDR output when the stream is HDR; skip the sink-capability gate
     Off = 2,  ///< Never passthrough; always use the existing SDR BT.709 output path

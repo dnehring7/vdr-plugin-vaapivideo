@@ -437,7 +437,7 @@ auto cVaapiOsd::Flush() -> void {
     createReq.bpp = 32;
 
     if (drmIoctl(drmFd_, DRM_IOCTL_MODE_CREATE_DUMB, &createReq) < 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: DRM_IOCTL_MODE_CREATE_DUMB failed: %s", strerror(errno));
+        esyslog("vaapivideo/osd: DRM_IOCTL_MODE_CREATE_DUMB failed: %s", std::strerror(errno));
         return false;
     }
 
@@ -453,7 +453,7 @@ auto cVaapiOsd::Flush() -> void {
 
     if (drmModeAddFB2(drmFd_, fbWidth, fbHeight, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &framebufferId_, 0) <
         0) [[unlikely]] {
-        esyslog("vaapivideo/osd: drmModeAddFB2 failed: %s", strerror(errno));
+        esyslog("vaapivideo/osd: drmModeAddFB2 failed: %s", std::strerror(errno));
         DestroyDumbBuffer();
         return false;
     }
@@ -465,7 +465,7 @@ auto cVaapiOsd::Flush() -> void {
     mapReq.handle = gemHandle_;
 
     if (drmIoctl(drmFd_, DRM_IOCTL_MODE_MAP_DUMB, &mapReq) < 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: DRM_IOCTL_MODE_MAP_DUMB failed: %s", strerror(errno));
+        esyslog("vaapivideo/osd: DRM_IOCTL_MODE_MAP_DUMB failed: %s", std::strerror(errno));
         DestroyDumbBuffer();
         return false;
     }
@@ -474,7 +474,7 @@ auto cVaapiOsd::Flush() -> void {
         mmap(nullptr, mappedSize_, PROT_READ | PROT_WRITE, MAP_SHARED, drmFd_, static_cast<off_t>(mapReq.offset)));
 
     if (pixels_ == MAP_FAILED) [[unlikely]] {
-        esyslog("vaapivideo/osd: mmap failed: %s", strerror(errno));
+        esyslog("vaapivideo/osd: mmap failed: %s", std::strerror(errno));
         pixels_ = nullptr;
         DestroyDumbBuffer();
         return false;

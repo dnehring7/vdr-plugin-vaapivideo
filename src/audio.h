@@ -14,6 +14,7 @@
 
 // Platform
 #include <alsa/asoundlib.h>
+#include <climits>
 
 // FFmpeg (forward declarations for IEC61937 spdif muxer)
 struct AVFormatContext;
@@ -104,6 +105,7 @@ class cAudioProcessor : public cThread {
     auto CloseDecoder() -> void; ///< Spins until in-flight DecodeToPcm() callers finish, then frees decoder + parser
     auto DrainPacketQueue() -> void;   ///< Pops and frees every queued packet. Caller must hold mutex.
     auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
+    auto RecreateParser() -> void;     ///< Close + re-init parser for the current codec; caller holds mutex.
     auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
                                        ///< Caller must hold mutex (single-writer invariant).
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
@@ -129,7 +131,7 @@ class cAudioProcessor : public cThread {
                                      ///< call
     auto ProbeSinkCaps()
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; cached per device name
-    auto SetIec958NonAudio(bool enable)
+    auto SetIec958NonAudio(bool enable) const
         -> void; ///< Sets/clears IEC 60958-3 AES0 bit 1 ("non-audio") on the HDMI mixer control.
                  ///< Must be set before passthrough writes; cleared on PCM open to prevent noise on the receiver.
     [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,
@@ -149,7 +151,7 @@ class cAudioProcessor : public cThread {
     std::atomic<int> alsaErrorCount{0};             ///< Consecutive snd_pcm_writei failures
     std::atomic<size_t> alsaFrameBytes{0};          ///< Bytes per interleaved frame
     snd_pcm_t *alsaHandle{nullptr};                 ///< Open PCM device handle; nullptr when closed
-    unsigned alsaIec958CtlIndex{0};                 ///< "IEC958 Playback Default" control index
+    unsigned alsaIec958CtlIndex{UINT_MAX};          ///< "IEC958 Playback Default" control index; UINT_MAX = unresolved
     std::atomic<bool> alsaPassthroughActive{false}; ///< True in IEC61937 passthrough mode
     std::atomic<unsigned> alsaSampleRate{0};        ///< Negotiated sample rate (Hz)
 

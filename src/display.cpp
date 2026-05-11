@@ -5,10 +5,9 @@
  * @brief DRM atomic-modeset display: VAAPI->PRIME import and page-flip pacing.
  *
  * Threading model:
- *   Producer (decoder):    SubmitFrame() under bufferMutex; one-slot pendingFrame.
+ *   Producer (decoder):    SubmitFrame() under bufferMutex; pushes onto pendingFrames (DISPLAY_PRERENDER_SLOTS deep).
  *   Consumer (Action()):   map -> commit -> drain page-flip event.
- *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down;
- *                          consumer cannot start av_hwframe_map() concurrently.
+ *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down.
  *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
  * Lock order: importMutex -> bufferMutex -> osdMutex.
@@ -20,6 +19,7 @@
 #include "display.h"
 #include "caps.h"
 #include "common.h"
+#include "config.h"
 #include "decoder.h"
 
 // POSIX
@@ -73,7 +73,7 @@ extern "C" {
 // ============================================================================
 
 constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
-constexpr int MAX_DRAIN_ITERATIONS =
+constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
 
 // ============================================================================
@@ -319,32 +319,24 @@ auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
 }
 
 auto cVaapiDisplay::BeginStreamSwitch() -> void {
-    // (1) Gate the consumer first so it exits the import block promptly.
+    // Order matters: gate consumer, drop queue (unblock submitters), drain flip BEFORE
+    // taking importMutex (reversed = deadlock), then hold importMutex for codec teardown.
+    // displayedBuffer/pendingBuffer stay alive so the last frame remains on screen.
     isClearing.store(true, std::memory_order_release);
-
-    // (2) Drop any queued frame so SubmitFrame() callers blocked on the slot unblock
-    // immediately rather than waiting for their full timeout.
     {
         const cMutexLock lock(&bufferMutex);
-        pendingFrame.reset();
+        pendingFrames.clear();
         frameSlotCond.Broadcast();
     }
-
-    // (3) Drain the in-flight flip BEFORE taking importMutex. Reversed order deadlocks:
-    // with importMutex held here, the consumer can't run DrainDrmEvents() to clear isFlipPending.
     WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS);
-
-    // (4) Hold importMutex while the caller tears down the codec. The consumer is either
-    // in the isClearing idle branch or about to see isClearing under the lock -- both safe.
-    // displayedBuffer/pendingBuffer are intentionally kept alive so the last frame stays
-    // on screen during the switch rather than flashing to black.
     importMutex.Lock();
+    // Reset under importMutex so an in-flight fresh commit cannot republish a pre-Clear timestamp.
+    lastFrameCommitMs.store(0, std::memory_order_release);
 }
 
 auto cVaapiDisplay::EndStreamSwitch() -> void {
-    // Unlock first, then clear isClearing. The consumer re-checks isClearing under importMutex
-    // before touching any surface, so clearing after the unlock is safe: it can't observe
-    // a stale "false" while the codec is still mid-teardown.
+    // Unlock first, then clear isClearing -- consumer re-checks isClearing under importMutex
+    // so it can't observe a stale "false" mid-teardown.
     importMutex.Unlock();
     isClearing.store(false, std::memory_order_release);
 }
@@ -538,7 +530,7 @@ auto cVaapiDisplay::Shutdown() -> void {
 
     // Drain residual page-flip events: without this the kernel keeps them pending on the fd
     // and the next process to open the DRM device inherits stale events.
-    for (int i = 0; i < MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
+    for (int i = 0; i < DISPLAY_MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
     }
 
     // Blank planes, reset HDR state, and deactivate the CRTC so fbcon or the next DRM client
@@ -575,7 +567,7 @@ auto cVaapiDisplay::Shutdown() -> void {
 
     {
         const cMutexLock lock(&bufferMutex);
-        pendingFrame.reset();
+        pendingFrames.clear();
         displayedBuffer = DrmFramebuffer{};
         pendingBuffer = DrmFramebuffer{};
     }
@@ -592,13 +584,13 @@ auto cVaapiDisplay::Shutdown() -> void {
     // HDR blobs: same constraint -- CRTC must already be disabled before freeing.
     if (appliedHdrBlobId != 0 && drmFd >= 0) {
         if (drmModeDestroyPropertyBlob(drmFd, appliedHdrBlobId) != 0) [[unlikely]] {
-            esyslog("vaapivideo/display: failed to destroy applied HDR blob: %s", strerror(errno));
+            esyslog("vaapivideo/display: failed to destroy applied HDR blob: %s", std::strerror(errno));
         }
         appliedHdrBlobId = 0;
     }
     if (pendingDestroyHdrBlobId != 0 && drmFd >= 0) {
         if (drmModeDestroyPropertyBlob(drmFd, pendingDestroyHdrBlobId) != 0) [[unlikely]] {
-            esyslog("vaapivideo/display: failed to destroy pending HDR blob: %s", strerror(errno));
+            esyslog("vaapivideo/display: failed to destroy pending HDR blob: %s", std::strerror(errno));
         }
         pendingDestroyHdrBlobId = 0;
     }
@@ -621,32 +613,30 @@ auto cVaapiDisplay::Shutdown() -> void {
 
     const cMutexLock lock(&bufferMutex);
 
-    // pendingFrame is a one-slot queue. The decoder blocks here (timeoutMs > 0) for VSync
-    // backpressure -- this is how it paces itself to the display refresh rate.
-    if (pendingFrame) {
+    // VSync-paced backpressure: block when the prerender queue is full.
+    if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS) {
         if (timeoutMs == 0) {
             return false;
         }
 
-        // Infinite timeout (-1) is sliced into 1 s windows so a stream switch is not
-        // blocked for the full duration waiting for the slot to clear.
+        // Slice infinite waits into 1 s windows so a stream switch isn't blocked indefinitely.
         const int waitMs = (timeoutMs < 0) ? 1000 : timeoutMs;
         const cTimeMs deadline(waitMs);
-        while (pendingFrame && ready.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
-            // BeginStreamSwitch() takes bufferMutex to drain pendingFrame; continuing to
-            // wait here with the lock held would deadlock that path.
+        while (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS && ready.load(std::memory_order_relaxed) &&
+               !deadline.TimedOut()) {
             if (isClearing.load(std::memory_order_relaxed)) {
                 return false;
             }
             frameSlotCond.TimedWait(bufferMutex, 10);
         }
 
-        if (pendingFrame || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS || isClearing.load(std::memory_order_relaxed))
+            [[unlikely]] {
             return false;
         }
     }
 
-    pendingFrame = std::move(frame);
+    pendingFrames.push_back(std::move(frame));
     return true;
 }
 
@@ -656,6 +646,30 @@ auto cVaapiDisplay::Shutdown() -> void {
 
 auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
+
+    // Decoder-stall tracker: counts VSyncs where pendingFrames was empty during active playback
+    // (last commit < ACTIVE_WINDOW_MS ago). Warmup grace suppresses spurious starves after
+    // Clear/cold-start while filter graph + audio anchor.
+    //
+    // STARVE_STREAK_THRESHOLD = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
+    //   SLOTS    -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
+    //   + 1      -> grace VSync for the decoder to catch up (single hiccup, no log)
+    //   + 1      -> one more sample so we trigger on sustained stalls, not transients
+    // Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't
+    // scale linearly: at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
+    constexpr auto STARVE_STREAK_THRESHOLD = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
+    constexpr int ACTIVE_WINDOW_MS = 500;
+    constexpr int STARVE_LOG_COOLDOWN_MS = 2000;
+    constexpr int WARMUP_GRACE_MS = 3000;
+    unsigned starveStreak = 0;
+    unsigned starveTotal = 0;
+    // cTimeMs(0) constructs a timer that's already timed out (begin == end == Now()), so
+    // TimedOut() returns true immediately. starveLogCooldown: first log fires without delay.
+    // warmupGraceUntil: no grace active until the first fresh commit arms it via the
+    // prevCommitMs==0 branch below; before that the IsValid() gate on pendingBuffer prevents
+    // the starve counter from running, so "no grace at construction" is the safe state.
+    cTimeMs starveLogCooldown(0);
+    cTimeMs warmupGraceUntil(0);
 
     while (!stopping.load(std::memory_order_relaxed) && ready.load(std::memory_order_relaxed)) {
         // Non-blocking drain so isFlipPending is up-to-date before the gate check below.
@@ -669,11 +683,19 @@ auto cVaapiDisplay::Action() -> void {
             continue;
         }
 
-        // Yield so BeginStreamSwitch() can acquire importMutex; we'd otherwise hold it
-        // across map+commit and block the switch for an entire frame period.
+        // Yield importMutex to BeginStreamSwitch() and reset the starve streak so
+        // post-switch pre-roll re-presents don't trigger a spurious starve log.
         if (isClearing.load(std::memory_order_relaxed)) {
+            starveStreak = 0;
             cCondWait::SleepMs(5);
             continue;
+        }
+
+        // Trick play: decoder commits at the trick hold (60-2000 ms), so most VSyncs re-present.
+        // That's not a stall; drop the streak so trick-exit doesn't carry a stale count.
+        const bool inTrick = trickActive.load(std::memory_order_relaxed);
+        if (inTrick) {
+            starveStreak = 0;
         }
 
         // importMutex spans both map AND commit: releasing between them lets BeginStreamSwitch()
@@ -689,8 +711,9 @@ auto cVaapiDisplay::Action() -> void {
                 std::unique_ptr<VaapiFrame> frameToShow;
                 {
                     const cMutexLock lock(&bufferMutex);
-                    if (pendingFrame) {
-                        frameToShow = std::move(pendingFrame);
+                    if (!pendingFrames.empty()) {
+                        frameToShow = std::move(pendingFrames.front());
+                        pendingFrames.pop_front();
                         frameSlotCond.Broadcast();
                     }
                 }
@@ -708,6 +731,18 @@ auto cVaapiDisplay::Action() -> void {
                             // scanning it (kernel use-after-free on next scanout).
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
+                            // Arm warmup grace whenever decoder resumes from idle: post-Clear
+                            // (lastCommit==0) OR after a long gap (commit > ACTIVE_WINDOW_MS old).
+                            // The latter covers transitions where BeginStreamSwitch wasn't invoked
+                            // (track switch, post-trick re-anchor). Done under importMutex so a
+                            // BeginStreamSwitch racing this commit cannot republish a stale value.
+                            const uint64_t prevCommitMs = lastFrameCommitMs.load(std::memory_order_relaxed);
+                            const uint64_t nowMs = cTimeMs::Now();
+                            if (prevCommitMs == 0 || nowMs - prevCommitMs > ACTIVE_WINDOW_MS) {
+                                warmupGraceUntil.Set(WARMUP_GRACE_MS);
+                            }
+                            lastFrameCommitMs.store(nowMs, std::memory_order_release);
+                            starveStreak = 0;
                             frameCommitted = true;
                         }
                     }
@@ -715,16 +750,28 @@ auto cVaapiDisplay::Action() -> void {
             }
         }
 
-        // No new frame: re-present the previous buffer.
-        // (a) Keeps the flip cadence alive so OSD changes committed via PresentBuffer don't
-        //     stall on a paused stream waiting for the next decoded frame.
-        // (b) Maintains continuous VSync timing for the decoder's backpressure mechanism.
+        // No new frame: re-present the previous buffer to keep flip cadence + OSD updates alive.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
+                // Only count a stall when decoder was recently active AND past warmup grace.
+                const uint64_t nowMs = cTimeMs::Now();
+                const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
+                if (!inTrick && lastCommitMs != 0 && nowMs - lastCommitMs < ACTIVE_WINDOW_MS &&
+                    warmupGraceUntil.TimedOut()) {
+                    ++starveStreak;
+                    ++starveTotal;
+                    if (starveStreak >= STARVE_STREAK_THRESHOLD && starveLogCooldown.TimedOut()) {
+                        dsyslog("vaapivideo/display: decoder/GPU starve -- streak=%u total=%u", starveStreak,
+                                starveTotal);
+                        starveLogCooldown.Set(STARVE_LOG_COOLDOWN_MS);
+                    }
+                } else {
+                    starveStreak = 0;
+                }
             } else {
-                cCondWait::SleepMs(5); // pre-first-frame: nothing to present
+                cCondWait::SleepMs(5);
             }
         }
     }
@@ -811,7 +858,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // EBUSY: previous flip event not yet consumed; Action() retries after DrainDrmEvents().
     // Not worth logging -- it's expected on the hot path when the consumer runs slightly ahead.
     if (errno != EBUSY) {
-        esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", strerror(errno), commitFlags);
+        esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(errno), commitFlags);
     }
     return false;
 }
@@ -941,7 +988,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             // requested format and also record P010 support in one pass -- ProbeHdrCapabilities
             // would otherwise have to re-parse the same blob. The modifier is validated by
             // KMS at commit time; matching the fourcc alone is sufficient here.
-            if (!hasFormatSupport && strcmp(name, "IN_FORMATS") == 0) {
+            if (!hasFormatSupport && std::strcmp(name, "IN_FORMATS") == 0) {
                 const auto blobId = static_cast<uint32_t>(planeProps->prop_values[j]);
                 if (blobId != 0) {
                     auto blob = std::unique_ptr<drmModePropertyBlobRes, decltype(&drmModeFreePropertyBlob)>(
@@ -964,41 +1011,41 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         }
                     }
                 }
-            } else if ((prop->flags & DRM_MODE_PROP_IMMUTABLE) && strcmp(name, "type") == 0) {
+            } else if ((prop->flags & DRM_MODE_PROP_IMMUTABLE) && std::strcmp(name, "type") == 0) {
                 planeType = static_cast<uint32_t>(planeProps->prop_values[j]);
                 tempProps.type = planeType;
-            } else if (strcmp(name, "CRTC_ID") == 0) {
+            } else if (std::strcmp(name, "CRTC_ID") == 0) {
                 tempProps.crtcId = prop->prop_id;
-            } else if (strcmp(name, "FB_ID") == 0) {
+            } else if (std::strcmp(name, "FB_ID") == 0) {
                 tempProps.fbId = prop->prop_id;
-            } else if (strcmp(name, "SRC_X") == 0) {
+            } else if (std::strcmp(name, "SRC_X") == 0) {
                 tempProps.srcX = prop->prop_id;
-            } else if (strcmp(name, "SRC_Y") == 0) {
+            } else if (std::strcmp(name, "SRC_Y") == 0) {
                 tempProps.srcY = prop->prop_id;
-            } else if (strcmp(name, "SRC_W") == 0) {
+            } else if (std::strcmp(name, "SRC_W") == 0) {
                 tempProps.srcW = prop->prop_id;
-            } else if (strcmp(name, "SRC_H") == 0) {
+            } else if (std::strcmp(name, "SRC_H") == 0) {
                 tempProps.srcH = prop->prop_id;
-            } else if (strcmp(name, "CRTC_X") == 0) {
+            } else if (std::strcmp(name, "CRTC_X") == 0) {
                 tempProps.crtcX = prop->prop_id;
-            } else if (strcmp(name, "CRTC_Y") == 0) {
+            } else if (std::strcmp(name, "CRTC_Y") == 0) {
                 tempProps.crtcY = prop->prop_id;
-            } else if (strcmp(name, "CRTC_W") == 0) {
+            } else if (std::strcmp(name, "CRTC_W") == 0) {
                 tempProps.crtcW = prop->prop_id;
-            } else if (strcmp(name, "CRTC_H") == 0) {
+            } else if (std::strcmp(name, "CRTC_H") == 0) {
                 tempProps.crtcH = prop->prop_id;
-            } else if (strcmp(name, "zpos") == 0) {
+            } else if (std::strcmp(name, "zpos") == 0) {
                 tempProps.zpos = prop->prop_id;
-            } else if (strcmp(name, "pixel blend mode") == 0) {
+            } else if (std::strcmp(name, "pixel blend mode") == 0) {
                 tempProps.pixelBlendMode = prop->prop_id;
-            } else if (strcmp(name, "COLOR_ENCODING") == 0) {
+            } else if (std::strcmp(name, "COLOR_ENCODING") == 0) {
                 tempProps.colorEncoding = prop->prop_id;
                 for (int e = 0; e < prop->count_enums; ++e) {
                     const char *enumName = prop->enums[e].name;
-                    if (strcmp(enumName, "ITU-R BT.709 YCbCr") == 0) {
+                    if (std::strcmp(enumName, "ITU-R BT.709 YCbCr") == 0) {
                         tempProps.colorEncodingBt709 = prop->enums[e].value;
                         tempProps.colorEncodingValid = true;
-                    } else if (strcmp(enumName, "ITU-R BT.2020 YCbCr") == 0) {
+                    } else if (std::strcmp(enumName, "ITU-R BT.2020 YCbCr") == 0) {
                         tempProps.colorEncodingBt2020 = prop->enums[e].value;
                         tempProps.colorEncodingBt2020Valid = true;
                     }
@@ -1007,10 +1054,10 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         plane->plane_id, tempProps.colorEncoding, (unsigned long)tempProps.colorEncodingBt709,
                         tempProps.colorEncodingValid ? "yes" : "no", (unsigned long)tempProps.colorEncodingBt2020,
                         tempProps.colorEncodingBt2020Valid ? "yes" : "no");
-            } else if (strcmp(name, "COLOR_RANGE") == 0) {
+            } else if (std::strcmp(name, "COLOR_RANGE") == 0) {
                 tempProps.colorRange = prop->prop_id;
                 for (int e = 0; e < prop->count_enums; ++e) {
-                    if (strcmp(prop->enums[e].name, "YCbCr limited range") == 0) {
+                    if (std::strcmp(prop->enums[e].name, "YCbCr limited range") == 0) {
                         tempProps.colorRangeLimited = prop->enums[e].value;
                         tempProps.colorRangeValid = true;
                         break;
@@ -1114,9 +1161,9 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             if (!prop) {
                 continue;
             }
-            if (strcmp(prop->name, "ACTIVE") == 0) {
+            if (std::strcmp(prop->name, "ACTIVE") == 0) {
                 modesetProps.crtcActive = prop->prop_id;
-            } else if (strcmp(prop->name, "MODE_ID") == 0) {
+            } else if (std::strcmp(prop->name, "MODE_ID") == 0) {
                 modesetProps.crtcModeId = prop->prop_id;
             }
         }
@@ -1133,7 +1180,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             if (!prop) {
                 continue;
             }
-            if (strcmp(prop->name, "CRTC_ID") == 0) {
+            if (std::strcmp(prop->name, "CRTC_ID") == 0) {
                 modesetProps.connectorCrtcId = prop->prop_id;
             }
         }
@@ -1165,15 +1212,15 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
                 continue;
             }
             const char *name = prop->name;
-            if (strcmp(name, "HDR_OUTPUT_METADATA") == 0) {
+            if (std::strcmp(name, "HDR_OUTPUT_METADATA") == 0) {
                 hdrProps.hdrOutputMetadata = prop->prop_id;
-            } else if (strcmp(name, "Colorspace") == 0) {
+            } else if (std::strcmp(name, "Colorspace") == 0) {
                 hdrProps.colorspace = prop->prop_id;
                 for (int e = 0; e < prop->count_enums; ++e) {
-                    if (strcmp(prop->enums[e].name, "BT2020_YCC") == 0) {
+                    if (std::strcmp(prop->enums[e].name, "BT2020_YCC") == 0) {
                         hdrProps.colorspaceBt2020Ycc = prop->enums[e].value;
                         haveBt2020Ycc = true;
-                    } else if (strcmp(prop->enums[e].name, "Default") == 0) {
+                    } else if (std::strcmp(prop->enums[e].name, "Default") == 0) {
                         hdrProps.colorspaceDefault = prop->enums[e].value;
                         haveDefault = true;
                     }
@@ -1182,13 +1229,13 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
                 // commits would be indistinguishable and we'd never actually change colorspace.
                 hdrProps.colorspaceValid =
                     haveBt2020Ycc && haveDefault && hdrProps.colorspaceBt2020Ycc != hdrProps.colorspaceDefault;
-            } else if (strcmp(name, "max bpc") == 0 && prop->count_values >= 2) {
+            } else if (std::strcmp(name, "max bpc") == 0 && prop->count_values >= 2) {
                 // Range property [min, max]: require both bounds so the commit path can't
                 // produce clamp(10, 0, 0) == 0 bpc, which the kernel rejects.
                 hdrProps.maxBpc = prop->prop_id;
                 hdrProps.maxBpcMin = prop->values[0];
                 hdrProps.maxBpcMax = prop->values[1];
-            } else if (strcmp(name, "EDID") == 0) {
+            } else if (std::strcmp(name, "EDID") == 0) {
                 const auto blobId = static_cast<uint32_t>(connProps->prop_values[i]);
                 if (blobId != 0) {
                     auto blob = std::unique_ptr<drmModePropertyBlobRes, decltype(&drmModeFreePropertyBlob)>(
@@ -1370,7 +1417,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
         if (drmModeCreatePropertyBlob(drmFd, &meta, sizeof(meta), &newBlobId) != 0) [[unlikely]] {
             // Shipping BT.2020 + 10 bpc without an EOTF blob renders as crushed green on most
             // sinks, so abort the whole commit and retry on the next frame.
-            esyslog("vaapivideo/display: drmModeCreatePropertyBlob(HDR_OUTPUT_METADATA) failed: %s", strerror(errno));
+            esyslog("vaapivideo/display: drmModeCreatePropertyBlob(HDR_OUTPUT_METADATA) failed: %s",
+                    std::strerror(errno));
             failed = true;
             return false;
         }
@@ -1480,7 +1528,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 
     uint32_t gemHandle = 0;
     if (drmPrimeFDToHandle(drmFd, desc->objects[0].fd, &gemHandle) != 0) [[unlikely]] {
-        esyslog("vaapivideo/display: drmPrimeFDToHandle failed: %s", strerror(errno));
+        esyslog("vaapivideo/display: drmPrimeFDToHandle failed: %s", std::strerror(errno));
         av_frame_free(&mappedFrame);
         return {};
     }
@@ -1536,7 +1584,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     uint32_t fbId = 0;
     if (drmModeAddFB2WithModifiers(drmFd, width, height, format, handles, pitches, offsets, modifiers, &fbId,
                                    DRM_MODE_FB_MODIFIERS) != 0) {
-        esyslog("vaapivideo/display: drmModeAddFB2WithModifiers failed: %s", strerror(errno));
+        esyslog("vaapivideo/display: drmModeAddFB2WithModifiers failed: %s", std::strerror(errno));
         drm_gem_close closeArgs{.handle = gemHandle, .pad = 0};
         drmIoctl(drmFd, DRM_IOCTL_GEM_CLOSE, &closeArgs);
         av_frame_free(&mappedFrame);
@@ -1666,13 +1714,13 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         if (success) {
             if (pendingDestroyHdrBlobId != 0) {
                 if (drmModeDestroyPropertyBlob(drmFd, pendingDestroyHdrBlobId) != 0) [[unlikely]] {
-                    esyslog("vaapivideo/display: failed to free previous HDR blob: %s", strerror(errno));
+                    esyslog("vaapivideo/display: failed to free previous HDR blob: %s", std::strerror(errno));
                 }
                 pendingDestroyHdrBlobId = 0;
             }
         } else {
             if (appliedHdrBlobId != 0 && drmModeDestroyPropertyBlob(drmFd, appliedHdrBlobId) != 0) [[unlikely]] {
-                esyslog("vaapivideo/display: failed to free rejected HDR blob: %s", strerror(errno));
+                esyslog("vaapivideo/display: failed to free rejected HDR blob: %s", std::strerror(errno));
             }
             appliedHdrBlobId = previousHdrBlobId;
             pendingDestroyHdrBlobId = 0;
