@@ -3,7 +3,7 @@ Section: video
 Priority: optional
 Maintainer: Dirk Nehring <dnehring@gmx.net>
 Build-Depends: debhelper-compat (= 13),
-               vdr-dev (>= 2.6.0),
+               vdr-dev (>= 2.6.6),
                libavcodec-dev,
                libavfilter-dev,
                libavformat-dev,

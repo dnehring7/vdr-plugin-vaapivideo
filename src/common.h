@@ -91,8 +91,8 @@ extern "C" {
 // === VERSION CHECKS ===
 // ============================================================================
 
-#if APIVERSNUM < 20600
-#error "VDR 2.6.0+ required (APIVERSNUM >= 20600)"
+#if APIVERSNUM < 20606
+#error "VDR 2.6.6+ required (APIVERSNUM >= 20606)"
 #endif
 
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 3, 100)
@@ -104,7 +104,7 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.5.4";
+inline constexpr const char *PLUGIN_VERSION = "1.5.5";
 
 // ============================================================================
 // === CONSTANTS ===

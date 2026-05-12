@@ -168,14 +168,11 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
-    [[nodiscard]] auto AttachHardware()
-        -> bool; ///< Open DRM/VAAPI hardware and start the decoder, display, and audio subsystems. Guarded by the
-                 ///< initState CAS so double-attach is a no-op error. Requires drmPath to be populated (latched by
-                 ///< Initialize()). Internal implementation shared by Initialize() (non-deferred) and Attach().
+    [[nodiscard]] auto AttachHardware() -> bool; ///< Open DRM/VAAPI and start decoder/display/audio; shared by
+                                                 ///< Initialize() and Attach(). Guarded by initState CAS.
     auto HandleAudioTrackChange(const char *reason, bool enteringDolby)
-        -> void; ///< Log + run full audio re-detection on track change. @p enteringDolby is set when called from
-                 ///< SetDigitalAudioDevice(true), where VDR fires the hook BEFORE assigning currentAudioTrack and
-                 ///< the read would otherwise return the OLD (stale) selection.
+        -> void; ///< Log + re-detect audio on track change. @p enteringDolby works around VDR firing the hook
+                 ///< BEFORE assigning currentAudioTrack from SetDigitalAudioDevice(true).
     [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI hw device context, find render node
     [[nodiscard]] auto ProbeVppCapabilities(std::string_view renderNode)
         -> bool;                         ///< Query VAAPI decode profiles and VPP filter capabilities
@@ -186,6 +183,8 @@ class cVaapiDevice : public cDevice {
         -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order
     auto SubmitBlackFrame() -> void; ///< Allocate a VAAPI NV12 black surface and submit it through the display pipeline
+    auto SuspendHardware() -> void; ///< Release DRM/VAAPI/ALSA/OSD without touching cControl or VT;
+                                    ///< shared by Detach() (SVDRP DETA) and SetPlayMode(pmExtern).
 
     // ========================================================================
     // === STATE ===
@@ -202,6 +201,8 @@ class cVaapiDevice : public cDevice {
     int drmFd{-1};                                                ///< DRM primary node fd
     std::string drmPath;                                          ///< DRM primary device path
     std::atomic<int> initState;                                   ///< 0=detached, 1=pending, 2=ready
+    std::atomic<bool> externActive{false};                        ///< True between SetPlayMode(pmExtern) and the next
+                                                                  ///< SetPlayMode call; gates the resume-Attach path.
     std::atomic<bool> startupComplete{false};                     ///< Gates deferred-attach against --detached
     std::atomic<bool> liveMode;                                   ///< True in Transfer Mode (live TV)
     int osdHeight{};                                              ///< Cached display height (px)

@@ -1084,6 +1084,30 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     const auto idx = static_cast<unsigned>(PlayMode);
     dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
 
+    // External-player handover (vdr-mpv): suspend hardware so it can grab DRM/VAAPI/ALSA.
+    // SuspendHardware (not Detach) -- cMpvControl is live, cControl::Shutdown would double-free.
+    // Arm externActive only on actual suspend; --detached startup uses MakePrimaryDevice's
+    // deferred-init path instead.
+    if (PlayMode == pmExtern_THIS_SHOULD_BE_AVOIDED) {
+        if (initState.load(std::memory_order_acquire) != 0) {
+            isyslog("vaapivideo/device: pmExtern -- releasing hardware for external player");
+            SuspendHardware();
+            externActive.store(true, std::memory_order_release);
+        }
+        return true;
+    }
+
+    // Resume before the pmNone branch dereferences `decoder` (SuspendHardware nulled it).
+    if (externActive.exchange(false, std::memory_order_acq_rel) && initState.load(std::memory_order_acquire) == 0 &&
+        !drmPath.empty()) {
+        isyslog("vaapivideo/device: SetPlayMode(%s) -- resuming hardware after pmExtern",
+                idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
+        if (!Attach()) [[unlikely]] {
+            esyslog("vaapivideo/device: failed to resume hardware after pmExtern");
+            return false;
+        }
+    }
+
     // Clear stale Freeze() flag first -- would otherwise block PlayVideo() in the new mode.
     paused.store(false, std::memory_order_relaxed);
 
@@ -1256,12 +1280,17 @@ auto cVaapiDevice::Detach() -> bool {
 
     isyslog("vaapivideo/device: detaching from hardware");
 
-    // Stop upstream sources before Stop(): cTransfer's tuner thread calls PlayVideo/PlayAudio
-    // which dereference `decoder`. cControl::Shutdown() must precede Stop() because the
-    // unwinding cPlayer::Detach() fires SetPlayMode(pmNone)->Clear(), which still needs the
-    // subsystems alive. Note: ~cVaapiDevice does NOT need this; VDR's shutdown sequence
-    // guarantees the correct order there.
+    // cControl::Shutdown before SuspendHardware: ~cPlayer's unwinding fires
+    // SetPlayMode(pmNone)->Clear() and still needs decoder/display/audio alive.
     cControl::Shutdown();
+    SuspendHardware();
+    const bool vtYielded = LeaveOwnVt();
+    isyslog("vaapivideo/device: detached");
+    return vtYielded;
+}
+
+auto cVaapiDevice::SuspendHardware() -> void {
+    // Hardware-only release; callers add cControl::Shutdown / LeaveOwnVt as appropriate.
     DetachAllReceivers();
 
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
@@ -1271,8 +1300,8 @@ auto cVaapiDevice::Detach() -> bool {
 
     Stop();
 
-    // Force-release OSD mmap'd dumb buffers: VDR may keep cVaapiOsd objects alive past
-    // Detach(), and their kernel refs would block drmDropMaster/close.
+    // Force-release OSD mmap'd dumb buffers: VDR may keep cVaapiOsd objects alive past this
+    // point, and their kernel refs would block drmDropMaster/close.
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
         provider->ReleaseAllOsdResources();
     }
@@ -1283,7 +1312,6 @@ auto cVaapiDevice::Detach() -> bool {
     }
 
     ReleaseHardware();
-    const bool vtYielded = LeaveOwnVt();
 
     // Reset all playback state so a subsequent Attach() re-detects codecs from scratch.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -1299,8 +1327,6 @@ auto cVaapiDevice::Detach() -> bool {
     osdWidth = 0;
     osdHeight = 0;
     initState.store(0, std::memory_order_release);
-    isyslog("vaapivideo/device: detached");
-    return vtYielded;
 }
 
 [[nodiscard]] auto cVaapiDevice::Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,

@@ -106,6 +106,9 @@ constexpr int DECODER_SYNC_WARMUP_SAMPLES =
     50; ///< Mean-seed samples before EMA starts; sqrt(N) cuts 50p deinterlace bias.
 constexpr int DECODER_SYNC_HARD_AHEAD_MAX_MS =
     500; ///< Live hard-ahead sleep cap (ms); prevents indefinite chase + upstream queue overflow.
+constexpr size_t DECODER_JITTERBUF_HARD_CAP =
+    150; ///< ~3 s @ 50 fps. Caps GPU surface retention when a stuck-but-valid audio clock holds the
+         ///< drain's due-gate closed (SkipStaleJitterFrames only drops BEHIND-clock heads).
 
 // ============================================================================
 // === STRUCTURES ===
@@ -975,6 +978,18 @@ auto cVaapiDecoder::Action() -> void {
         auto *const ap = audioProcessor.load(std::memory_order_acquire);
         for (auto &frame : pendingFrames) {
             jitterBuf.push_back(std::move(frame));
+        }
+
+        // Runaway guard: SkipStaleJitterFrames only drops BEHIND-clock heads, so a stuck-but-valid
+        // clock with PTS marching ahead would grow jitterBuf forever. Drop oldest to bound memory.
+        if (jitterBuf.size() > DECODER_JITTERBUF_HARD_CAP) [[unlikely]] {
+            const size_t dropCount = jitterBuf.size() - DECODER_JITTERBUF_HARD_CAP;
+            for (size_t i = 0; i < dropCount; ++i) {
+                jitterBuf.pop_front();
+            }
+            syncDropSinceLog += static_cast<int>(dropCount);
+            dsyslog("vaapivideo/decoder: jitterBuf overflow -- dropped %zu frame(s), cap=%zu", dropCount,
+                    DECODER_JITTERBUF_HARD_CAP);
         }
 
         // Bulk-drop catastrophically stale heads (post-seek, long decode stall, trick-exit backlog).

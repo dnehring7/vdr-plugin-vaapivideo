@@ -84,7 +84,7 @@ The coding conventions enforced across all sources are listed in
 | Dependency   | Minimum | Notes                                                                                   |
 |--------------|---------|-----------------------------------------------------------------------------------------|
 | Linux kernel | 5.15+   | DRM atomic modeset, universal planes, COLOR_ENCODING / COLOR_RANGE, HDR_OUTPUT_METADATA |
-| VDR          | 2.6.0+  | `APIVERSNUM >= 20600`                                                                   |
+| VDR          | 2.6.6+  | `APIVERSNUM >= 20606`                                                                   |
 | FFmpeg       | 7.0+    | `libavcodec >= 61.3.100`, built with `--enable-vaapi`                                   |
 | C++ compiler | C++20   | GCC 12+ or Clang 16+                                                                    |
 

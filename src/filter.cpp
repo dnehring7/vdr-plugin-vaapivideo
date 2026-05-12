@@ -45,7 +45,7 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
-#include <vdr/remux.h> // PTSTICKS
+#include <vdr/remux.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
