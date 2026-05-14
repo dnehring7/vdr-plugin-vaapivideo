@@ -23,8 +23,14 @@
  *                                                           sleep of (correctMs + frameDur);
  *                                                           EMA adjusted by measured effect
  *
- * Threading: codecMutex guards codec/parser/filter state; packetMutex guards packetQueue.
- *   Lock order: ALWAYS codecMutex -> packetMutex (Clear / EnqueueData / SetTrickSpeed match this).
+ * Threading: codecMutex guards codec context + filter graph (decode thread vs reopen/clear).
+ *   parserMutex guards the AVCodecParserContext (EnqueueData vs reopen/clear). Separate mutexes
+ *   so the dvbplayer/receiver feeding EnqueueData does not serialise the decode thread on its
+ *   way to VAAPI. av_parser_parse2 only reads immutable codecCtx fields. packetMutex guards
+ *   packetQueue (also the condvar futex).
+ *   Lock order: ALWAYS codecMutex -> parserMutex -> packetMutex. Writers of codecCtx existence
+ *   (OpenCodecWithInfo / Clear / SetTrickSpeed flush) take BOTH codecMutex and parserMutex;
+ *   the decode thread takes only codecMutex; EnqueueData takes only parserMutex.
  *   jitterBuf is decode-thread-owned (no lock needed); cross-thread requests use atomics +
  *   a deferred apply at the top of Action().
  */
@@ -89,7 +95,7 @@ extern "C" {
 // ============================================================================
 
 constexpr size_t DECODER_QUEUE_CAPACITY =
-    200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to TRICK_QUEUE_DEPTH.
+    200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to DECODER_TRICK_QUEUE_DEPTH.
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< VSync backpressure budget inside display->SubmitFrame().
 constexpr int DECODER_SYNC_COOLDOWN_MS = 5000; ///< Min interval between soft corrections; equals 5x EMA time constant.
 constexpr int64_t DECODER_SYNC_CORRIDOR_90K =
@@ -161,7 +167,11 @@ cVaapiDecoder::~cVaapiDecoder() noexcept {
 // ============================================================================
 
 auto cVaapiDecoder::Clear() -> void {
-    const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex order (matches EnqueueData).
+    // codecMutex first, parserMutex second (file-level lock order). Together they exclude both
+    // the decode thread (codecMutex) and any concurrent EnqueueData parse (parserMutex), so we
+    // can safely reset codec + parser as one atomic operation.
+    const cMutexLock decodeLock(&codecMutex);
+    const cMutexLock parseLock(&parserMutex);
 
     DrainQueue();
 
@@ -223,7 +233,11 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         return;
     }
 
-    const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex order (matches Clear).
+    // parserMutex only: av_parser_parse2 reads codecCtx's codec_id (set once at open) and writes
+    // parserCtx state. The decode thread modifies codecCtx under codecMutex without touching the
+    // parser, so the two paths run concurrently. Writers of codecCtx existence
+    // (OpenCodecWithInfo / Clear / SetTrickSpeed) take BOTH mutexes (codecMutex -> parserMutex).
+    const cMutexLock parseLock(&parserMutex);
 
     if (!codecCtx || !parserCtx) {
         return;
@@ -382,14 +396,14 @@ auto cVaapiDecoder::NoteStarvationTick(const AVPacket *pkt) noexcept -> void {
 auto cVaapiDecoder::FlushParser() -> void {
     // Still-picture / Goto(Still): the parser withholds the last AU until a start code follows.
     // NULL-input flush surfaces the single I-frame immediately.
-    const cMutexLock decodeLock(&codecMutex);
+    const cMutexLock parseLock(&parserMutex);
     DrainPendingParserAU();
 }
 
 auto cVaapiDecoder::DrainPendingParserAU() -> void {
     // NULL/0 input is the documented EOS-flush idiom for av_parser_parse2.
     // Callers: FlushParser (still-picture) and SetTrickSpeed (reverse isolated I-frames).
-    // Caller holds codecMutex; packetMutex taken internally.
+    // Caller holds parserMutex; packetMutex taken internally. codecCtx is read-only here.
     if (!codecCtx || !parserCtx) {
         return;
     }
@@ -530,7 +544,10 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::OpenCodecWithInfo(const VideoStreamInfo &info) -> bool {
+    // codecMutex + parserMutex: reopens both contexts atomically; lock order is fixed
+    // (codec -> parser) and matches Clear() / SetTrickSpeed().
     const cMutexLock decodeLock(&codecMutex);
+    const cMutexLock parseLock(&parserMutex);
 
     if (!ready.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire)) [[unlikely]] {
         esyslog("vaapivideo/decoder: not initialized or shutting down");
@@ -712,7 +729,10 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
     dsyslog("vaapivideo/decoder: SetTrickSpeed speed=%d forward=%d fast=%d needsFlush=%d", speed, forward, fast,
             needsFlush);
     {
-        const cMutexLock decodeLock(&codecMutex); // codecMutex -> packetMutex (inside DrainQueue).
+        // codecMutex + parserMutex: same atomicity guarantee as Clear() during the flush path
+        // (codec flush + parser recreate must not race a concurrent EnqueueData parse).
+        const cMutexLock decodeLock(&codecMutex);
+        const cMutexLock parseLock(&parserMutex);
 
         if (needsFlush) {
             DrainQueue();
@@ -745,7 +765,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         prevTrickPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     }
 
-    // Fast: PTS-derived hold via multiplier. Slow: fixed hold = speed * TRICK_HOLD_MS.
+    // Fast: PTS-derived hold via multiplier. Slow: fixed hold = speed * DECODER_TRICK_HOLD_MS.
     if (fast && speed > 0) {
         if (speed >= 6) {
             trickMultiplier.store(2, std::memory_order_relaxed);
@@ -845,7 +865,7 @@ auto cVaapiDecoder::Action() -> void {
                 int waitMs = 10; // jitterBuf empty: deep sleep, woken by next EnqueueData broadcast.
                 if (!jitterBuf.empty()) {
                     auto *const ap = audioProcessor.load(std::memory_order_acquire);
-                    const bool consumingDrop = (pendingDrops > 0);
+                    const bool consumingDrop = pendingDrops > 0;
                     const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
                     if (consumingDrop || canFreerun || !ap) {
                         waitMs = 1;
@@ -1005,7 +1025,7 @@ auto cVaapiDecoder::Action() -> void {
             if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
                 break;
             }
-            const bool consumingDrop = (pendingDrops > 0);
+            const bool consumingDrop = pendingDrops > 0;
             const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
 
             if (!consumingDrop && !canFreerun && ap) {
@@ -1029,10 +1049,14 @@ auto cVaapiDecoder::Action() -> void {
 
             // Trick play paces frames at the trick hold (60-2000 ms), well above the 2*frameDur
             // miss threshold. Don't count those as drain misses and reset lastDrainMs so the first
-            // post-trick drain isn't flagged either.
+            // post-trick drain isn't flagged either. A sync-correction sleep (hard-ahead / soft-ahead
+            // / WaitForAudioCatchUp) inside the previous SyncAndSubmitFrame causes the same big gap,
+            // so consume sleptInLastSubmit to skip exactly one miss.
             const bool inTrick = trickSpeed.load(std::memory_order_relaxed) != 0;
+            const bool consumedSleep = std::exchange(sleptInLastSubmit, false);
             const uint64_t nowMs = cTimeMs::Now();
-            if (!inTrick && lastDrainMs > 0 && static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs * 2) {
+            if (!inTrick && !consumedSleep && lastDrainMs > 0 &&
+                static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs * 2) {
                 ++drainMissCount;
             }
             lastDrainMs = inTrick ? 0 : nowMs;
@@ -1447,7 +1471,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
 
         // Fast: hold = |ptsDelta| / PTS_TICKS_PER_MS / mult, clamped to [10, 2000] ms.
-        // Slow: precomputed trickHoldMs = speed * TRICK_HOLD_MS.
+        // Slow: precomputed trickHoldMs = speed * DECODER_TRICK_HOLD_MS.
         const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
         if (mult > 0 && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
             const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
@@ -1475,6 +1499,11 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     const int64_t maxWaitMs = std::min<int64_t>((delta / PTS_TICKS_PER_MS) + 1000, 5000LL);
     const cTimeMs deadline(static_cast<int>(maxWaitMs));
 
+    // Tell the display thread we're deliberately pausing so its starve detector doesn't
+    // count the re-presents during this loop as a stall.
+    if (display) {
+        display->SetSyncSleeping(true);
+    }
     while (!deadline.TimedOut() && !stopping.load(std::memory_order_relaxed)) {
         // A Clear() / channel-switch arms freerunFrames; bail so the new clock domain starts fresh.
         if (freerunFrames.load(std::memory_order_relaxed) > 0) {
@@ -1486,7 +1515,13 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
         }
         cCondWait::SleepMs(10);
     }
+    if (display) {
+        display->SetSyncSleeping(false);
+    }
 
+    // Suppress the next drain-loop miss check: the long gap is from our deliberate wait, not
+    // upstream starvation.
+    sleptInLastSubmit = true;
     ResetSmoothedDelta();
     syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
     syncLogPending.store(true, std::memory_order_relaxed);
@@ -1507,12 +1542,17 @@ auto cVaapiDecoder::PublishLastPts(int64_t pts) noexcept -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncLatency90k(const cAudioProcessor *ap) const noexcept -> int64_t {
-    // User knob (PCM or passthrough) + 2-frame pipeline constant (decoder->scanout + HDMI link).
-    // The 2-frame model zeroes the default bias so knobs only need adjustment for unusual displays
-    // (gaming mode: positive; movie-mode ~50 ms input lag: negative).
+    // User knob (PCM or passthrough) + 1-frame pipeline constant.
+    // The 1-frame tail models the dominant scanout delay (commit + page flip) for an empty
+    // prerender cache, which is the throughput-bound regime where the EMA used to settle at
+    // -2*frameDur with the older 2-frame model. With 1*frameDur the throughput-bound baseline
+    // sits at -1*frameDur (~-20 ms @ 50 fps), well inside CORRIDOR (50 ms), so 10-15 ms/s
+    // crystal/pipeline drift takes ~3x longer to breach. Gate-bound (live TV, replay backlog)
+    // is unaffected: the gate releases at dueIn <= halfFrame, so the EMA still settles at
+    // +halfFrame regardless of latency. Operator knob still shifts the bias on top.
     const int latencyMs = (ap && ap->IsPassthrough()) ? vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)
                                                       : vaapiConfig.pcmLatency.load(std::memory_order_relaxed);
-    return (static_cast<int64_t>(latencyMs) + (2 * static_cast<int64_t>(outputFrameDurationMs))) * PTS_TICKS_PER_MS;
+    return (static_cast<int64_t>(latencyMs) + static_cast<int64_t>(outputFrameDurationMs)) * PTS_TICKS_PER_MS;
 }
 
 auto cVaapiDecoder::ResetSmoothedDelta() noexcept -> void {
@@ -1567,7 +1607,7 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
     if (!(syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut())) {
         return;
     }
-    // d= interval mean (not point sample). lat= SyncLatency90k (2*frameDur + user knob).
+    // d= interval mean (not point sample). lat= SyncLatency90k (frameDur + user knob).
     // If bumping the knob leaves lat= unchanged, the stream is using the other path (PCM vs PT).
     const int64_t meanRawDelta90k =
         (rawDeltaCountSinceLog > 0) ? (rawDeltaSumSinceLog90k / rawDeltaCountSinceLog) : rawDelta90k;
@@ -1702,11 +1742,10 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         return submitIfCurrent(std::move(frame));
     }
 
-    // Consume one pending drop from a previous soft-behind burst; PTS advances, clock doesn't.
-    // No extra log line: the triggering soft-behind entry already reported the burst count.
+    // Consume one pending drop from a previous soft- or hard-behind burst. The triggering
+    // event already logged the count; the EMA was reset there so we don't bump it here.
     if (pendingDrops > 0) {
         --pendingDrops;
-        smoothedDelta90k += static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
         ++syncDropSinceLog;
         return true;
     }
@@ -1722,6 +1761,15 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     //   Exit: rawDelta > -CORRIDOR. Hysteresis = CORRIDOR; ResetSmoothedDelta forces a fresh EMA
     //   warmup before re-entry, preventing ping-pong across the gap.
     if (catchingUp) {
+        // Exit at -CORRIDOR (not at +halfFrame): catch-up only progresses rawDelta when frames are
+        // already cached in jitterBuf (drop iter is then a fast pop, audio barely advances). Once
+        // the cache is drained each subsequent drop has to wait one VPP cycle for the next frame,
+        // and on marginal-VPP hardware (UHD upscale, ~50 fps == audio rate) the per-iter audio
+        // advance ~= PTS advance, so rawDelta no longer climbs. Targeting +halfFrame would then
+        // make catch-up hang forever, silently dropping every newly decoded frame. -CORRIDOR is
+        // the highest threshold that's guaranteed reachable from any typical entry point with
+        // ordinary jitterBuf depth -- the small permanent negative offset that may remain is well
+        // below the lipsync percept threshold.
         if (rawDelta > -DECODER_SYNC_CORRIDOR_90K) {
             dsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms", catchUpDrops,
                     static_cast<unsigned long long>(cTimeMs::Now() - catchUpStartMs),
@@ -1805,9 +1853,16 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
             return submitIfCurrent(std::move(frame));
         }
-        const int bigSleepMs = std::min(static_cast<int>(rawDelta / PTS_TICKS_PER_MS), DECODER_SYNC_HARD_AHEAD_MAX_MS);
+        const int rawDeltaMs = static_cast<int>(rawDelta / PTS_TICKS_PER_MS);
+        const int bigSleepMs = std::min(rawDeltaMs, DECODER_SYNC_HARD_AHEAD_MAX_MS);
         preSleepMs = cTimeMs::Now();
+        if (display) {
+            display->SetSyncSleeping(true);
+        }
         cCondWait::SleepMs(bigSleepMs + outputFrameDurationMs);
+        if (display) {
+            display->SetSyncSleeping(false);
+        }
         ++syncSkipSinceLog;
         dsyslog("vaapivideo/decoder: sync skip (hard-ahead live) pts=%lld raw=%+lldms slept=%dms",
                 static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS),
@@ -1818,33 +1873,38 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         hardAheadStreak = 0;
     }
 
-    // Soft corridor: proportional correction, capped at MAX_CORRECTION, rate-limited by cooldown.
-    // Ahead sleeps (correctMs + frameDur): extra frameDur compensates for the normal iteration period
-    // so the net shift equals correctMs. Measured post-hoc via elapsed for EMA feedback.
+    // Soft corridor: |EMA| crossed CORRIDOR -> the drift is real, not noise. Trigger uses the
+    // smoothed value (debounce); the correction size uses the instantaneous rawDelta (close
+    // the actual gap, not the lagging average). Behind bursts drops + resets the EMA, just
+    // like hard-behind, only smaller. Ahead sleeps. Cooldown rate-limits both directions.
     if (syncCooldown.TimedOut() && smoothedDeltaValid) {
         const int64_t absDelta90k = smoothedDelta90k < 0 ? -smoothedDelta90k : smoothedDelta90k;
         if (absDelta90k > DECODER_SYNC_CORRIDOR_90K) {
             const int correctMs =
-                std::min(static_cast<int>(absDelta90k / PTS_TICKS_PER_MS), DECODER_SYNC_MAX_CORRECTION_MS);
+                std::min(static_cast<int>(std::abs(rawDelta) / PTS_TICKS_PER_MS), DECODER_SYNC_MAX_CORRECTION_MS);
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
 
             if (smoothedDelta90k < 0) {
-                // Behind: drop N frames (round-to-nearest); one now, rest via pendingDrops.
                 const int totalDrops = std::max(1, (correctMs + (outputFrameDurationMs / 2)) / outputFrameDurationMs);
                 pendingDrops = totalDrops - 1;
-                // Log the pre-correction EMA so the "avg=" field shows what tripped the corridor.
                 const auto triggerAvgMs = static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS);
-                smoothedDelta90k += static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
                 ++syncDropSinceLog;
                 dsyslog("vaapivideo/decoder: sync drop (soft-behind) pts=%lld raw=%+lldms avg=%+lldms corr=%dms "
                         "drops=%d",
                         static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS), triggerAvgMs,
                         correctMs, totalDrops);
+                ResetSmoothedDelta();
                 return true;
             }
             // Ahead: sleep once; EMA feedback applied from measured elapsed after SubmitFrame.
             preSleepMs = cTimeMs::Now();
+            if (display) {
+                display->SetSyncSleeping(true);
+            }
             cCondWait::SleepMs(correctMs + outputFrameDurationMs);
+            if (display) {
+                display->SetSyncSleeping(false);
+            }
             ++syncSkipSinceLog;
             dsyslog("vaapivideo/decoder: sync skip (soft-ahead) pts=%lld raw=%+lldms avg=%+lldms slept=%dms",
                     static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS),
@@ -1858,6 +1918,9 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         const auto elapsedMs = static_cast<int>(cTimeMs::Now() - preSleepMs);
         const int extraMs = std::max(0, elapsedMs - outputFrameDurationMs);
         smoothedDelta90k -= static_cast<int64_t>(extraMs) * PTS_TICKS_PER_MS;
+        // Suppress the next drain-loop miss check: the gap straddling this submit was a
+        // deliberate hard-ahead / soft-ahead sleep, not upstream starvation.
+        sleptInLastSubmit = true;
     }
     return submitted;
 }

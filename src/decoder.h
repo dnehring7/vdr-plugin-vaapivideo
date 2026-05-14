@@ -121,7 +121,7 @@ class cVaapiDecoder : public cThread {
         -> std::unique_ptr<VaapiFrame>; ///< av_frame_clone() the filtered surface; extracts VASurfaceID from data[3].
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
-    auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds codecMutex.
+    auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
     auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< Push decodedFrame through the filter graph (lazily built) and append with monotonic PTS.
                  ///< Caller holds codecMutex and must have populated decodedFrame.
@@ -136,8 +136,9 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Audio-master A/V sync gate (four regimes; see decoder.cpp file comment and AVSYNC.md).
     [[nodiscard]] auto SyncLatency90k(const cAudioProcessor *ap) const noexcept
-        -> int64_t; ///< User latency knob (PCM or passthrough) + 2-frame pipeline constant (decoder->scanout + HDMI
-                    ///< link). Pass nullptr to use PCM knob (safe default before audio processor is attached).
+        -> int64_t; ///< User latency knob (PCM or passthrough) + 1-frame pipeline constant (dominant scanout delay:
+                    ///< commit + page flip). Pass nullptr to use PCM knob (safe default before audio processor is
+                    ///< attached).
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
         -> void;                                   ///< Residual-accumulator EMA; call once per output frame.
     auto ResetSmoothedDelta() noexcept -> void;    ///< Invalidate EMA, clear warmup, zero streak counters.
@@ -158,8 +159,16 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === SYNCHRONIZATION ===
     // ========================================================================
-    // Lock order: ALWAYS codecMutex -> packetMutex. DrainQueue takes only packetMutex.
-    mutable cMutex codecMutex;  ///< Guards codec context, parser, and filter graph (EnqueueData <-> decode thread).
+    // Lock order: ALWAYS codecMutex -> parserMutex -> packetMutex. DrainQueue takes only packetMutex.
+    //
+    // codecMutex and parserMutex are deliberately separate: the dvbplayer / receiver feeds the
+    // parser via EnqueueData() while the decode thread is busy submitting work to VAAPI. Sharing
+    // one mutex would serialise the two -- in replay that costs ~25 ms/s of GPU submission time
+    // on UHD upscale and shows up as sustained negative drift. av_parser_parse2() only reads
+    // immutable codecCtx fields (codec_id + descriptor); writers of codecCtx existence
+    // (OpenCodecWithInfo / Clear / SetTrickSpeed) take BOTH mutexes in fixed order.
+    mutable cMutex codecMutex;  ///< Guards codec context + filter graph (decode thread vs reopen/clear).
+    mutable cMutex parserMutex; ///< Guards parser context (EnqueueData vs reopen/clear).
     mutable cMutex packetMutex; ///< Guards packetQueue; also used as condvar futex.
     cCondVar packetCondition;   ///< Wakes the decode thread on enqueue or shutdown.
 
@@ -223,7 +232,8 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> isTrickReverse;        ///< REW: GOPs arrive backward; skip frames with rising PTS within a GOP.
     std::atomic<uint64_t> nextTrickFrameDue; ///< cTimeMs::Now() deadline for next submission; enforces pacing.
     std::atomic<int64_t> prevTrickPts{AV_NOPTS_VALUE}; ///< Source PTS of previous trick frame; detects field pairs.
-    std::atomic<uint64_t> trickHoldMs{DECODER_TRICK_HOLD_MS}; ///< Hold per frame in slow mode = speed * TRICK_HOLD_MS.
+    std::atomic<uint64_t> trickHoldMs{
+        DECODER_TRICK_HOLD_MS};            ///< Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS.
     std::atomic<uint64_t> trickMultiplier; ///< Fast-mode PTS-derived hold divisor (2/4/8x). 0 = slow mode.
 
     // ========================================================================
@@ -240,7 +250,11 @@ class cVaapiDecoder : public cThread {
     int drainMissCount{};             ///< Drain gaps > 2xframeDur since last sync log; indicates upstream starvation.
     int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log. Decode thread only.
     int syncSkipSinceLog{};           ///< Frames delayed (video ahead) since last sync log. Decode thread only.
-    int pendingDrops{};               ///< Remaining frames to drop in current soft-behind burst. Decode thread only.
+    int pendingDrops{};               ///< Remaining frames to drop in current soft- or hard-behind burst.
+                                      ///< Consumed one-per-iteration in SyncAndSubmitFrame. Decode thread only.
+    bool sleptInLastSubmit{};         ///< Set by SyncAndSubmitFrame / WaitForAudioCatchUp when a sync-correction
+                                      ///< sleep ran. Consumed (cleared) by the drain loop's miss check so the
+                                      ///< self-inflicted gap doesn't inflate drainMissCount. Decode thread only.
     int64_t rawDeltaSumSinceLog90k{}; ///< Accumulator for interval-mean rawDelta in the sync log.
     int rawDeltaCountSinceLog{};      ///< Sample count for rawDeltaSumSinceLog90k.
     int warmupSampleCount{};          ///< Samples accumulated during EMA warmup (post-reset). Decode thread only.

@@ -693,8 +693,11 @@ auto cVaapiDisplay::Action() -> void {
 
         // Trick play: decoder commits at the trick hold (60-2000 ms), so most VSyncs re-present.
         // That's not a stall; drop the streak so trick-exit doesn't carry a stale count.
+        // Sync sleep (hard-ahead / soft-ahead): decoder is deliberately paused inside a correction
+        // sleep, so re-presents during that window are intentional, not stalls.
         const bool inTrick = trickActive.load(std::memory_order_relaxed);
-        if (inTrick) {
+        const bool inSyncSleep = syncSleeping.load(std::memory_order_relaxed);
+        if (inTrick || inSyncSleep) {
             starveStreak = 0;
         }
 
@@ -758,7 +761,7 @@ auto cVaapiDisplay::Action() -> void {
                 // Only count a stall when decoder was recently active AND past warmup grace.
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
-                if (!inTrick && lastCommitMs != 0 && nowMs - lastCommitMs < ACTIVE_WINDOW_MS &&
+                if (!inTrick && !inSyncSleep && lastCommitMs != 0 && nowMs - lastCommitMs < ACTIVE_WINDOW_MS &&
                     warmupGraceUntil.TimedOut()) {
                     ++starveStreak;
                     ++starveTotal;

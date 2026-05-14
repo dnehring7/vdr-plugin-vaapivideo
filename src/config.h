@@ -26,8 +26,11 @@ inline constexpr uint32_t DISPLAY_DEFAULT_HEIGHT = 1080;     ///< Default displa
 inline constexpr uint32_t DISPLAY_DEFAULT_WIDTH = 1920;      ///< Default display width before a mode is selected (px)
 inline constexpr uint32_t DISPLAY_DEFAULT_REFRESH_RATE = 50; ///< Default refresh rate before a mode is selected (Hz)
 inline constexpr size_t DISPLAY_PRERENDER_SLOTS =
-    3; ///< Decoder->display handoff queue depth. Lets the decoder stay ahead so an occasional VPP spike
-       ///< drains a slot instead of missing the next VSync. SubmitFrame blocks when all slots are full.
+    6; ///< Decoder->display handoff queue depth (= 120 ms tolerance @ 50 fps). Sized to absorb a
+       ///< single UHD VPP/memory-bandwidth spike (observed ~80 ms in replay) without draining the
+       ///< cache and forcing a re-present. SubmitFrame blocks when all slots are full so audio
+       ///< clock stays in lipsync (the whole pipeline is delayed in lockstep, not just video).
+       ///< FHD never fills past 1-2 slots; the extra depth is a no-op there.
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===

@@ -1,49 +1,37 @@
 # Coding Rules
 
-See README.md for architecture, source layout, build instructions, and requirements.
-See `src/common.h` for RAII deleters (`FreeAVFrame`, `FreeAVPacket`, …) and `AvErr()`.
+README.md = architecture / build. `src/common.h` = RAII deleters + `AvErr()`.
 
-## Build & Lint
+Build: `make` | Lint: `make lint` (bear + clang-tidy) | Format: `make indent`.
 
-```sh
-make                # build plugin
-make lint           # clang-tidy (requires bear + clang-tidy; generates compile_commands.json)
-make indent         # clang-format all sources
-```
+## Hard rules
 
-## Hard Rules
+- Trailing return type on every function (incl. `-> void`, deleted ops).
+- `[[nodiscard]]` on every value-returning function.
+- `noexcept` on dtors, moves, trivial const getters.
+- Include guards `#ifndef/#define/#endif` -- no `#pragma once`.
+- `std::format` (never `snprintf` into `std::string`). `std::span` (never `ptr+size`). `std::`-qualified C funcs.
+- RAII for all resources; no naked `new`/`delete`, no manual `av_*_free`.
+- Check every C-API return value. No exceptions (VDR is exception-free).
+- VDR threading primitives only: `cThread`, `cMutex`, `cMutexLock`, `cCondVar`, `cCondWait::SleepMs()`, `cTimeMs` -- no `std::thread`/`std::mutex`.
+- `NOLINT` only at C-API boundaries; always name the check.
 
-- **Trailing return types** on every function, including `-> void` and deleted operators.
-- **`[[nodiscard]]`** on every value-returning function.
-- **`noexcept`** on destructors, move operations, trivial `const` getters.
-- **`#ifndef`/`#define`/`#endif`** include guards — never `#pragma once`.
-- **`std::format`** for strings — never `snprintf` into `std::string`.
-- **`std::span`** for buffers — never raw pointer + size.
-- **`std::`-qualified** C functions (`std::memcpy`, `std::memset`).
-- **RAII** for all resources — no naked `new`/`delete`, no manual `av_*_free`.
-- **Check every C API return value.**
-- **No exceptions** — VDR is exception-free.
-- **No `std::thread`/`std::mutex`** — use VDR primitives (`cThread`, `cMutex`, `cMutexLock`, `cCondVar`, `cCondWait::SleepMs()`, `cTimeMs`).
-- **`NOLINT`** only at C API boundaries; always name the check.
+## Conventions
 
-## Non-Obvious Conventions
+- Constants: `inline constexpr` UPPERCASE in headers, plain `constexpr` in `.cpp`.
+- File scope: `static` for free fns, anon namespace for types.
+- Logging: `"vaapivideo/<basename>: <msg>"`; never in hot paths.
+- Errors: FFmpeg -> `AvErr(ret).data()`; DRM/VAAPI -> `%m` or `strerror(errno)`.
+- Members: inline Doxygen `///<` after member, brace-init, alphabetical within groups.
+- Section rulers: `// === LABEL ===`.
+- Hints: `[[unlikely]]` on error paths, `[[likely]]` on hot paths, early returns.
 
-- **Constants:** `inline constexpr` + UPPERCASE in headers; plain `constexpr` in `.cpp`.
-- **File scope:** `static` for free functions; anonymous namespace for types.
-- **Logging:** `"vaapivideo/<basename>: <msg>"` — never in hot paths (decode/render loops).
-- **Errors:** FFmpeg → `AvErr(ret).data()`; DRM/VAAPI → `%m` or `strerror(errno)`.
-- **Members:** inline Doxygen `///<` after the member, brace-init, alphabetical within groups.
-- **Section headers:** full-width `// === LABEL ===` ruler (see existing files).
-- **Control flow:** `[[unlikely]]` on error paths, `[[likely]]` on hot paths, early returns.
+## Thread-safety
 
-## Thread-Safety Pitfall
+VDR's `Running()` is **not** thread-safe. Use `std::atomic<bool> stopping` / `hasExited` with `acquire`/`release`. Mirror existing `Shutdown()` patterns.
 
-VDR's `Running()` is **not** thread-safe. Use `std::atomic<bool> stopping` / `hasExited` with `memory_order_acquire`/`release`. See existing `Shutdown()` patterns in the codebase.
+## Lifecycle (match existing patterns)
 
-## Lifecycle
-
-Each component provides three methods — match existing patterns exactly:
-
-- `Clear()` — reset buffers, keep allocated resources.
-- `Shutdown()` — release everything, log stats, idempotent via `stopping.exchange(true)`.
-- `~Destructor() noexcept` — calls `Shutdown()` if not already done.
+- `Clear()` -- reset buffers, keep resources.
+- `Shutdown()` -- release everything, log stats, idempotent via `stopping.exchange(true)`.
+- `~Destructor() noexcept` -- calls `Shutdown()` if not yet done.

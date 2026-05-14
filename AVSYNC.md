@@ -57,8 +57,9 @@ rawDelta = videoPTS − GetClock() − pipelineLatency
 ```
 
 `rawDelta > 0` ⇒ video ahead, `< 0` ⇒ behind. `pipelineLatency` is the
-configured operator knob plus a fixed two-frame tail (one decoder→scanout
-period, one HDMI/panel period). The knob is split per output mode:
+configured operator knob plus a fixed one-frame tail (the dominant
+scanout delay = commit + page flip for an empty prerender cache). The
+knob is split per output mode:
 
 | Mode                 | `setup.conf` key     | Range       | Default |
 | -------------------- | -------------------- | ----------- | ------- |
@@ -71,15 +72,25 @@ Active variant is selected per stream via `cAudioProcessor::IsPassthrough()`.
 
 `rawDelta` carries up to ~150 ms field-alternation aliasing on
 deinterlaced 50p output; using it directly for soft corrections would
-churn. The smoother runs in two phases:
+churn. The smoother is an **Exponential Moving Average** — a running
+estimate that weights each new sample by `α` and the previous estimate
+by `1 − α`:
+
+```
+ema = α × new_value + (1 − α) × previous_ema
+```
+
+Small `α` (here `1 / EMA_SAMPLES = 1/50`) ignores single-frame spikes
+but tracks sustained drift; the time constant is `1 / α` samples (~1 s
+@ 50 fps). The smoother runs in two phases:
 
 1. **Warmup.** First `WARMUP_SAMPLES = 50` samples (~1 s @ 50 fps) feed a
-   simple mean. Soft corrections are gated on `smoothedDeltaValid`, so
-   no correction fires off a partial mean.
-2. **Steady-state EMA.** Integer EMA with a residual accumulator that
-   carries the `diff mod N` remainder across samples — guarantees exact
-   convergence to the rawDelta mean even when `|diff| < N`. Time
-   constant ~1 s (`EMA_SAMPLES = 50`).
+   simple mean to seed the EMA. Soft corrections are gated on
+   `smoothedDeltaValid`, so no correction fires off a partial mean.
+2. **Steady-state EMA.** Integer form of the formula above with a
+   residual accumulator that carries the `diff mod N` remainder across
+   samples — guarantees exact convergence to the rawDelta mean even
+   when `|diff| < N` (the naïve integer step would round to 0).
 
 `ResetSmoothedDelta()` clears warmup, EMA, residual, hard-streaks and
 catch-up state in one call. Called on channel switch, hard-behind fire,
@@ -92,21 +103,30 @@ bypass the cooldown.
 
 ### Soft corridor — `|smoothed| > CORRIDOR (50 ms)`, cooldown elapsed
 
-Let `correctMs = min(|smoothed|/90, MAX_CORRECTION_MS = 200)`.
+Trigger uses **smoothed** (so a single bad frame can't fire the
+correction); correction size uses **rawDelta** (so we close the actual
+gap, not the lagging average). Let
+`correctMs = min(|rawDelta|/90, MAX_CORRECTION_MS = 200)`.
 
 | Direction | Action |
 | --------- | ------ |
 | ahead     | `SleepMs(correctMs + frameDur)`, submit, then `smoothed −= (elapsed − frameDur) × 90` |
-| behind    | Drop `max(1, round(correctMs / frameDur))` frames (one now, rest via `pendingDrops`); per drop `smoothed += frameDur × 90` |
+| behind    | Drop `N = max(1, round(correctMs / frameDur))` frames in one burst (one now, `N−1` via `pendingDrops`); reset the EMA |
 
-The `+ frameDur` padding on the sleep is load-bearing: a bare
+The `+ frameDur` padding on the ahead sleep is load-bearing: a bare
 `SleepMs(correctMs)` only lengthens the iteration by `correctMs − frameDur`
 (the missing `frameDur` is absorbed by the next iteration's natural
 packet wait), so without padding the smoother sees half the requested
 shift and re-fires forever.
 
-Both paths feed back the **measured** effect, not the requested amount.
-This preserves the smoother across the correction and is what makes
+The behind path is the small cousin of hard-behind: same `rawDelta`-based
+drop count, same `ResetSmoothedDelta()`, same one-per-iteration drain of
+`pendingDrops`. The reset removes any open-loop EMA bump; honest
+re-measurement during the next warmup (~1 s) seeds the smoother from the
+post-correction reality. Earlier versions paced drops across the
+cooldown to hide each skip, but in measurement the pacing window
+overlapped persistent drift and the controller never converged — a
+single short burst lands a real correction and is what makes
 post-correction `d ≈ 0` reliably reproducible.
 
 `MAX_CORRECTION_MS = HARD_THRESHOLD = 200` so a single soft event can
@@ -116,10 +136,11 @@ controller to re-fire on.
 ### Cooldown — `COOLDOWN_MS = 5 s`
 
 Armed by every soft fire, hard-ahead transient, and `WaitForAudioCatchUp`.
-**Not** armed by catch-up exit or hard-behind: both reset the EMA, and
-warmup (~1 s) alone gates soft until the EMA reseeds. The smoother has
-therefore absorbed the previous correction plus several cycles of fresh
-samples before the next soft event can fire.
+Catch-up exit and hard-behind don't arm the cooldown; the EMA reset's
+warmup (~1 s) alone gates the next soft event. Soft-behind itself
+also resets the EMA *and* arms the cooldown, so the smoother has
+absorbed the previous correction plus several cycles of fresh samples
+before another soft event can fire.
 
 ### Hard transients (raw delta, no cooldown gate)
 
@@ -165,8 +186,15 @@ vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms
 
 Entry threshold (−100 ms) and exit threshold (−50 ms) give at least
 `CORRIDOR` of hysteresis, well above single-sample jitter. The exit at
-`−CORRIDOR` places the residual inside the soft corridor so no follow-up
-soft event is required.
+`−CORRIDOR` is also the **highest threshold guaranteed reachable**:
+catch-up only progresses `rawDelta` when frames are already cached in
+`jitterBuf` (drops are fast pops, audio barely advances). Once the
+cache drains, each further drop has to wait one VPP cycle for the next
+frame, so on marginal-VPP hardware (UHD upscale, ~50 fps == audio rate)
+PTS and clock advance equally and `rawDelta` stops climbing. Targeting
+`+halfFrame` would then hang catch-up forever, silently consuming every
+newly decoded frame. The small permanent negative offset that may
+remain after exit is well below the 80 ms lipsync percept threshold.
 
 `SkipStaleJitterFrames()` lifts its "keep ≥ 1" guard while catching up,
 since the kept frame would be dropped next iteration anyway. On exit
@@ -248,14 +276,17 @@ non-zero `aq` indicates the audio decoder is falling behind real-time
 
 `SyncAndSubmitFrame` hands the chosen frame to
 `cVaapiDisplay::SubmitFrame`, which pushes onto `pendingFrames` (a
-`std::deque`, depth `DISPLAY_PRERENDER_SLOTS = 3`). The display thread
+`std::deque`, depth `DISPLAY_PRERENDER_SLOTS = 6`). The display thread
 pops one per VSync, maps via VAAPI→PRIME, and commits via DRM atomic.
 `SubmitFrame` **blocks** when all slots are full — this is the VSync
 backpressure that paces the decoder to the display refresh rate.
 
-The 3-slot depth lets the decoder stay ahead so an occasional VPP spike
-(heavy keyframe through 4K HQ scaling, GPU contention) drains a slot
-instead of missing the next VSync.
+The 6-slot depth (= 120 ms tolerance @ 50 fps) is sized to absorb a
+single UHD VPP / memory-bandwidth spike (observed ~80 ms in replay on
+1280×720 → 3840×2160 upscale) without draining the cache and forcing
+a re-present. FHD never fills past 1–2 slots, so the extra depth is a
+no-op there; the lipsync pipeline is delayed in lockstep with audio,
+not just video, so the extra slots do not shift `rawDelta`.
 
 ### Starve detection
 
@@ -266,7 +297,7 @@ alive. A starve is logged when:
 
 - the last fresh commit was within `ACTIVE_WINDOW_MS = 500 ms`
   (decoder is "active"), AND
-- the empty-VSync streak reaches `DISPLAY_PRERENDER_SLOTS + 2 = 5`
+- the empty-VSync streak reaches `DISPLAY_PRERENDER_SLOTS + 2 = 8`
   (the prerender depth could not absorb it, so the user *will* see a
   missed VSync), AND
 - the warmup grace has expired (see below).
@@ -308,7 +339,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | Channel switch (`Clear()`) | reset              | unchanged  | flushed; freerun armed         |
 | Catch-up enter             | (drops silent)     | unchanged  | drained silently to alignment  |
 | Catch-up exit              | reset              | unchanged  | one frame submitted normally   |
-| Soft drop                  | `+= frameDur` / drop | armed    | one frame removed per drop     |
+| Soft drop                  | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
 | Soft sleep                 | `−= measured`      | armed      | unchanged                      |
 | Hard-behind                | reset              | unchanged  | N frames dropped               |
 | Hard-ahead (replay)        | reset              | armed      | unchanged                      |
@@ -329,7 +360,7 @@ sync d=+12.5ms avg=+11.7ms lat=40ms buf=50 aq=0 miss=0 drop=0 skip=0
 | ------ | ------- |
 | `d`    | Interval mean of `rawDelta` since the last log; comparable to `avg` |
 | `avg`  | EMA-smoothed delta; drives every soft-correction decision |
-| `lat`  | Active `SyncLatency90k` (2-frame tail + active operator knob) |
+| `lat`  | Active `SyncLatency90k` (1-frame tail + active operator knob) |
 | `buf`  | `jitterBuf` depth in frames at log emission |
 | `aq`   | Audio packet queue depth |
 | `miss` | Drain gaps > 2 × output frame period since last log (VSync backpressure, our sleeps) |
@@ -359,10 +390,13 @@ decoder is gate-bound or throughput-bound:
   `d ≈ +halfFrame` (~+7 ms @ 50 fps). The gate releases head when its
   pts is `+halfFrame` ahead of `clock + latency`, so submitted frames
   carry that small positive offset.
-- **Throughput-bound** (replay post-Clear, `buf ≈ 0`): `d ≈ −2 × frameDur`
-  (~−40 ms @ 50 fps). Each new frame is submitted as soon as decoded;
+- **Throughput-bound** (replay post-Clear, `buf ≈ 0`): `d ≈ −frameDur`
+  (~−20 ms @ 50 fps). Each new frame is submitted as soon as decoded;
   no buffered lead, and the audio clock has already advanced past the
-  latency target by the time `SyncAndSubmit` runs.
+  latency target by the time `SyncAndSubmit` runs. The 1-frame
+  pipeline-latency tail keeps this baseline well inside `CORRIDOR`,
+  giving ~30 ms of head room before a typical 10–15 ms/s
+  pipeline/crystal drift can trip soft-behind.
 
 Both baselines sit inside `±CORRIDOR` and are **not** drift — the
 controller leaves them alone, since correcting a non-drifting bias
@@ -401,8 +435,8 @@ Naming conventions:
 | `DECODER_SYNC_WARMUP_SAMPLES`       | 50    | Samples averaged before EMA seed (~1 s @ 50 fps) |
 | `DECODER_SYNC_FREERUN_FRAMES`       | 1     | Unpaced frames after sync-disrupting events |
 | `DECODER_SYNC_LOG_INTERVAL_MS`      | 2000  | Periodic sync diagnostic interval (ms) |
-| `DISPLAY_PRERENDER_SLOTS`           | 3     | Decoder→display handoff queue depth; absorbs single-VSync VPP spikes |
+| `DISPLAY_PRERENDER_SLOTS`           | 6     | Decoder→display handoff queue depth (= 120 ms tolerance @ 50 fps); absorbs UHD VPP / memory-bandwidth spikes |
 | `ACTIVE_WINDOW_MS` *(local)*        | 500   | Window after last fresh commit during which a VSync starve counts |
 | `STARVE_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between starve dsyslog lines |
 | `WARMUP_GRACE_MS` *(local)*         | 3000  | Post-idle grace suppressing starve logs while pipeline anchors |
-| `STARVE_STREAK_THRESHOLD` *(local)* | 5     | Empty-VSync streak length that trips a starve log (= PRERENDER_SLOTS + 2) |
+| `STARVE_STREAK_THRESHOLD` *(local)* | 8     | Empty-VSync streak length that trips a starve log (= PRERENDER_SLOTS + 2) |

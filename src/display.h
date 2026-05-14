@@ -132,7 +132,11 @@ class cVaapiDisplay : public cThread {
     /// Tell the display thread that the decoder is intentionally pacing slow (trick play).
     /// While set, the starve detector ignores re-presents -- they reflect trick pacing, not a stall.
     /// Cleared by the decoder when trick mode ends.
-    auto SetTrickActive(bool active) noexcept -> void { trickActive.store(active, std::memory_order_relaxed); }
+    auto SetTrickActive(bool enable) noexcept -> void { trickActive.store(enable, std::memory_order_relaxed); }
+    /// Decoder is intentionally sleeping inside a sync correction (hard-ahead / soft-ahead).
+    /// While set, the starve detector ignores re-presents -- they reflect the sleep, not a stall.
+    /// Decoder pairs each SleepMs with on/off so the suppression window matches the actual sleep.
+    auto SetSyncSleeping(bool enable) noexcept -> void { syncSleeping.store(enable, std::memory_order_relaxed); }
     /// Hand a decoded frame to the display thread (single-slot queue).
     /// timeoutMs: -1 = block indefinitely (decoder's VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
@@ -316,6 +320,8 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> stopping;      ///< Tells Action() to exit; set after isClearing to avoid import/exit race
     std::atomic<bool> trickActive{
         false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses starve log
+    std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
+                                           ///< suppresses starve log so an intentional sleep doesn't fire it.
     std::atomic<uint64_t> lastFrameCommitMs{0}; ///< Wall-clock ms of the most recent fresh-frame commit;
                                                 ///< 0 = inactive (post-Clear). Gates the starve tracker.
     std::atomic<uint64_t> lastVSyncTimeMs{0};   ///< Wall-clock ms of the most recent page-flip event

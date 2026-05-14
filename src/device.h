@@ -183,8 +183,8 @@ class cVaapiDevice : public cDevice {
         -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order
     auto SubmitBlackFrame() -> void; ///< Allocate a VAAPI NV12 black surface and submit it through the display pipeline
-    auto SuspendHardware() -> void; ///< Release DRM/VAAPI/ALSA/OSD without touching cControl or VT;
-                                    ///< shared by Detach() (SVDRP DETA) and SetPlayMode(pmExtern).
+    auto SuspendHardware() -> void;  ///< Release DRM/VAAPI/ALSA/OSD without touching cControl or VT;
+                                     ///< shared by Detach() (SVDRP DETA) and SetPlayMode(pmExtern).
 
     // ========================================================================
     // === STATE ===

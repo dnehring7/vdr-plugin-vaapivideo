@@ -324,15 +324,18 @@ auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
     consider(AV_CODEC_ID_H264, avcFinal, avc);
     consider(AV_CODEC_ID_MPEG2VIDEO, mpegOk, mpeg2);
 
+    // Use avcodec_get_name() so the codec identifier matches the one printed by device.cpp
+    // ("video codec h264 ...") and decoder.cpp ("opened h264 ...") -- otherwise the log mixes
+    // "H.264" / "HEVC" / "MPEG-2" with the lowercase FFmpeg names within a single channel switch.
     if (best == AV_CODEC_ID_HEVC) {
-        dsyslog("vaapivideo/stream: detected HEVC -- mask=0x%02X hits=%d pos=%zu", hevc.seenMask, bestHits,
-                hevc.lastPos);
+        dsyslog("vaapivideo/stream: detected %s -- mask=0x%02X hits=%d pos=%zu", avcodec_get_name(best), hevc.seenMask,
+                bestHits, hevc.lastPos);
     } else if (best == AV_CODEC_ID_H264) {
-        dsyslog("vaapivideo/stream: detected H.264 -- mask=0x%02X hits=%d pos=%zu", avc.seenMask, bestHits,
-                avc.lastPos);
+        dsyslog("vaapivideo/stream: detected %s -- mask=0x%02X hits=%d pos=%zu", avcodec_get_name(best), avc.seenMask,
+                bestHits, avc.lastPos);
     } else if (best == AV_CODEC_ID_MPEG2VIDEO) {
-        dsyslog("vaapivideo/stream: detected MPEG-2 -- mask=0x%02X hits=%d pos=%zu", mpeg2.seenMask, bestHits,
-                mpeg2.lastPos);
+        dsyslog("vaapivideo/stream: detected %s -- mask=0x%02X hits=%d pos=%zu", avcodec_get_name(best), mpeg2.seenMask,
+                bestHits, mpeg2.lastPos);
     }
 
     return best;
