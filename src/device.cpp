@@ -902,6 +902,12 @@ auto cVaapiDevice::Play() -> void {
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
         isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s)", avcodec_get_name(detectedCodec),
                 isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
+
+        // Mirrors HandleAudioTrackChange: re-arms freerun so a cold-VPP stall can't anchor
+        // sync to a clock that ran ~5 s ahead while the GPU loaded firmware on first use.
+        if (decoder) [[likely]] {
+            decoder->NotifyAudioChange();
+        }
     }
 
     // Radio detection: 3 s grace set by SetPlayMode(pmAudioVideo) with no video arriving;
