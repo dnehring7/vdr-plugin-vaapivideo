@@ -11,6 +11,7 @@
  *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
  * Lock order: importMutex -> bufferMutex -> osdMutex.
+ *             {bufferMutex, vaDriverMutex} -> videoRectMutex (innermost; never held while acquiring any other lock).
  * WaitForPageFlip() MUST complete before BeginStreamSwitch() takes importMutex;
  * reversing that order deadlocks because the consumer cannot drain DRM events while
  * importMutex is held by the main thread.
@@ -357,6 +358,7 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     activeMode = displayMode;
     outputWidth = displayMode.hdisplay;
     outputHeight = displayMode.vdisplay;
+    videoRect = cRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
     // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
     // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
     // are coupled; changing one without the other desyncs the A/V controllers.
@@ -1627,16 +1629,49 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     }
 }
 
+[[nodiscard]] auto cVaapiDisplay::GetVideoRectHeight() const -> uint32_t {
+    cMutexLock lock(&videoRectMutex);
+    return static_cast<uint32_t>(videoRect.Height());
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetVideoRectWidth() const -> uint32_t {
+    cMutexLock lock(&videoRectMutex);
+    return static_cast<uint32_t>(videoRect.Width());
+}
+
+[[nodiscard]] auto cVaapiDisplay::SetVideoRect(const cRect &rect) -> bool {
+    cMutexLock lock(&videoRectMutex);
+    cRect newRect;
+    if (rect.IsEmpty()) {
+        newRect = cRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
+    } else {
+        // NV12 (4:2:0) requires plane coordinates to be 2-pixel aligned on Intel DRM.
+        newRect = cRect(rect.X() & ~1, rect.Y() & ~1, std::max(2, rect.Width() & ~1), std::max(2, rect.Height() & ~1));
+    }
+    const bool dimsChanged = (newRect.Width() != videoRect.Width() || newRect.Height() != videoRect.Height());
+    dsyslog("vaapivideo/display: SetVideoRect x=%d y=%d w=%d h=%d%s", newRect.X(), newRect.Y(), newRect.Width(),
+            newRect.Height(), dimsChanged ? " (rebuild)" : "");
+    videoRect = newRect;
+    return dimsChanged;
+}
+
 [[nodiscard]] auto cVaapiDisplay::PresentBuffer(const DrmFramebuffer &fb) -> bool {
     if (!fb.IsValid()) {
         return false;
     }
 
-    // Letterbox/pillarbox by centering. The decoder's scale_vaapi already produced
-    // display-fitted dimensions preserving DAR; KMS scans out 1:1 (no plane scaler on
-    // the planes we use), so all we have to do here is offset.
-    const uint32_t destX = (fb.width < outputWidth) ? (outputWidth - fb.width) / 2 : 0;
-    const uint32_t destY = (fb.height < outputHeight) ? (outputHeight - fb.height) / 2 : 0;
+    // Snapshot the current video rect. scale_vaapi produces a framebuffer exactly sized to this
+    // rect, so CRTC_W/H == SRC_W/H — no DRM plane scaler. CRTC_X/Y positions the plane.
+    cRect vr;
+    {
+        cMutexLock lock(&videoRectMutex);
+        vr = videoRect;
+    }
+    // Center scale_vaapi output within the rect (handles brief transition before filter rebuild).
+    const int32_t destX =
+        vr.X() + (static_cast<int>(fb.width) < vr.Width() ? (vr.Width() - static_cast<int>(fb.width)) / 2 : 0);
+    const int32_t destY =
+        vr.Y() + (static_cast<int>(fb.height) < vr.Height() ? (vr.Height() - static_cast<int>(fb.height)) / 2 : 0);
 
     AtomicRequest req;
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
@@ -1669,14 +1704,23 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     if (videoProps.colorRangeValid) {
         req.AddProperty(videoPlaneId, videoProps.colorRange, videoProps.colorRangeLimited);
     }
+    // Clamp source + dest together to display bounds (1:1 crop, no DRM scaler).
+    // Also enforce 2-pixel alignment: NV12 (4:2:0) requires even CRTC_X/Y on Intel DRM.
+    const auto safeDestX = static_cast<uint32_t>(std::max(0, destX) & ~1);
+    const auto safeDestY = static_cast<uint32_t>(std::max(0, destY) & ~1);
+    const uint32_t planeW = std::min(fb.width, safeDestX < outputWidth ? outputWidth - safeDestX : 0u) & ~1u;
+    const uint32_t planeH = std::min(fb.height, safeDestY < outputHeight ? outputHeight - safeDestY : 0u) & ~1u;
+    if (planeW == 0 || planeH == 0) [[unlikely]] {
+        return false;
+    }
     req.AddProperty(videoPlaneId, videoProps.srcX, 0);
     req.AddProperty(videoPlaneId, videoProps.srcY, 0);
-    req.AddProperty(videoPlaneId, videoProps.srcW, static_cast<uint64_t>(fb.width) << 16);
-    req.AddProperty(videoPlaneId, videoProps.srcH, static_cast<uint64_t>(fb.height) << 16);
-    req.AddProperty(videoPlaneId, videoProps.crtcX, destX);
-    req.AddProperty(videoPlaneId, videoProps.crtcY, destY);
-    req.AddProperty(videoPlaneId, videoProps.crtcW, fb.width);
-    req.AddProperty(videoPlaneId, videoProps.crtcH, fb.height);
+    req.AddProperty(videoPlaneId, videoProps.srcW, static_cast<uint64_t>(planeW) << 16);
+    req.AddProperty(videoPlaneId, videoProps.srcH, static_cast<uint64_t>(planeH) << 16);
+    req.AddProperty(videoPlaneId, videoProps.crtcX, static_cast<uint64_t>(safeDestX));
+    req.AddProperty(videoPlaneId, videoProps.crtcY, static_cast<uint64_t>(safeDestY));
+    req.AddProperty(videoPlaneId, videoProps.crtcW, planeW);
+    req.AddProperty(videoPlaneId, videoProps.crtcH, planeH);
 
     // Bundle pending OSD geometry into the same atomic commit as the video flip. Both
     // planes switch on the exact same vblank: separate commits would let one plane lag

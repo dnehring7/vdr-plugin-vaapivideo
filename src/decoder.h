@@ -102,6 +102,8 @@ class cVaapiDecoder : public cThread {
     auto RequestCodecDrain() -> void;    ///< Ask decode thread to drain B-frame reorder buffer (e.g. before still).
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
+    auto RequestFilterRebuild()
+        -> void;                     ///< Schedule filter graph rebuild on next decoded frame (e.g. after ScaleVideo).
     auto RequestTrickExit() -> void; ///< Deferred Play()-without-TrickSpeed(0); cleared if SetTrickSpeed() follows.
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)
         -> void;             ///< Configure trick-play pacing. speed=0 returns to normal. fast=true -> key-frames only.
@@ -223,6 +225,8 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> liveMode;          ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
     std::atomic<bool> ready{false};      ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
     std::atomic<int> trickSpeed;         ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
+    std::atomic<bool> videoRectDirty{
+        false}; ///< Triggers filterChain.Reset() on next frame; set by RequestFilterRebuild().
 
     // ========================================================================
     // === TRICK MODE ===

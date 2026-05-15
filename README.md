@@ -377,7 +377,7 @@ The plugin uses the Linux console for two things:
 
 1. **KBD remote** — VDR reads keypresses from `stdin`; needs `stdin` bound to a VT.
 2. **VT auto-management** — startup and `ATTA` pull VDR's VT to the foreground;
-   `DETA` yields to `tty1` so the user lands on getty. Needs
+   `DETA` yields to `tty1` (override with `VDR_CONSOLE_TTY=N`) so the user lands on getty. Needs
    `CAP_SYS_TTY_CONFIG`.
 
 A single systemd drop-in covers both. `tty7` is conventional and keeps
@@ -412,7 +412,8 @@ Switch to VDR with `Ctrl+Alt+F7`; back to a login shell with `Ctrl+Alt+F1`.
 #### Behaviour during `DETA` / `ATTA`
 
 `DETA` releases DRM and switches the foreground to `tty1` so the user lands on
-the getty login (and `fbcon` takes over the screen). KBD keeps reading from
+the getty login (and `fbcon` takes over the screen). Set `VDR_CONSOLE_TTY=N` in
+the drop-in `[Service]` section to override the target VT. KBD keeps reading from
 `stdin`; the kernel only delivers keypresses to the foreground VT, so KBD
 pauses while you are on `tty1` and resumes on the next `ATTA` (which pulls
 VDR's VT, e.g. `tty7`, back to the foreground) or a manual `Ctrl+Alt+F7`.

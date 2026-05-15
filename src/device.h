@@ -93,6 +93,8 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === VDR DEVICE INTERFACE (public in cDevice) ===
     // ========================================================================
+    [[nodiscard]] auto CanScaleVideo(const cRect &rect, int alignment = taCenter)
+        -> cRect override;         ///< DRM overlay plane supports arbitrary output rects; returns rect unchanged.
     auto Clear() -> void override; ///< Flush decoder and audio queues without releasing hardware
     [[nodiscard]] auto DeviceName() const
         -> cString override; ///< Descriptive name (DRM path + connector) for SVDRP PRIM/LSTD replies
@@ -116,6 +118,8 @@ class cVaapiDevice : public cDevice {
     auto Play() -> void override; ///< Resume normal playback: clear trick speed and unpause
     [[nodiscard]] auto Poll(cPoller &Poller, int TimeoutMs = 0)
         -> bool override; ///< Return true when at least one queue has space for more data
+    auto ScaleVideo(const cRect &rect = cRect::Null)
+        -> void override;                                       ///< Apply video output rect via DRM plane scaler.
     auto SetPrimary(bool On) -> void { MakePrimaryDevice(On); } ///< Public accessor for protected MakePrimaryDevice()
     auto StillPicture(const uchar *Data, int Length)
         -> void override;                                      ///< Decode and hold a single PES frame as a still image

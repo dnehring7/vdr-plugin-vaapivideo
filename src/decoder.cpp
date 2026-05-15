@@ -535,6 +535,8 @@ auto cVaapiDecoder::RequestCodecReopen() -> void {
     forceCodecReopen = true;
 }
 
+auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, std::memory_order_release); }
+
 [[nodiscard]] auto cVaapiDecoder::OpenCodec(AVCodecID codecId) -> bool {
     // PES path: no extradata; SPS/PPS/VPS are inline, and FFmpeg infers profile on first frame.
     // Backend table defaults to 8-bit row; bit-depth update requires a full reopen via OpenCodecWithInfo.
@@ -1298,12 +1300,17 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             }
 
             // vaDriverMutex serializes VAAPI access against the display thread's DRM PRIME export.
-            // Filter graph is built lazily on first frame and after each Clear().
+            // Filter graph is built lazily on first frame and after each Clear() or ScaleVideo() change.
             const int64_t sourcePts = decodedFrame->pts;
             const size_t prevOutCount = outFrames.size();
             {
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
 
+                if (videoRectDirty.exchange(false, std::memory_order_acq_rel)) {
+                    dsyslog("vaapivideo/decoder: video rect changed, rebuilding filter graph");
+                    jitterBuf.clear(); // drop old-sized frames before they reach PresentBuffer
+                    filterChain.Reset();
+                }
                 if (!filterChain.IsBuilt()) {
                     (void)InitFilterGraph(decodedFrame.get());
                 }
@@ -1409,8 +1416,8 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.fpsDen = codecCtx->framerate.den;
     params.hwFramesCtx = codecCtx->hw_frames_ctx;
     params.hwDeviceRef = vaapiContext->hwDeviceRef;
-    params.outputWidth = display->GetOutputWidth();
-    params.outputHeight = display->GetOutputHeight();
+    params.outputWidth = display->GetVideoRectWidth();
+    params.outputHeight = display->GetVideoRectHeight();
     params.outputRefreshHz = display->GetOutputRefreshRate();
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;

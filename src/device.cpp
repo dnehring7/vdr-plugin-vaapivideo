@@ -160,7 +160,12 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     if (ownVt == 0) {
         return true;
     }
-    const int targetVt = (ownVt == 1) ? 2 : 1;
+    int targetVt = (ownVt == 1) ? 2 : 1;
+    if (const char *env = std::getenv("VDR_CONSOLE_TTY"); env != nullptr) {
+        const int n = std::atoi(env);
+        if (n >= 1 && n <= 63 && n != ownVt)
+            targetVt = n;
+    }
     if (!SwitchToVt(targetVt)) {
         return false;
     }
@@ -326,6 +331,8 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 [[nodiscard]] auto cVaapiDevice::CanReplay() const -> bool {
     return (initState.load(std::memory_order_acquire) == 2) && decoder && decoder->IsReady();
 }
+
+[[nodiscard]] auto cVaapiDevice::CanScaleVideo(const cRect &rect, int /*alignment*/) -> cRect { return rect; }
 
 auto cVaapiDevice::Clear() -> void {
     // Diagnostic: log thread + inter-call delta to diagnose unexpected Clear() bursts.
@@ -1068,6 +1075,16 @@ auto cVaapiDevice::Play() -> void {
 }
 
 [[nodiscard]] auto cVaapiDevice::Ready() -> bool { return initState.load(std::memory_order_acquire) == 2; }
+
+auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
+    dsyslog("vaapivideo/device: ScaleVideo x=%d y=%d w=%d h=%d", rect.X(), rect.Y(), rect.Width(), rect.Height());
+    if (display) [[likely]] {
+        const bool rebuild = display->SetVideoRect(rect);
+        if (decoder && rebuild) {
+            decoder->RequestFilterRebuild();
+        }
+    }
+}
 
 auto cVaapiDevice::SetAudioTrackDevice(eTrackType /*Type*/) -> void {
     // Fires AFTER currentAudioTrack is assigned, so the read in the handler is reliable.

@@ -57,7 +57,8 @@ class AtomicRequest {
 ///
 /// Thread safety: SubmitFrame(), SetOsd(), BeginStreamSwitch(), EndStreamSwitch() are
 /// safe from any thread. Initialize() and Shutdown() must be called from the same thread.
-/// Lock order: importMutex -> bufferMutex -> osdMutex (see display.cpp file header).
+/// Lock order: importMutex -> bufferMutex -> osdMutex; {bufferMutex, vaDriverMutex} -> videoRectMutex (innermost).
+/// Full rationale in display.cpp file header.
 class cVaapiDisplay : public cThread {
   public:
     // ========================================================================
@@ -117,6 +118,8 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t { return outputHeight; }
     [[nodiscard]] auto GetOutputRefreshRate() const noexcept -> uint32_t { return refreshRate; }
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t { return outputWidth; }
+    [[nodiscard]] auto GetVideoRectHeight() const -> uint32_t; ///< Thread-safe snapshot of videoRect height (pixels).
+    [[nodiscard]] auto GetVideoRectWidth() const -> uint32_t;  ///< Thread-safe snapshot of videoRect width (pixels).
     /// Set up planes, cache DRM property IDs, program the initial display mode, start the thread.
     [[nodiscard]] auto Initialize(int fileDescriptor, AVBufferRef *hwDevice, uint32_t crtcIdentifier,
                                   uint32_t connectorIdentifier, const drmModeModeInfo &displayMode) -> bool;
@@ -127,6 +130,10 @@ class cVaapiDisplay : public cThread {
     /// Stage new OSD geometry; applied on the next video commit (same vblank). Always marks
     /// dirty even for an unchanged fbId: VDR may repaint in-place, requiring FBC/PSR invalidation.
     auto SetOsd(const OsdOverlay &osd) -> void;
+    /// Update video output rect; cRect::Null or empty rect restores full-screen.
+    /// Returns true if the output dimensions changed (filter rebuild required).
+    /// Called from VDR main thread; PresentBuffer() snapshots it under videoRectMutex.
+    [[nodiscard]] auto SetVideoRect(const cRect &rect) -> bool;
     /// Stop display thread, blank both planes, deactivate CRTC, release all resources. Idempotent.
     auto Shutdown() -> void;
     /// Tell the display thread that the decoder is intentionally pacing slow (trick play).
@@ -339,6 +346,9 @@ class cVaapiDisplay : public cThread {
     uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active refresh rate in Hz; defaults to 50 if EDID reports 0
     uint32_t videoPlaneId{};                            ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{};                         ///< Cached atomic prop IDs for the video plane
+    cRect videoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH),
+                    static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Video output rect; Initialize() sets to full-screen.
+    mutable cMutex videoRectMutex; ///< Guards videoRect (written by VDR main thread, read by display thread).
 
     // ========================================================================
     // === HDR STATE ===
