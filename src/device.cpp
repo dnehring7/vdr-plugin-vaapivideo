@@ -28,6 +28,8 @@
 #include "pes.h"
 #include "stream.h"
 
+#include <vdr/osd.h> // cRect (used in CanScaleVideo / ScaleVideo signatures)
+
 // C++ Standard Library
 #include <algorithm>
 #include <array>
@@ -162,9 +164,11 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     }
     int targetVt = (ownVt == 1) ? 2 : 1;
     if (const char *env = std::getenv("VDR_CONSOLE_TTY"); env != nullptr) {
-        const int n = std::atoi(env);
-        if (n >= 1 && n <= 63 && n != ownVt)
-            targetVt = n;
+        char *endp = nullptr;
+        const long n = std::strtol(env, &endp, 10);
+        if (endp != env && *endp == '\0' && n >= 1 && n <= 63 && n != ownVt) {
+            targetVt = static_cast<int>(n);
+        }
     }
     if (!SwitchToVt(targetVt)) {
         return false;
@@ -428,9 +432,11 @@ auto cVaapiDevice::Freeze() -> void {
     }
 
     // Drop ALSA buffers: ~100-200 ms of audio is already queued in the sink and would
-    // continue playing past the freeze without an explicit drain.
+    // continue playing past the freeze without an explicit drain. DropOutput preserves the
+    // playback clock so the decoder stays paced and the display queue does not underrun on
+    // resume; using full Clear() here causes a video freerun and a starve log.
     if (audioProcessor) [[likely]] {
-        audioProcessor->Clear();
+        audioProcessor->DropOutput();
     }
 }
 
@@ -825,8 +831,11 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
 auto cVaapiDevice::Mute() -> void {
     cDevice::Mute();
 
+    // DropOutput silences the sink without nulling the playback clock; full Clear() here would
+    // null GetClock() and cause a video freerun + display underrun for every OSD-mediated mute
+    // (some skins toggle mute on menu open/close).
     if (audioProcessor) [[likely]] {
-        audioProcessor->Clear();
+        audioProcessor->DropOutput();
     }
 }
 
@@ -1255,9 +1264,11 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     }
 
     // Drop audio explicitly: VDR usually calls Mute() too but timing varies, and the
-    // queued sink content (~100-200 ms) would be audible after the trick command.
+    // queued sink content (~100-200 ms) would be audible after the trick command. DropOutput
+    // preserves the clock -- on trick-exit, WritePcmToAlsa()'s >5s-jump guard handles any
+    // timeline shift automatically.
     if (audioProcessor) [[likely]] {
-        audioProcessor->Clear();
+        audioProcessor->DropOutput();
     }
 }
 

@@ -143,7 +143,7 @@ class cVaapiDecoder : public cThread {
                     ///< attached).
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
         -> void;                                   ///< Residual-accumulator EMA; call once per output frame.
-    auto ResetSmoothedDelta() noexcept -> void;    ///< Invalidate EMA, clear warmup, zero streak counters.
+    auto ResetSmoothedDelta() noexcept -> void;    ///< Invalidate EMA, clear warmup, zero debounce counters.
     auto PushPacketToQueue(AVPacket *pkt) -> void; ///< Takes ownership of pkt. Trick mode: drops incoming on overflow.
                                                    ///< Normal mode: drops oldest. Shared by PES and mediaplayer paths.
     auto NoteStarvationTick(const AVPacket *pkt) noexcept
@@ -267,8 +267,8 @@ class cVaapiDecoder : public cThread {
     int64_t emaResidual90k{};         ///< Integer EMA remainder: carries sub-sample rounding so the filter converges
                                       ///< exactly to the mean rather than stalling when |diff| < EMA_SAMPLES ticks.
     bool smoothedDeltaValid{false};   ///< True after warmup completes. Gates soft-corridor and catch-up (sustained).
-    int hardAheadStreak{};            ///< Consecutive rawDelta > HARD_THRESHOLD; 2-sample debounce before action.
-    int hardBehindStreak{};           ///< Consecutive rawDelta < -HARD_THRESHOLD; 2-sample debounce before action.
+    int hardAheadDebounce{};          ///< Consecutive rawDelta > HARD_THRESHOLD; 2-sample debounce before action.
+    int hardBehindDebounce{};         ///< Consecutive rawDelta < -HARD_THRESHOLD; 2-sample debounce before action.
     bool catchingUp{};                ///< Bulk-dropping a catastrophic backlog (seek / startup stall).
     int catchUpDrops{};               ///< Frames silently dropped in the current catch-up pass.
     uint64_t catchUpStartMs{};        ///< cTimeMs::Now() at catch-up entry; reported at exit.

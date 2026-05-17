@@ -92,8 +92,8 @@ but tracks sustained drift; the time constant is `1 / α` samples (~1 s
    samples — guarantees exact convergence to the rawDelta mean even
    when `|diff| < N` (the naïve integer step would round to 0).
 
-`ResetSmoothedDelta()` clears warmup, EMA, residual, hard-streaks and
-catch-up state in one call. Called on channel switch, hard-behind fire,
+`ResetSmoothedDelta()` clears warmup, EMA, residual, hard-debounce counters
+and catch-up state in one call. Called on channel switch, hard-behind fire,
 catch-up exit, and `WaitForAudioCatchUp`.
 
 ## Correction regimes
@@ -150,10 +150,10 @@ before another soft event can fire.
 | `rawDelta > +HARD_THRESHOLD`, replay     | `WaitForAudioCatchUp()` blocks (≤ 5 s) until audio catches up, then submit; reset EMA, arm cooldown |
 | `rawDelta > +HARD_THRESHOLD`, live       | One sleep ≤ `DECODER_SYNC_HARD_AHEAD_MAX_MS = 500 ms`, submit; EMA `−= measured`, arm cooldown |
 
-Both directions are **streak-debounced** (`hardAheadStreak`,
-`hardBehindStreak`): a single sample over threshold submits unpaced and
+Both directions are **2-sample debounced** (`hardAheadDebounce`,
+`hardBehindDebounce`): a single sample over threshold submits unpaced and
 waits for the next sample to confirm. Real PCR discontinuities shift
-`pts` for every subsequent frame, so the streak reaches 2 within one
+`pts` for every subsequent frame, so the counter reaches 2 within one
 frame period and the correction still fires within ~20 ms. Isolated
 outliers (`snd_pcm_delay` quantization, scheduler hiccups, the
 `GetClock()` load-pair race) clear on the next sample and never trigger
@@ -288,27 +288,28 @@ a re-present. FHD never fills past 1–2 slots, so the extra depth is a
 no-op there; the lipsync pipeline is delayed in lockstep with audio,
 not just video, so the extra slots do not shift `rawDelta`.
 
-### Starve detection
+### Queue underrun detection
 
 The display thread tracks `lastFrameCommitMs` (atomic, updated on every
 fresh commit). On a VSync where no fresh frame is available it
 re-presents the previous buffer to keep flip cadence + OSD updates
-alive. A starve is logged when:
+alive. An underrun is logged when:
 
 - the last fresh commit was within `ACTIVE_WINDOW_MS = 500 ms`
   (decoder is "active"), AND
-- the empty-VSync streak reaches `DISPLAY_PRERENDER_SLOTS + 2 = 8`
-  (the prerender depth could not absorb it, so the user *will* see a
-  missed VSync), AND
+- the consecutive empty-VSync count reaches `DISPLAY_PRERENDER_SLOTS + 2
+  = 8` (the prerender depth could not absorb it, so the user *will* see
+  a missed VSync), AND
 - the warmup grace has expired (see below).
 
-Logged at most once per `STARVE_LOG_COOLDOWN_MS = 2 s`. Outside the
-active window (post-Clear, paused, pre-roll, post-trick) re-presents
+Onset is logged at most once per `UNDERRUN_LOG_COOLDOWN_MS = 2 s`; the
+matching recovery log on refill reports the actual peak length. Outside
+the active window (post-Clear, paused, pre-roll, post-trick) re-presents
 are expected and neither count nor log.
 
 ### Warmup grace
 
-`WARMUP_GRACE_MS = 3 s` suppresses the starve log for the first 3 s
+`WARMUP_GRACE_MS = 3 s` suppresses the underrun log for the first 3 s
 after the decoder resumes from idle. Armed in two cases:
 
 - **Post-Clear.** `BeginStreamSwitch()` zeroes `lastFrameCommitMs`;
@@ -318,7 +319,7 @@ after the decoder resumes from idle. Armed in two cases:
   where `BeginStreamSwitch` wasn't invoked (track switch, post-trick
   re-anchor).
 
-Without the grace, every Clear logs a spurious starve while the filter
+Without the grace, every Clear logs a spurious underrun while the filter
 graph rebuilds and the audio clock anchors.
 
 ## Sync bypass
@@ -436,7 +437,7 @@ Naming conventions:
 | `DECODER_SYNC_FREERUN_FRAMES`       | 1     | Unpaced frames after sync-disrupting events |
 | `DECODER_SYNC_LOG_INTERVAL_MS`      | 2000  | Periodic sync diagnostic interval (ms) |
 | `DISPLAY_PRERENDER_SLOTS`           | 6     | Decoder→display handoff queue depth (= 120 ms tolerance @ 50 fps); absorbs UHD VPP / memory-bandwidth spikes |
-| `ACTIVE_WINDOW_MS` *(local)*        | 500   | Window after last fresh commit during which a VSync starve counts |
-| `STARVE_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between starve dsyslog lines |
-| `WARMUP_GRACE_MS` *(local)*         | 3000  | Post-idle grace suppressing starve logs while pipeline anchors |
-| `STARVE_STREAK_THRESHOLD` *(local)* | 8     | Empty-VSync streak length that trips a starve log (= PRERENDER_SLOTS + 2) |
+| `ACTIVE_WINDOW_MS` *(local)*          | 500   | Window after last fresh commit during which an empty VSync counts as an underrun |
+| `UNDERRUN_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between underrun-onset dsyslog lines |
+| `WARMUP_GRACE_MS` *(local)*           | 3000  | Post-idle grace suppressing underrun logs while pipeline anchors |
+| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 8     | Consecutive empty-VSync count that trips an underrun log (= PRERENDER_SLOTS + 2) |

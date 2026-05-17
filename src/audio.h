@@ -57,7 +57,12 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    auto Clear() -> void; ///< Drops buffered audio and resets the playback clock; call on seek or channel change
+    auto Clear() -> void;      ///< Drops buffered audio and resets the playback clock; call on seek or channel change
+    auto DropOutput() -> void; ///< Silence playback fast: snd_pcm_drop + decode-queue flush, but DO NOT reset the
+                               ///< playback clock. Use from Mute/Freeze/SetTrickSpeed -- those are stream-preserving
+                               ///< events; a full Clear() would null GetClock(), force the decoder into freerun, and
+                               ///< cause a display underrun downstream. On position changes (FF/REW resume) the
+                               ///< Action()-thread >5s-jump guard re-anchors the clock automatically.
     auto Decode(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding/passthrough
     [[nodiscard]] auto GetClock() const noexcept
@@ -164,7 +169,7 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === DECODER ===
     // ========================================================================
-    int consecutiveDecodeErrors{};                               ///< avcodec_send_packet failure streak
+    int consecutiveDecodeErrors{};                               ///< Consecutive avcodec_send_packet failures
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder; ///< FFmpeg decoder context
     int decoderGracePackets{0};                                  ///< Packets to silently discard after (re)init
     std::atomic<int> decoderRefCount{0};                         ///< In-flight DecodeToPcm() callers
@@ -185,11 +190,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PCM CLOCK ===
     // ========================================================================
-    std::atomic<uint32_t> clearGeneration{0};         ///< Bumped on Clear()/codec swap; tags packet era
-    std::atomic<uint32_t> clockSequence{0};           ///< Seqlock for (playbackPts, lastClockUpdateMs); single-writer
-    std::atomic<uint64_t> lastClockUpdateMs{0};       ///< cTimeMs::Now() at last publish; 0 = never written
-    std::atomic<int64_t> pcmNextPts{AV_NOPTS_VALUE};  ///< DVB-anchored 90 kHz PTS for next ALSA write
-    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE}; ///< Estimated PTS at DAC output
+    std::atomic<uint32_t> clearGeneration{0};          ///< Bumped on Clear()/codec swap; tags packet era
+    std::atomic<uint32_t> clockSequence{0};            ///< Seqlock for (playbackPts, lastClockUpdateMs); single-writer
+    std::atomic<uint64_t> lastClockUpdateMs{0};        ///< cTimeMs::Now() at last publish; 0 = never written
+    std::atomic<int64_t> pcmNextPts{AV_NOPTS_VALUE};   ///< DVB-anchored 90 kHz PTS for next ALSA write
+    std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE};  ///< Estimated PTS at DAC output
+    mutable std::atomic<bool> clockStaleLogged{false}; ///< Edge-trigger flag for the GetClock() stale-age diagnostic;
+                                                       ///< set when GetClock() first returns NOPTS due to age, cleared
+                                                       ///< on the next valid read. Prevents log spam at 50 Hz polling.
 
     // ========================================================================
     // === SINK CAPABILITIES ===

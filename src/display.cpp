@@ -327,6 +327,7 @@ auto cVaapiDisplay::BeginStreamSwitch() -> void {
     {
         const cMutexLock lock(&bufferMutex);
         pendingFrames.clear();
+        pendingDepth.store(0, std::memory_order_release);
         frameSlotCond.Broadcast();
     }
     WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS);
@@ -570,6 +571,7 @@ auto cVaapiDisplay::Shutdown() -> void {
     {
         const cMutexLock lock(&bufferMutex);
         pendingFrames.clear();
+        pendingDepth.store(0, std::memory_order_release);
         displayedBuffer = DrmFramebuffer{};
         pendingBuffer = DrmFramebuffer{};
     }
@@ -639,6 +641,7 @@ auto cVaapiDisplay::Shutdown() -> void {
     }
 
     pendingFrames.push_back(std::move(frame));
+    pendingDepth.store(pendingFrames.size(), std::memory_order_release);
     return true;
 }
 
@@ -649,28 +652,29 @@ auto cVaapiDisplay::Shutdown() -> void {
 auto cVaapiDisplay::Action() -> void {
     isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
-    // Decoder-stall tracker: counts VSyncs where pendingFrames was empty during active playback
-    // (last commit < ACTIVE_WINDOW_MS ago). Warmup grace suppresses spurious starves after
-    // Clear/cold-start while filter graph + audio anchor.
+    // Queue-underrun tracker: counts VSyncs where pendingFrames was empty during active playback
+    // (last commit < ACTIVE_WINDOW_MS ago). Warmup grace suppresses spurious counts after
+    // Clear/cold-start while the filter graph + audio anchor.
     //
-    // STARVE_STREAK_THRESHOLD = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
+    // UNDERRUN_THRESHOLD_VSYNCS = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
     //   SLOTS    -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
     //   + 1      -> grace VSync for the decoder to catch up (single hiccup, no log)
-    //   + 1      -> one more sample so we trigger on sustained stalls, not transients
+    //   + 1      -> one more sample so we trigger on sustained gaps, not transients
     // Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't
     // scale linearly: at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
-    constexpr auto STARVE_STREAK_THRESHOLD = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
+    constexpr auto UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
     constexpr int ACTIVE_WINDOW_MS = 500;
-    constexpr int STARVE_LOG_COOLDOWN_MS = 2000;
+    constexpr int UNDERRUN_LOG_COOLDOWN_MS = 2000;
     constexpr int WARMUP_GRACE_MS = 3000;
-    unsigned starveStreak = 0;
-    unsigned starveTotal = 0;
+    unsigned gapVSyncs = 0;       ///< Consecutive empty VSyncs in the current gap.
+    unsigned peakGapVSyncs = 0;   ///< Longest gap in the current window; logged on recovery.
+    unsigned emptyVSyncTotal = 0; ///< Cumulative empty-VSync count since the display thread started.
     // cTimeMs(0) constructs a timer that's already timed out (begin == end == Now()), so
-    // TimedOut() returns true immediately. starveLogCooldown: first log fires without delay.
+    // TimedOut() returns true immediately. underrunLogCooldown: first log fires without delay.
     // warmupGraceUntil: no grace active until the first fresh commit arms it via the
     // prevCommitMs==0 branch below; before that the IsValid() gate on pendingBuffer prevents
-    // the starve counter from running, so "no grace at construction" is the safe state.
-    cTimeMs starveLogCooldown(0);
+    // the underrun counter from running, so "no grace at construction" is the safe state.
+    cTimeMs underrunLogCooldown(0);
     cTimeMs warmupGraceUntil(0);
 
     while (!stopping.load(std::memory_order_relaxed) && ready.load(std::memory_order_relaxed)) {
@@ -685,22 +689,22 @@ auto cVaapiDisplay::Action() -> void {
             continue;
         }
 
-        // Yield importMutex to BeginStreamSwitch() and reset the starve streak so
-        // post-switch pre-roll re-presents don't trigger a spurious starve log.
+        // Yield importMutex to BeginStreamSwitch() and reset the underrun counter so
+        // post-switch pre-roll re-presents don't trigger a spurious log.
         if (isClearing.load(std::memory_order_relaxed)) {
-            starveStreak = 0;
+            gapVSyncs = 0;
             cCondWait::SleepMs(5);
             continue;
         }
 
         // Trick play: decoder commits at the trick hold (60-2000 ms), so most VSyncs re-present.
-        // That's not a stall; drop the streak so trick-exit doesn't carry a stale count.
+        // That's not an underrun; clear the counter so trick-exit doesn't carry a stale count.
         // Sync sleep (hard-ahead / soft-ahead): decoder is deliberately paused inside a correction
-        // sleep, so re-presents during that window are intentional, not stalls.
+        // sleep, so re-presents during that window are intentional, not underruns.
         const bool inTrick = trickActive.load(std::memory_order_relaxed);
         const bool inSyncSleep = syncSleeping.load(std::memory_order_relaxed);
         if (inTrick || inSyncSleep) {
-            starveStreak = 0;
+            gapVSyncs = 0;
         }
 
         // importMutex spans both map AND commit: releasing between them lets BeginStreamSwitch()
@@ -719,6 +723,7 @@ auto cVaapiDisplay::Action() -> void {
                     if (!pendingFrames.empty()) {
                         frameToShow = std::move(pendingFrames.front());
                         pendingFrames.pop_front();
+                        pendingDepth.store(pendingFrames.size(), std::memory_order_release);
                         frameSlotCond.Broadcast();
                     }
                 }
@@ -747,7 +752,15 @@ auto cVaapiDisplay::Action() -> void {
                                 warmupGraceUntil.Set(WARMUP_GRACE_MS);
                             }
                             lastFrameCommitMs.store(nowMs, std::memory_order_release);
-                            starveStreak = 0;
+                            // Recovery log: onset fires at THRESHOLD regardless of how long the
+                            // gap actually lasts; peak captures the real length in VSyncs.
+                            if (peakGapVSyncs >= UNDERRUN_THRESHOLD_VSYNCS) {
+                                const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
+                                dsyslog("vaapivideo/display: queue refilled after %u vsyncs (~%ums); total=%u",
+                                        peakGapVSyncs, peakGapVSyncs * vsyncMs, emptyVSyncTotal);
+                            }
+                            gapVSyncs = 0;
+                            peakGapVSyncs = 0;
                             frameCommitted = true;
                         }
                     }
@@ -760,20 +773,23 @@ auto cVaapiDisplay::Action() -> void {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
-                // Only count a stall when decoder was recently active AND past warmup grace.
+                // Only count an underrun when decoder was recently active AND past warmup grace.
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
                 if (!inTrick && !inSyncSleep && lastCommitMs != 0 && nowMs - lastCommitMs < ACTIVE_WINDOW_MS &&
                     warmupGraceUntil.TimedOut()) {
-                    ++starveStreak;
-                    ++starveTotal;
-                    if (starveStreak >= STARVE_STREAK_THRESHOLD && starveLogCooldown.TimedOut()) {
-                        dsyslog("vaapivideo/display: decoder/GPU starve -- streak=%u total=%u", starveStreak,
-                                starveTotal);
-                        starveLogCooldown.Set(STARVE_LOG_COOLDOWN_MS);
+                    ++gapVSyncs;
+                    ++emptyVSyncTotal;
+                    peakGapVSyncs = std::max(gapVSyncs, peakGapVSyncs);
+                    if (gapVSyncs >= UNDERRUN_THRESHOLD_VSYNCS && underrunLogCooldown.TimedOut()) {
+                        const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
+                        dsyslog("vaapivideo/display: queue empty >=%ums; total=%u", UNDERRUN_THRESHOLD_VSYNCS * vsyncMs,
+                                emptyVSyncTotal);
+                        underrunLogCooldown.Set(UNDERRUN_LOG_COOLDOWN_MS);
                     }
                 } else {
-                    starveStreak = 0;
+                    gapVSyncs = 0;
+                    peakGapVSyncs = 0;
                 }
             } else {
                 cCondWait::SleepMs(5);
@@ -1630,17 +1646,17 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 }
 
 [[nodiscard]] auto cVaapiDisplay::GetVideoRectHeight() const -> uint32_t {
-    cMutexLock lock(&videoRectMutex);
+    const cMutexLock lock(&videoRectMutex);
     return static_cast<uint32_t>(videoRect.Height());
 }
 
 [[nodiscard]] auto cVaapiDisplay::GetVideoRectWidth() const -> uint32_t {
-    cMutexLock lock(&videoRectMutex);
+    const cMutexLock lock(&videoRectMutex);
     return static_cast<uint32_t>(videoRect.Width());
 }
 
 [[nodiscard]] auto cVaapiDisplay::SetVideoRect(const cRect &rect) -> bool {
-    cMutexLock lock(&videoRectMutex);
+    const cMutexLock lock(&videoRectMutex);
     cRect newRect;
     if (rect.IsEmpty()) {
         newRect = cRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
@@ -1661,10 +1677,10 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     }
 
     // Snapshot the current video rect. scale_vaapi produces a framebuffer exactly sized to this
-    // rect, so CRTC_W/H == SRC_W/H — no DRM plane scaler. CRTC_X/Y positions the plane.
+    // rect, so CRTC_W/H == SRC_W/H -- no DRM plane scaler. CRTC_X/Y positions the plane.
     cRect vr;
     {
-        cMutexLock lock(&videoRectMutex);
+        const cMutexLock lock(&videoRectMutex);
         vr = videoRect;
     }
     // Center scale_vaapi output within the rect (handles brief transition before filter rebuild).
@@ -1708,8 +1724,8 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // Also enforce 2-pixel alignment: NV12 (4:2:0) requires even CRTC_X/Y on Intel DRM.
     const auto safeDestX = static_cast<uint32_t>(std::max(0, destX) & ~1);
     const auto safeDestY = static_cast<uint32_t>(std::max(0, destY) & ~1);
-    const uint32_t planeW = std::min(fb.width, safeDestX < outputWidth ? outputWidth - safeDestX : 0u) & ~1u;
-    const uint32_t planeH = std::min(fb.height, safeDestY < outputHeight ? outputHeight - safeDestY : 0u) & ~1u;
+    const uint32_t planeW = std::min(fb.width, safeDestX < outputWidth ? outputWidth - safeDestX : 0U) & ~1U;
+    const uint32_t planeH = std::min(fb.height, safeDestY < outputHeight ? outputHeight - safeDestY : 0U) & ~1U;
     if (planeW == 0 || planeH == 0) [[unlikely]] {
         return false;
     }

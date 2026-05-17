@@ -718,8 +718,8 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
 
     // Tell the display thread we're (about to be) trick-paced BEFORE the codec/filter teardown
     // below. The teardown can hold vaDriverMutex for several VSyncs, during which the display
-    // would otherwise see (trickActive=false, pendingFrames=empty) and increment its starve
-    // streak. Setting trickActive up front closes that race; clearing it on speed==0 happens
+    // would otherwise see (trickActive=false, pendingFrames=empty) and increment its underrun
+    // counter. Setting trickActive up front closes that race; clearing it on speed==0 happens
     // at the end of this function once the new pacing state is fully published.
     if (display && speed != 0) {
         display->SetTrickActive(true);
@@ -880,10 +880,15 @@ auto cVaapiDecoder::Action() -> void {
                             const int64_t dueIn90k = headPts - clock - SyncLatency90k(ap);
                             const int64_t halfFrame =
                                 (static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS) / 2;
-                            waitMs =
-                                (dueIn90k <= halfFrame)
-                                    ? 1
-                                    : std::clamp(static_cast<int>((dueIn90k - halfFrame) / PTS_TICKS_PER_MS), 1, 18);
+                            const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+                            // Pre-fill wake: depth==0 means the next VSync would re-present. Wake
+                            // one frame earlier so the drain (below) reaches the pre-submit window.
+                            const int64_t wakeThreshold =
+                                (display && display->PendingDepth() == 0) ? halfFrame + frameDur : halfFrame;
+                            waitMs = (dueIn90k <= wakeThreshold)
+                                         ? 1
+                                         : std::clamp(static_cast<int>((dueIn90k - wakeThreshold) / PTS_TICKS_PER_MS),
+                                                      1, 18);
                         }
                     }
                 }
@@ -952,7 +957,7 @@ auto cVaapiDecoder::Action() -> void {
                 const uint64_t holdMs = trickHoldMs.load(std::memory_order_relaxed);
                 nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
             }
-            trickEmptyDecodes = 0; // codec was just flushed; restart the empty-streak counter
+            trickEmptyDecodes = 0; // codec was just flushed; restart the consecutive-empty counter
         }
 
         // --- Still-picture codec drain ---
@@ -1043,7 +1048,16 @@ auto cVaapiDecoder::Action() -> void {
                         const int64_t dueIn = headPts - clock - latency;
                         const int64_t halfFrame = (static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS) / 2;
                         if (dueIn > halfFrame) {
-                            break;
+                            // Pre-fill one frame ahead when display queue is empty: keeps depth
+                            // at 1-2 instead of 0-1 and absorbs audio-clock vs VSync phase drift
+                            // that would otherwise tick the underrun counter on a healthy stream.
+                            // Bounded to one frameDur so we never run further ahead.
+                            const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+                            const bool prefill =
+                                display && display->PendingDepth() == 0 && dueIn <= halfFrame + frameDur;
+                            if (!prefill) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1506,8 +1520,8 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     const int64_t maxWaitMs = std::min<int64_t>((delta / PTS_TICKS_PER_MS) + 1000, 5000LL);
     const cTimeMs deadline(static_cast<int>(maxWaitMs));
 
-    // Tell the display thread we're deliberately pausing so its starve detector doesn't
-    // count the re-presents during this loop as a stall.
+    // Tell the display thread we're deliberately pausing so its underrun detector doesn't
+    // count the re-presents during this loop.
     if (display) {
         display->SetSyncSleeping(true);
     }
@@ -1570,8 +1584,8 @@ auto cVaapiDecoder::ResetSmoothedDelta() noexcept -> void {
     warmupSampleSum90k = 0;
     rawDeltaSumSinceLog90k = 0;
     rawDeltaCountSinceLog = 0;
-    hardAheadStreak = 0;
-    hardBehindStreak = 0;
+    hardAheadDebounce = 0;
+    hardBehindDebounce = 0;
     catchingUp = false;
     catchUpDrops = 0;
 }
@@ -1697,7 +1711,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             trickSpeed.store(0, std::memory_order_relaxed);
             isTrickReverse.store(false, std::memory_order_relaxed);
             isTrickFastForward.store(false, std::memory_order_relaxed);
-            display->SetTrickActive(false); // re-enable starve detector now that pacing is normal
+            display->SetTrickActive(false); // re-enable underrun detector now that pacing is normal
             freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
             syncLogPending.store(true, std::memory_order_relaxed);
             // Fall through to the normal sync path.
@@ -1726,8 +1740,8 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     }
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
-        // Reset all controller state (EMA + warmup + streaks + catch-up + pendingDrops) so the
-        // old clock domain doesn't bleed into the new one.
+        // Reset all controller state (EMA + warmup + debounce counters + catch-up + pendingDrops)
+        // so the old clock domain doesn't bleed into the new one.
         pendingDrops = 0;
         ResetSmoothedDelta();
         return submitIfCurrent(std::move(frame));
@@ -1826,10 +1840,10 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // a single drop leaves ~HARD_THRESHOLD residual pinned for the 5 s cooldown; pendingDrops + warmup
     // serialize follow-up events and warmup reseeds inside the corridor so soft stays a no-op.
     if (rawDelta < -DECODER_SYNC_HARD_THRESHOLD_90K) [[unlikely]] {
-        if (++hardBehindStreak < 2) {
+        if (++hardBehindDebounce < 2) {
             return submitIfCurrent(std::move(frame));
         }
-        hardBehindStreak = 0;
+        hardBehindDebounce = 0;
         const int correctMs = static_cast<int>(-rawDelta / PTS_TICKS_PER_MS);
         const int totalDrops = std::max(1, (correctMs + (outputFrameDurationMs / 2)) / outputFrameDurationMs);
         pendingDrops = totalDrops - 1;
@@ -1840,17 +1854,17 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         ResetSmoothedDelta();
         return true;
     }
-    hardBehindStreak = 0;
+    hardBehindDebounce = 0;
 
     uint64_t preSleepMs = 0; // non-zero if a sleep occurred; used for post-submit EMA correction.
 
     // Hard-ahead: replay blocks via WaitForAudioCatchUp; live sleeps <= HARD_AHEAD_MAX_MS.
     // 2-sample debounce same as hard-behind: avoids a 500 ms freeze on a lone snd_pcm_delay spike.
     if (rawDelta > DECODER_SYNC_HARD_THRESHOLD_90K) {
-        if (++hardAheadStreak < 2) {
+        if (++hardAheadDebounce < 2) {
             return submitIfCurrent(std::move(frame));
         }
-        hardAheadStreak = 0;
+        hardAheadDebounce = 0;
         if (!liveMode.load(std::memory_order_relaxed)) {
             WaitForAudioCatchUp(ap, pts, latency, rawDelta);
             ++syncSkipSinceLog;
@@ -1877,7 +1891,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         pendingDrops = 0;
         syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
     } else {
-        hardAheadStreak = 0;
+        hardAheadDebounce = 0;
     }
 
     // Soft corridor: |EMA| crossed CORRIDOR -> the drift is real, not noise. Trigger uses the

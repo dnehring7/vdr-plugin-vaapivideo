@@ -137,16 +137,19 @@ class cVaapiDisplay : public cThread {
     /// Stop display thread, blank both planes, deactivate CRTC, release all resources. Idempotent.
     auto Shutdown() -> void;
     /// Tell the display thread that the decoder is intentionally pacing slow (trick play).
-    /// While set, the starve detector ignores re-presents -- they reflect trick pacing, not a stall.
+    /// While set, the underrun detector ignores re-presents -- they reflect trick pacing, not a stall.
     /// Cleared by the decoder when trick mode ends.
     auto SetTrickActive(bool enable) noexcept -> void { trickActive.store(enable, std::memory_order_relaxed); }
     /// Decoder is intentionally sleeping inside a sync correction (hard-ahead / soft-ahead).
-    /// While set, the starve detector ignores re-presents -- they reflect the sleep, not a stall.
+    /// While set, the underrun detector ignores re-presents -- they reflect the sleep, not a stall.
     /// Decoder pairs each SleepMs with on/off so the suppression window matches the actual sleep.
     auto SetSyncSleeping(bool enable) noexcept -> void { syncSleeping.store(enable, std::memory_order_relaxed); }
     /// Hand a decoded frame to the display thread (single-slot queue).
     /// timeoutMs: -1 = block indefinitely (decoder's VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
+    /// Lock-free pendingFrames depth poll. Decoder uses depth==0 to decide whether to pre-submit
+    /// one frame ahead of strict-due (avoids a VSync re-present from audio-clock vs VSync drift).
+    [[nodiscard]] auto PendingDepth() const noexcept -> size_t { return pendingDepth.load(std::memory_order_acquire); }
     /// Wall-clock ms of the most recent page-flip event; used by the decoder for VSync pacing.
     [[nodiscard]] auto GetLastVSyncTimeMs() const noexcept -> uint64_t {
         return lastVSyncTimeMs.load(std::memory_order_relaxed);
@@ -326,11 +329,11 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> ready;         ///< True after Initialize() succeeds; cleared first in Shutdown()
     std::atomic<bool> stopping;      ///< Tells Action() to exit; set after isClearing to avoid import/exit race
     std::atomic<bool> trickActive{
-        false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses starve log
+        false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses underrun log
     std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
-                                           ///< suppresses starve log so an intentional sleep doesn't fire it.
+                                           ///< suppresses underrun log so an intentional sleep doesn't fire it.
     std::atomic<uint64_t> lastFrameCommitMs{0}; ///< Wall-clock ms of the most recent fresh-frame commit;
-                                                ///< 0 = inactive (post-Clear). Gates the starve tracker.
+                                                ///< 0 = inactive (post-Clear). Gates the underrun tracker.
     std::atomic<uint64_t> lastVSyncTimeMs{0};   ///< Wall-clock ms of the most recent page-flip event
     uint32_t modeBlobId{};                      ///< KMS MODE_ID blob; must outlive CRTC enable, freed in Shutdown()
     ModesetProps modesetProps{};                ///< Cached CRTC + connector prop IDs for modeset commits
@@ -343,6 +346,8 @@ class cVaapiDisplay : public cThread {
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
     std::deque<std::unique_ptr<VaapiFrame>>
         pendingFrames; ///< Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
+    std::atomic<size_t> pendingDepth{0}; ///< Lock-free mirror of pendingFrames.size(); updated under bufferMutex
+                                         ///< on every push/pop/clear, polled by the decoder via PendingDepth().
     uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active refresh rate in Hz; defaults to 50 if EDID reports 0
     uint32_t videoPlaneId{};                            ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{};                         ///< Cached atomic prop IDs for the video plane

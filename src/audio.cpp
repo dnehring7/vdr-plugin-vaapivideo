@@ -220,18 +220,24 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
             break;
         }
     }
-    if (lastMs == 0) {
-        return AV_NOPTS_VALUE; // no write has occurred yet (post-construct or post-Clear())
-    }
-    if (pts == AV_NOPTS_VALUE) {
+    if (lastMs == 0 || pts == AV_NOPTS_VALUE) {
+        // Post-reset / pre-first-write: caller is expected to enter freerun; not a diagnostic event.
         return AV_NOPTS_VALUE;
     }
     const uint64_t nowMs = cTimeMs::Now();
     // Unsigned subtraction: wrap on clock skew / atomic race makes ageMs huge -> stale check fires safely.
     const uint64_t ageMs = nowMs - lastMs;
     if (ageMs > AUDIO_CLOCK_STALE_MS) {
+        // Stale path: writer thread stopped publishing without ResetPlaybackClock(). Edge-triggered
+        // log so a 50 Hz polling decoder doesn't spam syslog while the stall persists. Flag clears
+        // on the next valid read below.
+        if (!clockStaleLogged.exchange(true, std::memory_order_relaxed)) {
+            dsyslog("vaapivideo/audio: GetClock=NOPTS (stale: age=%lums, threshold=%lums)",
+                    static_cast<unsigned long>(ageMs), static_cast<unsigned long>(AUDIO_CLOCK_STALE_MS));
+        }
         return AV_NOPTS_VALUE;
     }
+    clockStaleLogged.store(false, std::memory_order_relaxed);
     return pts + (static_cast<int64_t>(ageMs) * PTS_TICKS_PER_MS);
 }
 
@@ -500,6 +506,25 @@ auto cAudioProcessor::RecreateParser() -> void {
     if (streamParams.codecId != AV_CODEC_ID_NONE) {
         parserCtx.reset(av_parser_init(streamParams.codecId));
     }
+}
+
+auto cAudioProcessor::DropOutput() -> void {
+    // Clock-preserving variant of Clear(): silence playback NOW (snd_pcm_drop drains the ~200 ms
+    // already queued in the ALSA sink), bump clearGeneration so in-flight decoder packets from the
+    // previous era are dropped silently, but leave (playbackPts, lastClockUpdateMs, pcmNextPts)
+    // intact. GetClock() keeps returning valid timestamps, the decoder stays paced, the display
+    // queue does not underrun. Used by Mute/Freeze/SetTrickSpeed -- all stream-preserving events.
+    //
+    // If the resumed audio is from a different timeline (FF/REW exit), WritePcmToAlsa()'s
+    // >5s-PTS-jump guard auto-detects and calls ResetPlaybackClock().
+    const cMutexLock lock(mutex.get());
+    if (alsaHandle) {
+        (void)snd_pcm_drop(alsaHandle);
+        (void)snd_pcm_prepare(alsaHandle);
+    }
+    alsaErrorCount.store(0, std::memory_order_relaxed);
+    clearGeneration.fetch_add(1, std::memory_order_release);
+    DrainPacketQueue();
 }
 
 auto cAudioProcessor::ResetPlaybackClock() -> void {
@@ -1511,6 +1536,9 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const int64_t endPts = startPts90k + static_cast<int64_t>((static_cast<uint64_t>(frames) * PTSTICKS) / rate);
 
     // playbackPts = PTS leaving the DAC = endPts minus the live ring-buffer backlog.
+    // If snd_pcm_delay() ever returns suspiciously small values for IEC61937 passthrough
+    // (some driver/sink combos don't track the queued IEC frames), playbackPts pins near
+    // endPts and GetClock() biases forward, surfacing as a positive rawDelta EMA offset.
     int64_t currentPlaybackPts = endPts;
     snd_pcm_sframes_t delayFrames = 0;
     if (alsaHandle && snd_pcm_delay(alsaHandle, &delayFrames) == 0) {
