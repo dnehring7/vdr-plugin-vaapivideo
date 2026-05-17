@@ -133,6 +133,9 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Fill BuildParams and delegate to filterChain_.Build().
     [[nodiscard]] auto ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept
         -> bool; ///< True when stream + GPU (vppP010) + display (EDID) + user config all permit HDR passthrough.
+    [[nodiscard]] auto SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame)
+        -> bool; ///< Submit unless clearEpoch raced this iteration; stale-epoch frames are dropped silently
+                 ///< (returns true so callers don't count it as a submit failure).
     [[nodiscard]] auto SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Pacing: wait deadline, skip reverse-GOP duplicates, arm next deadline; then submit.
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
@@ -157,6 +160,8 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Replay hard-ahead: block until audio clock reaches video PTS. Capped at delta/90 + 1 s, max 5 s.
     auto PublishLastPts(int64_t pts) noexcept
         -> void; ///< Decode thread only. Stores pts iff iterationEpoch matches clearEpoch (Clear-race guard).
+    auto ApplyDeferredJitterFlush(uint64_t &lastDrainMs) noexcept
+        -> void; ///< Consume a pending Clear(): reset EMA, drop jitterBuf, zero pendingDrops + lastDrainMs.
 
     // ========================================================================
     // === SYNCHRONIZATION ===
@@ -165,7 +170,7 @@ class cVaapiDecoder : public cThread {
     //
     // codecMutex and parserMutex are deliberately separate: the dvbplayer / receiver feeds the
     // parser via EnqueueData() while the decode thread is busy submitting work to VAAPI. Sharing
-    // one mutex would serialise the two -- in replay that costs ~25 ms/s of GPU submission time
+    // one mutex would serialize the two -- in replay that costs ~25 ms/s of GPU submission time
     // on UHD upscale and shows up as sustained negative drift. av_parser_parse2() only reads
     // immutable codecCtx fields (codec_id + descriptor); writers of codecCtx existence
     // (OpenCodecWithInfo / Clear / SetTrickSpeed) take BOTH mutexes in fixed order.

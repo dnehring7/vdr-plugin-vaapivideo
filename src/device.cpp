@@ -28,8 +28,6 @@
 #include "pes.h"
 #include "stream.h"
 
-#include <vdr/osd.h> // cRect (used in CanScaleVideo / ScaleVideo signatures)
-
 // C++ Standard Library
 #include <algorithm>
 #include <array>
@@ -91,6 +89,7 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/device.h>
+#include <vdr/osd.h>
 #include <vdr/player.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
@@ -110,8 +109,12 @@ static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
 // systemd drop-in (TTYPath=/dev/ttyN + AmbientCapabilities=CAP_SYS_TTY_CONFIG);
 // failures log once at INFO and fall back to manual Ctrl+Alt+F<n>. See README.
 //
-// VT_ACTIVATE/VT_WAITACTIVE work on any VT fd, so we use STDIN_FILENO directly
-// (set up by TTYPath=) and avoid touching /dev/tty0 -- no udev rule needed.
+// VT_ACTIVATE/VT_WAITACTIVE work on any VT fd, so STDIN_FILENO is used directly
+// (set up by TTYPath=) and /dev/tty0 is left alone -- no udev rule needed.
+
+constexpr int VT_SWITCH_TIMEOUT_MS = 1500; ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
+                                           ///< that refuse to release would otherwise block startup forever
+                                           ///< and look like a 60 s "plugin hang" until the watchdog fires.
 
 static std::atomic<bool> capWarned{false}, noVtHinted{false};
 
@@ -137,8 +140,20 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
         }
         return false;
     }
-    (void)ioctl(STDIN_FILENO, VT_WAITACTIVE, vt);
-    return true;
+    // Poll VT_GETSTATE instead of blocking on VT_WAITACTIVE: the latter can hang forever in
+    // VT_PROCESS mode if the owning process never releases. Bounded wait keeps startup non-fatal.
+    const cTimeMs timeout(VT_SWITCH_TIMEOUT_MS);
+    while (!timeout.TimedOut()) {
+        vt_stat state{};
+        if (ioctl(STDIN_FILENO, VT_GETSTATE, &state) == 0 && static_cast<int>(state.v_active) == vt) {
+            return true;
+        }
+        cCondWait::SleepMs(10);
+    }
+
+    isyslog("vaapivideo/device: VT%d activation timed out after %d ms -- continuing without waiting", vt,
+            VT_SWITCH_TIMEOUT_MS);
+    return false;
 }
 
 [[nodiscard]] static auto ActivateOwnVt() -> bool {
@@ -234,7 +249,7 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
     // would interpret SDR NV12 as BT.2020 PQ/HLG (crushed blacks, wrong colors). The atomic
     // commit clears HDR_OUTPUT_METADATA / Colorspace / BT.2020 COLOR_ENCODING together with
     // the black framebuffer. Normal SDR staging via the decoder is bypassed on all these
-    // call sites, so we must do it explicitly here.
+    // call sites, so it must be done explicitly here.
     display->SetHdrOutputState(HdrStreamInfo{});
 
     const auto w = static_cast<int>(display->GetOutputWidth());
@@ -301,7 +316,7 @@ cVaapiDevice::cVaapiDevice() {
 
 cVaapiDevice::~cVaapiDevice() noexcept {
     // Pass CheckDecoder=false: the decoder may already be torn down (e.g. after Detach()),
-    // and the default HasDecoder() gate would misreport us as non-primary.
+    // and the default HasDecoder() gate would misreport this device as non-primary.
     dsyslog("vaapivideo/device: destroying (isPrimary=%d)", IsPrimaryDevice(/*CheckDecoder=*/false));
 
     // Demote before destroying subsystems: prevents VDR from routing PlayVideo/OSD calls
@@ -603,7 +618,7 @@ namespace {
     return out;
 }
 
-/// Serialise an RGB24 AVFrame as a P6 PNM byte stream into a malloc()'d buffer.
+/// Serialize an RGB24 AVFrame as a P6 PNM byte stream into a malloc()'d buffer.
 /// PNM = trivial text header + raw RGB; no codec required.
 [[nodiscard]] auto MakePnm(const AVFrame *rgb24, int &outSize) -> uchar * {
     const std::string header = std::format("P6\n{} {}\n255\n", rgb24->width, rgb24->height);
@@ -720,7 +735,7 @@ namespace {
     //   tonemap -> BT.709 gamma/matrix, PC range -> yuv420p (RunGrabFilter appends rgb24).
     // Tuning:
     //   peak=1.0 must be EXPLICIT. The filter's default peak=0 means "auto-detect from MaxCLL /
-    //     mastering metadata", which we forward from the source frame -- for typical 1000-nit
+    //     mastering metadata", forwarded from the source frame -- for typical 1000-nit
     //     mastered HDR10 that derives peak~5 and produces visibly gray whites. peak=1.0 forces
     //     anything >= npl (200 nits) to clip to pure white; aggressive, but the right call for
     //     an SDR screen grab where preserving HDR specular detail isn't worth dim mid-tones.
@@ -802,7 +817,7 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
 
     if (On) {
         // CheckDecoder=false: under --detached the decoder isn't open yet; the default
-        // HasDecoder() gate would misreport us as non-primary.
+        // HasDecoder() gate would misreport this device as non-primary.
         if (IsPrimaryDevice(/*CheckDecoder=*/false)) {
             isyslog("vaapivideo/device: activated as primary device");
             // VDR owns the OSD provider's lifetime (frees it via cOsdProvider::Shutdown() at
@@ -1203,7 +1218,7 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
         return;
     }
 
-    // Re-entry guard: TS path re-enters us as PES; only outermost call manages state.
+    // Re-entry guard: TS path re-enters this method as PES; only the outermost call manages state.
     const bool isOuterCall = !inStillPicture;
 
     bool wasPaused = false;
@@ -1570,7 +1585,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     }
 
     // VAAPI requires the render node (/dev/dri/renderD*); drmGetDevice2 resolves the
-    // matching render path for the card node we already have open.
+    // matching render path for the card node already open.
     ::drmDevicePtr rawDevInfo = nullptr;
     if (drmGetDevice2(drmFd, 0, &rawDevInfo) != 0 || !rawDevInfo) [[unlikely]] {
         esyslog("vaapivideo/device: drmGetDevice2 failed");
@@ -1677,11 +1692,15 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     //   2. driver's PREFERRED mode (typically the panel's native mode)
     //   3. first listed mode (the connector won't expose any if nothing is connected)
 
-    for (int i = 0; i < resources->count_connectors; ++i) {
-        std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
-            drmModeGetConnector(drmFd, resources->connectors[i])};
-        if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) [[likely]] {
-            continue;
+    // Acceptance check for one connector. Returns true if the connector is accepted and
+    // crtcId/connectorId/activeMode have been latched. Pulled out of the loop so the same
+    // logic serves the fast cached pass and the slow full-probe fallback below.
+    // allowModeFallback=false (cached pass): accept only an exact (w,h,rate) match, so a
+    // partial cached mode list doesn't lock in preferred/first before the full EDID probe
+    // gets a chance to find the operator-selected mode.
+    const auto tryAccept = [&](drmModeConnector *connector, bool allowModeFallback) -> bool {
+        if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
+            return false;
         }
 
         // Build the kernel-style name (e.g. "HDMI-A-1", "DP-2"). Always computed -- used
@@ -1691,7 +1710,7 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
         const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
         if (!connectorName.empty() && name != connectorName) {
             dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
-            continue;
+            return false;
         }
 
         bool modeFound = false;
@@ -1703,8 +1722,10 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
                 break;
             }
         }
-
         if (!modeFound) {
+            if (!allowModeFallback) {
+                return false;
+            }
             for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
                 if (connector->modes[modeIdx].type & DRM_MODE_TYPE_PREFERRED) {
                     activeMode = connector->modes[modeIdx];
@@ -1717,6 +1738,7 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
             }
         }
 
+        uint32_t localCrtc = 0;
         std::unique_ptr<drmModeObjectProperties, FreeDrmObjectProperties> props{
             drmModeObjectGetProperties(drmFd, connector->connector_id, DRM_MODE_OBJECT_CONNECTOR)};
         if (props) {
@@ -1726,26 +1748,62 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
                 // Use CRTC_ID atomic property, not legacy encoder_id walk: the legacy path
                 // can return a stale CRTC on atomic drivers.
                 if (prop && std::strcmp(prop->name, "CRTC_ID") == 0) {
-                    crtcId = static_cast<uint32_t>(props->prop_values[propIdx]);
+                    localCrtc = static_cast<uint32_t>(props->prop_values[propIdx]);
                     break;
                 }
             }
         }
-
-        if (crtcId == 0 && resources->count_crtcs > 0) {
-            crtcId = resources->crtcs[0];
+        if (localCrtc == 0 && resources->count_crtcs > 0) {
+            localCrtc = resources->crtcs[0];
+        }
+        if (localCrtc == 0) {
+            return false;
         }
 
-        if (crtcId != 0) {
-            connectorId = connector->connector_id;
-            // Latch the chosen connector once. Sticky on subsequent re-attaches (operator
-            // expectation: a DETA/ATTA cycle keeps the same output). Also surfaces in
-            // SVDRP PRIM/LSTD via DeviceName().
-            if (connectorName.empty()) {
-                connectorName = name;
+        crtcId = localCrtc;
+        connectorId = connector->connector_id;
+        // Latch the chosen connector once. Sticky on subsequent re-attaches (operator
+        // expectation: a DETA/ATTA cycle keeps the same output). Also surfaces in
+        // SVDRP PRIM/LSTD via DeviceName().
+        if (connectorName.empty()) {
+            connectorName = name;
+        }
+        isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
+                activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
+        return true;
+    };
+
+    // Pass 1: cached state (no DDC). drmModeGetConnector() forces a fresh probe -- 100-500 ms
+    // per disconnected port, seconds on a CEC-standby sink. On boxes with 6-8 connectors that
+    // stacks up to the reported "60 s startup". Boot-probe / hot-plug cache suffices normally.
+    for (int i = 0; i < resources->count_connectors; ++i) {
+        const std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
+            drmModeGetConnectorCurrent(drmFd, resources->connectors[i])};
+        if (tryAccept(connector.get(), false)) {
+            return true;
+        }
+    }
+
+    // Pass 2: cold cache (DRM driver just loaded) or sink woke from standby after boot probe.
+    // Full DDC probe -- same cost as the pre-fix single pass, only when pass 1 missed. When a
+    // connector name is configured, pre-filter via the cached connector so we don't pay the
+    // probe cost on every connector just to find out the name doesn't match.
+    dsyslog("vaapivideo/device: no candidate in cached state -- forcing EDID probe");
+    for (int i = 0; i < resources->count_connectors; ++i) {
+        if (!connectorName.empty()) {
+            const std::unique_ptr<drmModeConnector, FreeDrmConnector> cached{
+                drmModeGetConnectorCurrent(drmFd, resources->connectors[i])};
+            if (cached) {
+                const char *typeName = drmModeGetConnectorTypeName(cached->connector_type);
+                const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", cached->connector_type_id);
+                if (name != connectorName) {
+                    continue;
+                }
             }
-            isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
-                    activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
+        }
+        const std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
+            drmModeGetConnector(drmFd, resources->connectors[i])};
+        if (tryAccept(connector.get(), true)) {
             return true;
         }
     }

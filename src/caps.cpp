@@ -90,7 +90,7 @@ namespace {
 [[nodiscard]] auto CanCreateSurfaceFourcc(VADisplay display, unsigned int rtFormat, uint32_t fourcc) noexcept -> bool {
     // NOLINTBEGIN(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
     // VASurfaceAttrib::value is a tagged union (VAGenericValue) with no zero enumerator;
-    // brace-init zeroes it, then we overwrite. Union access is the only libva ABI to set a FourCC.
+    // brace-init zeroes it; the union is then overwritten. Union access is the only libva ABI to set a FourCC.
     VASurfaceAttrib attrib{};
     attrib.type = VASurfaceAttribPixelFormat;
     attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
@@ -136,7 +136,7 @@ class ProbeVaDisplay {
 // ============================================================================
 
 auto DisplayCaps::CanDriveHdrPlane() const noexcept -> bool {
-    // All seven KMS conditions must hold before we attempt an HDR atomic commit.
+    // All seven KMS conditions must hold before attempting an HDR atomic commit.
     // Missing any one causes the commit to silently fall back or EINVAL at the kernel.
     // Sink EDID flags are NOT checked here; HdrMode::On bypasses the sink check.
     return hasHdrOutputMetadata && hasColorspaceEnum && colorspaceBt2020Ycc && hasMaxBpc && maxBpcSupported >= 10 &&

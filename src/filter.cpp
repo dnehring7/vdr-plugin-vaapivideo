@@ -107,7 +107,7 @@ auto ExtractHdrInfo(const AVFrame *frame) noexcept -> HdrStreamInfo {
         return info; // null-frame case already resolved to Sdr inside ClassifyStream
     }
     // Side-data size check guards against header/runtime ABI skew: FFmpeg's contract
-    // promises sizeof(AVMastering...), but >= lets us tolerate a larger future layout.
+    // promises sizeof(AVMastering...), but >= tolerates a larger future layout.
     if (const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
         sd != nullptr && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
         info.hasMasteringDisplay = true;
@@ -209,11 +209,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     if (!isUhd) {
         if (params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-            denoiseLevel = 16;   ///< empirical: removes MPEG-2 blocking without smearing motion
-            sharpnessLevel = 36; ///< empirical: compensates for heavy chroma subsampling
+            denoiseLevel = 16;   // empirical: removes MPEG-2 blocking without smearing motion
+            sharpnessLevel = 36; // empirical: compensates for heavy chroma subsampling
         } else {
-            denoiseLevel = 6;    ///< subtle: reduces H.264/H.265 ringing at bitrate-starved edges
-            sharpnessLevel = 30; ///< mild enhancement; strong values halate bright HD content
+            denoiseLevel = 6;    // subtle: reduces H.264/H.265 ringing at bitrate-starved edges
+            sharpnessLevel = 30; // mild enhancement; strong values halate bright HD content
         }
     }
 
@@ -254,7 +254,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Filter chain (comma-joined, built dynamically from flags above):
     //   SW decode: [bwdif|yadif] -> [hqdn3d] -> format -> hwupload -> scale_vaapi -> [sharpness_vaapi] -> [fps]
     //   HW decode: [deinterlace_vaapi] -> [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
-    // scale_vaapi is always present: it normalises pixel format and colorimetry regardless of resize.
+    // scale_vaapi is always present: it normalizes pixel format and colorimetry regardless of resize.
     std::vector<std::string> filters;
 
     // Still picture: skip the temporal deinterlacer entirely -- VAAPI VPP buffers one field pair
@@ -339,7 +339,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
 
     // hw_frames_ctx must be attached to the buffer source before avfilter_init_str();
-    // FFmpeg 7.x rejects initialisation of a HW-format source without it.
+    // FFmpeg 7.x rejects initialization of a HW-format source without it.
     bufferSrcCtx_ = avfilter_graph_alloc_filter(filterGraph_.get(), avfilter_get_by_name("buffer"), "in");
     if (!bufferSrcCtx_) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to allocate buffer source filter");
@@ -388,8 +388,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     }
 
     // FFmpeg names these from the filter-graph string's perspective, not the caller's:
-    // "outputs" connects to our buffer source (data flows out of the graph string input),
-    // "inputs" connects to our buffer sink (data flows into the graph string output).
+    // "outputs" connects to the buffer source (data flows out of the graph string input),
+    // "inputs" connects to the buffer sink (data flows into the graph string output).
     AVFilterInOut *graphInputs = avfilter_inout_alloc();
     AVFilterInOut *graphOutputs = avfilter_inout_alloc();
     if (!graphInputs || !graphOutputs) [[unlikely]] {

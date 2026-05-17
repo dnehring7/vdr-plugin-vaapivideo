@@ -25,7 +25,7 @@
  *
  * Threading: codecMutex guards codec context + filter graph (decode thread vs reopen/clear).
  *   parserMutex guards the AVCodecParserContext (EnqueueData vs reopen/clear). Separate mutexes
- *   so the dvbplayer/receiver feeding EnqueueData does not serialise the decode thread on its
+ *   so the dvbplayer/receiver feeding EnqueueData does not serialize the decode thread on its
  *   way to VAAPI. av_parser_parse2 only reads immutable codecCtx fields. packetMutex guards
  *   packetQueue (also the condvar futex).
  *   Lock order: ALWAYS codecMutex -> parserMutex -> packetMutex. Writers of codecCtx existence
@@ -115,6 +115,11 @@ constexpr int DECODER_SYNC_HARD_AHEAD_MAX_MS =
 constexpr size_t DECODER_JITTERBUF_HARD_CAP =
     150; ///< ~3 s @ 50 fps. Caps GPU surface retention when a stuck-but-valid audio clock holds the
          ///< drain's due-gate closed (SkipStaleJitterFrames only drops BEHIND-clock heads).
+constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
+    3000; ///< Drop any head sitting more than this far ahead of audio_clock. Such an offset is a real
+          ///< PTS discontinuity (post-ATTA anchor mismatch, broadcast PCR break) -- waiting for natural
+          ///< sync wastes seconds and looks like a startup freeze. Dropping immediately lets the next
+          ///< frame proceed and SyncAndSubmitFrame's catch-up path cleans up the residual.
 
 // ============================================================================
 // === STRUCTURES ===
@@ -168,8 +173,8 @@ cVaapiDecoder::~cVaapiDecoder() noexcept {
 
 auto cVaapiDecoder::Clear() -> void {
     // codecMutex first, parserMutex second (file-level lock order). Together they exclude both
-    // the decode thread (codecMutex) and any concurrent EnqueueData parse (parserMutex), so we
-    // can safely reset codec + parser as one atomic operation.
+    // the decode thread (codecMutex) and any concurrent EnqueueData parse (parserMutex), so the
+    // codec + parser can be reset as one atomic operation.
     const cMutexLock decodeLock(&codecMutex);
     const cMutexLock parseLock(&parserMutex);
 
@@ -716,11 +721,11 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
     // speed=0: normal. fast: FF/REW (speed>=6->2x, >=3->4x, else 8x). !fast: slow at 1/speed hold.
     trickExitPending.store(false, std::memory_order_relaxed); // supersedes any pending deferred trick-exit
 
-    // Tell the display thread we're (about to be) trick-paced BEFORE the codec/filter teardown
-    // below. The teardown can hold vaDriverMutex for several VSyncs, during which the display
-    // would otherwise see (trickActive=false, pendingFrames=empty) and increment its underrun
-    // counter. Setting trickActive up front closes that race; clearing it on speed==0 happens
-    // at the end of this function once the new pacing state is fully published.
+    // Notify the display thread that trick pacing is (about to be) active BEFORE the codec/filter
+    // teardown below. The teardown can hold vaDriverMutex for several VSyncs, during which the
+    // display would otherwise see (trickActive=false, pendingFrames=empty) and increment its
+    // underrun counter. Setting trickActive up front closes that race; clearing it on speed==0
+    // happens at the end of this function once the new pacing state is fully published.
     if (display && speed != 0) {
         display->SetTrickActive(true);
     }
@@ -808,7 +813,9 @@ auto cVaapiDecoder::Shutdown() -> void {
     const bool wasStopping = stopping.exchange(true, std::memory_order_acq_rel);
     // Close the public gate so concurrent OpenCodec()/EnqueueData() bail out.
     ready.store(false, std::memory_order_release);
-    dsyslog("vaapivideo/decoder: shutting down (wasStopping=%d)", wasStopping);
+    if (!wasStopping) {
+        dsyslog("vaapivideo/decoder: shutting down");
+    }
 
     if (!wasStopping) {
         {
@@ -856,6 +863,14 @@ auto cVaapiDecoder::Action() -> void {
         // clearEpoch so a Clear() / SetTrickSpeed(0) racing this iteration doesn't submit stale
         // frames or publish stale pts.
         iterationEpoch = clearEpoch.load(std::memory_order_acquire);
+
+        // Consume a Clear() that already fired before we got scheduled. Without this, the
+        // post-decode flush below would discard the first valid post-Clear frame -- Clear()
+        // drains the packet queue and calls avcodec_flush_buffers(), so the next decoded frame
+        // is genuinely new material that belongs in the jitter buffer.
+        if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
+            ApplyDeferredJitterFlush(lastDrainMs);
+        }
 
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
 
@@ -989,14 +1004,12 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         // --- Frame delivery ---
-        // Deferred Clear(): jitterBuf and EMA are decode-thread-owned; Clear() only arms the flag.
-        // pendingFrames carries pre-Clear PTS and must be discarded here too.
+        // Catches a Clear() that fired BETWEEN the top-of-iteration consume and now -- iow
+        // mid-decode, while we held codecMutex. pendingFrames in that case carries pre-Clear
+        // PTS and must be discarded along with the jitter buffer.
         if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
-            ResetSmoothedDelta();
-            jitterBuf.clear();
+            ApplyDeferredJitterFlush(lastDrainMs);
             pendingFrames.clear();
-            pendingDrops = 0;
-            lastDrainMs = 0;
         }
 
         // Unified drain for live and replay: push to jitterBuf, pop when due. SkipStaleJitterFrames
@@ -1026,9 +1039,9 @@ auto cVaapiDecoder::Action() -> void {
 
         // Freerun and pendingDrops (soft-behind burst) bypass the due-gate.
         while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
-            // Clear() / SetTrickSpeed(0) raced this iteration: abandon the stale jitterBuf so we
-            // don't scan out pre-Clear frames or burn the new freerun budget on them. Next iter's
-            // jitterFlushPending consumption empties jitterBuf.
+            // Clear() / SetTrickSpeed(0) raced this iteration: abandon the stale jitterBuf to
+            // avoid scanning out pre-Clear frames or burning the new freerun budget on them.
+            // The next iteration's jitterFlushPending consumption empties jitterBuf.
             if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
                 break;
             }
@@ -1048,10 +1061,20 @@ auto cVaapiDecoder::Action() -> void {
                         const int64_t dueIn = headPts - clock - latency;
                         const int64_t halfFrame = (static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS) / 2;
                         if (dueIn > halfFrame) {
+                            // Magnitude guard: head sitting >DECODER_DRAIN_FUTURE_MAX_MS ahead of
+                            // audio_clock is a real PTS discontinuity (post-ATTA anchor mismatch,
+                            // broadcast PCR break). Drop immediately; catch-up handles the residual.
+                            if (dueIn > DECODER_DRAIN_FUTURE_MAX_MS * PTS_TICKS_PER_MS) {
+                                dsyslog(
+                                    "vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- dropping",
+                                    static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
+                                jitterBuf.pop_front();
+                                continue; // re-check new head
+                            }
                             // Pre-fill one frame ahead when display queue is empty: keeps depth
                             // at 1-2 instead of 0-1 and absorbs audio-clock vs VSync phase drift
                             // that would otherwise tick the underrun counter on a healthy stream.
-                            // Bounded to one frameDur so we never run further ahead.
+                            // Bounded to one frameDur to never run further ahead.
                             const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
                             const bool prefill =
                                 display && display->PendingDepth() == 0 && dueIn <= halfFrame + frameDur;
@@ -1205,8 +1228,6 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
         break;
     }
-    // vaDriverMutex: avcodec_flush_buffers touches the VA driver (VAAPI hwaccel
-    // reset); without it the display thread's av_hwframe_map races on iHD.
     {
         // vaDriverMutex: avcodec_flush_buffers touches the VA driver (VAAPI hwaccel reset);
         // without it the display thread's av_hwframe_map races on iHD.
@@ -1520,7 +1541,7 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
     const int64_t maxWaitMs = std::min<int64_t>((delta / PTS_TICKS_PER_MS) + 1000, 5000LL);
     const cTimeMs deadline(static_cast<int>(maxWaitMs));
 
-    // Tell the display thread we're deliberately pausing so its underrun detector doesn't
+    // Notify the display thread of the deliberate pause so its underrun detector doesn't
     // count the re-presents during this loop.
     if (display) {
         display->SetSyncSleeping(true);
@@ -1540,7 +1561,7 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
         display->SetSyncSleeping(false);
     }
 
-    // Suppress the next drain-loop miss check: the long gap is from our deliberate wait, not
+    // Suppress the next drain-loop miss check: the long gap is from the deliberate wait, not
     // upstream starvation.
     sleptInLastSubmit = true;
     ResetSmoothedDelta();
@@ -1588,6 +1609,23 @@ auto cVaapiDecoder::ResetSmoothedDelta() noexcept -> void {
     hardBehindDebounce = 0;
     catchingUp = false;
     catchUpDrops = 0;
+}
+
+auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs) noexcept -> void {
+    ResetSmoothedDelta();
+    jitterBuf.clear();
+    pendingDrops = 0;
+    lastDrainMs = 0;
+}
+
+[[nodiscard]] auto cVaapiDecoder::SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame) -> bool {
+    // Clear-race guard for paths that sleep before submit: a Clear() during the sleep makes
+    // the frame's PTS belong to the old epoch. Drop silently (returning true so callers don't
+    // count it as a submit failure).
+    if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
+        return true;
+    }
+    return display->SubmitFrame(std::move(frame), DECODER_SUBMIT_TIMEOUT_MS);
 }
 
 auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
@@ -1695,15 +1733,6 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
 
     const int64_t pts = frame->pts;
 
-    // Clear-race guard for paths that sleep before submit; stale-epoch frames are dropped
-    // silently (returning true so callers don't count it as a submit failure).
-    auto submitIfCurrent = [this](std::unique_ptr<VaapiFrame> submitFrame) -> bool {
-        if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
-            return true;
-        }
-        return display->SubmitFrame(std::move(submitFrame), DECODER_SUBMIT_TIMEOUT_MS);
-    };
-
     // --- Trick mode ---
     if (trickSpeed.load(std::memory_order_acquire) != 0) {
         if (trickExitPending.exchange(false, std::memory_order_acquire)) {
@@ -1725,7 +1754,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         if (pts != AV_NOPTS_VALUE) {
             PublishLastPts(pts);
         }
-        return submitIfCurrent(std::move(frame));
+        return SubmitIfCurrent(std::move(frame));
     }
 
     // Publish PTS for lock-free readers (still detection, position query via GetLastPts).
@@ -1736,7 +1765,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // Freerun bypass: no audio processor, no PTS, or inside the post-Clear / trick-exit window.
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
     if (!ap || pts == AV_NOPTS_VALUE) {
-        return submitIfCurrent(std::move(frame));
+        return SubmitIfCurrent(std::move(frame));
     }
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
         freerunFrames.fetch_sub(1, std::memory_order_relaxed);
@@ -1744,7 +1773,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // so the old clock domain doesn't bleed into the new one.
         pendingDrops = 0;
         ResetSmoothedDelta();
-        return submitIfCurrent(std::move(frame));
+        return SubmitIfCurrent(std::move(frame));
     }
 
     // Snapshot latency once per frame; a mid-frame PCM<->passthrough flip must not change it.
@@ -1760,11 +1789,11 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
         }
-        return submitIfCurrent(std::move(frame));
+        return SubmitIfCurrent(std::move(frame));
     }
 
     // Consume one pending drop from a previous soft- or hard-behind burst. The triggering
-    // event already logged the count; the EMA was reset there so we don't bump it here.
+    // event already logged the count; the EMA was reset there, so it is not bumped here.
     if (pendingDrops > 0) {
         --pendingDrops;
         ++syncDropSinceLog;
@@ -1841,7 +1870,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // serialize follow-up events and warmup reseeds inside the corridor so soft stays a no-op.
     if (rawDelta < -DECODER_SYNC_HARD_THRESHOLD_90K) [[unlikely]] {
         if (++hardBehindDebounce < 2) {
-            return submitIfCurrent(std::move(frame));
+            return SubmitIfCurrent(std::move(frame));
         }
         hardBehindDebounce = 0;
         const int correctMs = static_cast<int>(-rawDelta / PTS_TICKS_PER_MS);
@@ -1862,7 +1891,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // 2-sample debounce same as hard-behind: avoids a 500 ms freeze on a lone snd_pcm_delay spike.
     if (rawDelta > DECODER_SYNC_HARD_THRESHOLD_90K) {
         if (++hardAheadDebounce < 2) {
-            return submitIfCurrent(std::move(frame));
+            return SubmitIfCurrent(std::move(frame));
         }
         hardAheadDebounce = 0;
         if (!liveMode.load(std::memory_order_relaxed)) {
@@ -1872,7 +1901,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                     static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
             pendingDrops = 0;
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
-            return submitIfCurrent(std::move(frame));
+            return SubmitIfCurrent(std::move(frame));
         }
         const int rawDeltaMs = static_cast<int>(rawDelta / PTS_TICKS_PER_MS);
         const int bigSleepMs = std::min(rawDeltaMs, DECODER_SYNC_HARD_AHEAD_MAX_MS);
@@ -1933,7 +1962,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         }
     }
 
-    const bool submitted = submitIfCurrent(std::move(frame));
+    const bool submitted = SubmitIfCurrent(std::move(frame));
     if (preSleepMs != 0) {
         // EMA feedback: subtract measured shift (elapsed - frameDur); std::max guards underflow.
         const auto elapsedMs = static_cast<int>(cTimeMs::Now() - preSleepMs);

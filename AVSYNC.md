@@ -26,7 +26,16 @@ Three invariants:
    age-extrapolation collapses period quantization to scheduling-jitter
    precision (~1 ms). After `AUDIO_CLOCK_STALE_MS = 1 s` without a write,
    or before any write has fired, `GetClock()` returns `AV_NOPTS_VALUE`
-   and the controller falls into freerun.
+   and the controller falls into freerun. Audio holds two write-path
+   commands: **`Clear()`** flushes ALSA and resets the playback clock
+   (seek / channel change); **`DropOutput()`** flushes ALSA + decode
+   queue but preserves the playback clock — used from Mute / Freeze /
+   SetTrickSpeed, where the stream is paused but not abandoned. A full
+   `Clear()` in those paths would null `GetClock()`, force the decoder
+   into freerun, and tick a display underrun on resume. The audio
+   thread additionally auto-resets the clock on any decoded-PTS jump
+   >5 s (channel switch, seek, wrap) so external paths that bypass
+   `Clear()` still re-anchor.
 
 2. **Audio is never resampled.** No `swr_set_compensation`, no software
    PLL. Only video adapts. This keeps the system stateless across
@@ -104,7 +113,7 @@ bypass the cooldown.
 ### Soft corridor — `|smoothed| > CORRIDOR (50 ms)`, cooldown elapsed
 
 Trigger uses **smoothed** (so a single bad frame can't fire the
-correction); correction size uses **rawDelta** (so we close the actual
+correction); correction size uses **rawDelta** (to close the actual
 gap, not the lagging average). Let
 `correctMs = min(|rawDelta|/90, MAX_CORRECTION_MS = 200)`.
 
@@ -215,12 +224,35 @@ frames onto `jitterBuf` (`std::deque`) and pop when due.
 
 ```
 push: pendingFrames → jitterBuf
+runaway guard: if size > JITTERBUF_HARD_CAP, drop oldest down to cap
 SkipStaleJitterFrames(): bulk-drop heads more than HARD_THRESHOLD behind clock
 loop:
   dueIn = headPts − GetClock() − latency
-  if dueIn > halfFrame: break          // head not yet due, hold buffer
-  else:                 SyncAndSubmitFrame(head)
+  if dueIn > FUTURE_MAX: drop head; continue        // PTS discontinuity
+  if dueIn > halfFrame:
+      if PendingDepth() == 0 && dueIn ≤ halfFrame + frameDur:
+          submit (pre-fill)                         // absorb phase drift
+      else:
+          break                                     // hold buffer
+  else:                  SyncAndSubmitFrame(head)
 ```
+
+`FUTURE_MAX` (`DECODER_DRAIN_FUTURE_MAX_MS`) treats multi-second future
+heads as PTS discontinuities and drops them before the normal due-gate
+wait. Smaller future offsets remain paced by the due gate.
+
+`JITTERBUF_HARD_CAP` (`DECODER_JITTERBUF_HARD_CAP = 150`, ~3 s @ 50 fps)
+caps GPU surface retention when a stuck-but-still-valid clock holds the
+due-gate closed: `SkipStaleJitterFrames()` only drops heads *behind* the
+clock, so without this guard PTS marching ahead would grow `jitterBuf`
+without bound. Drop-oldest preserves the closest-to-due tail.
+
+The **pre-fill bypass** submits the head one frameDur early when the
+display prerender queue is empty, keeping `PendingDepth()` at 1–2
+instead of 0–1. Bounded to one frameDur so the decoder never runs
+further ahead than the gate intends; absorbs audio-clock vs VSync phase
+drift that would otherwise tick the underrun counter on a healthy
+stream.
 
 `liveMode` selects only the **hard-ahead policy** inside
 `SyncAndSubmitFrame` (replay → `WaitForAudioCatchUp`, live → bounded
@@ -364,7 +396,7 @@ sync d=+12.5ms avg=+11.7ms lat=40ms buf=50 aq=0 miss=0 drop=0 skip=0
 | `lat`  | Active `SyncLatency90k` (1-frame tail + active operator knob) |
 | `buf`  | `jitterBuf` depth in frames at log emission |
 | `aq`   | Audio packet queue depth |
-| `miss` | Drain gaps > 2 × output frame period since last log (VSync backpressure, our sleeps) |
+| `miss` | Drain gaps > 2 × output frame period since last log (VSync backpressure, deliberate sync sleeps) |
 | `drop` | Frames dropped (video behind) since last log — soft + hard combined |
 | `skip` | Render delays (video ahead) since last log — soft sleep + hard-ahead combined |
 
@@ -427,10 +459,12 @@ Naming conventions:
 | `AUDIO_CLOCK_STALE_MS`              | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
 | `AUDIO_QUEUE_CAPACITY`              | 300   | Audio packet queue depth (~10 s AC-3); sized for slow-start decoders |
 | `DECODER_QUEUE_CAPACITY`            | 200   | Video packet queue depth (~4 s @ 50 fps) |
+| `DECODER_JITTERBUF_HARD_CAP`        | 150   | Decoded-frame backlog cap (~3 s @ 50 fps); drop-oldest runaway guard |
 | `DECODER_SYNC_CORRIDOR_90K`         | 4500  | Soft corridor half-width (= 50 ms × PTS_TICKS_PER_MS); below lipsync percept threshold |
 | `DECODER_SYNC_HARD_THRESHOLD_90K`   | 18000 | Hard-transient threshold (= 200 ms × PTS_TICKS_PER_MS); 2× = catch-up spike entry |
 | `DECODER_SYNC_MAX_CORRECTION_MS`    | 200   | Soft-event cap (matches HARD_THRESHOLD) so one event fully closes corridor |
 | `DECODER_SYNC_HARD_AHEAD_MAX_MS`    | 500   | Live hard-ahead sleep cap (ms) |
+| `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard before the normal due-gate wait |
 | `DECODER_SYNC_COOLDOWN_MS`          | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
 | `DECODER_SYNC_EMA_SAMPLES`          | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
 | `DECODER_SYNC_WARMUP_SAMPLES`       | 50    | Samples averaged before EMA seed (~1 s @ 50 fps) |

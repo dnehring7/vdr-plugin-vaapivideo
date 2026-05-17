@@ -409,7 +409,7 @@ Verify:
 
 Switch to VDR with `Ctrl+Alt+F7`; back to a login shell with `Ctrl+Alt+F1`.
 
-#### Behaviour during `DETA` / `ATTA`
+#### Behavior during `DETA` / `ATTA`
 
 `DETA` releases DRM and switches the foreground to `tty1` so the user lands on
 the getty login (and `fbcon` takes over the screen). Set `VDR_CONSOLE_TTY=N` in

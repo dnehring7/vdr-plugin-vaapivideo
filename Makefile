@@ -16,7 +16,7 @@ VERSION = $(shell sed -n 's/.*PLUGIN_VERSION[^"]*"\([^"]*\)".*/\1/p' src/common.
 
 ### The directory environment:
 
-# Use package data if installed...otherwise assume we're under the VDR source directory:
+# Use package data if installed...otherwise assume the build runs under the VDR source directory:
 PKG_CONFIG ?= pkg-config
 PKGCFG = $(if $(VDRDIR),$(shell $(PKG_CONFIG) --variable=$(1) $(VDRDIR)/vdr.pc),$(shell PKG_CONFIG_PATH="$$PKG_CONFIG_PATH:../../.." $(PKG_CONFIG) --variable=$(1) vdr))
 LIBDIR = $(call PKGCFG,libdir)

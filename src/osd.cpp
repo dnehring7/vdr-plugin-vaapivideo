@@ -11,8 +11,8 @@
  *
  * Threading: cPixmap rendering runs under VDR's LOCK_PIXMAPS macro and feeds Flush() on
  * the main VDR thread; provider->UpdateOsd() is called *after* releasing LOCK_PIXMAPS so
- * we don't hold the global pixmap lock across the display's atomic-commit path. The
- * display reads no pixel data from us -- it scans the dumb buffer directly via KMS, so
+ * the global pixmap lock is not held across the display's atomic-commit path. The display
+ * reads no pixel data from this code -- it scans the dumb buffer directly via KMS, so
  * the OSD lifetime must outlive any pageflip that referenced its fbId (see ~cVaapiOsd).
  */
 
@@ -54,10 +54,10 @@ cOsdProvider *osdProvider = nullptr;
 
 namespace {
 
-// cOsd's 3-arg constructor is protected and only befriended to cOsdProvider, so we can't
-// use `new cOsd(...)` directly. This thin subclass exposes it so CreateOsd() can return a
-// safe no-op object when the display is not yet attached (inheriting cOsd's default behavior:
-// no painting, level=999, not active).
+// cOsd's 3-arg constructor is protected and only befriended to cOsdProvider, so
+// `new cOsd(...)` is not callable directly. This thin subclass exposes it so CreateOsd() can
+// return a safe no-op object when the display is not yet attached (inheriting cOsd's default
+// behavior: no painting, level=999, not active).
 class cVaapiDummyOsd : public cOsd {
   public:
     cVaapiDummyOsd(int leftArg, int topArg, uint levelArg) : cOsd(leftArg, topArg, levelArg) {}
@@ -85,7 +85,7 @@ cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
     dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(GetDisplay()));
 
     // A fast restart installs the new provider before VDR destroys the old one; only null
-    // the global if it still points at us.
+    // the global if it still points at this instance.
     if (::osdProvider == this) {
         ::osdProvider = nullptr;
     }
@@ -151,9 +151,9 @@ auto cVaapiOsdProvider::CompositeOntoRgb24(uint8_t *rgb24, const int width, cons
                 if (a == 0) {
                     // fully transparent -- leave video pixel untouched
                 } else if (a == 255) {
-                    dst[0] = src[2]; ///< R
-                    dst[1] = src[1]; ///< G
-                    dst[2] = src[0]; ///< B
+                    dst[0] = src[2]; // R
+                    dst[1] = src[1]; // G
+                    dst[2] = src[0]; // B
                 } else {
                     // Straight ARGB (not premultiplied): VDR's pixmaps are non-premultiplied,
                     // and the OSD plane is configured with pixel blend mode "Coverage".
@@ -341,7 +341,7 @@ auto cVaapiOsd::Flush() -> void {
             const size_t srcStride = static_cast<size_t>(vp.Width()) * 4;
 
             // Skins routinely place pixmaps partially off-screen (animated slides, etc.);
-            // clamp to FB bounds or we'd write past mappedSize_.
+            // clamp to FB bounds or writes would overrun mappedSize_.
             const int dstX = std::max(vp.X(), 0);
             const int dstY = std::max(vp.Y(), 0);
             const int dstRight = std::min(vp.X() + vp.Width(), static_cast<int>(width_));
@@ -390,8 +390,8 @@ auto cVaapiOsd::Flush() -> void {
             continue;
         }
 
-        // Bitmap-local (x,y) maps to FB offset (bmpX0+x, bmpY0+y); clamp dirty rect so we
-        // don't write outside the mmap'd region.
+        // Bitmap-local (x,y) maps to FB offset (bmpX0+x, bmpY0+y); clamp dirty rect so writes
+        // stay inside the mmap'd region.
         const int bmpX0 = bitmap->X0();
         const int bmpY0 = bitmap->Y0();
         const int cx1 = std::max(x1, -bmpX0);
@@ -460,7 +460,7 @@ auto cVaapiOsd::Flush() -> void {
 
     // PROT_READ | PROT_WRITE: some hardened libc / ASan builds verify that the source side
     // of memcpy is readable even when only writes occur at this address. Kernel FBC/PSR reads
-    // go through the GPU mapping, not our user mmap.
+    // go through the GPU mapping, not the user mmap.
     drm_mode_map_dumb mapReq{};
     mapReq.handle = gemHandle_;
 

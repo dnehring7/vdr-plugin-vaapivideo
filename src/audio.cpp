@@ -68,7 +68,7 @@ extern "C" {
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
-// Pin our derived constant to VDR's authoritative definition.
+// Pin the derived constant to VDR's authoritative definition.
 static_assert(PTS_TICKS_PER_MS == PTSTICKS / 1000, "PTS_TICKS_PER_MS must equal VDR PTSTICKS / 1000");
 
 // ============================================================================
@@ -447,9 +447,8 @@ auto cAudioProcessor::Shutdown() -> void {
     // Initialize()'s device-swap path calls CloseDevice() directly instead, keeping the
     // processing thread alive across the swap.
     const bool wasStopping = stopping.exchange(true, std::memory_order_release);
-    dsyslog("vaapivideo/audio: shutting down (wasStopping=%d)", wasStopping);
-
     if (!wasStopping) {
+        dsyslog("vaapivideo/audio: shutting down");
         packetCondition.Broadcast();
         Cancel(3);
     }
@@ -826,12 +825,12 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    // Increment refcount so a concurrent CloseDecoder() spins until we release it.
+    // Increment refcount so a concurrent CloseDecoder() spins until this caller releases it.
     // Acquire pairs with the generation re-check immediately below.
     decoderRefCount.fetch_add(1, std::memory_order_acquire);
 
     // Re-check decoder pointer AND generation. The refcount only blocks *concurrent*
-    // teardown; a completed teardown + fresh OpenDecoder() before our increment slips
+    // teardown; a completed teardown + fresh OpenDecoder() before this increment slips
     // through. The generation marker (bumped before any swap) catches old-era packets:
     // feeding them to the new decoder would trigger an INVALIDDATA cascade.
     if (!decoder || clearGeneration.load(std::memory_order_acquire) != expectedGeneration) {
@@ -1543,6 +1542,16 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     snd_pcm_sframes_t delayFrames = 0;
     if (alsaHandle && snd_pcm_delay(alsaHandle, &delayFrames) == 0) {
         delayFrames = std::max<snd_pcm_sframes_t>(delayFrames, 0);
+        // Upward clamp: some drivers return stale (multi-second) delays for a few writes
+        // after snd_pcm_drop+prepare, pinning playbackPts in the past and freezing video
+        // startup until the clock recovers. 2x the configured buffer is ample headroom.
+        const auto maxSaneDelay =
+            static_cast<snd_pcm_sframes_t>(static_cast<uint64_t>(rate) * AUDIO_ALSA_BUFFER_MS * 2 / 1000);
+        if (delayFrames > maxSaneDelay) [[unlikely]] {
+            dsyslog("vaapivideo/audio: snd_pcm_delay implausible (%ld frames @ %uHz, cap=%ld) -- clamping",
+                    static_cast<long>(delayFrames), rate, static_cast<long>(maxSaneDelay));
+            delayFrames = maxSaneDelay;
+        }
         const auto delay90k = static_cast<int64_t>((static_cast<uint64_t>(delayFrames) * PTSTICKS) / rate);
         currentPlaybackPts = endPts - delay90k;
     }

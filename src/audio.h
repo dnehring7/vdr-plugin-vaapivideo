@@ -212,8 +212,8 @@ class cAudioProcessor : public cThread {
     AudioStreamParams streamParams;       ///< Active codec and format; extradata pointer (when non-null) always points
                                           ///< into storedExtradata -- never at caller memory (see AdoptStreamParams())
     std::vector<uint8_t> storedExtradata; ///< Owning copy of the active stream's extradata. AudioStreamInfo::extradata
-                                          ///< is non-owning (see src/stream.h), so we deep-copy it here to avoid a
-                                          ///< use-after-free when the caller frees its buffer between calls.
+                                          ///< is non-owning (see src/stream.h); the bytes are deep-copied here to avoid
+                                          ///< a use-after-free when the caller frees its buffer between calls.
 
     auto AdoptStreamParams(const AudioStreamParams &params)
         -> void; ///< Deep-copies params.extradata into storedExtradata and rewires streamParams.extradata

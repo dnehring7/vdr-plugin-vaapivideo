@@ -279,7 +279,7 @@ class cVaapiDisplay : public cThread {
     /// Submit an atomic commit. Sets isFlipPending for page-flip commits (non-modeset).
     /// EBUSY is silently swallowed; all other errors are logged.
     [[nodiscard]] auto AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool;
-    /// Find the planeIndex-th plane supporting @p format on our CRTC; cache its property IDs.
+    /// Find the planeIndex-th plane supporting @p format on the active CRTC; cache its property IDs.
     /// Prefers HDR-capable planes (P010 + COLOR_ENCODING BT.2020) for the NV12 video slot.
     [[nodiscard]] auto BindDrmPlane(int planeIndex, uint32_t format) -> bool;
     /// Poll for and dispatch one pending DRM event; returns true when an event was handled.
@@ -317,7 +317,7 @@ class cVaapiDisplay : public cThread {
     DrmFramebuffer displayedBuffer; ///< Front buffer currently being scanned out; kept alive until flip completes
     int drmFd{-1};                  ///< Borrowed DRM fd; lifetime owned by cVaapiDevice
     drmEventContext eventContext{}; ///< libdrm event dispatch table; only page_flip_handler is wired
-    cCondVar frameSlotCond;         ///< Signalled when a pendingFrames slot opens up (under bufferMutex)
+    cCondVar frameSlotCond;         ///< Signaled when a pendingFrames slot opens up (under bufferMutex)
     std::atomic<bool> hasExited;    ///< Set by Action() just before return; Shutdown() polls this
     AVBufferRef *hwDeviceRef{};     ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
     mutable cMutex importMutex;     ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it

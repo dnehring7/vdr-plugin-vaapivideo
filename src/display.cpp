@@ -296,9 +296,9 @@ cVaapiDisplay::~cVaapiDisplay() noexcept {
 // ============================================================================
 
 auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
-    // Called by cVaapiOsd::~cVaapiOsd before the underlying dumb buffer is freed: we must
-    // not let the destructor return while the KMS plane still references fbId, or the
-    // kernel scanout will read freed memory.
+    // Called by cVaapiOsd::~cVaapiOsd before the underlying dumb buffer is freed: the destructor
+    // must not return while the KMS plane still references fbId, or the kernel scanout will read
+    // freed memory.
     if (fbId == 0 || !ready.load(std::memory_order_relaxed)) {
         return;
     }
@@ -377,7 +377,7 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     //   2. BindDrmPlane(NV12): mandatory; also populates IN_FORMATS for step 4.
     //   3. BindDrmPlane(ARGB): optional OSD plane; playback continues without it.
     //   4. ProbeHdrCapabilities: needs videoPlaneId (set in step 2) for P010 check.
-    //   5. ApplyDisplayMode: ALLOW_MODESET commit; also initialises SDR connector state.
+    //   5. ApplyDisplayMode: ALLOW_MODESET commit; also initializes SDR connector state.
     //   6. ready=true + Start(): consumer thread must not run before step 5 completes.
     if (!LoadDrmProperties()) {
         esyslog("vaapivideo/display: failed to cache DRM properties");
@@ -444,7 +444,7 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         return nullptr;
     }
 
-    // Serialise with VPP: iHD's VEBOX deadlocks if download races with concurrent filter execution.
+    // Serialize with VPP: iHD's VEBOX deadlocks if download races with concurrent filter execution.
     const cMutexLock vaLock(&vaDriverMutex);
     if (const int ret = av_hwframe_transfer_data(dest.get(), source.get(), 0); ret < 0) [[unlikely]] {
         esyslog("vaapivideo/display: grab transfer failed: %s", AvErr(ret).data());
@@ -491,12 +491,10 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
 
 auto cVaapiDisplay::Shutdown() -> void {
     const bool wasInitialized = ready.exchange(false, std::memory_order_acq_rel);
-    dsyslog("vaapivideo/display: shutting down (wasInitialized=%d)", wasInitialized);
-
     if (!wasInitialized) {
-        dsyslog("vaapivideo/display: already shut down, skipping");
         return;
     }
+    dsyslog("vaapivideo/display: shutting down");
 
     // isClearing before stopping: if reversed, the consumer could observe (stopping=false,
     // isClearing=false) and start one more import between the two stores.
@@ -659,7 +657,7 @@ auto cVaapiDisplay::Action() -> void {
     // UNDERRUN_THRESHOLD_VSYNCS = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
     //   SLOTS    -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
     //   + 1      -> grace VSync for the decoder to catch up (single hiccup, no log)
-    //   + 1      -> one more sample so we trigger on sustained gaps, not transients
+    //   + 1      -> one more sample so the trigger fires on sustained gaps, not transients
     // Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't
     // scale linearly: at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
     constexpr auto UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
@@ -708,7 +706,7 @@ auto cVaapiDisplay::Action() -> void {
         }
 
         // importMutex spans both map AND commit: releasing between them lets BeginStreamSwitch()
-        // free the codec while we hold a pointer to its surface.
+        // free the codec while a pointer to its surface is still held.
         bool frameCommitted = false;
         {
             const cMutexLock importLock(&importMutex);
@@ -932,7 +930,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::BindDrmPlane(int planeIndex, uint32_t format) -> bool {
-    // Find the planeIndex-th plane supporting @p format on our CRTC, cache its atomic prop IDs,
+    // Find the planeIndex-th plane supporting @p format on the active CRTC, cache its atomic prop IDs,
     // and assign it as the video or OSD plane (whichever is still unbound). Format support is
     // checked via the IN_FORMATS blob -- the legacy plane->formats array has no modifier
     // information and VAAPI surfaces are always tiled.
@@ -1247,7 +1245,7 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
                     }
                 }
                 // Guard: if BT2020_YCC and Default map to the same value, SDR and HDR
-                // commits would be indistinguishable and we'd never actually change colorspace.
+                // commits would be indistinguishable and the colorspace would never actually change.
                 hdrProps.colorspaceValid =
                     haveBt2020Ycc && haveDefault && hdrProps.colorspaceBt2020Ycc != hdrProps.colorspaceDefault;
             } else if (std::strcmp(name, "max bpc") == 0 && prop->count_values >= 2) {
@@ -1495,7 +1493,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 
     const AVFrame *srcFrame = vaapiFrame->avFrame;
 
-    // Export the VAAPI surface as DRM PRIME so we can wrap it in a KMS framebuffer below.
+    // Export the VAAPI surface as DRM PRIME so it can be wrapped in a KMS framebuffer below.
     AVFrame *mappedFrame = av_frame_alloc();
     if (!mappedFrame) [[unlikely]] {
         return {};
@@ -1504,7 +1502,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     mappedFrame->format = AV_PIX_FMT_DRM_PRIME;
     // MAP_READ: KMS scanout reads pixels.
     // MAP_DIRECT: zero-copy -- the PRIME fd refers to the same memory as the VA surface,
-    //   no intermediate copy is allocated. Without this we'd duplicate every frame on
+    //   no intermediate copy is allocated. Without this every frame would be duplicated on
     //   the GPU heap.
     // vaDriverMutex: serializes VA-driver entry against the decoder thread's filter-graph
     //   execution. The iHD driver's VEBOX path is not thread-safe when shared with VPP
@@ -1532,8 +1530,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
             mappedFrame->data[0]);
     // The rest of this function assumes a single DMA-BUF object holding both NV12 layers
     // (Y + UV at different offsets). On the iHD/Mesa stacks tested this is always the
-    // shape we get; on hypothetical drivers that split planes across multiple objects
-    // we would need a per-object GEM import + multi-fd AddFB2 path. Reject early so the
+    // shape returned; on hypothetical drivers that split planes across multiple objects
+    // a per-object GEM import + multi-fd AddFB2 path would be required. Reject early so the
     // failure mode is "no scanout, log line" rather than "scanout reads from one object's
     // GEM handle plus another object's offset".
     if (!desc || desc->nb_objects == 0 || desc->nb_layers == 0 || desc->nb_objects != 1) [[unlikely]] {
@@ -1634,9 +1632,9 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] unsigned int seq,
                                     [[maybe_unused]] unsigned int sec, [[maybe_unused]] unsigned int usec, void *data)
     -> void {
-    // libdrm dispatches this from drmHandleEvent() on the consumer thread (we never call
-    // drmHandleEvent from anywhere else). The `data` cookie is the `this` pointer we passed
-    // to drmModeAtomicCommit. Release-store on isFlipPending makes the consumer's next
+    // libdrm dispatches this from drmHandleEvent() on the consumer thread (drmHandleEvent is
+    // never called from anywhere else). The `data` cookie is the `this` pointer passed to
+    // drmModeAtomicCommit. Release-store on isFlipPending makes the consumer's next
     // acquire-load see "flip done" and submit the next frame.
     auto *display = static_cast<cVaapiDisplay *>(data);
     if (display) {
@@ -1756,8 +1754,8 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         }
     }
 
-    // ALLOW_MODESET is required on AMDGPU (and i915 on some kernels) whenever we change
-    // HDR_OUTPUT_METADATA / Colorspace / max bpc -- those can force a link retrain that a
+    // ALLOW_MODESET is required on AMDGPU (and i915 on some kernels) whenever
+    // HDR_OUTPUT_METADATA / Colorspace / max bpc changes -- those can force a link retrain that a
     // "pure page-flip" commit is not permitted to trigger. The brief blackout is acceptable
     // because HDR transitions only happen at channel-switch time, never per-frame.
     const uint32_t commitFlags = hdrStateChanged ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0U;
@@ -1803,12 +1801,12 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 auto cVaapiDisplay::WaitForPageFlip(int timeoutMs) -> void {
     // Called from BeginStreamSwitch() on the main thread BEFORE taking importMutex (the
     // ordering rule documented at the top of this file). DrainDrmEvents() here works
-    // because the consumer thread runs poll() too -- only one of us actually sees a
+    // because the consumer thread runs poll() too -- only one caller actually sees a
     // given event, and isFlipPending's release/acquire serializes the result.
     const cTimeMs deadline(timeoutMs);
     while (isFlipPending.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
         // Bail on shutdown / stream-switch so callers don't sit through the full timeout
-        // when the answer is "we're tearing down anyway".
+        // when the answer is "tearing down anyway".
         if (stopping.load(std::memory_order_relaxed) || !ready.load(std::memory_order_relaxed) ||
             isClearing.load(std::memory_order_relaxed)) {
             break;

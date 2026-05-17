@@ -105,8 +105,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 
   private:
     // Labels derived from PassthroughModeName() -- keeps enum, setup.conf, and menu in sync.
-    // Order must match enum numeric values; cMenuEditStraItem stores the index and we
-    // round-trip it through setup.conf as PassthroughMode(int).
+    // Order must match enum numeric values; cMenuEditStraItem stores the index, which is
+    // round-tripped through setup.conf as PassthroughMode(int).
     static constexpr std::array kPassthroughModeLabels{
         PassthroughModeName(PassthroughMode::Auto),
         PassthroughModeName(PassthroughMode::On),
@@ -253,7 +253,7 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 
     // Must create cVaapiDevice in Initialize(), not Start(): VDR calls all Initialize() first, then sets the primary
     // device, then calls all Start(). Skin plugins query cOsdProvider::SupportsTrueColor() in their Start(), which
-    // requires our OSD provider registered via MakePrimaryDevice() -- deferring to Start() misses that window.
+    // requires the OSD provider registered via MakePrimaryDevice() -- deferring to Start() misses that window.
 
     const cString resolvedDrm = ResolveDrmDevice();
     if (isempty(*resolvedDrm)) {
@@ -275,7 +275,7 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
         esyslog("vaapivideo: VDR will continue with DVB devices only");
         esyslog("vaapivideo: see error messages above for details");
         esyslog("vaapivideo: ========================================");
-        vaapiDevice = nullptr; // VDR still destroys the instance; just relinquish our pointer
+        vaapiDevice = nullptr; // VDR still destroys the instance; just relinquish the pointer
         return false;
     }
 
@@ -404,7 +404,7 @@ auto cVaapiVideoPlugin::Start() -> bool {
     }
 
     // VDR has processed setup.conf and called MakePrimaryDevice() for the stored primary.
-    // If our device was not promoted (first-run or misconfigured setup), force it now.
+    // If the device was not promoted (first-run or misconfigured setup), force it now.
     if (!vaapiDevice->IsPrimaryDevice()) {
         const int primaryIndex = vaapiDevice->DeviceNumber() + 1;
         if (cDevice::SetPrimaryDevice(primaryIndex)) {
