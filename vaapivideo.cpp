@@ -478,8 +478,13 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
             replyCode = 550;
             return "VAAPI device attach failed - check logs for details";
         }
-        // Only retune if we are the primary device. With --detached, ATTA is valid for
-        // non-primary devices too; retuning the current primary would interrupt other playback.
+        // Promote to primary on ATTA: a non-primary vaapivideo holds the hardware but does
+        // not render. SetPrimaryDevice() is synchronous, so the IsPrimaryDevice() gate below
+        // observes the new state.
+        if (!vaapiDevice->IsPrimaryDevice()) {
+            isyslog("vaapivideo: ATTA promoting device %d to primary", vaapiDevice->DeviceNumber() + 1);
+            cDevice::SetPrimaryDevice(vaapiDevice->DeviceNumber() + 1);
+        }
         if (vaapiDevice->IsPrimaryDevice()) {
             LOCK_CHANNELS_READ;
             if (const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel())) {
