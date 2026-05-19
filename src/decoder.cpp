@@ -382,7 +382,7 @@ auto cVaapiDecoder::NoteStarvationTick(const AVPacket *pkt) noexcept -> void {
 
     // Tier 1 (~3 s): typical for long-GOP streams where mid-entry must wait for the next IDR.
     if (elapsed > 3000 && !starvationWarned.exchange(true, std::memory_order_relaxed)) {
-        isyslog("vaapivideo/decoder: no frame %llu ms after open (packets sent=%zu, "
+        dsyslog("vaapivideo/decoder: no frame %llu ms after open (packets sent=%zu, "
                 "of which keyframes=%zu) -- FFmpeg is waiting for a random-access point; "
                 "likely mid-GOP entry on a long-GOP stream",
                 static_cast<unsigned long long>(elapsed), sent, keyPacketsSinceOpen.load(std::memory_order_relaxed));
@@ -557,7 +557,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     const cMutexLock parseLock(&parserMutex);
 
     if (!ready.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire)) [[unlikely]] {
-        esyslog("vaapivideo/decoder: not initialized or shutting down");
+        dsyslog("vaapivideo/decoder: not initialized or shutting down");
         return false;
     }
 
@@ -852,7 +852,7 @@ auto cVaapiDecoder::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDecoder::Action() -> void {
-    isyslog("vaapivideo/decoder: thread started");
+    dsyslog("vaapivideo/decoder: thread started");
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
     uint64_t lastDrainMs{0};
@@ -893,13 +893,14 @@ auto cVaapiDecoder::Action() -> void {
                             waitMs = 18;
                         } else {
                             const int64_t dueIn90k = headPts - clock - SyncLatency90k(ap);
-                            const int64_t halfFrame =
-                                (static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS) / 2;
                             const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+                            const int64_t halfFrame = frameDur / 2;
+                            const int64_t prefillMargin = frameDur / 2;
                             // Pre-fill wake: depth==0 means the next VSync would re-present. Wake
-                            // one frame earlier so the drain (below) reaches the pre-submit window.
+                            // half a frame earlier than strict-due so the drain (below) reaches the
+                            // pre-submit window. MUST match the drain-loop prefill threshold below.
                             const int64_t wakeThreshold =
-                                (display && display->PendingDepth() == 0) ? halfFrame + frameDur : halfFrame;
+                                (display && display->PendingDepth() == 0) ? halfFrame + prefillMargin : halfFrame;
                             waitMs = (dueIn90k <= wakeThreshold)
                                          ? 1
                                          : std::clamp(static_cast<int>((dueIn90k - wakeThreshold) / PTS_TICKS_PER_MS),
@@ -1059,7 +1060,11 @@ auto cVaapiDecoder::Action() -> void {
                     if (headPts != AV_NOPTS_VALUE) {
                         const int64_t latency = SyncLatency90k(ap);
                         const int64_t dueIn = headPts - clock - latency;
-                        const int64_t halfFrame = (static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS) / 2;
+                        // Derive halfFrame from frameDur so the prefill-margin relationship
+                        // (halfFrame = frameDur/2, prefillMargin = frameDur/2) is expressed once
+                        // and the same shape is used in the waitMs path above.
+                        const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+                        const int64_t halfFrame = frameDur / 2;
                         if (dueIn > halfFrame) {
                             // Magnitude guard: head sitting >DECODER_DRAIN_FUTURE_MAX_MS ahead of
                             // audio_clock is a real PTS discontinuity (post-ATTA anchor mismatch,
@@ -1071,13 +1076,19 @@ auto cVaapiDecoder::Action() -> void {
                                 jitterBuf.pop_front();
                                 continue; // re-check new head
                             }
-                            // Pre-fill one frame ahead when display queue is empty: keeps depth
-                            // at 1-2 instead of 0-1 and absorbs audio-clock vs VSync phase drift
-                            // that would otherwise tick the underrun counter on a healthy stream.
-                            // Bounded to one frameDur to never run further ahead.
-                            const int64_t frameDur = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+                            // Pre-fill when display queue is empty: keeps depth at 1 instead of 0
+                            // and absorbs audio-clock vs VSync phase drift that would otherwise
+                            // tick the underrun counter on a healthy stream.
+                            //
+                            // Margin = frameDur/2 above strict-due (=halfFrame). Originally a
+                            // full frameDur, but that pushed steady-state d= so far above halfFrame
+                            // that any short audio glitch under heavy VPP load drained the queue to
+                            // 0 before recovery. Half a frame keeps enough headroom for scheduling
+                            // jitter and slow-hardware VPP variance without giving the glitch budget
+                            // back. MUST match the wakeThreshold in the waitMs path above.
+                            const int64_t prefillMargin = frameDur / 2;
                             const bool prefill =
-                                display && display->PendingDepth() == 0 && dueIn <= halfFrame + frameDur;
+                                display && display->PendingDepth() == 0 && dueIn <= halfFrame + prefillMargin;
                             if (!prefill) {
                                 break;
                             }

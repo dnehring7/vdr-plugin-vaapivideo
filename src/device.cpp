@@ -363,9 +363,9 @@ auto cVaapiDevice::Clear() -> void {
     std::array<char, 16> threadName{};
     (void)pthread_getname_np(pthread_self(), threadName.data(), threadName.size());
     if (prevMs == 0) {
-        isyslog("vaapivideo/device: Clear() thread='%s' (first call)", threadName.data());
+        dsyslog("vaapivideo/device: Clear() thread='%s' (first call)", threadName.data());
     } else {
-        isyslog("vaapivideo/device: Clear() thread='%s' delta=%llums", threadName.data(),
+        dsyslog("vaapivideo/device: Clear() thread='%s' delta=%llums", threadName.data(),
                 static_cast<unsigned long long>(nowMs - prevMs));
     }
 

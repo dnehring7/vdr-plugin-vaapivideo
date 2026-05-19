@@ -648,11 +648,17 @@ auto cVaapiDisplay::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDisplay::Action() -> void {
-    isyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
+    dsyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
-    // Queue-underrun tracker: counts VSyncs where pendingFrames was empty during active playback
-    // (last commit < ACTIVE_WINDOW_MS ago). Warmup grace suppresses spurious counts after
-    // Clear/cold-start while the filter graph + audio anchor.
+    // Queue-underrun tracker: measures the wall-clock duration of consecutive empty VSyncs
+    // during active playback. Warmup grace suppresses spurious counts after Clear/cold-start
+    // while the filter graph + audio anchor.
+    //
+    // Duration is taken directly from (nowMs - lastCommitMs) -- a wall-clock delta -- rather
+    // than a VSync count multiplied by a nominal vsyncMs. The latter lies when the consumer
+    // loop is preempted or page_flip events arrive late: a 4 s real-time stall could be
+    // mis-reported as 25 vsyncs * 20 ms (=500 ms) or, with a stale-reset bug, as 238 * 20 ms.
+    // Wall-clock makes the printed value true by construction.
     //
     // UNDERRUN_THRESHOLD_VSYNCS = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
     //   SLOTS    -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
@@ -664,8 +670,19 @@ auto cVaapiDisplay::Action() -> void {
     constexpr int ACTIVE_WINDOW_MS = 500;
     constexpr int UNDERRUN_LOG_COOLDOWN_MS = 2000;
     constexpr int WARMUP_GRACE_MS = 3000;
-    unsigned gapVSyncs = 0;       ///< Consecutive empty VSyncs in the current gap.
-    unsigned peakGapVSyncs = 0;   ///< Longest gap in the current window; logged on recovery.
+    // Beyond this the gap is no longer treated as an underrun: a stream-paused / radio-mode /
+    // suspended-stream scenario can leave lastCommitMs hours in the past, and the recovery log
+    // on resume would otherwise scream a multi-hour "queue refilled" event. inTrick / inSyncSleep
+    // catch the explicit pause paths; this is the catch-all for everything else.
+    constexpr uint64_t IDLE_THRESHOLD_MS = 10000;
+    // refreshRate is set once in EndStreamSwitch() before Action() starts and stays constant for
+    // the consumer-thread lifetime, so vsyncMs / thresholdMs are loop invariants -- hoisted.
+    const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
+    const uint64_t thresholdMs = UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
+    uint64_t gapStartMs = 0;      ///< Wall-clock baseline for the current gap; 0 = "anchor on next re-present".
+                                  ///< Reset on commit / isClearing / inTrick / inSyncSleep so a deliberate sleep
+                                  ///< or trick-pace exit does not surface its duration as a fake underrun.
+    uint64_t peakGapMs = 0;       ///< Wall-clock peak duration of the current gap; reset on commit.
     unsigned emptyVSyncTotal = 0; ///< Cumulative empty-VSync count since the display thread started.
     // cTimeMs(0) constructs a timer that's already timed out (begin == end == Now()), so
     // TimedOut() returns true immediately. underrunLogCooldown: first log fires without delay.
@@ -687,22 +704,29 @@ auto cVaapiDisplay::Action() -> void {
             continue;
         }
 
-        // Yield importMutex to BeginStreamSwitch() and reset the underrun counter so
-        // post-switch pre-roll re-presents don't trigger a spurious log.
+        // Yield importMutex to BeginStreamSwitch() and reset the underrun counters so
+        // post-switch pre-roll re-presents don't trigger a spurious log. gapStartMs reset to 0
+        // so the next non-suppressed iteration re-anchors at nowMs rather than measuring back
+        // through the isClearing window.
         if (isClearing.load(std::memory_order_relaxed)) {
-            gapVSyncs = 0;
+            gapStartMs = 0;
+            peakGapMs = 0;
             cCondWait::SleepMs(5);
             continue;
         }
 
         // Trick play: decoder commits at the trick hold (60-2000 ms), so most VSyncs re-present.
-        // That's not an underrun; clear the counter so trick-exit doesn't carry a stale count.
+        // That's not an underrun; clear the counters so trick-exit doesn't carry a stale peak
+        // OR a stale gapStartMs (which would otherwise log the trick hold itself as an underrun).
         // Sync sleep (hard-ahead / soft-ahead): decoder is deliberately paused inside a correction
-        // sleep, so re-presents during that window are intentional, not underruns.
+        // sleep, so re-presents during that window are intentional, not underruns. Same reset --
+        // gapStartMs=0 means the post-sleep re-present re-anchors instead of reporting the
+        // sleep duration as a gap.
         const bool inTrick = trickActive.load(std::memory_order_relaxed);
         const bool inSyncSleep = syncSleeping.load(std::memory_order_relaxed);
         if (inTrick || inSyncSleep) {
-            gapVSyncs = 0;
+            gapStartMs = 0;
+            peakGapMs = 0;
         }
 
         // importMutex spans both map AND commit: releasing between them lets BeginStreamSwitch()
@@ -751,14 +775,13 @@ auto cVaapiDisplay::Action() -> void {
                             }
                             lastFrameCommitMs.store(nowMs, std::memory_order_release);
                             // Recovery log: onset fires at THRESHOLD regardless of how long the
-                            // gap actually lasts; peak captures the real length in VSyncs.
-                            if (peakGapVSyncs >= UNDERRUN_THRESHOLD_VSYNCS) {
-                                const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
-                                dsyslog("vaapivideo/display: queue refilled after %u vsyncs (~%ums); total=%u",
-                                        peakGapVSyncs, peakGapVSyncs * vsyncMs, emptyVSyncTotal);
+                            // gap actually lasts; peak captures the real wall-clock length.
+                            if (peakGapMs >= thresholdMs) {
+                                dsyslog("vaapivideo/display: queue refilled after %llums; total=%u",
+                                        static_cast<unsigned long long>(peakGapMs), emptyVSyncTotal);
                             }
-                            gapVSyncs = 0;
-                            peakGapVSyncs = 0;
+                            gapStartMs = 0;
+                            peakGapMs = 0;
                             frameCommitted = true;
                         }
                     }
@@ -771,23 +794,37 @@ auto cVaapiDisplay::Action() -> void {
             const cMutexLock lock(&bufferMutex);
             if (pendingBuffer.IsValid()) {
                 (void)PresentBuffer(pendingBuffer);
-                // Only count an underrun when decoder was recently active AND past warmup grace.
+                // Only count an underrun when decoder was previously active AND past warmup
+                // grace. Gap duration is measured from gapStartMs (NOT lastFrameCommitMs):
+                // anchoring on the first re-present in a streak means a deliberate hard-ahead
+                // sleep, trick hold or stream-switch does not surface its own duration as a fake
+                // underrun the moment it ends. Beyond IDLE_THRESHOLD_MS we stop accumulating so
+                // a paused stream doesn't grow peakGapMs without bound.
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
-                if (!inTrick && !inSyncSleep && lastCommitMs != 0 && nowMs - lastCommitMs < ACTIVE_WINDOW_MS &&
-                    warmupGraceUntil.TimedOut()) {
-                    ++gapVSyncs;
-                    ++emptyVSyncTotal;
-                    peakGapVSyncs = std::max(gapVSyncs, peakGapVSyncs);
-                    if (gapVSyncs >= UNDERRUN_THRESHOLD_VSYNCS && underrunLogCooldown.TimedOut()) {
-                        const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
-                        dsyslog("vaapivideo/display: queue empty >=%ums; total=%u", UNDERRUN_THRESHOLD_VSYNCS * vsyncMs,
-                                emptyVSyncTotal);
-                        underrunLogCooldown.Set(UNDERRUN_LOG_COOLDOWN_MS);
+                if (!inTrick && !inSyncSleep && lastCommitMs != 0 && warmupGraceUntil.TimedOut()) {
+                    if (gapStartMs == 0) {
+                        gapStartMs = nowMs; // anchor: first re-present of the current gap
+                    }
+                    const uint64_t currentGapMs = nowMs - gapStartMs;
+                    if (currentGapMs < IDLE_THRESHOLD_MS) {
+                        ++emptyVSyncTotal;
+                        peakGapMs = std::max(peakGapMs, currentGapMs);
+                        if (currentGapMs >= thresholdMs && underrunLogCooldown.TimedOut()) {
+                            dsyslog("vaapivideo/display: queue empty %llums; total=%u",
+                                    static_cast<unsigned long long>(currentGapMs), emptyVSyncTotal);
+                            underrunLogCooldown.Set(UNDERRUN_LOG_COOLDOWN_MS);
+                        }
+                    } else {
+                        // Gap exceeded IDLE_THRESHOLD_MS: treat as paused / stopped, not as an
+                        // underrun. Clear peak so the recovery log stays silent on resume;
+                        // gapStartMs stays put so we don't re-anchor and start a fresh accounting
+                        // window every iteration during a long pause.
+                        peakGapMs = 0;
                     }
                 } else {
-                    gapVSyncs = 0;
-                    peakGapVSyncs = 0;
+                    gapStartMs = 0;
+                    peakGapMs = 0;
                 }
             } else {
                 cCondWait::SleepMs(5);

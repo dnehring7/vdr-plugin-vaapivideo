@@ -263,7 +263,6 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     ProbeSinkCaps();
 
     if (!OpenAlsaDevice()) {
-        esyslog("vaapivideo/audio: failed to open ALSA device");
         CloseDevice();
         alsaDeviceName.clear();
         return false;
@@ -547,7 +546,7 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
 // ============================================================================
 
 auto cAudioProcessor::Action() -> void {
-    isyslog("vaapivideo/audio: processing thread started");
+    dsyslog("vaapivideo/audio: processing thread started");
 
     while (!stopping.load(std::memory_order_acquire)) {
         std::unique_ptr<AVPacket, FreeAVPacket> packet;
@@ -635,7 +634,7 @@ auto cAudioProcessor::Action() -> void {
     }
 
     hasExited.store(true, std::memory_order_release);
-    isyslog("vaapivideo/audio: processing thread stopped");
+    dsyslog("vaapivideo/audio: processing thread stopped");
 }
 
 // ============================================================================
@@ -718,43 +717,47 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     snd_pcm_hw_params_t *hwParams = nullptr;
     snd_pcm_hw_params_alloca(&hwParams);
 
-    if (snd_pcm_nonblock(handle, 1) < 0) {
-        esyslog("vaapivideo/audio: cannot set non-blocking mode");
+    if (const int err = snd_pcm_nonblock(handle, 1); err < 0) {
+        dsyslog("vaapivideo/audio: cannot set non-blocking mode: %s", snd_strerror(err));
         return false;
     }
 
-    if (snd_pcm_hw_params_any(handle, hwParams) < 0) {
-        esyslog("vaapivideo/audio: cannot initialize hardware parameters");
+    if (const int err = snd_pcm_hw_params_any(handle, hwParams); err < 0) {
+        dsyslog("vaapivideo/audio: cannot initialize hardware parameters: %s", snd_strerror(err));
         return false;
     }
 
-    if (snd_pcm_hw_params_set_access(handle, hwParams, SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
-        esyslog("vaapivideo/audio: interleaved access not supported");
+    if (const int err = snd_pcm_hw_params_set_access(handle, hwParams, SND_PCM_ACCESS_RW_INTERLEAVED); err < 0) {
+        dsyslog("vaapivideo/audio: interleaved access not supported: %s", snd_strerror(err));
         return false;
     }
 
-    if (snd_pcm_hw_params_set_format(handle, hwParams, format) < 0) {
-        esyslog("vaapivideo/audio: format %s not supported", snd_pcm_format_name(format));
+    if (const int err = snd_pcm_hw_params_set_format(handle, hwParams, format); err < 0) {
+        dsyslog("vaapivideo/audio: format %s not supported: %s", snd_pcm_format_name(format), snd_strerror(err));
         return false;
     }
 
-    if (snd_pcm_hw_params_set_channels(handle, hwParams, channels) < 0) {
-        esyslog("vaapivideo/audio: %uch configuration failed", channels);
+    if (const int err = snd_pcm_hw_params_set_channels(handle, hwParams, channels); err < 0) {
+        dsyslog("vaapivideo/audio: %uch configuration failed: %s", channels, snd_strerror(err));
         return false;
     }
 
     snd_pcm_hw_params_set_rate_resample(handle, hwParams, allowResample ? 1 : 0);
 
     unsigned actualRate = rate;
-    if (snd_pcm_hw_params_set_rate(handle, hwParams, actualRate, 0) < 0) {
-        if (!allowResample || snd_pcm_hw_params_set_rate_near(handle, hwParams, &actualRate, nullptr) < 0) {
-            esyslog("vaapivideo/audio: %uHz sample rate not supported", rate);
+    if (const int err = snd_pcm_hw_params_set_rate(handle, hwParams, actualRate, 0); err < 0) {
+        if (!allowResample) {
+            dsyslog("vaapivideo/audio: %uHz sample rate not supported: %s", rate, snd_strerror(err));
+            return false;
+        }
+        if (const int nearErr = snd_pcm_hw_params_set_rate_near(handle, hwParams, &actualRate, nullptr); nearErr < 0) {
+            dsyslog("vaapivideo/audio: %uHz sample rate not supported: %s", rate, snd_strerror(nearErr));
             return false;
         }
     }
 
     if (actualRate != rate && !allowResample) {
-        esyslog("vaapivideo/audio: rate mismatch (%u requested, %u actual)", rate, actualRate);
+        dsyslog("vaapivideo/audio: rate mismatch (%u requested, %u actual)", rate, actualRate);
         return false;
     }
 
@@ -764,27 +767,44 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     auto bufferSize = static_cast<snd_pcm_uframes_t>(static_cast<uint64_t>(actualRate) * AUDIO_ALSA_BUFFER_MS / 1000);
     auto periodSize = static_cast<snd_pcm_uframes_t>(actualRate / 40); // 25 ms per interrupt
 
-    if (snd_pcm_hw_params_set_buffer_size_near(handle, hwParams, &bufferSize) < 0 ||
-        snd_pcm_hw_params_set_period_size_near(handle, hwParams, &periodSize, nullptr) < 0 ||
-        snd_pcm_hw_params(handle, hwParams) < 0 || snd_pcm_prepare(handle) < 0) {
-        esyslog("vaapivideo/audio: hardware parameter configuration failed");
+    if (const int err = snd_pcm_hw_params_set_buffer_size_near(handle, hwParams, &bufferSize); err < 0) {
+        dsyslog("vaapivideo/audio: set_buffer_size_near failed: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_hw_params_set_period_size_near(handle, hwParams, &periodSize, nullptr); err < 0) {
+        dsyslog("vaapivideo/audio: set_period_size_near failed: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_hw_params(handle, hwParams); err < 0) {
+        dsyslog("vaapivideo/audio: snd_pcm_hw_params failed: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_prepare(handle); err < 0) {
+        dsyslog("vaapivideo/audio: snd_pcm_prepare failed: %s", snd_strerror(err));
         return false;
     }
 
     snd_pcm_sw_params_t *swParams = nullptr;
     snd_pcm_sw_params_alloca(&swParams);
 
-    if (snd_pcm_sw_params_current(handle, swParams) < 0) {
-        esyslog("vaapivideo/audio: cannot get software parameters");
+    if (const int err = snd_pcm_sw_params_current(handle, swParams); err < 0) {
+        dsyslog("vaapivideo/audio: cannot get software parameters: %s", snd_strerror(err));
         return false;
     }
 
     // Start threshold at 1/3 of the ring: caps channel-switch-to-first-audio latency
     // at ~133 ms while giving the decode ramp-up time to prebuffer.
     const snd_pcm_uframes_t startThreshold = bufferSize / 3;
-    if (snd_pcm_sw_params_set_start_threshold(handle, swParams, startThreshold) < 0 ||
-        snd_pcm_sw_params_set_avail_min(handle, swParams, periodSize) < 0 || snd_pcm_sw_params(handle, swParams) < 0) {
-        esyslog("vaapivideo/audio: software parameter configuration failed");
+    if (const int err = snd_pcm_sw_params_set_start_threshold(handle, swParams, startThreshold); err < 0) {
+        dsyslog("vaapivideo/audio: set_start_threshold failed: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_sw_params_set_avail_min(handle, swParams, periodSize); err < 0) {
+        dsyslog("vaapivideo/audio: set_avail_min failed: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_sw_params(handle, swParams); err < 0) {
+        dsyslog("vaapivideo/audio: snd_pcm_sw_params failed: %s", snd_strerror(err));
         return false;
     }
 
@@ -795,14 +815,17 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     (void)snd_pcm_hw_params_get_period_size(hwParams, &actualPeriod, nullptr);
     const unsigned bufMs = (actualRate > 0) ? static_cast<unsigned>(actualBuffer * 1000 / actualRate) : 0;
     const unsigned periodMs = (actualRate > 0) ? static_cast<unsigned>(actualPeriod * 1000 / actualRate) : 0;
-    isyslog("vaapivideo/audio: ALSA buffer=%ums period=%ums start=%ums (target=%dms)", bufMs, periodMs, bufMs / 3,
+    dsyslog("vaapivideo/audio: ALSA buffer=%ums period=%ums start=%ums (target=%dms)", bufMs, periodMs, bufMs / 3,
             AUDIO_ALSA_BUFFER_MS);
 
     unsigned configuredChannels = 0;
     unsigned configuredRate = 0;
-    if (snd_pcm_hw_params_get_channels(hwParams, &configuredChannels) < 0 ||
-        snd_pcm_hw_params_get_rate(hwParams, &configuredRate, nullptr) < 0) [[unlikely]] {
-        esyslog("vaapivideo/audio: failed to read negotiated ALSA parameters");
+    if (const int err = snd_pcm_hw_params_get_channels(hwParams, &configuredChannels); err < 0) [[unlikely]] {
+        dsyslog("vaapivideo/audio: failed to read negotiated channels: %s", snd_strerror(err));
+        return false;
+    }
+    if (const int err = snd_pcm_hw_params_get_rate(hwParams, &configuredRate, nullptr); err < 0) [[unlikely]] {
+        dsyslog("vaapivideo/audio: failed to read negotiated rate: %s", snd_strerror(err));
         return false;
     }
     alsaChannels.store(configuredChannels, std::memory_order_release);
@@ -810,7 +833,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
     const auto frameBytes = snd_pcm_frames_to_bytes(handle, 1);
     if (frameBytes <= 0) {
-        esyslog("vaapivideo/audio: invalid frame size");
+        dsyslog("vaapivideo/audio: invalid frame size");
         return false;
     }
 
@@ -938,13 +961,8 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             convertedBuffer.resize(bufferSize);
 
             // outPtr cannot be const: swr_convert writes through &outPtr.
-            // frame->data is uint8_t*[] (writable for decoders); swr_convert's input
-            // wants const uint8_t**, with no FFmpeg API to express the read-only intent.
             uint8_t *outPtr = convertedBuffer.data(); // NOLINT(misc-const-correctness)
-            const int converted =
-                swr_convert(swrCtx, &outPtr, maxOutSamples,
-                            const_cast<const uint8_t **>(frame->data), // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                            frame->nb_samples);
+            const int converted = swr_convert(swrCtx, &outPtr, maxOutSamples, frame->data, frame->nb_samples);
 
             if (converted < 0) [[unlikely]] {
                 esyslog("vaapivideo/audio: swr_convert failed");
@@ -1024,7 +1042,7 @@ auto cAudioProcessor::OpenSpdifMuxer(AVCodecID codecId, int sampleRate) -> bool 
     CloseSpdifMuxer();
 
     if (avformat_alloc_output_context2(&spdifMuxCtx, nullptr, "spdif", nullptr) < 0 || !spdifMuxCtx) {
-        esyslog("vaapivideo/audio: failed to allocate spdif muxer context");
+        dsyslog("vaapivideo/audio: failed to allocate spdif muxer context");
         return false;
     }
 
@@ -1055,10 +1073,10 @@ auto cAudioProcessor::OpenSpdifMuxer(AVCodecID codecId, int sampleRate) -> bool 
     stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     stream->codecpar->codec_id = codecId;
     stream->codecpar->sample_rate = sampleRate;
-    stream->codecpar->ch_layout.nb_channels = 2;
+    av_channel_layout_default(&stream->codecpar->ch_layout, 2);
 
     if (avformat_write_header(spdifMuxCtx, nullptr) < 0) {
-        esyslog("vaapivideo/audio: spdif muxer write_header failed for %s", avcodec_get_name(codecId));
+        dsyslog("vaapivideo/audio: spdif muxer write_header failed for %s", avcodec_get_name(codecId));
         CloseSpdifMuxer();
         return false;
     }
@@ -1117,7 +1135,8 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     std::array<char, 16> ctlName{};
     (void)std::snprintf(ctlName.data(), ctlName.size(), "hw:%d", alsaCardId);
     snd_ctl_t *ctl = nullptr;
-    if (snd_ctl_open(&ctl, ctlName.data(), 0) < 0) {
+    if (const int err = snd_ctl_open(&ctl, ctlName.data(), 0); err < 0) {
+        dsyslog("vaapivideo/audio: snd_ctl_open(%s) failed: %s", ctlName.data(), snd_strerror(err));
         return;
     }
 
@@ -1134,15 +1153,17 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     // IEC 60958-3 AES0 bit 1 ("non-audio") gates compressed bitstreams. Always write rather than
     // compare-and-skip: the kernel cache drifts from the actual link state across AVR power-cycle,
     // hotplug, or another process touching IEC958.
-    if (snd_ctl_elem_read(ctl, val) < 0) {
-        dsyslog("vaapivideo/audio: IEC958 read failed (cardId=%d ctlIndex=%u)", alsaCardId, alsaIec958CtlIndex);
+    if (const int err = snd_ctl_elem_read(ctl, val); err < 0) {
+        dsyslog("vaapivideo/audio: IEC958 read failed (cardId=%d ctlIndex=%u): %s", alsaCardId, alsaIec958CtlIndex,
+                snd_strerror(err));
     } else {
         const auto aes0 = snd_ctl_elem_value_get_byte(val, 0);
         const auto newAes0 =
             enable ? static_cast<unsigned char>(aes0 | 0x02U) : static_cast<unsigned char>(aes0 & ~0x02U);
         snd_ctl_elem_value_set_byte(val, 0, newAes0);
-        if (snd_ctl_elem_write(ctl, val) < 0) {
-            dsyslog("vaapivideo/audio: IEC958 write failed (cardId=%d aes0=0x%02x)", alsaCardId, aes0);
+        if (const int err = snd_ctl_elem_write(ctl, val); err < 0) {
+            dsyslog("vaapivideo/audio: IEC958 write failed (cardId=%d aes0=0x%02x): %s", alsaCardId, aes0,
+                    snd_strerror(err));
         } else {
             dsyslog("vaapivideo/audio: IEC958 AES0 0x%02x -> 0x%02x (%s)", aes0, newAes0,
                     enable ? "non-audio" : "audio");
@@ -1177,8 +1198,9 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     constexpr snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE; // fixed; WriteToAlsa() reinterprets as int16_t
 
     snd_pcm_t *handle = nullptr;
-    if (snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) {
-        esyslog("vaapivideo/audio: snd_pcm_open failed for '%s'", alsaDeviceName.c_str());
+    if (const int err = snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+        err < 0) {
+        esyslog("vaapivideo/audio: snd_pcm_open failed for '%s': %s", alsaDeviceName.c_str(), snd_strerror(err));
         return false;
     }
 
@@ -1204,8 +1226,9 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
         snd_pcm_close(handle);
         handle = nullptr;
 
-        if (snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) {
-            esyslog("vaapivideo/audio: snd_pcm_open failed for PCM fallback");
+        if (const int err = snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+            err < 0) {
+            esyslog("vaapivideo/audio: snd_pcm_open failed for PCM fallback: %s", snd_strerror(err));
             return false;
         }
 
@@ -1281,8 +1304,8 @@ auto cAudioProcessor::OpenDecoder() -> void {
         ctx->extradata_size = streamParams.extradataSize;
     }
 
-    if (avcodec_open2(ctx, codec, nullptr) < 0) {
-        esyslog("vaapivideo/audio: avcodec_open2() failed");
+    if (const int ret = avcodec_open2(ctx, codec, nullptr); ret < 0) {
+        esyslog("vaapivideo/audio: avcodec_open2(%s) failed: %s", codec->name, AvErr(ret).data());
         decoder.reset();
         return;
     }
@@ -1325,15 +1348,15 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             continue;
         }
 
-        dsyslog("vaapivideo/audio: cannot probe capabilities, PCM-only mode");
+        dsyslog("vaapivideo/audio: cannot probe capabilities, PCM-only mode: %s", snd_strerror(ret));
         return;
     }
 
     snd_pcm_info_t *info = nullptr;
     snd_pcm_info_alloca(&info);
 
-    if (snd_pcm_info(handle, info) < 0) {
-        dsyslog("vaapivideo/audio: snd_pcm_info failed");
+    if (const int err = snd_pcm_info(handle, info); err < 0) {
+        dsyslog("vaapivideo/audio: snd_pcm_info failed: %s", snd_strerror(err));
         snd_pcm_close(handle);
         return;
     }
@@ -1348,8 +1371,8 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const auto ctlName = std::format("hw:{}", cardId);
 
     snd_ctl_t *ctlRaw = nullptr;
-    if (snd_ctl_open(&ctlRaw, ctlName.c_str(), SND_CTL_READONLY) < 0) {
-        dsyslog("vaapivideo/audio: snd_ctl_open failed for hw:%d", cardId);
+    if (const int err = snd_ctl_open(&ctlRaw, ctlName.c_str(), SND_CTL_READONLY); err < 0) {
+        dsyslog("vaapivideo/audio: snd_ctl_open failed for hw:%d: %s", cardId, snd_strerror(err));
     } else {
         const std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> ctl{ctlRaw, snd_ctl_close};
 
@@ -1661,7 +1684,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         const int errorCount = alsaErrorCount.fetch_add(1, std::memory_order_relaxed) + 1;
         if (errorCount >= AUDIO_ALSA_ERROR_LIMIT) {
             if (lastReopenAttempt.Elapsed() > 1000) {
-                dsyslog("vaapivideo/audio: attempting device reopen");
+                isyslog("vaapivideo/audio: attempting device reopen after %s", snd_strerror(err));
                 lastReopenAttempt.Set();
                 alsaErrorCount.store(0, std::memory_order_relaxed);
 
@@ -1706,7 +1729,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         stopping.store(true, std::memory_order_release);
         packetCondition.Broadcast();
 
-        esyslog("vaapivideo/audio: unrecoverable error, device closed");
+        esyslog("vaapivideo/audio: unrecoverable error, device closed: %s", snd_strerror(err));
         return false;
     }
 
