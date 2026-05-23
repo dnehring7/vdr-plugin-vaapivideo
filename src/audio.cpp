@@ -742,22 +742,19 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         return false;
     }
 
-    snd_pcm_hw_params_set_rate_resample(handle, hwParams, allowResample ? 1 : 0);
-
-    unsigned actualRate = rate;
-    if (const int err = snd_pcm_hw_params_set_rate(handle, hwParams, actualRate, 0); err < 0) {
-        if (!allowResample) {
-            dsyslog("vaapivideo/audio: %uHz sample rate not supported: %s", rate, snd_strerror(err));
-            return false;
-        }
-        if (const int nearErr = snd_pcm_hw_params_set_rate_near(handle, hwParams, &actualRate, nullptr); nearErr < 0) {
-            dsyslog("vaapivideo/audio: %uHz sample rate not supported: %s", rate, snd_strerror(nearErr));
-            return false;
-        }
+    if (const int err = snd_pcm_hw_params_set_rate_resample(handle, hwParams, allowResample ? 1 : 0); err < 0) {
+        dsyslog("vaapivideo/audio: cannot set ALSA rate-resample mode: %s", snd_strerror(err));
+        return false;
     }
 
-    if (actualRate != rate && !allowResample) {
-        dsyslog("vaapivideo/audio: rate mismatch (%u requested, %u actual)", rate, actualRate);
+    // set_rate_near picks the exact rate when supported and the closest match otherwise; set_rate
+    // is strict. Selecting one or the other up front by allowResample keeps the success path linear.
+    // strict set_rate cannot return success with actualRate != rate, so no post-check needed.
+    unsigned actualRate = rate;
+    if (const int err = allowResample ? snd_pcm_hw_params_set_rate_near(handle, hwParams, &actualRate, nullptr)
+                                      : snd_pcm_hw_params_set_rate(handle, hwParams, actualRate, 0);
+        err < 0) {
+        dsyslog("vaapivideo/audio: %uHz sample rate not supported: %s", rate, snd_strerror(err));
         return false;
     }
 
@@ -1156,20 +1153,18 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     if (const int err = snd_ctl_elem_read(ctl, val); err < 0) {
         dsyslog("vaapivideo/audio: IEC958 read failed (cardId=%d ctlIndex=%u): %s", alsaCardId, alsaIec958CtlIndex,
                 snd_strerror(err));
-    } else {
-        const auto aes0 = snd_ctl_elem_value_get_byte(val, 0);
-        const auto newAes0 =
-            enable ? static_cast<unsigned char>(aes0 | 0x02U) : static_cast<unsigned char>(aes0 & ~0x02U);
-        snd_ctl_elem_value_set_byte(val, 0, newAes0);
-        if (const int err = snd_ctl_elem_write(ctl, val); err < 0) {
-            dsyslog("vaapivideo/audio: IEC958 write failed (cardId=%d aes0=0x%02x): %s", alsaCardId, aes0,
-                    snd_strerror(err));
-        } else {
-            dsyslog("vaapivideo/audio: IEC958 AES0 0x%02x -> 0x%02x (%s)", aes0, newAes0,
-                    enable ? "non-audio" : "audio");
-        }
+        snd_ctl_close(ctl);
+        return;
     }
-
+    const auto aes0 = snd_ctl_elem_value_get_byte(val, 0);
+    const auto newAes0 = enable ? static_cast<unsigned char>(aes0 | 0x02U) : static_cast<unsigned char>(aes0 & ~0x02U);
+    snd_ctl_elem_value_set_byte(val, 0, newAes0);
+    if (const int err = snd_ctl_elem_write(ctl, val); err < 0) {
+        dsyslog("vaapivideo/audio: IEC958 write failed (cardId=%d aes0=0x%02x): %s", alsaCardId, aes0,
+                snd_strerror(err));
+    } else {
+        dsyslog("vaapivideo/audio: IEC958 AES0 0x%02x -> 0x%02x (%s)", aes0, newAes0, enable ? "non-audio" : "audio");
+    }
     snd_ctl_close(ctl);
 }
 

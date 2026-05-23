@@ -170,7 +170,7 @@ indent:
 clean:
 	@-rm -f $(OBJECTS) $(SOFILE) $(PROBE_BIN) .deps compile_commands.json
 	@-rm -f *.so *.tgz core* *~ src/*~
-	@-rm -rf docs
+	@-rm -rf docs .lint
 
 install: $(SOFILE)
 	install -D $< $(DESTDIR)$(LIBDIR)/$<.$(APIVERSION)
@@ -190,10 +190,48 @@ docs:
 # Static Code Analysis using clang-tidy (checks configured in .clang-tidy)
 # Filter out GCC-specific flags that clang doesn't understand.
 CLANG_CXXFLAGS = $(filter-out -Wno-complain-wrong-lang -specs=% -grecord-gcc-switches -fanalyzer,$(CXXFLAGS))
+PROBE_CLANG_CXXFLAGS = $(filter-out -I/usr/include/ffmpeg,$(CLANG_CXXFLAGS)) \
+	$(shell $(PKG_CONFIG) --cflags $(PROBE_PKGS))
 
-lint:
-	@echo "Running clang-tidy analysis..."
-	@command -v clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 0; }
+# Default parallel job count: nproc if available, else 1. Override with `make lint NJOBS=N`.
+NJOBS ?= $(shell nproc 2>/dev/null || echo 1)
+
+# Per-source stamp files. Touching the source re-lints just that file; running with -j$(NJOBS)
+# spreads the per-file clang-tidy invocations across cores (clang-tidy itself is single-threaded).
+LINT_STAMPS = $(SOURCES:%.cpp=.lint/%.stamp) $(PROBE_SRC:%.cpp=.lint/%.stamp)
+
+# compile_commands.json is regenerated only when sources or headers change. The bear-driven full
+# rebuild is the expensive step; without this dependency lint would pay ~15s on every invocation.
+# Makefile is a dep so build-flag edits also invalidate the database.
+compile_commands.json: $(SOURCES) $(HEADERS) $(PROBE_SRC) Makefile
 	@command -v bear >/dev/null 2>&1 || { echo "bear not found"; exit 1; }
 	@bear --force-preload -- $(MAKE) --no-print-directory -B $(OBJECTS)
-	@clang-tidy $(SOURCES) --quiet -- $(CLANG_CXXFLAGS)
+
+# Check clang-tidy availability BEFORE running the expensive bear step, so a missing
+# tool short-circuits without paying for the rebuild. compile_commands.json is invoked
+# only after the check passes.
+lint:
+	@if ! command -v clang-tidy >/dev/null 2>&1; then \
+		echo "clang-tidy not found"; \
+		exit 0; \
+	fi; \
+	echo "Running clang-tidy analysis (NJOBS=$(NJOBS))..."; \
+	$(MAKE) --no-print-directory compile_commands.json && \
+	$(MAKE) --no-print-directory -j$(NJOBS) $(LINT_STAMPS)
+
+# Probe uses libdrm/libva flags (specific rule). Plugin sources use the FFmpeg/VDR set
+# (pattern rule). Make prefers the explicit rule for the probe stamp.
+# .clang-tidy / Makefile in deps: a check-config or build-flag change invalidates the stamp
+# so the next lint actually picks them up.
+.lint/$(PROBE_SRC:%.cpp=%.stamp): $(PROBE_SRC) .clang-tidy Makefile
+	@mkdir -p $(dir $@)
+	@clang-tidy $< --quiet -- $(PROBE_CLANG_CXXFLAGS)
+	@touch $@
+
+# $(HEADERS) in deps: re-lint when any header changes (avoids stale results when a
+# transitively included symbol moves or a definition changes). compile_commands.json in
+# deps so a stamp invoked directly still rebuilds the database first.
+.lint/%.stamp: %.cpp $(HEADERS) .clang-tidy compile_commands.json Makefile
+	@mkdir -p $(dir $@)
+	@clang-tidy $< --quiet -- $(CLANG_CXXFLAGS)
+	@touch $@

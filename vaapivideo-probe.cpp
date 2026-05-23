@@ -41,7 +41,11 @@
 #include <va/va_drm.h>
 #include <va/va_vpp.h>
 
+#include <libdrm/drm.h>
+#include <libdrm/drm_fourcc.h>
+#include <libdrm/drm_mode.h>
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 
 // Small enough to avoid wasting VRAM; large enough that no driver rejects it as
 // below its minimum surface alignment (typically 16 px).
@@ -403,6 +407,314 @@ static auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool h
     PrintCapability("PQ/HDR10 -> SDR     (tone map)", any10Bit && hasHdrToneMapping);
 }
 
+// ============================================================================
+// === DRM PROBING ===
+// ============================================================================
+
+namespace {
+
+[[nodiscard]] auto ConnectorTypeName(uint32_t t) -> const char * {
+    switch (t) {
+        case DRM_MODE_CONNECTOR_HDMIA: return "HDMI-A";
+        case DRM_MODE_CONNECTOR_HDMIB: return "HDMI-B";
+        case DRM_MODE_CONNECTOR_DisplayPort: return "DisplayPort";
+        case DRM_MODE_CONNECTOR_eDP: return "eDP";
+        case DRM_MODE_CONNECTOR_DVII: return "DVI-I";
+        case DRM_MODE_CONNECTOR_DVID: return "DVI-D";
+        case DRM_MODE_CONNECTOR_DVIA: return "DVI-A";
+        case DRM_MODE_CONNECTOR_VGA: return "VGA";
+        case DRM_MODE_CONNECTOR_LVDS: return "LVDS";
+        case DRM_MODE_CONNECTOR_Composite: return "Composite";
+        case DRM_MODE_CONNECTOR_SVIDEO: return "S-Video";
+        case DRM_MODE_CONNECTOR_Component: return "Component";
+        case DRM_MODE_CONNECTOR_DSI: return "DSI";
+        default: return "?";
+    }
+}
+
+[[nodiscard]] auto PlaneTypeName(uint64_t t) -> const char * {
+    switch (t) {
+        case DRM_PLANE_TYPE_PRIMARY: return "PRIMARY";
+        case DRM_PLANE_TYPE_OVERLAY: return "OVERLAY";
+        case DRM_PLANE_TYPE_CURSOR: return "CURSOR";
+        default: return "?";
+    }
+}
+
+auto PrintDrmCap(int fd, const char *name, uint64_t cap) -> void {
+    uint64_t value = 0;
+    const bool hasCap = drmGetCap(fd, cap, &value) == 0;
+    // For boolean / bitmask caps a successful query returning 0 means "not enabled".
+    // Treat (hasCap && value == 0) as a "no" so the report doesn't lie about disabled caps.
+    const bool enabled = hasCap && value != 0;
+    const std::string detail = hasCap ? " = " + std::to_string(value) : "";
+    std::printf("  %-44s %s%s\n", name, enabled ? "\033[32myes\033[0m" : "\033[31mno\033[0m", detail.c_str());
+}
+
+auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
+    // Probe is non-destructive: setting these caps for the duration of the process is fine,
+    // the runtime sets the same caps itself.
+    const bool ok = drmSetClientCap(fd, cap, 1) == 0;
+    std::printf("  %-44s %s\n", name, ok ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
+}
+
+auto ProbeDrmDeviceCaps(int fd) -> void {
+    std::printf("\n--- DRM Driver ---\n");
+    if (drmVersionPtr v = drmGetVersion(fd); v != nullptr) {
+        std::printf("  Driver:      %.*s %d.%d.%d (%.*s)\n", v->name_len, v->name ? v->name : "?", v->version_major,
+                    v->version_minor, v->version_patchlevel, v->desc_len, v->desc ? v->desc : "");
+        drmFreeVersion(v);
+    } else {
+        std::printf("  Driver: (drmGetVersion failed)\n");
+    }
+
+    std::printf("\n--- DRM Device Caps ---\n");
+    PrintDrmCap(fd, "DUMB_BUFFER          (OSD framebuffer)", DRM_CAP_DUMB_BUFFER);
+    PrintDrmCap(fd, "PRIME (export/import VAAPI surfaces)", DRM_CAP_PRIME);
+    PrintDrmCap(fd, "ADDFB2_MODIFIERS (tiled framebuffers)", DRM_CAP_ADDFB2_MODIFIERS);
+    PrintDrmCap(fd, "CRTC_IN_VBLANK_EVENT (atomic flip ev.)", DRM_CAP_CRTC_IN_VBLANK_EVENT);
+    PrintDrmCap(fd, "ASYNC_PAGE_FLIP", DRM_CAP_ASYNC_PAGE_FLIP);
+    PrintDrmCap(fd, "TIMESTAMP_MONOTONIC", DRM_CAP_TIMESTAMP_MONOTONIC);
+
+    std::printf("\n--- DRM Client Caps ---\n");
+    PrintDrmClientCap(fd, "UNIVERSAL_PLANES (overlay enumeration)", DRM_CLIENT_CAP_UNIVERSAL_PLANES);
+    PrintDrmClientCap(fd, "ATOMIC           (atomic modeset)", DRM_CLIENT_CAP_ATOMIC);
+    PrintDrmClientCap(fd, "ASPECT_RATIO     (mode aspect)", DRM_CLIENT_CAP_ASPECT_RATIO);
+}
+
+struct PropEntry {
+    uint64_t value;
+    std::string name;
+};
+
+[[nodiscard]] auto LoadObjectProps(int fd, uint32_t objectId, uint32_t objectType) -> std::vector<PropEntry> {
+    std::vector<PropEntry> out;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, objectId, objectType);
+    if (props == nullptr) {
+        return out;
+    }
+    for (uint32_t i = 0; i < props->count_props; ++i) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (p == nullptr) {
+            continue;
+        }
+        out.push_back({.value = props->prop_values[i], .name = p->name});
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return out;
+}
+
+[[nodiscard]] auto FindProp(const std::vector<PropEntry> &props, const char *name) -> const PropEntry * {
+    for (const auto &p : props) {
+        if (p.name == name) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
+    std::printf("\n--- DRM Connectors ---\n");
+    uint32_t disconnected = 0;
+    for (int i = 0; i < res->count_connectors; ++i) {
+        drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
+        if (c == nullptr) {
+            continue;
+        }
+        if (c->connection != DRM_MODE_CONNECTED) {
+            ++disconnected;
+            drmModeFreeConnector(c);
+            continue;
+        }
+        std::printf("  Connector %u: %s-%u  connected  modes=%d\n", c->connector_id,
+                    ConnectorTypeName(c->connector_type), c->connector_type_id, c->count_modes);
+        if (c->count_modes > 0) {
+            const drmModeModeInfo &m = c->modes[0];
+            std::printf("    preferred mode:           %ux%u@%uHz\n", m.hdisplay, m.vdisplay, m.vrefresh);
+        }
+        const auto props = LoadObjectProps(fd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR);
+        std::printf("    HDR_OUTPUT_METADATA       %s\n",
+                    FindProp(props, "HDR_OUTPUT_METADATA") != nullptr ? "yes" : "no");
+        if (const auto *p = FindProp(props, "max bpc"); p != nullptr) {
+            std::printf("    max bpc                   %u\n", static_cast<uint32_t>(p->value));
+        }
+        if (const auto *p = FindProp(props, "Colorspace"); p != nullptr) {
+            std::printf("    Colorspace (current)      %u\n", static_cast<uint32_t>(p->value));
+        }
+        drmModeFreeConnector(c);
+    }
+    if (disconnected != 0) {
+        std::printf("  (+%u disconnected, not listed)\n", disconnected);
+    }
+}
+
+struct PlaneSummary {
+    uint32_t id;            ///< DRM plane object ID
+    uint64_t type;          ///< DRM_PLANE_TYPE_* or ~0 if absent
+    uint32_t possibleCrtcs; ///< CRTC bitmask the plane can attach to
+    bool hasNV12;           ///< accepts NV12 (8-bit video scanout, Gen9.5+)
+    bool hasP010;           ///< accepts P010 (10-bit / HDR scanout, Gen12+)
+    bool hasARGB8888;       ///< accepts ARGB8888 (OSD candidate)
+    uint64_t colorEncoding; ///< current value, ~0 if property absent
+};
+
+// Collapse one plane's IN_FORMATS / properties to a few yes/no flags.
+[[nodiscard]] auto SummarizePlane(int fd, drmModePlane *plane, const std::vector<PropEntry> &props) -> PlaneSummary {
+    PlaneSummary s{
+        .id = plane->plane_id,
+        .type = ~uint64_t{0},
+        .possibleCrtcs = plane->possible_crtcs,
+        .hasNV12 = false,
+        .hasP010 = false,
+        .hasARGB8888 = false,
+        .colorEncoding = ~uint64_t{0},
+    };
+    if (const auto *p = FindProp(props, "type"); p != nullptr) {
+        s.type = p->value;
+    }
+    if (const auto *p = FindProp(props, "COLOR_ENCODING"); p != nullptr) {
+        s.colorEncoding = p->value;
+    }
+
+    // Prefer IN_FORMATS (modifier-aware), fall back to the raw format list.
+    const auto *inFormats = FindProp(props, "IN_FORMATS");
+    drmModePropertyBlobRes *blob =
+        (inFormats != nullptr) ? drmModeGetPropertyBlob(fd, static_cast<uint32_t>(inFormats->value)) : nullptr;
+    std::span<const uint32_t> formats;
+    // Bounds-check the blob before constructing a span over it: a malformed kernel blob
+    // (or one allocated with a future ABI extension we don't know about) could otherwise
+    // produce an out-of-bounds read. Falls back to plane->formats on any validation failure.
+    if (blob != nullptr && blob->data != nullptr && blob->length >= sizeof(drm_format_modifier_blob)) {
+        const auto *formatsHeader = static_cast<const drm_format_modifier_blob *>(blob->data);
+        const auto formatsOffset = static_cast<size_t>(formatsHeader->formats_offset);
+        const auto formatsBytes = static_cast<size_t>(formatsHeader->count_formats) * sizeof(uint32_t);
+        if (formatsOffset <= blob->length && formatsBytes <= blob->length - formatsOffset) {
+            const auto *blobBytes = static_cast<const uint8_t *>(blob->data) + formatsOffset;
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- mandated by DRM blob layout
+            const auto *formatData = reinterpret_cast<const uint32_t *>(blobBytes);
+            formats = {formatData, formatsHeader->count_formats};
+        }
+    }
+    if (formats.empty()) {
+        formats = {plane->formats, plane->count_formats};
+    }
+    for (const uint32_t fc : formats) {
+        if (fc == DRM_FORMAT_NV12) {
+            s.hasNV12 = true;
+        } else if (fc == DRM_FORMAT_P010) {
+            s.hasP010 = true;
+        } else if (fc == DRM_FORMAT_ARGB8888) {
+            s.hasARGB8888 = true;
+        }
+    }
+    if (blob != nullptr) {
+        drmModeFreePropertyBlob(blob);
+    }
+    return s;
+}
+
+auto ProbeDrmPlanes(int fd) -> void {
+    std::printf("\n--- DRM Planes ---\n");
+    drmModePlaneRes *planeRes = drmModeGetPlaneResources(fd);
+    if (planeRes == nullptr) {
+        std::printf("  (drmModeGetPlaneResources failed -- ensure UNIVERSAL_PLANES is set)\n");
+        return;
+    }
+
+    std::vector<PlaneSummary> all;
+    all.reserve(planeRes->count_planes);
+    for (uint32_t i = 0; i < planeRes->count_planes; ++i) {
+        drmModePlane *plane = drmModeGetPlane(fd, planeRes->planes[i]);
+        if (plane == nullptr) {
+            continue;
+        }
+        const auto props = LoadObjectProps(fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
+        all.push_back(SummarizePlane(fd, plane, props));
+        drmModeFreePlane(plane);
+    }
+
+    uint32_t nPrim = 0;
+    uint32_t nOver = 0;
+    uint32_t nCurs = 0;
+    uint32_t nNV12 = 0;
+    uint32_t nP010 = 0;
+    uint32_t nOsd = 0;
+    for (const auto &s : all) {
+        if (s.type == DRM_PLANE_TYPE_PRIMARY) {
+            ++nPrim;
+        } else if (s.type == DRM_PLANE_TYPE_OVERLAY) {
+            ++nOver;
+        } else if (s.type == DRM_PLANE_TYPE_CURSOR) {
+            ++nCurs;
+        }
+        if (s.hasNV12) {
+            ++nNV12;
+        }
+        if (s.hasP010) {
+            ++nP010;
+        }
+        if (s.hasARGB8888) {
+            ++nOsd;
+        }
+    }
+    std::printf("  Total: %u planes  (PRIMARY=%u OVERLAY=%u CURSOR=%u)\n", planeRes->count_planes, nPrim, nOver, nCurs);
+    std::printf("  NV12     planes (8-bit video):  %u\n", nNV12);
+    std::printf("  P010     planes (10-bit / HDR): %u\n", nP010);
+    std::printf("  ARGB8888 planes (OSD):          %u\n", nOsd);
+
+    // Flag non-default COLOR_ENCODING. i915 defaults to 1 (BT.709); a leftover 2 (BT.2020)
+    // from a prior HDR session on the same plane can reject the next plain SDR commit on Gen12+.
+    bool printedHeader = false;
+    for (const auto &s : all) {
+        if (s.colorEncoding == ~uint64_t{0} || s.colorEncoding == 1) {
+            continue;
+        }
+        if (!printedHeader) {
+            std::printf("  Stale plane state (non-default COLOR_ENCODING, may block atomic commits):\n");
+            printedHeader = true;
+        }
+        const char *enc = "?";
+        if (s.colorEncoding == 0) {
+            enc = "BT.601";
+        } else if (s.colorEncoding == 2) {
+            enc = "BT.2020";
+        }
+        std::printf("    plane %u (%s, crtcs=0x%x): COLOR_ENCODING=%lu (%s)\n", s.id, PlaneTypeName(s.type),
+                    s.possibleCrtcs, static_cast<unsigned long>(s.colorEncoding), enc);
+    }
+
+    drmModeFreePlaneResources(planeRes);
+}
+
+auto ProbeDrm(const char *devicePath) -> void {
+    std::printf("\n================================================\n"
+                "DRM Capability Trace (%s)\n"
+                "================================================\n",
+                devicePath);
+    const int fd = open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    if (fd < 0) {
+        std::printf("  (cannot open %s: %s)\n", devicePath, std::strerror(errno));
+        return;
+    }
+    ProbeDrmDeviceCaps(fd);
+    drmModeRes *res = drmModeGetResources(fd);
+    if (res == nullptr) {
+        std::printf("\n  (drmModeGetResources failed -- not a KMS device?)\n");
+        close(fd);
+        return;
+    }
+    std::printf("\n--- DRM Resources ---\n");
+    std::printf("  CRTCs: %d  Connectors: %d  Encoders: %d\n", res->count_crtcs, res->count_connectors,
+                res->count_encoders);
+    ProbeDrmConnectors(fd, res);
+    ProbeDrmPlanes(fd);
+    drmModeFreeResources(res);
+    close(fd);
+}
+
+} // namespace
+
 auto main(int argc, char *argv[]) -> int {
     if (argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0)) {
         std::printf("Usage: %s [/dev/dri/cardN]  (default: /dev/dri/card0)\n", argv[0]);
@@ -547,6 +859,8 @@ auto main(int argc, char *argv[]) -> int {
     vaDestroyConfig(vaDisplay, vppConfig);
     vaTerminate(vaDisplay);
     close(renderFd);
+
+    ProbeDrm(devicePath);
 
     return EXIT_SUCCESS;
 }

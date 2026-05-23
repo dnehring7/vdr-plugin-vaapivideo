@@ -74,8 +74,8 @@ class cVideoFilterChain {
         AVBufferRef *hwDeviceRef{nullptr};   ///< VAAPI device (required, borrowed -- Build() refs internally)
 
         // --- Target surface ---
-        uint32_t outputWidth{0};     ///< DRM plane width; VPP output is scaled to this (no HW scaler downstream)
-        uint32_t outputHeight{0};    ///< DRM plane height
+        uint32_t outputWidth{0};     ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout
+        uint32_t outputHeight{0};    ///< Target video rect height
         uint32_t outputRefreshHz{0}; ///< Used to decide whether to insert an fps upconvert filter
 
         // --- HDR decisions (resolved by caller before Build) ---
@@ -90,6 +90,7 @@ class cVideoFilterChain {
         // --- Playback mode flags ---
         bool trickMode{false};    ///< Trick speed: use minimal chain + bob deint (no priming delay)
         bool stillPicture{false}; ///< Single I-frame: skip temporal deinterlace (would never flush)
+        bool compactLog{false};   ///< true for ScaleVideo-only rebuilds: one-line dsyslog instead of full diagnostic
     };
 
     /// Build the filter graph. Source geometry (size, SAR, interlaced flag, pixel format) is

@@ -10,8 +10,7 @@
  *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down.
  *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
- * Lock order: importMutex -> bufferMutex -> osdMutex.
- *             {bufferMutex, vaDriverMutex} -> videoRectMutex (innermost; never held while acquiring any other lock).
+ * Lock order: importMutex -> bufferMutex -> osdMutex; videoRectMutex is leaf.
  * WaitForPageFlip() MUST complete before BeginStreamSwitch() takes importMutex;
  * reversing that order deadlocks because the consumer cannot drain DRM events while
  * importMutex is held by the main thread.
@@ -65,6 +64,7 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/osd.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
@@ -76,6 +76,7 @@ extern "C" {
 constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
 constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
+constexpr uint32_t PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 
 // ============================================================================
 // === HELPER FUNCTIONS ===
@@ -92,6 +93,12 @@ constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
         default:
             return "???";
     }
+}
+
+// Read a DRM device cap, returning 0 if unsupported. Used only by the one-time init diagnostic.
+[[nodiscard]] static auto GetDrmCap(int drmFd, uint64_t cap) noexcept -> uint64_t {
+    uint64_t value = 0;
+    return drmGetCap(drmFd, cap, &value) == 0 ? value : uint64_t{0};
 }
 
 namespace {
@@ -296,27 +303,24 @@ cVaapiDisplay::~cVaapiDisplay() noexcept {
 // ============================================================================
 
 auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
-    // Called by cVaapiOsd::~cVaapiOsd before the underlying dumb buffer is freed: the destructor
-    // must not return while the KMS plane still references fbId, or the kernel scanout will read
-    // freed memory.
+    // Called from cVaapiOsd::~cVaapiOsd before freeing the dumb buffer; must not return while
+    // the kernel still scans out fbId. lastCommittedOsdFbId tracks the fbId of the most recent
+    // successful OSD commit, so fbIds that never reached the kernel return immediately.
     if (fbId == 0 || !ready.load(std::memory_order_relaxed)) {
         return;
     }
-
-    // Poll until PresentBuffer() clears osdDirty AND advances currentOsd past this fbId.
-    // 100 ms is generous: a page flip at 25 Hz takes 40 ms; the OSD is committed on the
-    // next video frame, which must arrive before the VDR OSD destructor returns.
-    const cTimeMs deadline(100);
+    constexpr int kTimeoutMs = 500;
+    const cTimeMs deadline(kTimeoutMs);
     while (!deadline.TimedOut()) {
         {
             const cMutexLock lock(&osdMutex);
-            if (!osdDirty && currentOsd.fbId != fbId) {
+            if (lastCommittedOsdFbId != fbId) {
                 return;
             }
         }
         cCondWait::SleepMs(5);
     }
-    esyslog("vaapivideo/display: AwaitOsdHidden timed out for fbId=%u", fbId);
+    esyslog("vaapivideo/display: AwaitOsdHidden timed out for fbId=%u after %d ms", fbId, kTimeoutMs);
 }
 
 auto cVaapiDisplay::BeginStreamSwitch() -> void {
@@ -359,7 +363,21 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     activeMode = displayMode;
     outputWidth = displayMode.hdisplay;
     outputHeight = displayMode.vdisplay;
-    videoRect = cRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
+    {
+        const cMutexLock lock(&videoRectMutex);
+        const cRect fullRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
+        videoRect = fullRect;
+        targetVideoRect = fullRect;
+    }
+    // Reset plane-state caches so the first commit re-writes every stateful property regardless
+    // of any leftover values the kernel may carry from a prior session.
+    constexpr uint64_t kCacheSentinel = ~uint64_t{0};
+    lastCommittedOsdFbId = 0;
+    lastOsdPixelBlendMode = kCacheSentinel;
+    lastVideoColorEncoding = kCacheSentinel;
+    lastVideoColorRange = kCacheSentinel;
+    lastVideoSrcW = lastVideoSrcH = kCacheSentinel;
+    lastVideoCrtcX = lastVideoCrtcY = lastVideoCrtcW = lastVideoCrtcH = kCacheSentinel;
     // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
     // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
     // are coupled; changing one without the other desyncs the A/V controllers.
@@ -416,8 +434,10 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
 }
 
 [[nodiscard]] auto cVaapiDisplay::GetActiveOsdFbId() const noexcept -> uint32_t {
+    // Return what KMS is actually scanning out, not the staged fbId -- GrabImage uses this to
+    // composite only the OSD currently on screen.
     const cMutexLock lock(&osdMutex);
-    return currentOsd.fbId;
+    return lastCommittedOsdFbId;
 }
 
 [[nodiscard]] auto cVaapiDisplay::GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame> {
@@ -675,7 +695,7 @@ auto cVaapiDisplay::Action() -> void {
     // on resume would otherwise scream a multi-hour "queue refilled" event. inTrick / inSyncSleep
     // catch the explicit pause paths; this is the catch-all for everything else.
     constexpr uint64_t IDLE_THRESHOLD_MS = 10000;
-    // refreshRate is set once in EndStreamSwitch() before Action() starts and stays constant for
+    // refreshRate is set once in Initialize() before Action() starts and stays constant for
     // the consumer-thread lifetime, so vsyncMs / thresholdMs are loop invariants -- hoisted.
     const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
     const uint64_t thresholdMs = UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
@@ -699,8 +719,20 @@ auto cVaapiDisplay::Action() -> void {
 
         // VSync gate: don't queue a new flip until the previous one's event has arrived.
         // 5 ms poll avoids busy-spinning; page_flip_handler latency is the real bottleneck.
+        // Recovery: on first plane attach over HDMI, the kernel occasionally swallows the page
+        // flip event (link renegotiation, sink probe failure, etc.). After PAGE_FLIP_STUCK_MS the
+        // event isn't coming -- force-clear so the next commit can proceed.
         if (isFlipPending.load(std::memory_order_relaxed)) {
             (void)DrainDrmEvents(5);
+            constexpr uint64_t PAGE_FLIP_STUCK_MS = 200;
+            const uint64_t since = flipPendingSinceMs.load(std::memory_order_acquire);
+            if (since != 0 && cTimeMs::Now() - since > PAGE_FLIP_STUCK_MS &&
+                isFlipPending.load(std::memory_order_relaxed)) {
+                esyslog("vaapivideo/display: page-flip event missing after %llums, forcing recovery",
+                        static_cast<unsigned long long>(cTimeMs::Now() - since));
+                flipPendingSinceMs.store(0, std::memory_order_release);
+                isFlipPending.store(false, std::memory_order_release);
+            }
             continue;
         }
 
@@ -839,51 +871,56 @@ auto cVaapiDisplay::Action() -> void {
 // === INTERNAL METHODS ===
 // ============================================================================
 
-auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) const -> void {
+auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) const -> bool {
     if (osd.fbId == 0 || osdPlaneId == 0) {
-        return;
+        return false;
     }
 
-    if (osd.x < 0 || osd.y < 0) {
-        esyslog("vaapivideo/display: OSD invalid negative position (%d,%d)", osd.x, osd.y);
-        return;
-    }
+    // Skins may place the OSD partly off-screen on the left/top: crop the source by the
+    // negative offset and place the visible part at zero. Right/bottom overflow is clipped
+    // by capping clippedW/clippedH below. int64_t avoids the -INT32_MIN UB corner case.
+    const auto sourceOffsetX = static_cast<uint32_t>(std::clamp<int64_t>(-static_cast<int64_t>(osd.x), 0, osd.width));
+    const auto sourceOffsetY = static_cast<uint32_t>(std::clamp<int64_t>(-static_cast<int64_t>(osd.y), 0, osd.height));
+    const auto destX = static_cast<uint32_t>(std::max(0, osd.x));
+    const auto destY = static_cast<uint32_t>(std::max(0, osd.y));
 
-    if (static_cast<uint32_t>(osd.x) >= outputWidth || static_cast<uint32_t>(osd.y) >= outputHeight) {
-        esyslog("vaapivideo/display: OSD off-screen pos=(%d,%d) screen=%ux%u", osd.x, osd.y, outputWidth, outputHeight);
-        return;
-    }
-
-    // KMS rejects a commit where CRTC_X+CRTC_W > CRTC width (similarly for Y).
-    // Clip here so the entire atomic commit doesn't fail over a slightly oversized OSD.
-    const auto clippedW = std::min(osd.width, outputWidth - static_cast<uint32_t>(osd.x));
-    const auto clippedH = std::min(osd.height, outputHeight - static_cast<uint32_t>(osd.y));
-
+    // KMS rejects CRTC_X+CRTC_W > CRTC width (similarly for Y); clip here so the entire atomic
+    // commit doesn't fail over a slightly oversized OSD. If nothing remains visible after clipping,
+    // emit a hide commit -- a silent no-op would leave the previously-shown OSD scanned out
+    // forever (PresentBuffer clears osdDirty on success).
+    const bool offScreen =
+        sourceOffsetX >= osd.width || sourceOffsetY >= osd.height || destX >= outputWidth || destY >= outputHeight;
+    const auto clippedW = offScreen ? 0U : std::min(osd.width - sourceOffsetX, outputWidth - destX);
+    const auto clippedH = offScreen ? 0U : std::min(osd.height - sourceOffsetY, outputHeight - destY);
     if (clippedW == 0 || clippedH == 0) {
-        return;
+        req.AddProperty(osdPlaneId, osdProps.fbId, 0);
+        req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
+        return false;
     }
 
     req.AddProperty(osdPlaneId, osdProps.crtcId, crtcId);
     req.AddProperty(osdPlaneId, osdProps.fbId, osd.fbId);
-    req.AddProperty(osdPlaneId, osdProps.srcX, 0);
-    req.AddProperty(osdPlaneId, osdProps.srcY, 0);
+    req.AddProperty(osdPlaneId, osdProps.srcX, static_cast<uint64_t>(sourceOffsetX) << 16);
+    req.AddProperty(osdPlaneId, osdProps.srcY, static_cast<uint64_t>(sourceOffsetY) << 16);
     // SRC_* properties use 16.16 fixed-point (value = pixels << 16).
     req.AddProperty(osdPlaneId, osdProps.srcW, static_cast<uint64_t>(clippedW) << 16);
     req.AddProperty(osdPlaneId, osdProps.srcH, static_cast<uint64_t>(clippedH) << 16);
-    req.AddProperty(osdPlaneId, osdProps.crtcX, static_cast<uint64_t>(osd.x));
-    req.AddProperty(osdPlaneId, osdProps.crtcY, static_cast<uint64_t>(osd.y));
+    req.AddProperty(osdPlaneId, osdProps.crtcX, destX);
+    req.AddProperty(osdPlaneId, osdProps.crtcY, destY);
     req.AddProperty(osdPlaneId, osdProps.crtcW, clippedW);
     req.AddProperty(osdPlaneId, osdProps.crtcH, clippedH);
 
     // VDR stores straight (non-premultiplied) ARGB via tColor. "Coverage" blending (enum 1)
     // applies alpha correctly; "Pre-multiplied" (enum 0) would double-apply it and produce
-    // darker edges with ringing on translucent backgrounds.
-    if (osdProps.pixelBlendMode != 0) {
+    // darker edges with ringing on translucent backgrounds. Write only on change -- the value
+    // is sticky in the kernel; rewriting every animator frame is wasted validation.
+    if (osdProps.pixelBlendMode != 0 && lastOsdPixelBlendMode != 1) {
         req.AddProperty(osdPlaneId, osdProps.pixelBlendMode, 1);
     }
     // zpos is NOT written: on tested i915 it causes the commit to fail (the property is
     // immutable on overlay planes). On amdgpu the driver's default z-order already places
     // the OSD above the video plane. Empirical -- re-verify on new hardware before adding.
+    return true;
 }
 
 [[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool {
@@ -891,31 +928,32 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return true; // empty commit -- nothing to do, treat as success
     }
 
-    // Page-flip: NONBLOCK + PAGE_FLIP_EVENT -- kernel queues the work and delivers a
-    // completion event that Action() drains via DrainDrmEvents().
-    // Modeset: synchronous and event-less -- mode programming must complete before the
-    // next page-flip is submitted.
-    // DRM_MODE_ATOMIC_ASYNC is intentionally not used: it requires linear (untiled) buffers,
-    // but VAAPI surfaces are always tiled (Y/X-tile or CCS compressed); the kernel rejects
-    // async commits on tiled BOs with EINVAL.
-    uint32_t commitFlags = flags;
-    if ((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
-        commitFlags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
-    }
-
-    const int ret = drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, this);
-    if (ret == 0) {
-        if ((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
+    // flags==0: async page-flip (PAGE_FLIP_EVENT | NONBLOCK), event clears isFlipPending. Covers
+    //   steady-state video frames, plane-position updates (ScaleVideo), color encoding/range
+    //   updates, and OSD show/hide -- all fastset-eligible because scale_vaapi emits the final
+    //   framebuffer size, so SRC == CRTC and KMS does not need to drive a plane scaler.
+    // flags==DRM_MODE_ATOMIC_ALLOW_MODESET (sync, no event): used for ApplyDisplayMode, CRTC
+    //   disable on shutdown, and HDR connector-state changes that may link-retrain. Display
+    //   thread blocks until applied.
+    // ATOMIC_ASYNC is unused -- it requires linear buffers, our VAAPI surfaces are tiled.
+    const uint32_t commitFlags = (flags == 0) ? PAGE_FLIP_COMMIT_FLAGS : flags;
+    if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, this) == 0) {
+        if ((commitFlags & DRM_MODE_PAGE_FLIP_EVENT) != 0) {
+            flipPendingSinceMs.store(cTimeMs::Now(), std::memory_order_release);
             isFlipPending.store(true, std::memory_order_release);
         }
         return true;
     }
-
+    const int origErrno = errno;
     // EBUSY: previous flip event not yet consumed; Action() retries after DrainDrmEvents().
-    // Not worth logging -- it's expected on the hot path when the consumer runs slightly ahead.
-    if (errno != EBUSY) {
-        esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(errno), commitFlags);
+    if (origErrno == EBUSY) {
+        return false;
     }
+    // No EINVAL fallback to sync ALLOW_MODESET: with scale_vaapi emitting the final-sized
+    // framebuffer, every page-flip commit is fastset-eligible. An EINVAL here means either an
+    // invalid plane state or an unintended scaler/crop path -- surface it loud rather than
+    // hide it behind a modeset retry that would silently degrade to a real modeset.
+    esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
     return false;
 }
 
@@ -1172,6 +1210,13 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             isyslog("vaapivideo/display: OSD plane %u type=%s zpos=%s", osdPlaneId, GetPlaneTypeName(props.type),
                     props.zpos ? "yes" : "no");
         }
+        dsyslog("vaapivideo/display: plane %u props: fbId=%u crtcId=%u srcX/Y/W/H=%u/%u/%u/%u "
+                "crtcX/Y/W/H=%u/%u/%u/%u zpos=%u blend=%u colorEncoding=%u(bt709=%d,bt2020=%d) "
+                "colorRange=%u(limited=%d) supportsP010=%d",
+                planeId, props.fbId, props.crtcId, props.srcX, props.srcY, props.srcW, props.srcH, props.crtcX,
+                props.crtcY, props.crtcW, props.crtcH, props.zpos, props.pixelBlendMode, props.colorEncoding,
+                props.colorEncodingValid ? 1 : 0, props.colorEncodingBt2020Valid ? 1 : 0, props.colorRange,
+                props.colorRangeValid ? 1 : 0, props.supportsP010 ? 1 : 0);
         return true;
     }
 
@@ -1205,6 +1250,21 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // Both are per-fd opt-ins; no-ops on already-set caps.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1);
+
+    // One-time DRM identification + relevant device caps. Logged at init so the syslog
+    // of any field deploy carries the kernel driver fingerprint relevant to atomic-commit
+    // behavior (modifiers, async page-flip, vblank events).
+    if (drmVersionPtr v = drmGetVersion(drmFd); v != nullptr) {
+        dsyslog("vaapivideo/display: DRM driver=%.*s %d.%d.%d  caps: addfb2_modifiers=%lu async_flip=%lu "
+                "vblank_event=%lu prime=%lu dumb=%lu",
+                v->name_len, v->name ? v->name : "?", v->version_major, v->version_minor, v->version_patchlevel,
+                static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_ADDFB2_MODIFIERS)),
+                static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_ASYNC_PAGE_FLIP)),
+                static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_CRTC_IN_VBLANK_EVENT)),
+                static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_PRIME)),
+                static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_DUMB_BUFFER)));
+        drmFreeVersion(v);
+    }
 
     // CRTC ACTIVE / MODE_ID: needed by every modeset commit.
     auto crtcProps = std::unique_ptr<drmModeObjectProperties, decltype(&drmModeFreeObjectProperties)>(
@@ -1676,33 +1736,78 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     auto *display = static_cast<cVaapiDisplay *>(data);
     if (display) {
         display->lastVSyncTimeMs.store(cTimeMs::Now(), std::memory_order_release);
+        display->flipPendingSinceMs.store(0, std::memory_order_release);
         display->isFlipPending.store(false, std::memory_order_release);
     }
 }
 
-[[nodiscard]] auto cVaapiDisplay::GetVideoRectHeight() const -> uint32_t {
-    const cMutexLock lock(&videoRectMutex);
-    return static_cast<uint32_t>(videoRect.Height());
+[[nodiscard]] auto FitVideoToRect(uint32_t srcWidth, uint32_t srcHeight, const cRect &rect) noexcept -> VideoPlacement {
+    if (srcWidth == 0 || srcHeight == 0 || rect.Width() < 2 || rect.Height() < 2) [[unlikely]] {
+        return {};
+    }
+    const auto rectW = static_cast<uint32_t>(rect.Width());
+    const auto rectH = static_cast<uint32_t>(rect.Height());
+    uint32_t w = 0;
+    uint32_t h = 0;
+    if (static_cast<uint64_t>(srcWidth) * rectH >= static_cast<uint64_t>(srcHeight) * rectW) {
+        w = rectW;
+        h = static_cast<uint32_t>(static_cast<uint64_t>(rectW) * srcHeight / srcWidth);
+    } else {
+        h = rectH;
+        w = static_cast<uint32_t>(static_cast<uint64_t>(rectH) * srcWidth / srcHeight);
+    }
+    w = std::max(2U, w & ~1U);
+    h = std::max(2U, h & ~1U);
+    const int32_t cx = rect.X() + ((static_cast<int32_t>(rectW) - static_cast<int32_t>(w)) / 2);
+    const int32_t cy = rect.Y() + ((static_cast<int32_t>(rectH) - static_cast<int32_t>(h)) / 2);
+    return {.destX = static_cast<uint32_t>(std::max(0, cx) & ~1),
+            .destY = static_cast<uint32_t>(std::max(0, cy) & ~1),
+            .height = h,
+            .width = w};
 }
 
-[[nodiscard]] auto cVaapiDisplay::GetVideoRectWidth() const -> uint32_t {
+[[nodiscard]] auto cVaapiDisplay::GetVideoRect() const -> cRect {
     const cMutexLock lock(&videoRectMutex);
-    return static_cast<uint32_t>(videoRect.Width());
+    return videoRect;
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetTargetVideoRect() const -> cRect {
+    const cMutexLock lock(&videoRectMutex);
+    return targetVideoRect;
+}
+
+[[nodiscard]] auto cVaapiDisplay::NormalizeVideoRect(const cRect &rect) const -> cRect {
+    const int outW = static_cast<int>(outputWidth);
+    const int outH = static_cast<int>(outputHeight);
+    // Guard invalid modes; std::clamp() with lo > hi is UB.
+    if (outW < 2 || outH < 2) [[unlikely]] {
+        return cRect::Null;
+    }
+    if (rect.IsEmpty()) {
+        return {0, 0, outW, outH};
+    }
+    // 2-px alignment: NV12/P010 chroma is 4:2:0 (same constraint for 8- and 10-bit).
+    const int x = std::clamp(rect.X(), 0, outW - 2) & ~1;
+    const int y = std::clamp(rect.Y(), 0, outH - 2) & ~1;
+    const int w = std::clamp(rect.Width() & ~1, 2, (outW - x) & ~1);
+    const int h = std::clamp(rect.Height() & ~1, 2, (outH - y) & ~1);
+    return {x, y, w, h};
 }
 
 [[nodiscard]] auto cVaapiDisplay::SetVideoRect(const cRect &rect) -> bool {
-    const cMutexLock lock(&videoRectMutex);
-    cRect newRect;
-    if (rect.IsEmpty()) {
-        newRect = cRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
-    } else {
-        // NV12 (4:2:0) requires plane coordinates to be 2-pixel aligned on Intel DRM.
-        newRect = cRect(rect.X() & ~1, rect.Y() & ~1, std::max(2, rect.Width() & ~1), std::max(2, rect.Height() & ~1));
+    const cRect normalized = NormalizeVideoRect(rect);
+    if (normalized.IsEmpty()) [[unlikely]] {
+        return false;
     }
-    const bool dimsChanged = (newRect.Width() != videoRect.Width() || newRect.Height() != videoRect.Height());
-    dsyslog("vaapivideo/display: SetVideoRect x=%d y=%d w=%d h=%d%s", newRect.X(), newRect.Y(), newRect.Width(),
-            newRect.Height(), dimsChanged ? " (rebuild)" : "");
-    videoRect = newRect;
+    // Stage the target only; PresentBuffer promotes the active scanout rect (videoRect) once a fb
+    // of the new size arrives. Old-sized jitterBuf frames keep painting at the old rect during the
+    // VPP rebuild, so no underrun and no crop.
+    bool dimsChanged = false;
+    {
+        const cMutexLock lock(&videoRectMutex);
+        dimsChanged = normalized.Width() != targetVideoRect.Width() || normalized.Height() != targetVideoRect.Height();
+        targetVideoRect = normalized;
+    }
     return dimsChanged;
 }
 
@@ -1711,28 +1816,40 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         return false;
     }
 
-    // Snapshot the current video rect. scale_vaapi produces a framebuffer exactly sized to this
-    // rect, so CRTC_W/H == SRC_W/H -- no DRM plane scaler. CRTC_X/Y positions the plane.
+    // The filter chain pre-fits the fb to targetVideoRect; the active videoRect advances only once
+    // a fb matching the new target arrives, so old-sized jitterBuf frames keep painting at the old
+    // rect during the rebuild (no underrun, no crop). KMS scanout is always 1:1. Promotion is
+    // deferred: if this commit fails, videoRect must not have moved ahead of what KMS holds.
     cRect vr;
+    cRect promoteRect;
+    bool promoteVideoRect = false;
     {
         const cMutexLock lock(&videoRectMutex);
-        vr = videoRect;
+        const auto fitTarget = FitVideoToRect(fb.width, fb.height, targetVideoRect);
+        if (fitTarget.width == fb.width && fitTarget.height == fb.height) {
+            vr = targetVideoRect;
+            promoteRect = targetVideoRect;
+            promoteVideoRect = (vr.Width() != videoRect.Width() || vr.Height() != videoRect.Height() ||
+                                vr.X() != videoRect.X() || vr.Y() != videoRect.Y());
+        } else {
+            vr = videoRect;
+        }
     }
-    // Center scale_vaapi output within the rect (handles brief transition before filter rebuild).
-    const int32_t destX =
-        vr.X() + (static_cast<int>(fb.width) < vr.Width() ? (vr.Width() - static_cast<int>(fb.width)) / 2 : 0);
-    const int32_t destY =
-        vr.Y() + (static_cast<int>(fb.height) < vr.Height() ? (vr.Height() - static_cast<int>(fb.height)) / 2 : 0);
+    const auto placement = FitVideoToRect(fb.width, fb.height, vr);
+    if (placement.width == 0) [[unlikely]] {
+        return false;
+    }
+    const uint32_t destX = placement.destX;
+    const uint32_t destY = placement.destY;
+    const uint32_t planeW = placement.width;
+    const uint32_t planeH = placement.height;
 
     AtomicRequest req;
     req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
     req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
 
-    // HDR connector signaling is written only on state transitions, and must precede the
-    // per-frame COLOR_ENCODING below so the kernel sees a coherent HDR picture in one atomic.
-    // Snapshot the previous applied state for rollback: MaybeAppendHdrOutputState updates
-    // appliedHdrState/appliedHdrBlobId optimistically even though the kernel only observes
-    // them once this commit lands.
+    // HDR connector signaling: must precede the plane color-space write so the kernel sees one
+    // coherent HDR picture per commit. Snapshot for rollback on commit failure.
     const HdrStreamInfo previousHdrState = appliedHdrState;
     const uint32_t previousHdrBlobId = appliedHdrBlobId;
     bool hdrStateFailed = false;
@@ -1741,62 +1858,90 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         return false;
     }
 
-    // COLOR_ENCODING follows the applied HDR state. Forcing the enum explicitly matters
-    // because driver defaults (i915 BT.601 full / AMD BT.709 full) mismatch scale_vaapi's
-    // limited-range output. An HDR-active state with no BT.2020 enum is refused upstream
-    // by CanDriveHdrPlane(); intentionally no BT.709 fallback here (would produce a green cast).
-    if (appliedHdrState.kind != StreamHdrKind::Sdr) {
-        if (videoProps.colorEncodingBt2020Valid) {
-            req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt2020);
-        }
-    } else if (videoProps.colorEncodingValid) {
-        req.AddProperty(videoPlaneId, videoProps.colorEncoding, videoProps.colorEncodingBt709);
+    // Plane state: write each stateful property only on change. Some drivers treat redundant
+    // rewrites as transitions and reject them on the steady-state page-flip path. Cache advances
+    // only on commit success so a failed commit retries cleanly next frame.
+    const uint64_t stagedColorEncoding =
+        (appliedHdrState.kind != StreamHdrKind::Sdr && videoProps.colorEncodingBt2020Valid)
+            ? videoProps.colorEncodingBt2020
+            : videoProps.colorEncodingBt709;
+    const uint64_t stagedSrcW = static_cast<uint64_t>(planeW) << 16;
+    const uint64_t stagedSrcH = static_cast<uint64_t>(planeH) << 16;
+    if (videoProps.colorEncodingValid && stagedColorEncoding != lastVideoColorEncoding) {
+        req.AddProperty(videoPlaneId, videoProps.colorEncoding, stagedColorEncoding);
     }
-    if (videoProps.colorRangeValid) {
+    if (videoProps.colorRangeValid && videoProps.colorRangeLimited != lastVideoColorRange) {
         req.AddProperty(videoPlaneId, videoProps.colorRange, videoProps.colorRangeLimited);
     }
-    // Clamp source + dest together to display bounds (1:1 crop, no DRM scaler).
-    // Also enforce 2-pixel alignment: NV12 (4:2:0) requires even CRTC_X/Y on Intel DRM.
-    const auto safeDestX = static_cast<uint32_t>(std::max(0, destX) & ~1);
-    const auto safeDestY = static_cast<uint32_t>(std::max(0, destY) & ~1);
-    const uint32_t planeW = std::min(fb.width, safeDestX < outputWidth ? outputWidth - safeDestX : 0U) & ~1U;
-    const uint32_t planeH = std::min(fb.height, safeDestY < outputHeight ? outputHeight - safeDestY : 0U) & ~1U;
-    if (planeW == 0 || planeH == 0) [[unlikely]] {
-        return false;
+    // SRC_X/Y are always 0 (no source crop); bundled with the SRC_W/H write so they're emitted
+    // once on the first commit and again only when the source rect actually changes.
+    if (stagedSrcW != lastVideoSrcW || stagedSrcH != lastVideoSrcH) {
+        req.AddProperty(videoPlaneId, videoProps.srcX, 0);
+        req.AddProperty(videoPlaneId, videoProps.srcY, 0);
+        req.AddProperty(videoPlaneId, videoProps.srcW, stagedSrcW);
+        req.AddProperty(videoPlaneId, videoProps.srcH, stagedSrcH);
     }
-    req.AddProperty(videoPlaneId, videoProps.srcX, 0);
-    req.AddProperty(videoPlaneId, videoProps.srcY, 0);
-    req.AddProperty(videoPlaneId, videoProps.srcW, static_cast<uint64_t>(planeW) << 16);
-    req.AddProperty(videoPlaneId, videoProps.srcH, static_cast<uint64_t>(planeH) << 16);
-    req.AddProperty(videoPlaneId, videoProps.crtcX, static_cast<uint64_t>(safeDestX));
-    req.AddProperty(videoPlaneId, videoProps.crtcY, static_cast<uint64_t>(safeDestY));
-    req.AddProperty(videoPlaneId, videoProps.crtcW, planeW);
-    req.AddProperty(videoPlaneId, videoProps.crtcH, planeH);
+    if (destX != lastVideoCrtcX) {
+        req.AddProperty(videoPlaneId, videoProps.crtcX, destX);
+    }
+    if (destY != lastVideoCrtcY) {
+        req.AddProperty(videoPlaneId, videoProps.crtcY, destY);
+    }
+    if (planeW != lastVideoCrtcW) {
+        req.AddProperty(videoPlaneId, videoProps.crtcW, planeW);
+    }
+    if (planeH != lastVideoCrtcH) {
+        req.AddProperty(videoPlaneId, videoProps.crtcH, planeH);
+    }
 
-    // Bundle pending OSD geometry into the same atomic commit as the video flip. Both
-    // planes switch on the exact same vblank: separate commits would let one plane lag
-    // by a vblank period and produce visible OSD tearing on top of moving video.
+    // Bundle the OSD plane into the same atomic commit -- separate commits let one plane lag a
+    // vblank and tear over moving video. osdFbId reflects what the kernel will actually scan out
+    // after this commit lands: if AppendOsdPlane hides (clipped off-screen / no OSD plane), it
+    // reports false and we record 0 instead of currentOsd.fbId.
     bool osdCommitted = false;
+    uint32_t osdFbId = 0;
     {
         const cMutexLock lock(&osdMutex);
+        osdFbId = lastCommittedOsdFbId;
         if (osdDirty) {
+            osdCommitted = true;
             if (currentOsd.fbId != 0) {
-                AppendOsdPlane(req, currentOsd);
-                osdCommitted = true;
+                osdFbId = AppendOsdPlane(req, currentOsd) ? currentOsd.fbId : 0;
             } else if (osdPlaneId != 0) {
                 req.AddProperty(osdPlaneId, osdProps.fbId, 0);
                 req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
-                osdCommitted = true;
+                osdFbId = 0;
             }
         }
     }
 
-    // ALLOW_MODESET is required on AMDGPU (and i915 on some kernels) whenever
-    // HDR_OUTPUT_METADATA / Colorspace / max bpc changes -- those can force a link retrain that a
-    // "pure page-flip" commit is not permitted to trigger. The brief blackout is acceptable
-    // because HDR transitions only happen at channel-switch time, never per-frame.
+    // Two commit paths: steady-state nonblocking page flip (flags=0), and sync ALLOW_MODESET for
+    // HDR connector-state changes that may link-retrain. Plane/OSD updates ride the page-flip
+    // path because scale_vaapi already emits the final framebuffer size, so KMS sees SRC == CRTC
+    // and no plane scaler is involved -- the kernel internally picks fastset where applicable.
     const uint32_t commitFlags = hdrStateChanged ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0U;
     const bool success = AtomicCommit(req, commitFlags);
+    if (success) {
+        if (promoteVideoRect) {
+            const cMutexLock lock(&videoRectMutex);
+            videoRect = promoteRect;
+        }
+        lastVideoColorEncoding = stagedColorEncoding;
+        lastVideoColorRange = videoProps.colorRangeLimited;
+        lastVideoSrcW = stagedSrcW;
+        lastVideoSrcH = stagedSrcH;
+        lastVideoCrtcX = destX;
+        lastVideoCrtcY = destY;
+        lastVideoCrtcW = planeW;
+        lastVideoCrtcH = planeH;
+        if (osdCommitted) {
+            const cMutexLock lock(&osdMutex);
+            lastCommittedOsdFbId = osdFbId;
+            if (osdFbId != 0) {
+                lastOsdPixelBlendMode = 1; // AppendOsdPlane wrote it iff it differed.
+            }
+        }
+    }
 
     // Only clear osdDirty when the commit actually landed -- a failed commit (e.g. EBUSY)
     // must keep the OSD update queued for the next attempt.

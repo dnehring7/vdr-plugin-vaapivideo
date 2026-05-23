@@ -163,6 +163,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         esyslog("vaapivideo/filter: zero output dimensions");
         return false;
     }
+    // Compact dsyslog only when explicitly requested by the caller (ScaleVideo-driven rebuild).
+    // A Clear() / channel-switch rebuild still emits the full chain diagnostic.
+    const bool compactLog = params.compactLog;
 
     const int srcWidth = firstFrame->width;
     const int srcHeight = firstFrame->height;
@@ -176,8 +179,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const uint32_t dstWidth = params.outputWidth;
     const uint32_t dstHeight = params.outputHeight;
 
-    // DRM atomic planes have no hardware scaler, so VPP must output the letterboxed/pillarboxed
-    // size directly. Guard against streams that report SAR 0/0 (treated as square).
+    // VPP outputs DAR-fitted to the active video rect; KMS scanout stays 1:1 (no plane scaler).
+    // Guard against streams that report SAR 0/0 (treated as square).
     const int sarNum = firstFrame->sample_aspect_ratio.num > 0 ? firstFrame->sample_aspect_ratio.num : 1;
     const int sarDen = firstFrame->sample_aspect_ratio.den > 0 ? firstFrame->sample_aspect_ratio.den : 1;
 
@@ -336,7 +339,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         std::format("video_size={}x{}:pix_fmt={}:time_base=1/{}:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
                     srcHeight, static_cast<int>(srcPixFmt), PTSTICKS, sarNum, sarDen, fpsNum, fpsDen);
 
-    dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
+    if (!compactLog) {
+        dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
+    }
 
     // hw_frames_ctx must be attached to the buffer source before avfilter_init_str();
     // FFmpeg 7.x rejects initialization of a HW-format source without it.
@@ -441,11 +446,15 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     outputFrameDurationMs_ = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20; // 20 ms = 50 fps fallback
 
-    isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
-            filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "",
-            upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "", pixFmt,
-            params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
-    dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
+    if (compactLog) {
+        dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
+    } else {
+        isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
+                filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "",
+                upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "", pixFmt,
+                params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
+        dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
+    }
     return true;
 }
 

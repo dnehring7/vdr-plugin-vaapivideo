@@ -23,6 +23,13 @@
 #include <atomic>
 #include <vector>
 
+// VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/osd.h>
+#include <vdr/thread.h>
+#pragma GCC diagnostic pop
+
 class cVaapiOsd;
 
 // ============================================================================

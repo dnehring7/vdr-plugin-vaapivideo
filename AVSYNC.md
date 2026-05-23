@@ -228,31 +228,53 @@ runaway guard: if size > JITTERBUF_HARD_CAP, drop oldest down to cap
 SkipStaleJitterFrames(): bulk-drop heads more than HARD_THRESHOLD behind clock
 loop:
   dueIn = headPts − GetClock() − latency
-  if dueIn > FUTURE_MAX: drop head; continue        // PTS discontinuity
+  if dueIn > FUTURE_MAX:                 drop head; continue   // PTS discontinuity
   if dueIn > halfFrame:
-      if PendingDepth() == 0 && dueIn ≤ halfFrame + frameDur:
-          submit (pre-fill)                         // absorb phase drift
+      if PendingDepth() == 0 && dueIn ≤ halfFrame + prefillMargin:
+          submit (pre-fill)                                    // absorb phase drift
+      else if (now − lastDrainMs) > STALL_MS:
+          re-arm freerun; continue                             // anti-stall watchdog
       else:
-          break                                     // hold buffer
-  else:                  SyncAndSubmitFrame(head)
+          break                                                // hold buffer
+  else:                                  SyncAndSubmitFrame(head)
 ```
 
-`FUTURE_MAX` (`DECODER_DRAIN_FUTURE_MAX_MS`) treats multi-second future
-heads as PTS discontinuities and drops them before the normal due-gate
-wait. Smaller future offsets remain paced by the due gate.
+The drain has three independent guards against startup / re-anchor stalls:
 
-`JITTERBUF_HARD_CAP` (`DECODER_JITTERBUF_HARD_CAP = 150`, ~3 s @ 50 fps)
-caps GPU surface retention when a stuck-but-still-valid clock holds the
-due-gate closed: `SkipStaleJitterFrames()` only drops heads *behind* the
-clock, so without this guard PTS marching ahead would grow `jitterBuf`
-without bound. Drop-oldest preserves the closest-to-due tail.
+- **`FUTURE_MAX` (`DECODER_DRAIN_FUTURE_MAX_MS = 3 s`).** Drops heads
+  sitting more than 3 s ahead of the audio clock as PTS discontinuities
+  (post-ATTA anchor mismatch, broadcast PCR break, post-seek backlog).
+  Waiting for the gate to clear naturally would look like a multi-second
+  startup freeze. Smaller future offsets remain paced normally.
 
-The **pre-fill bypass** submits the head one frameDur early when the
-display prerender queue is empty, keeping `PendingDepth()` at 1–2
-instead of 0–1. Bounded to one frameDur so the decoder never runs
-further ahead than the gate intends; absorbs audio-clock vs VSync phase
-drift that would otherwise tick the underrun counter on a healthy
-stream.
+- **`STALL_MS` (`DECODER_DRAIN_STALL_MS = 500 ms`).** Walltime watchdog
+  for the case `FUTURE_MAX` misses: a steady gap that stays just under
+  3 s never trips the drop, and during EMA warmup no per-frame log
+  fires, so the pipeline would silently sit in the gate for tens of
+  seconds. When no frame has reached `SyncAndSubmitFrame` for
+  `STALL_MS` while `jitterBuf` is non-empty, the watchdog re-arms one
+  freerun frame (`freerunFrames.store(1)`) and continues — the next
+  iteration's `canFreerun` re-read submits the head unpaced. The
+  catch-up state machine inside `SyncAndSubmitFrame` cleans up any
+  residual on the very next frame. Each fire emits one log line:
+  `vaapivideo/decoder: drain stalled 514ms (dueIn=+31ms buf=20) -- re-arming freerun`.
+
+- **`JITTERBUF_HARD_CAP` (`DECODER_JITTERBUF_HARD_CAP = 150`, ~3 s @ 50 fps).**
+  Drop-oldest runaway guard for the case both gates above miss
+  (`SkipStaleJitterFrames` only drops heads *behind* the clock, so PTS
+  marching ahead with a valid clock could grow `jitterBuf` without
+  bound). Drop-oldest preserves the closest-to-due tail.
+
+The **pre-fill bypass** submits the head up to one prefillMargin early
+when the display prerender queue is empty, keeping `PendingDepth()` at
+1–2 instead of 0–1. `prefillMargin = frameDur / 2` (half a frame above
+strict-due), so the total prefill window is `halfFrame + prefillMargin
+= frameDur` — the decoder never runs more than one frame ahead of
+strict-due. Absorbs audio-clock vs VSync phase drift that would
+otherwise tick the underrun counter on a healthy stream. Originally
+`prefillMargin = frameDur` but that pushed steady-state `d` so far
+above `halfFrame` that a short audio glitch under heavy VPP load
+drained the queue to 0 before recovery.
 
 `liveMode` selects only the **hard-ahead policy** inside
 `SyncAndSubmitFrame` (replay → `WaitForAudioCatchUp`, live → bounded
@@ -265,7 +287,8 @@ backlog.
 The due check is bypassed for:
 
 - **Freerun** (`freerunFrames > 0` after `Clear()`, trick exit, audio
-  codec change) — gives an instant first picture.
+  codec change, **stall-watchdog re-arm**) — gives an instant first
+  picture, or a re-anchor after a startup stall.
 - **`pendingDrops`** from a soft-behind burst — one drop per drain
   iteration until exhausted.
 
@@ -325,41 +348,66 @@ not just video, so the extra slots do not shift `rawDelta`.
 The display thread tracks `lastFrameCommitMs` (atomic, updated on every
 fresh commit). On a VSync where no fresh frame is available it
 re-presents the previous buffer to keep flip cadence + OSD updates
-alive. An underrun is logged when:
+alive. Each re-present streak is measured in **wall-clock** instead of
+VSync count, so the printed duration is true even when the consumer
+loop is preempted or page-flip events arrive late.
 
-- the last fresh commit was within `ACTIVE_WINDOW_MS = 500 ms`
-  (decoder is "active"), AND
-- the consecutive empty-VSync count reaches `DISPLAY_PRERENDER_SLOTS + 2
-  = 8` (the prerender depth could not absorb it, so the user *will* see
-  a missed VSync), AND
-- the warmup grace has expired (see below).
+State carried across iterations:
 
-Onset is logged at most once per `UNDERRUN_LOG_COOLDOWN_MS = 2 s`; the
-matching recovery log on refill reports the actual peak length. Outside
-the active window (post-Clear, paused, pre-roll, post-trick) re-presents
-are expected and neither count nor log.
+- `gapStartMs` — wall-clock baseline anchored on the first re-present
+  of the current streak; `0` means "anchor on next re-present".
+- `peakGapMs` — wall-clock peak of the current streak; reset on every
+  fresh commit.
+
+Per re-present iteration (only when `lastFrameCommitMs != 0` and outside
+trick / sync-sleep / warmup grace):
+
+1. Anchor `gapStartMs = nowMs` if it's `0`.
+2. `currentGapMs = nowMs − gapStartMs`.
+3. If `currentGapMs < IDLE_THRESHOLD_MS (10 s)`:
+   - `peakGapMs = max(peakGapMs, currentGapMs)`.
+   - If `currentGapMs ≥ thresholdMs` and the log cooldown has elapsed,
+     emit `queue empty Nms; total=M`.
+4. Else (gap ≥ 10 s): treat as paused / stopped, clear `peakGapMs`,
+   leave `gapStartMs` put so a long pause doesn't re-anchor every
+   iteration.
+
+`thresholdMs = (DISPLAY_PRERENDER_SLOTS + 2) × vsyncMs` — at 50 Hz that's
+`8 × 20 ms = 160 ms`. The `+2` margin gives one VSync of natural absorption
+by the prerender depth plus one more so a single hiccup doesn't trip.
+
+On the next fresh commit:
+- If `peakGapMs ≥ thresholdMs` the recovery line `queue refilled after
+  Nms; total=M` reports the actual peak.
+- `gapStartMs` and `peakGapMs` reset; the streak ends.
+
+Onset is rate-limited to once per `UNDERRUN_LOG_COOLDOWN_MS = 2 s`.
+`isClearing`, `inTrick`, and `inSyncSleep` each force `gapStartMs = 0`
+so a deliberate hard-ahead sleep (up to 500 ms) or trick hold
+(60–2000 ms) does not surface its own duration as a fake underrun.
 
 ### Warmup grace
 
-`WARMUP_GRACE_MS = 3 s` suppresses the underrun log for the first 3 s
-after the decoder resumes from idle. Armed in two cases:
+`WARMUP_GRACE_MS = 3 s` suppresses the underrun gate for the first 3 s
+after the decoder resumes from idle. Armed on a fresh commit when:
 
-- **Post-Clear.** `BeginStreamSwitch()` zeroes `lastFrameCommitMs`;
-  the next fresh commit detects the zero and arms the grace.
-- **Idle resume.** Any fresh commit where the previous commit is
-  older than `ACTIVE_WINDOW_MS` arms the grace. Covers transitions
-  where `BeginStreamSwitch` wasn't invoked (track switch, post-trick
+- `lastFrameCommitMs == 0` (post-`Clear()` reset), OR
+- `nowMs − lastFrameCommitMs > ACTIVE_WINDOW_MS (500 ms)` (idle resume
+  where `BeginStreamSwitch` wasn't invoked — track switch, post-trick
   re-anchor).
 
-Without the grace, every Clear logs a spurious underrun while the filter
-graph rebuilds and the audio clock anchors.
+Without the grace, every Clear would log a spurious underrun while the
+filter graph rebuilds and the audio clock anchors. `ACTIVE_WINDOW_MS`
+exists only to arm this grace — it does **not** gate the underrun log
+itself (that gate is `IDLE_THRESHOLD_MS`).
 
 ## Sync bypass
 
 The sync gate is bypassed (frame submitted unpaced) in:
 
 - Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
-- Freerun window after `Clear()`, trick exit, or `NotifyAudioChange()`.
+- Freerun window after `Clear()`, trick exit, `NotifyAudioChange()`, or
+  the drain stall-watchdog re-arm.
 - Radio mode / NOPTS frame (no audio processor or no PTS to align on).
 - Audio not yet running (`GetClock()` is NOPTS until the first
   `WritePcmToAlsa()` fires).
@@ -370,6 +418,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | -------------------------- | ------------------ | ---------- | ------------------------------ |
 | Plugin start               | invalid            | —          | empty                          |
 | Channel switch (`Clear()`) | reset              | unchanged  | flushed; freerun armed         |
+| Drain stall-watchdog fire  | unchanged          | unchanged  | unchanged; freerun re-armed    |
 | Catch-up enter             | (drops silent)     | unchanged  | drained silently to alignment  |
 | Catch-up exit              | reset              | unchanged  | one frame submitted normally   |
 | Soft drop                  | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
@@ -386,7 +435,7 @@ arrives, so dropping ~1 s of still-valid video buys nothing.
 ## Diagnostic log
 
 ```
-sync d=+12.5ms avg=+11.7ms lat=40ms buf=50 aq=0 miss=0 drop=0 skip=0
+sync d=+15.2ms avg=+15.1ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
 ```
 
 | Field  | Meaning |
@@ -411,8 +460,9 @@ ALSA-cushion-driven; replay cold start: ~40–60; replay post-Clear: ~0).
 Each soft / hard event also emits a per-event `dsyslog` line naming the
 cause (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead
 replay`, `hard-behind`, `stale-jitter bulk`, `catch-up
-entered (spike|warmup|sustained)`, `catch-up complete`) for "why did
-this fire?" without waiting for the next periodic line.
+entered (spike|warmup|sustained)`, `catch-up complete`, `drain
+stalled … re-arming freerun`) for "why did this fire?" without waiting
+for the next periodic line.
 
 ### Steady-state offset
 
@@ -420,9 +470,15 @@ The EMA does not settle at zero. The baseline depends on whether the
 decoder is gate-bound or throughput-bound:
 
 - **Gate-bound** (live TV, replay cold start, anything with `buf > 0`):
-  `d ≈ +halfFrame` (~+7 ms @ 50 fps). The gate releases head when its
-  pts is `+halfFrame` ahead of `clock + latency`, so submitted frames
-  carry that small positive offset.
+  `d` settles inside the prefill envelope `[halfFrame, halfFrame +
+  prefillMargin]` — at 50 fps that's `[+10 ms, +20 ms]`, with observed
+  values centering around `+15…+18 ms`. The exact position depends on
+  how often the display drains the prerender queue to zero (which
+  enables the prefill bypass) vs. holding at depth 1+ (which gates at
+  strict `halfFrame`). On marginal-VPP hardware where the queue
+  oscillates between 0 and 1, `d` lands near the middle of the
+  envelope; on FHD where the queue stays at 1–2, `d` sits closer to
+  `halfFrame`.
 - **Throughput-bound** (replay post-Clear, `buf ≈ 0`): `d ≈ −frameDur`
   (~−20 ms @ 50 fps). Each new frame is submitted as soon as decoded;
   no buffered lead, and the audio clock has already advanced past the
@@ -465,13 +521,16 @@ Naming conventions:
 | `DECODER_SYNC_MAX_CORRECTION_MS`    | 200   | Soft-event cap (matches HARD_THRESHOLD) so one event fully closes corridor |
 | `DECODER_SYNC_HARD_AHEAD_MAX_MS`    | 500   | Live hard-ahead sleep cap (ms) |
 | `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard before the normal due-gate wait |
+| `DECODER_DRAIN_STALL_MS`            | 500   | Anti-stall watchdog: re-arm freerun if drain has not fired this long |
 | `DECODER_SYNC_COOLDOWN_MS`          | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
 | `DECODER_SYNC_EMA_SAMPLES`          | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
 | `DECODER_SYNC_WARMUP_SAMPLES`       | 50    | Samples averaged before EMA seed (~1 s @ 50 fps) |
 | `DECODER_SYNC_FREERUN_FRAMES`       | 1     | Unpaced frames after sync-disrupting events |
 | `DECODER_SYNC_LOG_INTERVAL_MS`      | 2000  | Periodic sync diagnostic interval (ms) |
-| `DISPLAY_PRERENDER_SLOTS`           | 6     | Decoder→display handoff queue depth (= 120 ms tolerance @ 50 fps); absorbs UHD VPP / memory-bandwidth spikes |
-| `ACTIVE_WINDOW_MS` *(local)*          | 500   | Window after last fresh commit during which an empty VSync counts as an underrun |
+| `DISPLAY_PRERENDER_SLOTS`             | 6     | Decoder→display handoff queue depth (= 120 ms tolerance @ 50 fps); absorbs UHD VPP / memory-bandwidth spikes |
+| `ACTIVE_WINDOW_MS` *(local)*          | 500   | Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log itself) |
+| `IDLE_THRESHOLD_MS` *(local)*         | 10000 | Wall-clock streak length beyond which a re-present gap is treated as paused / stopped (peak cleared) |
 | `UNDERRUN_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between underrun-onset dsyslog lines |
 | `WARMUP_GRACE_MS` *(local)*           | 3000  | Post-idle grace suppressing underrun logs while pipeline anchors |
-| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 8     | Consecutive empty-VSync count that trips an underrun log (= PRERENDER_SLOTS + 2) |
+| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 8     | `(PRERENDER_SLOTS + 2)`; `thresholdMs = THRESHOLD_VSYNCS × vsyncMs` is the wall-clock gap that trips a log |
+| `PAGE_FLIP_STUCK_MS` *(local)*        | 200   | Stuck-flip watchdog: force-clear `isFlipPending` if the kernel swallows the page-flip event |

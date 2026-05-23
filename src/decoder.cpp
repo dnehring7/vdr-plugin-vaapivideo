@@ -86,6 +86,7 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/osd.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
@@ -120,6 +121,11 @@ constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
           ///< PTS discontinuity (post-ATTA anchor mismatch, broadcast PCR break) -- waiting for natural
           ///< sync wastes seconds and looks like a startup freeze. Dropping immediately lets the next
           ///< frame proceed and SyncAndSubmitFrame's catch-up path cleans up the residual.
+constexpr uint64_t DECODER_DRAIN_STALL_MS =
+    500; ///< Walltime budget for the future-head gate to clear naturally. After this, the audio clock
+         ///< has been anchored to a different domain than the incoming video PTS (post-Clear / ATTA /
+         ///< PCR break) and waiting only extends the startup black screen. Re-arm one freerun frame to
+         ///< force the head through and re-anchor the controller -- catch-up cleans up any residual.
 
 // ============================================================================
 // === STRUCTURES ===
@@ -855,6 +861,7 @@ auto cVaapiDecoder::Action() -> void {
     dsyslog("vaapivideo/decoder: thread started");
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
+    uint64_t drainBlockedSinceMs{0}; ///< Walltime of first consecutive due-gate block; 0 = not blocked.
     uint64_t lastDrainMs{0};
     int trickEmptyDecodes{0}; ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
 
@@ -870,6 +877,7 @@ auto cVaapiDecoder::Action() -> void {
         // is genuinely new material that belongs in the jitter buffer.
         if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
             ApplyDeferredJitterFlush(lastDrainMs);
+            drainBlockedSinceMs = 0;
         }
 
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
@@ -1038,6 +1046,10 @@ auto cVaapiDecoder::Action() -> void {
             SkipStaleJitterFrames(ap);
         }
 
+        if (jitterBuf.empty()) {
+            drainBlockedSinceMs = 0;
+        }
+
         // Freerun and pendingDrops (soft-behind burst) bypass the due-gate.
         while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
             // Clear() / SetTrickSpeed(0) raced this iteration: abandon the stale jitterBuf to
@@ -1073,6 +1085,7 @@ auto cVaapiDecoder::Action() -> void {
                                 dsyslog(
                                     "vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- dropping",
                                     static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
+                                drainBlockedSinceMs = 0;
                                 jitterBuf.pop_front();
                                 continue; // re-check new head
                             }
@@ -1090,6 +1103,30 @@ auto cVaapiDecoder::Action() -> void {
                             const bool prefill =
                                 display && display->PendingDepth() == 0 && dueIn <= halfFrame + prefillMargin;
                             if (!prefill) {
+                                // Stall watchdog: track walltime since the due-gate first started
+                                // blocking the head. If this exceeds DECODER_DRAIN_STALL_MS while
+                                // jitterBuf is non-empty, the audio clock anchored to a domain
+                                // incompatible with the incoming video PTS (the 3 s future-head guard
+                                // above only fires for a single discontinuity, not for a steady gap
+                                // that stays just under the threshold). Re-arm one freerun frame so
+                                // the next iteration submits unpaced and the controller re-anchors;
+                                // catch-up handles any residual. Tracked independently of lastDrainMs
+                                // so a post-Clear stall (where ApplyDeferredJitterFlush zeros
+                                // lastDrainMs) is still measured from the first actual block.
+                                const uint64_t nowMs = cTimeMs::Now();
+                                if (drainBlockedSinceMs == 0) {
+                                    drainBlockedSinceMs = nowMs;
+                                }
+                                const uint64_t blockedMs = nowMs - drainBlockedSinceMs;
+                                if (blockedMs >= DECODER_DRAIN_STALL_MS) {
+                                    dsyslog("vaapivideo/decoder: drain stalled %llums (dueIn=%+lldms buf=%zu) -- "
+                                            "re-arming freerun",
+                                            static_cast<unsigned long long>(blockedMs),
+                                            static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
+                                    freerunFrames.store(1, std::memory_order_relaxed);
+                                    drainBlockedSinceMs = 0;
+                                    continue; // re-evaluate with canFreerun=true on the next iter
+                                }
                                 break;
                             }
                         }
@@ -1109,6 +1146,7 @@ auto cVaapiDecoder::Action() -> void {
                 static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs * 2) {
                 ++drainMissCount;
             }
+            drainBlockedSinceMs = 0;
             lastDrainMs = inTrick ? 0 : nowMs;
 
             auto drainFrame = std::move(jitterBuf.front());
@@ -1352,13 +1390,17 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             {
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
 
+                // ScaleVideo() target changed: rebuild the VPP graph for the new size. jitterBuf
+                // is kept; old-sized frames keep painting at the old scanout rect until a matching
+                // fb arrives (PresentBuffer promotes videoRect there). compactLog distinguishes
+                // this rebuild from a Clear/channel-switch rebuild so logging stays informative.
+                bool compactLog = false;
                 if (videoRectDirty.exchange(false, std::memory_order_acq_rel)) {
-                    dsyslog("vaapivideo/decoder: video rect changed, rebuilding filter graph");
-                    jitterBuf.clear(); // drop old-sized frames before they reach PresentBuffer
                     filterChain.Reset();
+                    compactLog = true;
                 }
                 if (!filterChain.IsBuilt()) {
-                    (void)InitFilterGraph(decodedFrame.get());
+                    (void)InitFilterGraph(decodedFrame.get(), compactLog);
                 }
 
                 if (filterChain.IsBuilt()) {
@@ -1437,7 +1479,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     return anyFrameDecoded;
 }
 
-[[nodiscard]] auto cVaapiDecoder::InitFilterGraph(AVFrame *firstFrame) -> bool {
+[[nodiscard]] auto cVaapiDecoder::InitFilterGraph(AVFrame *firstFrame, bool compactLog) -> bool {
     // Fills BuildParams from decoder/display/config/caps and delegates to cVideoFilterChain::Build().
     // The filter chain itself has no decoder/display dependencies, so a future mediaplayer
     // orchestrator can reuse it by supplying different BuildParams.
@@ -1462,8 +1504,11 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.fpsDen = codecCtx->framerate.den;
     params.hwFramesCtx = codecCtx->hw_frames_ctx;
     params.hwDeviceRef = vaapiContext->hwDeviceRef;
-    params.outputWidth = display->GetVideoRectWidth();
-    params.outputHeight = display->GetVideoRectHeight();
+    // Target the staged ScaleVideo() rect (not the active one) so the next fb already fits and
+    // KMS scanout stays 1:1.
+    const cRect targetRect = display->GetTargetVideoRect();
+    params.outputWidth = static_cast<uint32_t>(targetRect.Width());
+    params.outputHeight = static_cast<uint32_t>(targetRect.Height());
     params.outputRefreshHz = display->GetOutputRefreshRate();
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;
@@ -1472,6 +1517,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;
     params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
+    params.compactLog = compactLog;
 
     if (!filterChain.Build(firstFrame, params)) {
         return false;

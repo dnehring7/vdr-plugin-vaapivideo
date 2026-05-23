@@ -24,6 +24,7 @@
 #include "common.h"
 #include "config.h"
 #include "decoder.h"
+#include "display.h"
 #include "osd.h"
 #include "pes.h"
 #include "stream.h"
@@ -351,7 +352,9 @@ cVaapiDevice::~cVaapiDevice() noexcept {
     return (initState.load(std::memory_order_acquire) == 2) && decoder && decoder->IsReady();
 }
 
-[[nodiscard]] auto cVaapiDevice::CanScaleVideo(const cRect &rect, int /*alignment*/) -> cRect { return rect; }
+[[nodiscard]] auto cVaapiDevice::CanScaleVideo(const cRect &rect, int /*alignment*/) -> cRect {
+    return Ready() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
+}
 
 auto cVaapiDevice::Clear() -> void {
     // Diagnostic: log thread + inter-call delta to diagnose unexpected Clear() bursts.
@@ -618,6 +621,24 @@ namespace {
     return out;
 }
 
+// Reproduce on-screen geometry inside the grab canvas. The VPP filter has already DAR-fitted the
+// fb to videoRect (no DRM scaler), so frame dimensions equal placement dimensions and the only
+// remaining step is a pad to full output size when videoRect is a sub-rect (skin thumbnail mode).
+[[nodiscard]] auto BuildGrabLayoutChain(const AVFrame *frame, const cVaapiDisplay &display) -> std::string {
+    if (!frame || frame->width <= 0 || frame->height <= 0) [[unlikely]] {
+        return {};
+    }
+    const auto placement = FitVideoToRect(static_cast<uint32_t>(frame->width), static_cast<uint32_t>(frame->height),
+                                          display.GetVideoRect());
+    const uint32_t outW = display.GetOutputWidth();
+    const uint32_t outH = display.GetOutputHeight();
+    if (placement.width == 0 ||
+        (placement.destX == 0 && placement.destY == 0 && placement.width == outW && placement.height == outH)) {
+        return {};
+    }
+    return std::format("pad={}:{}:{}:{}:color=black", outW, outH, placement.destX, placement.destY);
+}
+
 /// Serialize an RGB24 AVFrame as a P6 PNM byte stream into a malloc()'d buffer.
 /// PNM = trivial text header + raw RGB; no codec required.
 [[nodiscard]] auto MakePnm(const AVFrame *rgb24, int &outSize) -> uchar * {
@@ -741,10 +762,18 @@ namespace {
     //     an SDR screen grab where preserving HDR specular detail isn't worth dim mid-tones.
     //   r=pc (not r=tv) avoids the swscale TV->PC expansion clamping max RGB near Y=235.
     //   desat=1 is the mid-ground; the filter default of 2 over-desaturates toward white.
-    const std::string_view videoChain = isHdr ? "zscale=t=linear:npl=200,format=gbrpf32le,zscale=p=bt709,"
-                                                "tonemap=hable:desat=1:peak=1.0,"
-                                                "zscale=t=bt709:m=bt709:r=pc,format=yuv420p"
-                                              : std::string_view{};
+    std::string videoChain;
+    if (isHdr) {
+        videoChain = "zscale=t=linear:npl=200,format=gbrpf32le,zscale=p=bt709,"
+                     "tonemap=hable:desat=1:peak=1.0,"
+                     "zscale=t=bt709:m=bt709:r=pc,format=yuv420p";
+    }
+    if (const std::string layoutChain = BuildGrabLayoutChain(srcFrame.get(), *display); !layoutChain.empty()) {
+        if (!videoChain.empty()) {
+            videoChain += ',';
+        }
+        videoChain += layoutChain;
+    }
     auto rgb24 = RunGrabFilter(srcFrame.get(), videoChain, AV_PIX_FMT_RGB24,
                                isHdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_UNSPECIFIED,
                                isHdr ? AVCOL_RANGE_MPEG : AVCOL_RANGE_UNSPECIFIED);
@@ -752,7 +781,7 @@ namespace {
         return nullptr;
     }
 
-    // 3. Composite the visible OSD on top at native display res, before any user-requested
+    // 3. Composite the visible OSD on top at native display geometry, before any user-requested
     // resize -- OSD geometry is screen-space and would misalign if the video was scaled first.
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
         provider->CompositeOntoRgb24(rgb24->data[0], rgb24->width, rgb24->height, rgb24->linesize[0],
@@ -1101,12 +1130,17 @@ auto cVaapiDevice::Play() -> void {
 [[nodiscard]] auto cVaapiDevice::Ready() -> bool { return initState.load(std::memory_order_acquire) == 2; }
 
 auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
-    dsyslog("vaapivideo/device: ScaleVideo x=%d y=%d w=%d h=%d", rect.X(), rect.Y(), rect.Width(), rect.Height());
-    if (display) [[likely]] {
-        const bool rebuild = display->SetVideoRect(rect);
-        if (decoder && rebuild) {
-            decoder->RequestFilterRebuild();
-        }
+    if (!display) [[unlikely]] {
+        return;
+    }
+    // On dim change, the decoder rebuilds the VPP chain to emit fbs pre-sized for the new rect.
+    const bool needsFilterRebuild = display->SetVideoRect(rect);
+    if (needsFilterRebuild) {
+        dsyslog("vaapivideo/device: ScaleVideo rect=(%d,%d %dx%d) (rebuild)", rect.X(), rect.Y(), rect.Width(),
+                rect.Height());
+    }
+    if (needsFilterRebuild && decoder) {
+        decoder->RequestFilterRebuild();
     }
 }
 
@@ -1522,11 +1556,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     const auto pid = static_cast<uint16_t>(track ? track->id : 0);
 
     if (type != ttNone && type == lastHandledAudioTrack && pid == lastHandledAudioPid) {
-        // Same (type, PID): PMT churn or duplicate hook. Log for correlation, skip reset.
-        isyslog("vaapivideo/device: %s -> %s track %d (PID=%u) -- no change", reason,
-                IS_AUDIO_TRACK(type) ? "audio" : (IS_DOLBY_TRACK(type) ? "dolby" : "unknown"), static_cast<int>(type),
-                pid);
-        return;
+        return; // PMT churn / duplicate hook: VDR fires this repeatedly per channel switch.
     }
     lastHandledAudioTrack = type;
     lastHandledAudioPid = pid;

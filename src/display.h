@@ -14,6 +14,14 @@
 
 #include <deque>
 
+// VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/osd.h>
+#include <vdr/thread.h>
+#include <vdr/tools.h>
+#pragma GCC diagnostic pop
+
 struct VaapiFrame;
 
 // ============================================================================
@@ -48,6 +56,23 @@ class AtomicRequest {
 };
 
 // ============================================================================
+// === PLACEMENT HELPER ===
+// ============================================================================
+
+/// Result of fitting (srcWidth x srcHeight) into a target rect with DAR preservation.
+/// All fields are zero when the input was invalid (use `width == 0` as the failure flag).
+struct VideoPlacement {
+    uint32_t destX{};  ///< Top-left X in viewport coordinates (even).
+    uint32_t destY{};  ///< Top-left Y in viewport coordinates (even).
+    uint32_t height{}; ///< Scaled height (even, >= 2).
+    uint32_t width{};  ///< Scaled width (even, >= 2).
+};
+
+/// DAR-preserving fit of (srcWidth x srcHeight) into @p rect, centered, 2-px aligned for
+/// NV12/P010 chroma. Returns an empty placement on invalid input or a rect smaller than 2x2.
+[[nodiscard]] auto FitVideoToRect(uint32_t srcWidth, uint32_t srcHeight, const cRect &rect) noexcept -> VideoPlacement;
+
+// ============================================================================
 // === VAAPI DISPLAY ===
 // ============================================================================
 
@@ -57,8 +82,7 @@ class AtomicRequest {
 ///
 /// Thread safety: SubmitFrame(), SetOsd(), BeginStreamSwitch(), EndStreamSwitch() are
 /// safe from any thread. Initialize() and Shutdown() must be called from the same thread.
-/// Lock order: importMutex -> bufferMutex -> osdMutex; {bufferMutex, vaDriverMutex} -> videoRectMutex (innermost).
-/// Full rationale in display.cpp file header.
+/// Lock order: importMutex -> bufferMutex -> osdMutex; videoRectMutex is leaf. See display.cpp.
 class cVaapiDisplay : public cThread {
   public:
     // ========================================================================
@@ -118,8 +142,13 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t { return outputHeight; }
     [[nodiscard]] auto GetOutputRefreshRate() const noexcept -> uint32_t { return refreshRate; }
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t { return outputWidth; }
-    [[nodiscard]] auto GetVideoRectHeight() const -> uint32_t; ///< Thread-safe snapshot of videoRect height (pixels).
-    [[nodiscard]] auto GetVideoRectWidth() const -> uint32_t;  ///< Thread-safe snapshot of videoRect width (pixels).
+    /// Thread-safe snapshot of the active scanout rect.
+    [[nodiscard]] auto GetVideoRect() const -> cRect;
+    /// Thread-safe snapshot of the rect the next VPP build should target (differs from videoRect
+    /// only between a ScaleVideo() call and the first fb of the new size).
+    [[nodiscard]] auto GetTargetVideoRect() const -> cRect;
+    /// Rect SetVideoRect() will store: full-screen for empty, otherwise clipped + 2-px aligned.
+    [[nodiscard]] auto NormalizeVideoRect(const cRect &rect) const -> cRect;
     /// Set up planes, cache DRM property IDs, program the initial display mode, start the thread.
     [[nodiscard]] auto Initialize(int fileDescriptor, AVBufferRef *hwDevice, uint32_t crtcIdentifier,
                                   uint32_t connectorIdentifier, const drmModeModeInfo &displayMode) -> bool;
@@ -130,9 +159,8 @@ class cVaapiDisplay : public cThread {
     /// Stage new OSD geometry; applied on the next video commit (same vblank). Always marks
     /// dirty even for an unchanged fbId: VDR may repaint in-place, requiring FBC/PSR invalidation.
     auto SetOsd(const OsdOverlay &osd) -> void;
-    /// Update video output rect; cRect::Null or empty rect restores full-screen.
-    /// Returns true if the output dimensions changed (filter rebuild required).
-    /// Called from VDR main thread; PresentBuffer() snapshots it under videoRectMutex.
+    /// Stage the target video output rect (empty/null = full-screen). Returns true on dimension
+    /// change, signaling the caller to trigger a VPP filter rebuild.
     [[nodiscard]] auto SetVideoRect(const cRect &rect) -> bool;
     /// Stop display thread, blank both planes, deactivate CRTC, release all resources. Idempotent.
     auto Shutdown() -> void;
@@ -272,12 +300,13 @@ class cVaapiDisplay : public cThread {
     // ========================================================================
 
     /// Add OSD plane properties to @p req, clipping to screen bounds.
-    /// No-op if osd.fbId==0 or osdPlaneId==0 (no OSD plane on this hardware).
-    auto AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) const -> void;
+    /// Returns true iff the commit will attach @p osd.fbId; false means the plane was hidden
+    /// (no OSD plane on this hardware, fully clipped off-screen, or zero-size after clipping).
+    [[nodiscard]] auto AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) const -> bool;
     /// Program a new display mode via an ALLOW_MODESET commit; resets HDR state to SDR.
     [[nodiscard]] auto ApplyDisplayMode(const drmModeModeInfo &mode) -> bool;
-    /// Submit an atomic commit. Sets isFlipPending for page-flip commits (non-modeset).
-    /// EBUSY is silently swallowed; all other errors are logged.
+    /// Submit an atomic commit. flags==0 selects the async page-flip path; pass
+    /// DRM_MODE_ATOMIC_ALLOW_MODESET for a synchronous transition. EBUSY is silently swallowed.
     [[nodiscard]] auto AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool;
     /// Find the planeIndex-th plane supporting @p format on the active CRTC; cache its property IDs.
     /// Prefers HDR-capable planes (P010 + COLOR_ENCODING BT.2020) for the NV12 video slot.
@@ -325,9 +354,12 @@ class cVaapiDisplay : public cThread {
     mutable cMutex vaDriverMutex; ///< Serializes VA-driver calls: MapVaapiFrame (display) vs VPP pull (decoder).
                                   ///< iHD VEBOX is not re-entrant when shared with filter execution.
     std::atomic<bool> isClearing; ///< Set during stream switch; gates new frame imports in Action() and SubmitFrame()
-    std::atomic<bool> isFlipPending; ///< True between commit and page-flip event; Action() waits on this
-    std::atomic<bool> ready;         ///< True after Initialize() succeeds; cleared first in Shutdown()
-    std::atomic<bool> stopping;      ///< Tells Action() to exit; set after isClearing to avoid import/exit race
+    std::atomic<bool> isFlipPending;             ///< True between commit and page-flip event; Action() waits on this
+    std::atomic<uint64_t> flipPendingSinceMs{0}; ///< cTimeMs::Now() when isFlipPending was set; 0 = not pending.
+                                                 ///< Action() force-clears the flag if no event arrives within a
+                                                 ///< few vblanks (kernel can swallow events on first plane attach).
+    std::atomic<bool> ready;                     ///< True after Initialize() succeeds; cleared first in Shutdown()
+    std::atomic<bool> stopping; ///< Tells Action() to exit; set after isClearing to avoid import/exit race
     std::atomic<bool> trickActive{
         false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses underrun log
     std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
@@ -351,9 +383,26 @@ class cVaapiDisplay : public cThread {
     uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active refresh rate in Hz; defaults to 50 if EDID reports 0
     uint32_t videoPlaneId{};                            ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{};                         ///< Cached atomic prop IDs for the video plane
+    cRect targetVideoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH),
+                          static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Requested rect (next VPP build target).
     cRect videoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH),
-                    static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Video output rect; Initialize() sets to full-screen.
-    mutable cMutex videoRectMutex; ///< Guards videoRect (written by VDR main thread, read by display thread).
+                    static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Active scanout rect; matches current fb 1:1.
+                                                               ///< Advances to targetVideoRect once a matching fb
+                                                               ///< arrives, so old frames keep painting during rebuild.
+    mutable cMutex videoRectMutex;                             ///< Guards targetVideoRect and videoRect.
+
+    // Last-committed plane property caches. Sentinel ~0 forces a write on the first commit after
+    // Initialize; cache advances only on commit success so failed commits retry next frame.
+    uint32_t lastCommittedOsdFbId{}; ///< OSD fbId in scanout after last successful commit; 0 = none.
+    uint64_t lastOsdPixelBlendMode{~uint64_t{0}};
+    uint64_t lastVideoColorEncoding{~uint64_t{0}};
+    uint64_t lastVideoColorRange{~uint64_t{0}};
+    uint64_t lastVideoSrcW{~uint64_t{0}};
+    uint64_t lastVideoSrcH{~uint64_t{0}};
+    uint64_t lastVideoCrtcX{~uint64_t{0}};
+    uint64_t lastVideoCrtcY{~uint64_t{0}};
+    uint64_t lastVideoCrtcW{~uint64_t{0}};
+    uint64_t lastVideoCrtcH{~uint64_t{0}};
 
     // ========================================================================
     // === HDR STATE ===

@@ -82,9 +82,7 @@ extern "C" {
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
-#include <vdr/plugin.h>
-#include <vdr/thread.h>
-#include <vdr/tools.h>
+#include <vdr/config.h>
 #pragma GCC diagnostic pop
 
 // ============================================================================
@@ -104,7 +102,7 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.5.7";
+inline constexpr const char *PLUGIN_VERSION = "1.5.8";
 
 // ============================================================================
 // === CONSTANTS ===

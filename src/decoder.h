@@ -14,6 +14,13 @@
 
 #include <deque>
 
+// VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/thread.h>
+#include <vdr/tools.h>
+#pragma GCC diagnostic pop
+
 class cAudioProcessor;
 class cVaapiDisplay;
 struct VaapiContext;
@@ -103,7 +110,7 @@ class cVaapiDecoder : public cThread {
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
     auto RequestFilterRebuild()
-        -> void;                     ///< Schedule filter graph rebuild on next decoded frame (e.g. after ScaleVideo).
+        -> void; ///< Schedule filter graph rebuild on next decoded frame (e.g. after ScaleVideo dim change).
     auto RequestTrickExit() -> void; ///< Deferred Play()-without-TrickSpeed(0); cleared if SetTrickSpeed() follows.
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)
         -> void;             ///< Configure trick-play pacing. speed=0 returns to normal. fast=true -> key-frames only.
@@ -129,8 +136,9 @@ class cVaapiDecoder : public cThread {
                  ///< Caller holds codecMutex and must have populated decodedFrame.
     auto DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< NULL-packet EOS drain, then avcodec_flush_buffers to re-arm. Caller holds codecMutex.
-    [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame)
-        -> bool; ///< Fill BuildParams and delegate to filterChain_.Build().
+    [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame, bool compactLog = false)
+        -> bool; ///< Fill BuildParams and delegate to filterChain_.Build(). compactLog=true for
+                 ///< ScaleVideo-driven rebuilds (one-line dsyslog); false for first build / channel switch.
     [[nodiscard]] auto ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept
         -> bool; ///< True when stream + GPU (vppP010) + display (EDID) + user config all permit HDR passthrough.
     [[nodiscard]] auto SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame)
@@ -224,14 +232,14 @@ class cVaapiDecoder : public cThread {
     std::atomic<size_t> packetsSinceOpen;  ///< avcodec_send_packet calls since last open; starvation counters.
     std::atomic<size_t> keyPacketsSinceOpen; ///< Subset with AV_PKT_FLAG_KEY; distinguishes silent feed vs HW stall.
     std::atomic<int64_t> lastPts{
-        AV_NOPTS_VALUE};                 ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
-    std::atomic<uint64_t> clearEpoch{0}; ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
-    uint64_t iterationEpoch{0};          ///< Decode thread only. Snapshot of clearEpoch at each Action() iter top.
-    std::atomic<bool> liveMode;          ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
-    std::atomic<bool> ready{false};      ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
-    std::atomic<int> trickSpeed;         ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
-    std::atomic<bool> videoRectDirty{
-        false}; ///< Triggers filterChain.Reset() on next frame; set by RequestFilterRebuild().
+        AV_NOPTS_VALUE};                     ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
+    std::atomic<uint64_t> clearEpoch{0};     ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
+    uint64_t iterationEpoch{0};              ///< Decode thread only. Snapshot of clearEpoch at each Action() iter top.
+    std::atomic<bool> liveMode;              ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
+    std::atomic<bool> ready{false};          ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
+    std::atomic<int> trickSpeed;             ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
+    std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
+                                             ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
 
     // ========================================================================
     // === TRICK MODE ===
