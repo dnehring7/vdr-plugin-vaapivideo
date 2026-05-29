@@ -17,6 +17,7 @@
 #include "src/common.h"
 #include "src/config.h"
 #include "src/device.h"
+#include "src/mediaplayer.h"
 #include "src/osd.h"
 
 // POSIX
@@ -34,6 +35,9 @@
 #include <cstring>
 #include <format>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 // FFmpeg
 #pragma GCC diagnostic push
@@ -51,6 +55,7 @@ extern "C" {
 #include <vdr/device.h>
 #include <vdr/i18n.h>
 #include <vdr/menuitems.h>
+#include <vdr/osdbase.h>
 #include <vdr/plugin.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
@@ -148,6 +153,8 @@ class cVaapiVideoPlugin : public cPlugin {
     [[nodiscard]] auto Description() -> const char * override { return PLUGIN_DESCRIPTION; }
     auto Housekeeping() -> void override;
     [[nodiscard]] auto Initialize() -> bool override;
+    [[nodiscard]] auto MainMenuEntry() -> const char * override;
+    [[nodiscard]] auto MainMenuAction() -> cOsdObject * override;
     [[nodiscard]] auto ProcessArgs(int argc, char *argv[]) -> bool override;
     [[nodiscard]] auto Service(const char *serviceId, void *data = nullptr) -> bool override;
     [[nodiscard]] auto SetupMenu() -> cMenuSetupPage * override;
@@ -166,6 +173,7 @@ class cVaapiVideoPlugin : public cPlugin {
     cString audioDevice;       ///< ALSA device (-a / --audio); defaults to "default".
     cString connectorName;     ///< DRM connector (-c / --connector); empty = first connected.
     cString drmPath;           ///< DRM device path (-d / --drm); empty = auto-detect.
+    cString mediaDir{"/"};     ///< Mediaplayer initial directory (-m / --media-dir); defaults to "/".
     bool startDetached{false}; ///< -D / --detached: defer all hardware init until SVDRP ATTA or
                                ///<   primary-device switch.
 
@@ -229,23 +237,33 @@ auto cVaapiVideoPlugin::ResolveDrmDevice() const -> cString {
 auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
     // VDR stores the returned pointer for the process lifetime; must be static.
     static const std::string kHelp =
-        std::format("  -d DEV, --drm=DEV           Use DRM device DEV "
-                    "(default: auto-detect)\n"
-                    "  -a DEV, --audio=DEV         Use ALSA audio device DEV "
+        std::format("  -a DEV, --audio=DEV         Use ALSA audio device DEV "
                     "(default: 'default')\n"
                     "  -c NAME, --connector=NAME   Use DRM connector NAME "
                     "(default: first connected)\n"
-                    "  -r RES, --resolution=RES    Output resolution "
-                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n"
                     "  -D, --detached              Start without opening the "
                     "DRM/VAAPI/ALSA hardware;\n"
                     "                              attach later via the primary-device "
-                    "switch or SVDRP ATTA\n",
+                    "switch or SVDRP ATTA\n"
+                    "  -d DEV, --drm=DEV           Use DRM device DEV "
+                    "(default: auto-detect)\n"
+                    "  -m DIR, --media-dir=DIR     Mediaplayer initial directory "
+                    "(default: '/')\n"
+                    "  -r RES, --resolution=RES    Output resolution "
+                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n",
                     DISPLAY_DEFAULT_WIDTH, DISPLAY_DEFAULT_HEIGHT, DISPLAY_DEFAULT_REFRESH_RATE);
     return kHelp.c_str();
 }
 
 auto cVaapiVideoPlugin::Housekeeping() -> void {}
+
+auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("Mediaplayer"); }
+
+auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
+    // Browser uses the configured initial directory; the user navigates from there.
+    // Constructor falls back to "/" if the string is empty.
+    return new cVaapiFileBrowser(isempty(*mediaDir) ? std::string{"/"} : std::string{*mediaDir});
+}
 
 auto cVaapiVideoPlugin::Initialize() -> bool {
     // PPS/SPS parse errors during initial stream acquisition flood the log; only fatal FFmpeg errors are relevant.
@@ -286,17 +304,18 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
     // NOLINTBEGIN(misc-include-cleaner) -- getopt symbols (option, getopt_long, optind, optarg,
     // required_argument, no_argument) come from <getopt.h>, but clang-tidy's IWYU doesn't track them.
-    static constexpr std::array<option, 6> kLongOptions = {
-        {{.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'},
-         {.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
+    static constexpr std::array<option, 7> kLongOptions = {
+        {{.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
-         {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
          {.name = "detached", .has_arg = no_argument, .flag = nullptr, .val = 'D'},
+         {.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'},
+         {.name = "media-dir", .has_arg = required_argument, .flag = nullptr, .val = 'm'},
+         {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
     optind = 1; // getopt state is global; reset so re-invocation by VDR parses cleanly.
     int opt{};
-    while ((opt = getopt_long(argc, argv, "d:a:c:r:D", kLongOptions.data(), nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:a:c:r:m:D", kLongOptions.data(), nullptr)) != -1) {
         switch (opt) {
             case 'd':
                 if (optarg == nullptr || *optarg == '\0') {
@@ -333,6 +352,14 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
                 }
                 dsyslog("vaapivideo: resolution set to %ux%u@%u", vaapiConfig.display.GetWidth(),
                         vaapiConfig.display.GetHeight(), vaapiConfig.display.GetRefreshRate());
+                break;
+            case 'm':
+                if (optarg == nullptr || *optarg == '\0') {
+                    esyslog("vaapivideo: empty media-dir argument");
+                    return false;
+                }
+                mediaDir = optarg;
+                dsyslog("vaapivideo: mediaplayer initial directory '%s'", *mediaDir);
                 break;
             case 'D':
                 startDetached = true;
@@ -525,6 +552,36 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
         return cString::sprintf("Configuration:\n%s", vaapiConfig.GetSummary().c_str());
     }
 
+    if (strcasecmp(command, "PLAY") == 0) {
+        if (option == nullptr || *option == '\0') {
+            replyCode = 550;
+            return "PLAY needs a path or URL";
+        }
+        if (!vaapiDevice || !vaapiDevice->IsReady()) {
+            replyCode = 550;
+            return "VAAPI device not ready -- cannot start playback";
+        }
+
+        std::vector<PlaylistEntry> entries;
+        const std::string_view uri{option};
+        if (IsPlaylistUri(uri)) {
+            entries = ParseM3U(uri);
+            if (entries.empty()) {
+                replyCode = 550;
+                return cString::sprintf("Empty or unreadable playlist: %s", option);
+            }
+        } else {
+            entries.push_back(PlaylistEntry{.uri = std::string{uri}, .title = std::string{uri}});
+        }
+
+        if (!StartPlayback(std::move(entries))) {
+            replyCode = 550;
+            return "Could not start mediaplayer (no primary vaapivideo device?)";
+        }
+        replyCode = 900;
+        return cString::sprintf("Playing %s", option);
+    }
+
     replyCode = 500;
     return {"Unknown SVDRP command"};
 }
@@ -533,7 +590,9 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
     static const char *const kHelpPages[] = {
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
-        "STAT\n    Show detailed device status and statistics.", "CONFIG\n    Display current configuration settings.",
+        "STAT\n    Show detailed device status and statistics.",
+        "CONFIG\n    Display current configuration settings.",
+        "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
         nullptr};
     // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
     // both pointee levels are read-only at the call site, so stripping the inner const is safe.

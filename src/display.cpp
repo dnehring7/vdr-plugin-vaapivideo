@@ -756,7 +756,8 @@ auto cVaapiDisplay::Action() -> void {
         // sleep duration as a gap.
         const bool inTrick = trickActive.load(std::memory_order_relaxed);
         const bool inSyncSleep = syncSleeping.load(std::memory_order_relaxed);
-        if (inTrick || inSyncSleep) {
+        const bool inPause = devicePaused.load(std::memory_order_relaxed);
+        if (inTrick || inSyncSleep || inPause) {
             gapStartMs = 0;
             peakGapMs = 0;
         }
@@ -823,9 +824,21 @@ auto cVaapiDisplay::Action() -> void {
 
         // No new frame: re-present the previous buffer to keep flip cadence + OSD updates alive.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
-            const cMutexLock lock(&bufferMutex);
-            if (pendingBuffer.IsValid()) {
-                (void)PresentBuffer(pendingBuffer);
+            bool didPresent = false;
+            {
+                const cMutexLock lock(&bufferMutex);
+                if (pendingBuffer.IsValid()) {
+                    (void)PresentBuffer(pendingBuffer);
+                    didPresent = true;
+                }
+            }
+            // bufferMutex is intentionally released BEFORE the underrun tracking and the
+            // SleepMs() below. Holding it across the sleep on the pre-first-frame startup
+            // path (when pendingBuffer is invalid every iteration) starves SubmitFrame()
+            // for seconds -- pthread mutexes are not FIFO, and re-acquiring tightly in
+            // this loop won the race against the decoder thread reliably enough to push
+            // first-picture latency from ms to seconds.
+            if (didPresent) {
                 // Only count an underrun when decoder was previously active AND past warmup
                 // grace. Gap duration is measured from gapStartMs (NOT lastFrameCommitMs):
                 // anchoring on the first re-present in a streak means a deliberate hard-ahead
@@ -834,7 +847,7 @@ auto cVaapiDisplay::Action() -> void {
                 // a paused stream doesn't grow peakGapMs without bound.
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
-                if (!inTrick && !inSyncSleep && lastCommitMs != 0 && warmupGraceUntil.TimedOut()) {
+                if (!inTrick && !inSyncSleep && !inPause && lastCommitMs != 0 && warmupGraceUntil.TimedOut()) {
                     if (gapStartMs == 0) {
                         gapStartMs = nowMs; // anchor: first re-present of the current gap
                     }

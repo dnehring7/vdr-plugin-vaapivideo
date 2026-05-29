@@ -250,14 +250,33 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const int64_t outputRateDen = std::max<int64_t>(fpsDen, 1);
     const int naturalOutputFps = static_cast<int>((outputRateNum + (outputRateDen / 2)) / outputRateDen);
     const int displayFps = static_cast<int>(params.outputRefreshHz);
-    const bool upconvertProgressive =
-        (!isInterlaced && naturalOutputFps > 0 && displayFps > 0 && naturalOutputFps < displayFps);
-    const int outputFps = upconvertProgressive ? displayFps : naturalOutputFps;
+    // Insert fps=display whenever the post-deinterlace output rate differs from the display rate.
+    // The fps filter paces the decoder at source rate by buffering its output to the target rate;
+    // without it, the decoder thread is paced by SubmitFrame's vsync backpressure (= display rate)
+    // and source-rate consumption drifts off real time:
+    //   60 fps -> 50 Hz, no fps filter: decoder pulls 50/sec, source advances 50/60 = 83% (slow)
+    //   24 fps -> 50 Hz, no fps filter: decoder pulls 50/sec, source advances 50/24 = 208% (fast)
+    // With audio anchored the due-gate corrects this (catch-up drops / re-presents), but video-only
+    // playback (HDR demo files etc.) depends entirely on the fps filter for correct pacing. The
+    // filter nearest-neighbor (drops for source>display, duplicates for source<display) -- same
+    // visual cadence the display would produce anyway -- but the producer-side pacing is what makes
+    // the decoder consume source at its actual rate. Adding it on audio-clocked paths is safe (and
+    // eliminates "catch-up cycling sustained" log spam from the routine source>display drop work).
+    const int64_t displayRateInSourceDen = static_cast<int64_t>(displayFps) * outputRateDen;
+    const bool ratesDiffer = outputRateNum > 0 && displayFps > 0 && outputRateNum != displayRateInSourceDen;
+    const int outputFps = ratesDiffer ? displayFps : naturalOutputFps;
 
     // Filter chain (comma-joined, built dynamically from flags above):
-    //   SW decode: [bwdif|yadif] -> [hqdn3d] -> format -> hwupload -> scale_vaapi -> [sharpness_vaapi] -> [fps]
+    //   SW decode: [bwdif|yadif] -> [hqdn3d for MPEG-2 w/o HW denoise] -> format -> hwupload ->
+    //              [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
     //   HW decode: [deinterlace_vaapi] -> [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
     // scale_vaapi is always present: it normalizes pixel format and colorimetry regardless of resize.
+    // Denoise / sharpness run on the GPU (denoise_vaapi / sharpness_vaapi) whenever VPP exposes them,
+    // so they never compete with a CPU-bound SW decoder (libdav1d 1080p50 etc). CPU hqdn3d is only
+    // retained as a fall-back for MPEG-2 SW decode on GPUs that lack denoise_vaapi (e.g. some
+    // Radeon iGPUs): MPEG-2 SW decode is cheap and the block-artefact removal materially improves
+    // perceived quality. For modern codecs (H.264/HEVC/AV1) without HW denoise we skip denoise
+    // entirely -- not worth the CPU cost on an already-saturated decoder thread.
     std::vector<std::string> filters;
 
     // Still picture: skip the temporal deinterlacer entirely -- VAAPI VPP buffers one field pair
@@ -267,6 +286,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Both modes also skip denoise/sharpness: quality irrelevant at trick speeds, and still frames
     // are typically JPEG-style I-frames where spatial filters add no value.
     const bool useSimpleDeinterlace = params.trickMode || params.stillPicture;
+    const bool wantDenoise = !useSimpleDeinterlace && denoiseLevel > 0;
 
     if (isSoftwareDecode) {
         if (isInterlaced && !params.stillPicture) {
@@ -279,10 +299,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filters.emplace_back("bwdif=mode=send_field:parity=auto:deint=all");
             }
         }
-        if (!useSimpleDeinterlace && denoiseLevel > 0) {
-            // hqdn3d: temporal weight 5 for MPEG-2 (heavy grain), 3 for H.264/H.265 (spatial artefacts).
-            const int hqdn3dStrength = (params.codecId == AV_CODEC_ID_MPEG2VIDEO) ? 5 : 3;
-            filters.push_back(std::format("hqdn3d={}", hqdn3dStrength));
+        // MPEG-2 SW fall-back: only when the GPU lacks denoise_vaapi. SW decode is cheap and the
+        // block-artefact removal is worth the per-frame CPU cost here (~5 ms @ 1080p25).
+        if (wantDenoise && !params.hasDenoise && params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
+            filters.emplace_back("hqdn3d=5");
         }
         filters.push_back(std::format("format={}", pixFmt));
         filters.emplace_back("hwupload");
@@ -296,9 +316,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", params.deinterlaceMode));
             }
         }
-        if (!useSimpleDeinterlace && denoiseLevel > 0 && params.hasDenoise) {
-            filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
-        }
+    }
+
+    // HW denoise (post-hwupload for SW / native for HW). Skipped on GPUs that don't expose it;
+    // the MPEG-2 SW fall-back above covers the one case where that materially hurts quality.
+    if (wantDenoise && params.hasDenoise) {
+        filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
     }
 
     if (needsResize) {
@@ -313,9 +336,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.push_back(std::format("sharpness_vaapi=sharpness={}", sharpnessLevel));
     }
 
-    if (!useSimpleDeinterlace && upconvertProgressive) {
-        // fps placed last: scale and sharpness run once per source frame; fps only duplicates
-        // timestamps and presentation timing metadata -- no pixel work on duplicated frames.
+    hasFpsFilter_ = !useSimpleDeinterlace && ratesDiffer;
+    if (hasFpsFilter_) {
+        // Nearest-neighbor sample/duplicate to the display rate. Drops for source>display, dupes
+        // for source<display (exact 2x for 25->50/24->48, or uneven cadence for inexact ratios).
+        // No pixel work on the duplicated frame.
         filters.push_back(std::format("fps={}", displayFps));
     }
 
@@ -392,49 +417,81 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         return failBuild();
     }
 
-    // FFmpeg names these from the filter-graph string's perspective, not the caller's:
-    // "outputs" connects to the buffer source (data flows out of the graph string input),
-    // "inputs" connects to the buffer sink (data flows into the graph string output).
-    AVFilterInOut *graphInputs = avfilter_inout_alloc();
-    AVFilterInOut *graphOutputs = avfilter_inout_alloc();
-    if (!graphInputs || !graphOutputs) [[unlikely]] {
-        avfilter_inout_free(&graphInputs);
-        avfilter_inout_free(&graphOutputs);
-        return failBuild();
-    }
-
-    graphOutputs->name = av_strdup("in");
-    graphOutputs->filter_ctx = bufferSrcCtx_;
-
-    graphInputs->name = av_strdup("out");
-    graphInputs->filter_ctx = bufferSinkCtx_;
-
-    if (!graphOutputs->name || !graphInputs->name) [[unlikely]] {
-        avfilter_inout_free(&graphInputs);
-        avfilter_inout_free(&graphOutputs);
-        return failBuild();
-    }
-
-    ret = avfilter_graph_parse_ptr(filterGraph_.get(), filterChain.c_str(), &graphInputs, &graphOutputs, nullptr);
-    avfilter_inout_free(&graphInputs);
-    avfilter_inout_free(&graphOutputs);
-
+    // Segment API (not parse_ptr) because FFmpeg 8.x hwupload_init() rejects a filter with
+    // no hw_device_ctx and parse_ptr inits filters as part of parsing -- too early to attach
+    // the device. Segment splits parse / create / init so we can set hw_device_ctx between
+    // create and init. (HW decode doesn't strictly need hw_device_ctx on the VAAPI filters --
+    // they pick it up from hw_frames_ctx via the link -- but setting it is harmless.)
+    AVFilterGraphSegment *segment = nullptr;
+    ret = avfilter_graph_segment_parse(filterGraph_.get(), filterChain.c_str(), 0, &segment);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to parse filter chain '%s': %s", filterChain.c_str(), FmtErr(ret).data());
         return failBuild();
     }
 
-    // SW decode: every filter node must have hw_device_ctx, not just hwupload.
-    // scale_vaapi and sharpness_vaapi resolve their VAAPI device through this context; omitting
-    // it on those nodes causes AVERROR(EINVAL) at graph config time on FFmpeg 6+.
-    if (isSoftwareDecode) {
-        for (unsigned int i = 0; i < filterGraph_->nb_filters; ++i) {
-            filterGraph_->filters[i]->hw_device_ctx = av_buffer_ref(params.hwDeviceRef);
-            if (!filterGraph_->filters[i]->hw_device_ctx) [[unlikely]] {
-                esyslog("vaapivideo/filter: av_buffer_ref(hwDeviceRef) failed for filter %u", i);
-                return failBuild();
-            }
+    ret = avfilter_graph_segment_create_filters(segment, 0);
+    if (ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/filter: failed to create segment filters '%s': %s", filterChain.c_str(),
+                FmtErr(ret).data());
+        avfilter_graph_segment_free(&segment);
+        return failBuild();
+    }
+
+    // Attach hw_device_ctx to every newly created filter (skip the externally allocated
+    // buffer source/sink, which were already initialized above). Without this, hwupload's
+    // init returns EINVAL and scale_vaapi/sharpness_vaapi fail at graph config time.
+    for (unsigned int i = 0; i < filterGraph_->nb_filters; ++i) {
+        AVFilterContext *filterCtx = filterGraph_->filters[i];
+        if (filterCtx == bufferSrcCtx_ || filterCtx == bufferSinkCtx_) {
+            continue;
         }
+        if (filterCtx->hw_device_ctx) {
+            continue;
+        }
+        filterCtx->hw_device_ctx = av_buffer_ref(params.hwDeviceRef);
+        if (!filterCtx->hw_device_ctx) [[unlikely]] {
+            esyslog("vaapivideo/filter: av_buffer_ref(hwDeviceRef) failed for '%s'", filterCtx->name);
+            avfilter_graph_segment_free(&segment);
+            return failBuild();
+        }
+    }
+
+    AVFilterInOut *segmentInputs = nullptr;
+    AVFilterInOut *segmentOutputs = nullptr;
+    ret = avfilter_graph_segment_apply(segment, 0, &segmentInputs, &segmentOutputs);
+    if (ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/filter: failed to apply segment '%s': %s", filterChain.c_str(), FmtErr(ret).data());
+        avfilter_inout_free(&segmentInputs);
+        avfilter_inout_free(&segmentOutputs);
+        avfilter_graph_segment_free(&segment);
+        return failBuild();
+    }
+
+    // segmentInputs  = unlinked input pads of the chain head  -> wire buffersrc into them.
+    // segmentOutputs = unlinked output pads of the chain tail -> wire them into buffersink.
+    if (!segmentInputs || !segmentOutputs) [[unlikely]] {
+        esyslog("vaapivideo/filter: segment has no free in/out pads (chain='%s')", filterChain.c_str());
+        avfilter_inout_free(&segmentInputs);
+        avfilter_inout_free(&segmentOutputs);
+        avfilter_graph_segment_free(&segment);
+        return failBuild();
+    }
+
+    // avfilter_link takes pad indices as unsigned; AVFilterInOut stores them as int. Cast
+    // explicitly to keep -Wsign-conversion happy; libavfilter only ever emits non-negative
+    // pad indices here so the cast is safe.
+    ret = avfilter_link(bufferSrcCtx_, 0, segmentInputs->filter_ctx, static_cast<unsigned>(segmentInputs->pad_idx));
+    if (ret >= 0) {
+        ret = avfilter_link(segmentOutputs->filter_ctx, static_cast<unsigned>(segmentOutputs->pad_idx), bufferSinkCtx_,
+                            0);
+    }
+    avfilter_inout_free(&segmentInputs);
+    avfilter_inout_free(&segmentOutputs);
+    avfilter_graph_segment_free(&segment);
+    if (ret < 0) [[unlikely]] {
+        esyslog("vaapivideo/filter: failed to link buffersrc/buffersink to chain '%s': %s", filterChain.c_str(),
+                FmtErr(ret).data());
+        return failBuild();
     }
 
     ret = avfilter_graph_config(filterGraph_.get(), nullptr);
@@ -449,9 +506,16 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     if (compactLog) {
         dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
     } else {
+        const char *cadenceTag = "";
+        if (ratesDiffer) {
+            if (outputRateNum < displayRateInSourceDen) {
+                cadenceTag = (displayRateInSourceDen % outputRateNum) == 0 ? ", duplicated" : ", uneven cadence";
+            } else {
+                cadenceTag = ", decimated";
+            }
+        }
         isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
-                filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "",
-                upconvertProgressive ? (isInterlaced ? "" : ", upconverted") : "", pixFmt,
+                filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "", cadenceTag, pixFmt,
                 params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
         dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
     }
@@ -483,6 +547,7 @@ auto cVideoFilterChain::ReceiveFrame(AVFrame *out) noexcept -> int {
 auto cVideoFilterChain::Reset() noexcept -> void {
     bufferSrcCtx_ = nullptr;
     bufferSinkCtx_ = nullptr;
+    hasFpsFilter_ = false;
     // Keep the old graph alive in previousFilterGraph_: destroying it immediately causes
     // -EIO on iHD because the VPP output surfaces are still DMA-BUF mapped by the display
     // thread. The saved graph (and its hw_frames_ctx) is released on the next Build() or

@@ -10,13 +10,26 @@ Without active correction, lip-sync drifts by milliseconds per minute.
 ## Architecture
 
 ```
-DVB stream / replay file (PCR)
-  ├── audio PTS → decoder → ALSA ring → DAC ── GetClock() ── master
-  └── video PTS → decoder → filter → jitterBuf → SyncAndSubmitFrame
-                                                       │
-                                                       ▼
-                                       pendingFrames (3 slots) → display thread → KMS commit
+DVB live / replay (PCR)   ─┐
+                           ├─▶ 90 kHz PTS ─┬─ audio → ALSA ring → DAC ── GetClock() ── master
+Mediaplayer (libavformat) ─┘               └─ video → decoder → filter → jitterBuf → SyncAndSubmitFrame
+                                                                                          │
+                                                                                          ▼
+                                                                          pendingFrames (DISPLAY_PRERENDER_SLOTS = 6) → display thread → KMS commit
 ```
+
+The controller is **input-path-agnostic**: VDR's PES path and the
+libavformat-based mediaplayer (see [README.md → Mediaplayer](README.md#mediaplayer))
+both deliver packets in VDR's 90 kHz PTS domain. PES arrives in that
+domain natively; the mediaplayer rebases each packet from the container's
+time base via `av_rescale_q` and subtracts `ptsOrigin90k`, set in
+`PopulateStreamInfo` to `max(stream.start_time)` across the tracked
+streams so the trailing stream defines t=0 and any pre-sync leading
+packets (rebased PTS < 0) are dropped by `ReadPacket` — both streams
+begin at rebased PTS 0 together. See `cVaapiMediaSource::PopulateStreamInfo`
+and `::ReadPacket` in [src/mediaplayer.cpp](src/mediaplayer.cpp). Downstream
+the EMA, soft corridor, hard transients, catch-up, drain and jitter buffer
+behave identically for either source.
 
 Three invariants:
 
@@ -42,11 +55,16 @@ Three invariants:
    channel switches and avoids the feedback-loop instabilities of
    software audio resampling.
 
-3. **Video output cadence is uniform.** The filter graph appends
-   `fps=<displayFps>` whenever the source rate is below the display
-   refresh, so 25p, 25i-deinterlaced and native 50p all reach
-   `SyncAndSubmitFrame` at the same cadence. One controller regime fits
-   every source.
+3. **Video output cadence is uniform for exact-ratio sources.** The filter
+   graph appends `fps=<displayFps>` only when the source rate divides the
+   display rate evenly (rational test `displayHz × sourceDen mod sourceNum == 0`),
+   so 25p→50, 24p→48, and 25i-deinterlaced (50fps via `rate=field`) and
+   native 50p all reach `SyncAndSubmitFrame` at the same cadence and one
+   controller regime fits them. Uneven ratios (15→50, 24→50, 30000/1001→60)
+   are left to natural VSync re-presentation — `fps=` would only do
+   nearest-neighbor duplicate/drop producing the same uneven cadence the
+   display does anyway, so we save a filter node. No motion interpolation
+   exists in the VAAPI VPP chain.
 
 ## Filter pipeline
 
@@ -414,23 +432,38 @@ The sync gate is bypassed (frame submitted unpaced) in:
 
 ## Lifecycle
 
-| Event                      | EMA                | Cooldown   | Jitter buffer                  |
-| -------------------------- | ------------------ | ---------- | ------------------------------ |
-| Plugin start               | invalid            | —          | empty                          |
-| Channel switch (`Clear()`) | reset              | unchanged  | flushed; freerun armed         |
-| Drain stall-watchdog fire  | unchanged          | unchanged  | unchanged; freerun re-armed    |
-| Catch-up enter             | (drops silent)     | unchanged  | drained silently to alignment  |
-| Catch-up exit              | reset              | unchanged  | one frame submitted normally   |
-| Soft drop                  | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
-| Soft sleep                 | `−= measured`      | armed      | unchanged                      |
-| Hard-behind                | reset              | unchanged  | N frames dropped               |
-| Hard-ahead (replay)        | reset              | armed      | unchanged                      |
-| Hard-ahead (live)          | `−= measured`      | armed      | unchanged                      |
-| Audio codec / track change | unchanged          | unchanged  | preserved; freerun armed       |
+| Event                          | EMA                | Cooldown   | Jitter buffer                  |
+| ------------------------------ | ------------------ | ---------- | ------------------------------ |
+| Plugin start                   | invalid            | —          | empty                          |
+| Channel switch (`Clear()`)     | reset              | unchanged  | flushed; freerun armed         |
+| Drain stall-watchdog fire      | unchanged          | unchanged  | unchanged; freerun re-armed    |
+| Catch-up enter                 | (drops silent)     | unchanged  | drained silently to alignment  |
+| Catch-up exit                  | reset              | unchanged  | one frame submitted normally   |
+| Soft drop                      | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
+| Soft sleep                     | `−= measured`      | armed      | unchanged                      |
+| Hard-behind                    | reset              | unchanged  | N frames dropped               |
+| Hard-ahead (replay)            | reset              | armed      | unchanged                      |
+| Hard-ahead (live)              | `−= measured`      | armed      | unchanged                      |
+| Audio codec / track change     | unchanged          | unchanged  | preserved; freerun armed       |
+| Mediaplayer seek               | reset              | unchanged  | flushed; freerun armed; filter graph **preserved** |
+| Mediaplayer playlist advance   | reset (on reopen)  | unchanged  | flushed; freerun armed; filter graph rebuilt        |
 
 Audio codec / track change preserves the buffer across the switch — the
 catch-up path will silently realign against the new clock once it
 arrives, so dropping ~1 s of still-valid video buys nothing.
+
+Mediaplayer seek calls `cVaapiDevice::FlushForSeek()`, which fans out to
+`decoder->FlushForSeek()` + `audioProcessor->Clear()`. Same drain semantics
+as a channel switch (packet queues drained, codec buffers reset, ALSA
+drained, audio clock re-anchors on next frame) **except the filter chain
+stays alive** — `FlushForSeek` is `Clear` minus `filterChain.Reset()`,
+since seek does not change stream parameters and the VAAPI VPP rebuild
+would cost ~100 ms per seek for no benefit. Entry open/close uses the
+heavier `ClearForMediaPlayer()` which does rebuild the filter (codec
+params may change at the next entry). Playlist advance closes the current
+`cVaapiMediaSource` and opens the next, which may reopen the codec when
+codecId / extradata differ — `OpenCodecWithInfo()` then performs a full
+teardown the same way a same-codec bit-depth change does on the PES path.
 
 ## Diagnostic log
 

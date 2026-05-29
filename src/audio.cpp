@@ -224,6 +224,15 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         // Post-reset / pre-first-write: caller is expected to enter freerun; not a diagnostic event.
         return AV_NOPTS_VALUE;
     }
+    if (clockPaused.load(std::memory_order_acquire)) {
+        // Freeze() pinned the clock so it cannot extrapolate or age-out through ALSA silence.
+        // Returning pts verbatim keeps the decoder's view of the master clock stable across the
+        // pause and resume window. The flag clears on the next WritePcmToAlsa() / Clear() /
+        // ResetPlaybackClock(); clear clockStaleLogged here so a long pause followed by resume
+        // does not suppress a real staleness diagnostic later.
+        clockStaleLogged.store(false, std::memory_order_relaxed);
+        return pts;
+    }
     const uint64_t nowMs = cTimeMs::Now();
     // Unsigned subtraction: wrap on clock skew / atomic race makes ageMs huge -> stale check fires safely.
     const uint64_t ageMs = nowMs - lastMs;
@@ -304,6 +313,13 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     }
 
     return SetStreamParams({.channels = channels, .codecId = codecId, .sampleRate = sampleRate});
+}
+
+[[nodiscard]] auto cAudioProcessor::OpenCodecWithInfo(const AudioStreamInfo &info) -> bool {
+    // Mediaplayer path: AudioStreamInfo carries extradata (e.g. AAC raw, MP4 ESDS payload).
+    // AdoptStreamParams inside SetStreamParams() deep-copies the bytes into storedExtradata,
+    // so the caller can free/reuse its buffer immediately after this returns.
+    return SetStreamParams(info);
 }
 
 [[nodiscard]] auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> bool {
@@ -506,7 +522,7 @@ auto cAudioProcessor::RecreateParser() -> void {
     }
 }
 
-auto cAudioProcessor::DropOutput() -> void {
+auto cAudioProcessor::DropOutput(bool pauseClock) -> void {
     // Clock-preserving variant of Clear(): silence playback NOW (snd_pcm_drop drains the ~200 ms
     // already queued in the ALSA sink), bump clearGeneration so in-flight decoder packets from the
     // previous era are dropped silently, but leave (playbackPts, lastClockUpdateMs, pcmNextPts)
@@ -515,6 +531,12 @@ auto cAudioProcessor::DropOutput() -> void {
     //
     // If the resumed audio is from a different timeline (FF/REW exit), WritePcmToAlsa()'s
     // >5s-PTS-jump guard auto-detects and calls ResetPlaybackClock().
+    //
+    // pauseClock=true (Freeze() path): pin GetClock() at the current playbackPts so it cannot
+    // extrapolate against wall-clock through ALSA silence (a short pause < AUDIO_CLOCK_STALE_MS
+    // would otherwise produce a fake-advanced clock on resume, which then drops the preserved
+    // jitterBuf head via SkipStaleJitterFrames -- silent playback-position skip on un-pause).
+    // Cleared by ResetPlaybackClock() / Clear() / the next WritePcmToAlsa() that re-anchors it.
     const cMutexLock lock(mutex.get());
     if (alsaHandle) {
         (void)snd_pcm_drop(alsaHandle);
@@ -523,6 +545,9 @@ auto cAudioProcessor::DropOutput() -> void {
     alsaErrorCount.store(0, std::memory_order_relaxed);
     clearGeneration.fetch_add(1, std::memory_order_release);
     DrainPacketQueue();
+    if (pauseClock) {
+        clockPaused.store(true, std::memory_order_release);
+    }
 }
 
 auto cAudioProcessor::ResetPlaybackClock() -> void {
@@ -539,6 +564,8 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
     lastClockUpdateMs.store(0, std::memory_order_relaxed);
     clockSequence.fetch_add(1, std::memory_order_release);
     pcmNextPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+    // Reset content boundary: clear any pause pin so the new timeline doesn't inherit it.
+    clockPaused.store(false, std::memory_order_release);
 }
 
 // ============================================================================
@@ -687,11 +714,10 @@ auto cAudioProcessor::CloseDecoder() -> void {
 
 auto cAudioProcessor::FlushDecoderState() -> void {
     avcodec_flush_buffers(decoder.get());
-    if (swrCtx) {
-        swr_free(&swrCtx);
-    }
-    swrChannels = 0;
-    swrFormat = AV_SAMPLE_FMT_NONE;
+    // swrCtx intentionally retained: a seek inside the same stream keeps the same sample
+    // format / channel layout, so reinitializing swresample is wasted work (and emits a
+    // log line per seek). The format-change guard in the conversion path drops swrCtx
+    // automatically when the post-flush frame's format actually differs.
     consecutiveDecodeErrors = 0;
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
 }
@@ -1581,6 +1607,10 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     playbackPts.store(currentPlaybackPts, std::memory_order_relaxed);
     lastClockUpdateMs.store(nowMs, std::memory_order_relaxed);
     clockSequence.fetch_add(1, std::memory_order_release);
+    // First write after Freeze() re-anchors the clock: lift the pin so GetClock() resumes
+    // wall-clock extrapolation on top of the new (now-advancing) playbackPts. Outside the
+    // seqlock pair on purpose -- the pin is its own atomic, not part of the (pts, lastMs) tuple.
+    clockPaused.store(false, std::memory_order_release);
 
     // NOPTS continuations of a multi-frame PES inherit endPts as their startPts90k.
     pcmNextPts.store(endPts, std::memory_order_relaxed);

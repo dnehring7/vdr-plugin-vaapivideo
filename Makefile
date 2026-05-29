@@ -116,6 +116,7 @@ SOURCES = $(PLUGIN).cpp \
 	  	  src/device.cpp \
           src/display.cpp \
           src/filter.cpp \
+          src/mediaplayer.cpp \
           src/osd.cpp \
           src/pes.cpp \
           src/stream.cpp
@@ -205,7 +206,7 @@ LINT_STAMPS = $(SOURCES:%.cpp=.lint/%.stamp) $(PROBE_SRC:%.cpp=.lint/%.stamp)
 # Makefile is a dep so build-flag edits also invalidate the database.
 compile_commands.json: $(SOURCES) $(HEADERS) $(PROBE_SRC) Makefile
 	@command -v bear >/dev/null 2>&1 || { echo "bear not found"; exit 1; }
-	@bear --force-preload -- $(MAKE) --no-print-directory -B $(OBJECTS)
+	@bear --force-preload -- $(MAKE) --no-print-directory -B -j$(NJOBS) $(OBJECTS)
 
 # Check clang-tidy availability BEFORE running the expensive bear step, so a missing
 # tool short-circuits without paying for the rebuild. compile_commands.json is invoked

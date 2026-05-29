@@ -64,12 +64,17 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    auto Clear() -> void;      ///< Drops buffered audio and resets the playback clock; call on seek or channel change
-    auto DropOutput() -> void; ///< Silence playback fast: snd_pcm_drop + decode-queue flush, but DO NOT reset the
-                               ///< playback clock. Use from Mute/Freeze/SetTrickSpeed -- those are stream-preserving
-                               ///< events; a full Clear() would null GetClock(), force the decoder into freerun, and
-                               ///< cause a display underrun downstream. On position changes (FF/REW resume) the
-                               ///< Action()-thread >5s-jump guard re-anchors the clock automatically.
+    auto Clear() -> void; ///< Drops buffered audio and resets the playback clock; call on seek or channel change
+    auto DropOutput(bool pauseClock = false)
+        -> void; ///< Silence playback fast: snd_pcm_drop + decode-queue flush, but DO NOT reset the
+                 ///< playback clock. Use from Mute/Freeze/SetTrickSpeed -- those are stream-preserving
+                 ///< events; a full Clear() would null GetClock(), force the decoder into freerun, and
+                 ///< cause a display underrun downstream. On position changes (FF/REW resume) the
+                 ///< Action()-thread >5s-jump guard re-anchors the clock automatically.
+                 ///< pauseClock=true pins GetClock() at the current playbackPts (no wall-clock
+                 ///< extrapolation) until the next ALSA write re-anchors it. Used by Freeze() so a
+                 ///< short pause does not advance the master clock through silence and silently shift
+                 ///< the preserved jitterBuf head on resume.
     auto Decode(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding/passthrough
     [[nodiscard]] auto GetClock() const noexcept
@@ -84,6 +89,12 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Current number of packets in the decode queue
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper around SetStreamParams() for simple codec+rate+channels changes
+    [[nodiscard]] auto OpenCodecWithInfo(const AudioStreamInfo &info)
+        -> bool; ///< Mediaplayer path: forwards AudioStreamInfo (carrying extradata) to SetStreamParams().
+                 ///< Caller's extradata buffer is deep-copied inside AdoptStreamParams; safe to free after return.
+    [[nodiscard]] auto EnqueuePacket(const AVPacket *packet)
+        -> bool; ///< Mediaplayer path: clones a pre-demuxed AU onto the audio queue. Returns false on
+                 ///< capacity overflow; caller is expected to back off and retry.
     auto SetVolume(int vol)
         -> void;             ///< PCM volume in range [0, 255]; 0 = mute, 255 = full scale; skipped for passthrough
     auto Shutdown() -> void; ///< Stops the processing thread and closes ALSA + decoder + parser. Idempotent;
@@ -130,8 +141,6 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Decodes one compressed packet and forwards S16LE PCM to WritePcmToAlsa().
                  ///< expectedGeneration is clearGeneration captured at dequeue; mismatch means the
                  ///< packet is from a previous codec era and is dropped to avoid an INVALIDDATA cascade.
-    [[nodiscard]] auto EnqueuePacket(const AVPacket *packet)
-        -> bool; ///< Clones the packet and appends it to the queue; returns false if at capacity
     [[nodiscard]] auto OpenAlsaDevice()
         -> bool; ///< Opens alsaDeviceName in passthrough or PCM mode; falls back to PCM if passthrough fails
     auto OpenDecoder() -> void; ///< Allocates and opens the FFmpeg decoder + parser for streamParams
@@ -205,6 +214,10 @@ class cAudioProcessor : public cThread {
     mutable std::atomic<bool> clockStaleLogged{false}; ///< Edge-trigger flag for the GetClock() stale-age diagnostic;
                                                        ///< set when GetClock() first returns NOPTS due to age, cleared
                                                        ///< on the next valid read. Prevents log spam at 50 Hz polling.
+    std::atomic<bool> clockPaused{false};              ///< Set by DropOutput(pauseClock=true) (Freeze()); cleared by
+                                                       ///< Clear() / ResetPlaybackClock() / the next WritePcmToAlsa.
+                                                       ///< While set, GetClock() returns playbackPts verbatim instead
+                                                       ///< of extrapolating against wall-clock through ALSA silence.
 
     // ========================================================================
     // === SINK CAPABILITIES ===

@@ -15,64 +15,75 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 
 ## Features
 
-| Component | Capabilities                                                                                       |
-|-----------|----------------------------------------------------------------------------------------------------|
-| Decode    | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10) — hardware (VAAPI) with per-profile software fallback; AV1 Main / Main 10 recognized for future mediaplayer path |
-| Filters   | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
-| Audio     | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D)           |
-| Display   | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
-| OSD       | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
-| A/V sync  | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
+| Component   | Capabilities                                                                                       |
+|-------------|----------------------------------------------------------------------------------------------------|
+| Decode      | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10), AV1 Main / Main 10 — hardware (VAAPI) with per-profile software fallback |
+| Filters     | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
+| Audio       | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D)           |
+| Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
+| OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
+| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists — see [Mediaplayer](#mediaplayer) |
+| A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
 
 ## Architecture
 
 ```
-VDR ──PES──▶ cVaapiDevice ──▶ PES Parser ──▶ cVaapiDecoder
-                                                 │
-                                    ┌────────────┴────────────┐
-                                    ▼                         ▼
-                              VAAPI HW Decode          FFmpeg SW Decode
-                                    │                         │
-                                    ▼                         ▼
-                              VAAPI VPP Filters     SW Filters (bwdif, hqdn3d)
-                              (deinterlace, denoise)     + hwupload
-                                    │                         │
-                                    └────────────┬────────────┘
-                                                 ▼
-                                            scale_vaapi
-                                        + sharpness_vaapi
-                               (SDR: BT.709 NV12; HDR: BT.2020 P010)
-                                                 │
-                                                 ▼
-                                     DRM PRIME (zero-copy)
-                                                 │
-                                    ┌────────────┴────────────┐
-                                    ▼                         ▼
-                              Video Plane              OSD Plane (ARGB8888)
-                              (NV12 SDR / P010 HDR)
-                                    │                         │
-                                    └────────────┬────────────┘
-                                                 ▼
-                                    DRM Atomic Page-Flip ──▶ Display
+VDR live/replay ──PES──▶ cVaapiDevice ──▶ PES Parser ─┐
+                                                       │
+Mediaplayer ──libavformat──▶ AVPacket ─────────────────┼──▶ cVaapiDecoder
+                                                       │
+                                          ┌────────────┴────────────┐
+                                          ▼                         ▼
+                                    VAAPI HW Decode          FFmpeg SW Decode
+                                          │                         │
+                                          ▼                         ▼
+                                    VAAPI VPP Filters     SW Filters (bwdif, hqdn3d)
+                                 (deinterlace, denoise)        + hwupload
+                                          │                         │
+                                          └────────────┬────────────┘
+                                                       ▼
+                                                  scale_vaapi
+                                              + sharpness_vaapi
+                                     (SDR: BT.709 NV12; HDR: BT.2020 P010)
+                                                       │
+                                                       ▼
+                                           DRM PRIME (zero-copy)
+                                                       │
+                                          ┌────────────┴────────────┐
+                                          ▼                         ▼
+                                     Video Plane             OSD Plane (ARGB8888)
+                                (NV12 SDR / P010 HDR)
+                                          │                         │
+                                          └────────────┬────────────┘
+                                                       ▼
+                                          DRM Atomic Page-Flip ──▶ Display
 ```
+
+Two input paths share the decoder/filter/display pipeline unchanged: VDR's live and
+replay traffic enters via PES through `cVaapiDevice::PlayVideo` / `PlayAudio`; the
+integrated mediaplayer demuxes files and URLs with libavformat and pushes
+pre-framed access units straight into the decoder via a narrow feed surface
+(`SubmitVideoPacket` / `SubmitAudioPacket`). Codec selection, HDR routing, A/V
+sync — all path-agnostic.
 
 ### Source layout
 
-| File              | Responsibility                                                                        |
-|-------------------|---------------------------------------------------------------------------------------|
-| `vaapivideo.cpp`  | Plugin entry point, VDR lifecycle, setup menu, SVDRP                                  |
-| `src/device.cpp`  | VDR device integration, PES routing, hardware init/teardown                           |
-| `src/decoder.cpp` | VAAPI decode + A/V sync controller                                                    |
-| `src/filter.cpp`  | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
-| `src/display.cpp` | DRM atomic modesetting, PRIME import, page-flip thread                                |
-| `src/audio.cpp`   | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe                                |
-| `src/osd.cpp`     | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
-| `src/stream.cpp`  | Shared codec/profile data model, H.264/HEVC SPS probe                                 |
-| `src/pes.cpp`     | PES header parsing                                                                    |
-| `src/caps.cpp`    | One-shot GPU/display/sink capability probes (GpuCaps, DisplayCaps, AudioSinkCaps)     |
-| `src/config.cpp`  | Resolution parsing, `setup.conf` storage                                              |
-| `src/common.h`    | RAII deleters, `AvErr()` helper, version/API guards                                   |
+| File                  | Responsibility                                                                        |
+|-----------------------|---------------------------------------------------------------------------------------|
+| `vaapivideo.cpp`      | Plugin entry point, VDR lifecycle, setup menu, SVDRP, main-menu hook                  |
+| `src/device.cpp`      | VDR device integration, PES routing, hardware init/teardown, mediaplayer feed surface |
+| `src/decoder.cpp`     | VAAPI decode + A/V sync controller                                                    |
+| `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
+| `src/display.cpp`     | DRM atomic modesetting, PRIME import, page-flip thread                                |
+| `src/audio.cpp`       | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe                                |
+| `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
+| `src/mediaplayer.cpp` | libavformat demux, file browser, cControl with OSD replay bar                         |
+| `src/stream.cpp`      | Shared codec/profile data model, H.264/HEVC SPS probe                                 |
+| `src/pes.cpp`         | PES header parsing                                                                    |
+| `src/caps.cpp`        | One-shot GPU/display/sink capability probes (GpuCaps, DisplayCaps, AudioSinkCaps)     |
+| `src/config.cpp`      | Resolution parsing, `setup.conf` storage                                              |
+| `src/common.h`        | RAII deleters, `AvErr()` helper, version/API guards                                   |
 
 The A/V sync controller is documented separately in [AVSYNC.md](AVSYNC.md).
 The coding conventions enforced across all sources are listed in
@@ -86,6 +97,7 @@ The coding conventions enforced across all sources are listed in
 | Linux kernel | 5.15+   | DRM atomic modeset, universal planes, COLOR_ENCODING / COLOR_RANGE, HDR_OUTPUT_METADATA |
 | VDR          | 2.6.6+  | `APIVERSNUM >= 20606`                                                                   |
 | FFmpeg       | 7.0+    | `libavcodec >= 61.3.100`, built with `--enable-vaapi`                                   |
+| libva        | 1.22+   | `VAProfileVVCMain10` is unconditionally referenced                                      |
 | C++ compiler | C++20   | GCC 12+ or Clang 16+                                                                    |
 
 ### Supported VAAPI drivers
@@ -285,15 +297,16 @@ sink's EDID at startup:
 
 ### Command-line options
 
-    vdr -P 'vaapivideo [-d DEV] [-a DEV] [-c NAME] [-r WxH@R] [-D]'
+    vdr -P 'vaapivideo [-a DEV] [-c NAME] [-D] [-d DEV] [-m DIR] [-r WxH@R]'
 
-| Option            | Default           | Description                                           |
-|-------------------|-------------------|-------------------------------------------------------|
-| `-d DEV`          | auto-detect       | DRM device path (`/dev/dri/cardN`)                    |
-| `-a DEV`          | `default`         | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
-| `-c NAME`         | first connected   | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
-| `-r WxH@R`        | `1920x1080@50`    | Output resolution and refresh rate (max 3840×2160)    |
-| `-D`, `--detached`| off               | Start without opening the DRM/VAAPI/ALSA hardware     |
+| Option                           | Default         | Description                                           |
+|----------------------------------|-----------------|-------------------------------------------------------|
+| `-a DEV`, `--audio=DEV`          | `default`       | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
+| `-c NAME`, `--connector=NAME`    | first connected | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
+| `-D`, `--detached`               | off             | Start without opening the DRM/VAAPI/ALSA hardware     |
+| `-d DEV`, `--drm=DEV`            | auto-detect     | DRM device path (`/dev/dri/cardN`)                    |
+| `-m DIR`, `--media-dir=DIR`      | `/`             | Mediaplayer file-browser root directory               |
+| `-r WxH@R`, `--resolution=WxH@R` | `1920x1080@50`  | Output resolution and refresh rate (max 3840×2160)    |
 
 Use `-d` explicitly when multiple GPUs are present. Use `-c` to select a
 specific output when multiple displays are connected — connector names match
@@ -358,18 +371,22 @@ leaving the setup menu to activate the new mode.
 
 ### SVDRP commands
 
-| Command                  | Description                                                |
-|--------------------------|------------------------------------------------------------|
-| `PLUG vaapivideo STAT`   | Device status, active resolution, refresh rate             |
-| `PLUG vaapivideo CONFIG` | Current configuration summary                              |
-| `PLUG vaapivideo DETA`   | Detach from DRM/VAAPI hardware (release for other apps)    |
-| `PLUG vaapivideo ATTA`   | Re-attach to DRM/VAAPI hardware; if primary, resume output |
+| Command                        | Description                                                |
+|--------------------------------|------------------------------------------------------------|
+| `PLUG vaapivideo STAT`         | Device status, active resolution, refresh rate             |
+| `PLUG vaapivideo CONFIG`       | Current configuration summary                              |
+| `PLUG vaapivideo DETA`         | Detach from DRM/VAAPI hardware (release for other apps)    |
+| `PLUG vaapivideo ATTA`         | Re-attach to DRM/VAAPI hardware; if primary, resume output |
+| `PLUG vaapivideo PLAY <uri>`   | Start mediaplayer on a file, URL, or `.m3u/.m3u8` playlist |
 
 DETA hands the display to another application (an external player, a
 diagnostic tool, etc.) and ATTA reclaims it without restarting VDR. When the
 VAAPI device is the current primary device, ATTA also forces a channel
 re-tune so data flows through the freshly initialized decoder/display
 pipeline.
+
+PLAY launches the integrated mediaplayer — see [Mediaplayer](#mediaplayer)
+for accepted URI forms, replay key bindings, and playlist semantics.
 
 ### Console and keyboard integration
 
@@ -541,18 +558,101 @@ content forced through the SDR pipeline (HdrMode::Off, or `auto` with any gate
 failing) will show clipped highlights and compressed primaries because no
 PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
 
+## Mediaplayer
+
+An integrated player for local files, http(s) / ftp URLs, and m3u / m3u8
+playlists. Demuxing is done by libavformat; the demuxed access units are
+pushed straight into the existing decoder, filter and display pipeline,
+so HDR passthrough, deinterlacing, VPP scaling and IEC61937 audio
+passthrough work identically to the live-TV path.
+
+### Entry points
+
+- **Main menu** → *Mediaplayer*: opens the file browser rooted at the
+  directory passed via `-m DIR / --media-dir=DIR` (default `/`).
+  Subdirectories enter on `OK`; m3u files launch as playlists; other
+  media files play directly.
+- **SVDRP**: `PLUG vaapivideo PLAY <uri>` — `<uri>` is a local path, an
+  http(s) / ftp URL, or a local `.m3u/.m3u8` playlist.
+- **Remote key**: bind a button on your remote to launch the file
+  browser via VDR's `keymacros.conf`:
+
+      User1   @vaapivideo
+
+  Then assign your remote's button to `User1` in `remote.conf` (or via
+  *Setup → Remote control → Learning*). Pressing it opens the file
+  browser at `--media-dir`. Launching a specific URI from a key needs
+  SVDRP, e.g. a wrapper that calls `svdrpsend PLUG vaapivideo PLAY …`.
+
+### Replay controls
+
+| Key                        | Action                       |
+|----------------------------|------------------------------|
+| `OK`                       | Toggle replay-bar OSD        |
+| `Play` / `Up`              | Resume if paused             |
+| `Pause` / `Down`           | Toggle pause                 |
+| `Left` / `Right`           | Seek −/+ 10 s                |
+| `Green` / `Yellow`         | Seek −/+ 60 s                |
+| `Next`                     | Skip to next playlist entry  |
+| `Blue` / `Back` / `Stop`   | Exit playback                |
+
+Rapid key repeats sum: pressing `Right` three times before the demuxer
+services the first one lands at +30 s, not +10 s.
+
+### File-browser scope
+
+The browser filters its listing to `.mp4 .mkv .avi .mov .ts .m4v .webm`
+plus `.m3u/.m3u8`. The filter is for usability only; `PLUG vaapivideo
+PLAY` via SVDRP accepts any URI libavformat can open. Audio-only
+formats are not supported — the source requires a video stream.
+
+### Playlist format
+
+Plain or extended m3u / m3u8. Lines starting with
+`#EXTINF:<duration>,<title>` supply the display title for the URI on
+the following line; other `#`-prefixed lines are ignored. Relative
+paths are resolved against the playlist's parent directory; absolute
+paths and URLs are taken verbatim. HLS manifests over http(s) are
+deliberately *not* parsed locally — they are forwarded to libavformat
+instead.
+
+### Pause and seek
+
+Pause routes through `cDevice::Freeze() / Play()` so the audio master
+clock halts together with the demux thread. Seek calls
+`av_seek_frame(AVSEEK_FLAG_BACKWARD)` on the video stream and then
+flushes the decoder packet queue and audio
+(`cVaapiDevice::FlushForSeek`) so playback resumes at the keyframe
+nearest the requested offset. The VAAPI filter chain and swresample
+state are intentionally preserved across the seek — stream parameters
+do not change, so rebuilding them would only add ~100 ms of latency
+per seek. The A/V sync controller re-anchors on the next packet.
+
+### Frame-rate conversion
+
+Source frame rates that do not match the display refresh rate are
+resampled in the VAAPI filter graph by an `fps=<display>` node so the
+decoder runs at source rate rather than at the display's vsync
+backpressure. Without it, video-only playback would drift off real
+time (60 fps source on a 50 Hz display would otherwise play at 83 %,
+24 fps at 208 %). The filter is nearest-neighbor: duplicate frames for
+source-below-display, drop frames for source-above-display.
+
+
 ## Roadmap
 
-- Mediaplayer: libavformat-based local file / network playback (MP4, MKV,
-  HLS, RTSP) plugged into the existing `IMediaSource` seam.
 - Dynamic resolution switching on SD / HD / UHD channel changes.
 - AV1 live decode path: OBU sequence-header probe + Main / Main 10 backend
-  routing, closing the AV1 branch already stubbed in `kVideoBackendTable`.
+  routing, closing the AV1 live branch (the mediaplayer path already opens
+  AV1 with codec params from the container).
 - Dolby Vision Profile 5 / 8 passthrough on displays that advertise DV EDID
   metadata (RPU forwarding, no tone-mapping).
 - Variable refresh rate (HDMI VRR / FreeSync) for judder-free 24p and 25p
   film playback: tie the DRM page-flip cadence to the decoded stream's
   frame rate instead of the panel's fixed refresh.
+- Mediaplayer: subtitle rendering, audio-track switching mid-file,
+  trick-speed (fast/slow forward and reverse) and persistent resume
+  position.
 
 
 ## Credits

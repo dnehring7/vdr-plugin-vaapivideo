@@ -98,9 +98,20 @@ extern "C" {
 constexpr size_t DECODER_QUEUE_CAPACITY =
     200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to DECODER_TRICK_QUEUE_DEPTH.
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< VSync backpressure budget inside display->SubmitFrame().
+constexpr int DECODER_CATCHUP_LOG_THROTTLE_MS =
+    2000; ///< Min interval between catch-up entry/exit log pairs. Suppresses log flood during sustained
+          ///< slow-decode cycling (e.g. VVC SW decode on hardware without VVC HW support); the next
+          ///< non-throttled entry emits an aggregated summary of the suppressed cycles.
+constexpr int DECODER_CATCHUP_SUMMARY_INTERVAL_MS =
+    10000; ///< Periodic summary cadence while catch-up keeps cycling under throttle.
 constexpr int DECODER_SYNC_COOLDOWN_MS = 5000; ///< Min interval between soft corrections; equals 5x EMA time constant.
 constexpr int64_t DECODER_SYNC_CORRIDOR_90K =
     50 * PTS_TICKS_PER_MS; ///< Soft half-width: 50 ms in 90k ticks. Below the ~80 ms lipsync percept threshold.
+constexpr int DECODER_SYNC_HINT_MAX_AGE_MS =
+    DECODER_SYNC_COOLDOWN_MS; ///< Max age of a pre-correction stableDelta snapshot before it counts as stale and the
+                              ///< hint falls back to the current smoothedDelta. Mirrors the soft-correction cooldown:
+                              ///< if no correction has fired in this window, smoothedDelta is in its own steady-state
+                              ///< and is a better seed than an older snapshot from a different operating point.
 constexpr int DECODER_SYNC_EMA_SAMPLES =
     50; ///< EMA alpha = 1/N (~= 1 s @ 50 fps). Residual accumulator avoids truncation stall.
 constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear() / track switch / trick-exit.
@@ -118,14 +129,31 @@ constexpr size_t DECODER_JITTERBUF_HARD_CAP =
          ///< drain's due-gate closed (SkipStaleJitterFrames only drops BEHIND-clock heads).
 constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
     3000; ///< Drop any head sitting more than this far ahead of audio_clock. Such an offset is a real
-          ///< PTS discontinuity (post-ATTA anchor mismatch, broadcast PCR break) -- waiting for natural
-          ///< sync wastes seconds and looks like a startup freeze. Dropping immediately lets the next
-          ///< frame proceed and SyncAndSubmitFrame's catch-up path cleans up the residual.
+          ///< PTS discontinuity (ATTA anchor swap, broadcast PCR break, stale snd_pcm_delay clamp).
+          ///< Legitimate offsets must stay below this: TS live recordings can have video leading audio
+          ///< by ~1500 ms after channel switches or recording start -- those should converge naturally
+          ///< as the audio clock advances, not be dropped. Sync alignment of mediaplayer streams is
+          ///< handled at the source (cVaapiMediaSource::PopulateStreamInfo picks ptsOrigin = max of
+          ///< per-stream start_times so both streams begin at rebased PTS 0 together), so the
+          ///< threshold only needs to catch genuine discontinuities, not normal startup offsets.
 constexpr uint64_t DECODER_DRAIN_STALL_MS =
     500; ///< Walltime budget for the future-head gate to clear naturally. After this, the audio clock
          ///< has been anchored to a different domain than the incoming video PTS (post-Clear / ATTA /
          ///< PCR break) and waiting only extends the startup black screen. Re-arm one freerun frame to
          ///< force the head through and re-anchor the controller -- catch-up cleans up any residual.
+constexpr uint64_t DECODER_NO_CLOCK_HOLD_MS =
+    1500; ///< Walltime the drain holds (jitterBuf non-empty, ap non-null, GetClock()=NOPTS) before
+          ///< falling back to no-clock freerun. TS seeks can land on a video keyframe up to ~1 s
+          ///< ahead of the target audio (the mux interleave offset documented around
+          ///< MEDIAPLAYER_MAX_LOOKAHEAD_90K); a 500 ms hold expired before audio anchored and let
+          ///< freerun submit pre-anchor video at VSync rate, putting the head that far ahead of
+          ///< clock on anchor -- which the due-gate then drained at 1 frame per
+          ///< DECODER_DRAIN_STALL_MS (visible as ~2 fps jerk after seek). Holding keeps frames in
+          ///< jitterBuf so the post-anchor catch-up can drop the pre-target excess in one burst.
+          ///< Bounded so video-only streams (ap non-null but no audio writes will ever occur) do
+          ///< not freeze indefinitely; the nearCap escape below additionally bypasses the hold if
+          ///< jitterBuf hits the 150-frame cap, so a fast HW decoder cannot stall waiting for an
+          ///< audio anchor that will never come.
 
 // ============================================================================
 // === STRUCTURES ===
@@ -178,6 +206,37 @@ cVaapiDecoder::~cVaapiDecoder() noexcept {
 // ============================================================================
 
 auto cVaapiDecoder::Clear() -> void {
+    // Content-boundary flush (channel switch, playlist advance, mediaplayer close, ...): the new
+    // pipeline may have an entirely different GPU-vs-audio offset, so the EMA must warm up from
+    // scratch. preserveSeekHint=false is bound to this request directly so a coalesced flush
+    // can't accidentally preserve a hint from an unrelated FlushForSeek that happened in between.
+    ClearInternal(/*resetFilter=*/true, /*preserveSeekHint=*/false);
+}
+
+auto cVaapiDecoder::FlushForSeek() -> void {
+    // Filter reset is required only when the active chain contains a temporal filter that
+    // cannot survive a seek-sized PTS jump. Today that's just `fps=N` (added for source rates
+    // below the display rate, e.g. 25 fps source on a 50 Hz display): it bridges the gap
+    // between previous_output_pts and the first post-seek input by emitting hundreds of
+    // duplicate frames at stale PTS -- observable in syslog as a long stale-jitter /
+    // catch-up cascade with raw advancing ~40 ms per outer iter (one source frame).
+    //
+    // bwdif / yadif hold at most 1-2 pre-seek fields and self-clear inside one filter window,
+    // so for chains without `fps=N` we keep the filter graph alive across the seek and save
+    // the ~100 ms rebuild + the 3-line filter-init log spam per seek. The atomic load is
+    // safe: cVideoFilterChain methods only mutate hasFpsFilter_ from the decode thread under
+    // codecMutex, and FlushForSeek already serializes with that mutex inside ClearInternal.
+    const bool needFilterReset = filterChain.HasFpsFilter();
+    filterCompactRebuildPending.store(needFilterReset, std::memory_order_release);
+    // Carry the converged smoothedDelta across the flush as a "fast start" hint: the GPU vs.
+    // audio offset is a property of the pipeline, unchanged by the playback position. The
+    // preserve policy travels *with* the flush request (jitterFlushRequest=2), not as a separate
+    // atomic, so a stale flush observed by the decode thread always carries its originator's
+    // policy -- never a later issuer's.
+    ClearInternal(needFilterReset, /*preserveSeekHint=*/true);
+}
+
+auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> void {
     // codecMutex first, parserMutex second (file-level lock order). Together they exclude both
     // the decode thread (codecMutex) and any concurrent EnqueueData parse (parserMutex), so the
     // codec + parser can be reset as one atomic operation.
@@ -195,8 +254,10 @@ auto cVaapiDecoder::Clear() -> void {
             avcodec_flush_buffers(codecCtx.get()); // codec stays open; next I-frame continues without reopen.
         }
 
-        // Graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily on next frame.
-        filterChain.Reset();
+        if (resetFilter) {
+            // Graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily on next frame.
+            filterChain.Reset();
+        }
         if (decodedFrame) {
             av_frame_unref(decodedFrame.get());
         }
@@ -221,11 +282,13 @@ auto cVaapiDecoder::Clear() -> void {
     codecDrainPending.store(false, std::memory_order_relaxed);
     stillPictureMode.store(false, std::memory_order_relaxed);
 
-    // jitterBuf and EMA state are decode-thread-owned; reset is deferred via atomic flag.
-    // freerunFrames MUST store before jitterFlushPending: if the order is reversed the
-    // decode thread could drain through the due-gate on a still-NOPTS clock and black the screen.
+    // jitterBuf and EMA state are decode-thread-owned; reset is deferred via atomic request.
+    // freerunFrames MUST store before jitterFlushRequest: if the order is reversed the decode
+    // thread could drain through the due-gate on a still-NOPTS clock and black the screen.
+    // Request encodes the preserve-hint policy *with* the flush request so a stale flush in
+    // the decode-thread's queue can never observe a later issuer's policy by accident.
     freerunFrames.store(DECODER_SYNC_FREERUN_FRAMES, std::memory_order_relaxed);
-    jitterFlushPending.store(true, std::memory_order_release);
+    jitterFlushRequest.store(preserveSeekHint ? 2 : 1, std::memory_order_release);
 
     syncLogPending.store(true, std::memory_order_relaxed);
 }
@@ -556,6 +619,39 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     return OpenCodecWithInfo(info);
 }
 
+/// True iff @p codec exposes a VAAPI hw_device_ctx-style HW config entry. Used to filter
+/// sibling decoders for the same codec ID when avcodec_find_decoder()'s default pick is
+/// software-only (libdav1d / libvpx in typical FFmpeg builds).
+[[nodiscard]] static auto HasVaapiHwConfig(const AVCodec *codec) noexcept -> bool {
+    if (codec == nullptr) {
+        return false;
+    }
+    for (int i = 0;; ++i) {
+        const AVCodecHWConfig *hwCfg = avcodec_get_hw_config(codec, i);
+        if (hwCfg == nullptr) {
+            return false;
+        }
+        if ((hwCfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 &&
+            hwCfg->device_type == AV_HWDEVICE_TYPE_VAAPI) {
+            return true;
+        }
+    }
+}
+
+/// Walk every registered decoder for @p codecId and return the first one whose HW config
+/// matches HasVaapiHwConfig(). Returns nullptr if FFmpeg has no VAAPI-capable decoder for
+/// this codec ID at all (caller must keep its avcodec_find_decoder() result as the SW
+/// fallback and clear useHwDecode).
+[[nodiscard]] static auto FindVaapiDecoder(AVCodecID codecId) noexcept -> const AVCodec * {
+    void *iter = nullptr;
+    while (const AVCodec *codec = av_codec_iterate(&iter)) {
+        if (av_codec_is_decoder(codec) != 0 && codec->id == codecId && HasVaapiHwConfig(codec)) {
+            return codec;
+        }
+    }
+    return nullptr;
+}
+
 [[nodiscard]] auto cVaapiDecoder::OpenCodecWithInfo(const VideoStreamInfo &info) -> bool {
     // codecMutex + parserMutex: reopens both contexts atomically; lock order is fixed
     // (codec -> parser) and matches Clear() / SetTrickSpeed().
@@ -580,22 +676,19 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
         useHwDecode = vaapiContext->caps.*capFlag;
     }
 
-    // VA driver advertising a profile is necessary but not sufficient; FFmpeg also needs
-    // a VAAPI AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX entry. Require both.
+    // VA driver advertising a profile is necessary but not sufficient; FFmpeg also needs a
+    // decoder for this codec ID that exposes a VAAPI AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX
+    // entry. avcodec_find_decoder() above returns the highest-priority registered decoder,
+    // which for AV1 / VP9 in most distro FFmpeg builds is libdav1d / libvpx -- both
+    // software-only, so the VAAPI path would be silently bypassed even though hwAv1 / hwVp9
+    // is true. Switch to a sibling decoder that does expose VAAPI; fall back to SW (keep the
+    // original decoder pointer) if none exists, since the original is a valid SW codec.
     if (useHwDecode) {
-        bool hasHwConfig = false;
-        for (int i = 0;; ++i) {
-            const AVCodecHWConfig *hwCfg = avcodec_get_hw_config(decoder, i);
-            if (!hwCfg) {
-                break;
-            }
-            if (hwCfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-                hwCfg->device_type == AV_HWDEVICE_TYPE_VAAPI) {
-                hasHwConfig = true;
-                break;
-            }
+        if (const AVCodec *hwDecoder = FindVaapiDecoder(info.codecId); hwDecoder != nullptr) {
+            decoder = hwDecoder;
+        } else {
+            useHwDecode = false;
         }
-        useHwDecode = hasHwConfig;
     }
 
     // Reuse only when codec ID, HW/SW choice, AND extradata all match.
@@ -658,6 +751,14 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     decoderCtx->err_recognition = AV_EF_CAREFUL;
     decoderCtx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
+    // Mediaplayer hint: VP9/AV1 carry no bitstream framerate; without this seed
+    // codecCtx->framerate stays 0/0 and the filter chain falls back to the DVB 50/1
+    // default. The decoder may overwrite this from VUI for h.264/HEVC -- the hint is
+    // strictly a fallback for codecs that don't signal it.
+    if (info.fpsNum > 0 && info.fpsDen > 0) {
+        decoderCtx->framerate = AVRational{.num = info.fpsNum, .den = info.fpsDen};
+    }
+
     // Mediaplayer path: container demuxers (mkv/mp4) store parameter sets in the track header,
     // not in every AU like DVB. FFmpeg requires them here before avcodec_open2.
     if (info.extradata && info.extradataSize > 0) {
@@ -691,7 +792,8 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
             return AV_PIX_FMT_NONE;
         };
     }
-    // SW decode: hw_device_ctx left unset; filter chain inserts hwupload so VPP still runs on the GPU.
+    // SW decode: thread_count left at lavc auto (libdav1d honors it via FF_CODEC_CAP_AUTO_THREADS);
+    // hw_device_ctx left unset, filter chain's hwupload still runs VPP on the GPU.
 
     if (const int ret = avcodec_open2(decoderCtx.get(), decoder, nullptr); ret < 0) [[unlikely]] {
         esyslog("vaapivideo/decoder: failed to open %s: %s", decoder->name, AvErr(ret).data());
@@ -705,6 +807,22 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     isyslog("vaapivideo/decoder: opened %s (%s%s)", decoder->name, useHwDecode ? "hardware" : "software",
             info.extradataSize > 0 ? ", extradata" : "");
 
+    // Software-fallback warning: heavy codecs without a hardware decoder are likely to
+    // miss real-time on consumer iGPUs. VVC has no widely-deployed HW decoder yet (requires
+    // Intel Lunar Lake / Battlemage or newer); AV1 SW pegs the CPU at 1080p+; HEVC SW is
+    // borderline at 4K. The warning is purely diagnostic -- playback still proceeds -- and
+    // gives the user a clear hint when the symptom is sustained catch-up cycling.
+    if (!useHwDecode) {
+        const bool tooHeavy = info.codecId == AV_CODEC_ID_VVC ||
+                              (info.codecId == AV_CODEC_ID_AV1 && info.codedHeight >= 1080) ||
+                              (info.codecId == AV_CODEC_ID_HEVC && info.codedHeight >= 2160);
+        if (tooHeavy) {
+            esyslog("vaapivideo/decoder: warning: %s software decode at %dx%d may not sustain real-time on this "
+                    "hardware; expect dropped frames if catch-up cycling appears in the log",
+                    decoder->name, info.codedWidth, info.codedHeight);
+        }
+    }
+
     return true;
 }
 
@@ -717,6 +835,12 @@ auto cVaapiDecoder::NotifyAudioChange() -> void {
 
 auto cVaapiDecoder::SetAudioProcessor(cAudioProcessor *audio) -> void {
     audioProcessor.store(audio, std::memory_order_release);
+}
+
+auto cVaapiDecoder::SetDevicePaused(bool paused) noexcept -> void {
+    // Flips the drain-loop hold gate. See decoder.h declaration for the rationale; the read
+    // site lives at the top of the drain `while` in Action().
+    devicePaused.store(paused, std::memory_order_release);
 }
 
 auto cVaapiDecoder::SetLiveMode(bool live) -> void { liveMode.store(live, std::memory_order_relaxed); }
@@ -861,9 +985,12 @@ auto cVaapiDecoder::Action() -> void {
     dsyslog("vaapivideo/decoder: thread started");
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
-    uint64_t drainBlockedSinceMs{0}; ///< Walltime of first consecutive due-gate block; 0 = not blocked.
+    uint64_t drainBlockedSinceMs{0};   ///< Walltime of first consecutive due-gate block; 0 = not blocked.
+    uint64_t noClockBlockedSinceMs{0}; ///< Walltime of first consecutive no-clock hold; 0 = not blocked.
     uint64_t lastDrainMs{0};
-    int trickEmptyDecodes{0}; ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
+    int trickEmptyDecodes{0};        ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
+    cTimeMs jitterOverflowLogGate;   ///< Rate-limits the per-iter "jitterBuf overflow" syslog spam.
+    size_t jitterOverflowSinceLog{}; ///< Sum of frames dropped since the last overflow log line.
 
     while (!stopping.load(std::memory_order_acquire)) {
         // Snapshot for this iteration. Drain loops and PublishLastPts() abort on mismatch with
@@ -875,9 +1002,10 @@ auto cVaapiDecoder::Action() -> void {
         // post-decode flush below would discard the first valid post-Clear frame -- Clear()
         // drains the packet queue and calls avcodec_flush_buffers(), so the next decoded frame
         // is genuinely new material that belongs in the jitter buffer.
-        if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
-            ApplyDeferredJitterFlush(lastDrainMs);
+        if (const int flushRequest = jitterFlushRequest.exchange(0, std::memory_order_acquire); flushRequest != 0) {
+            ApplyDeferredJitterFlush(lastDrainMs, /*preserveSeekHint=*/flushRequest == 2);
             drainBlockedSinceMs = 0;
+            noClockBlockedSinceMs = 0;
         }
 
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
@@ -1016,8 +1144,10 @@ auto cVaapiDecoder::Action() -> void {
         // Catches a Clear() that fired BETWEEN the top-of-iteration consume and now -- iow
         // mid-decode, while we held codecMutex. pendingFrames in that case carries pre-Clear
         // PTS and must be discarded along with the jitter buffer.
-        if (jitterFlushPending.exchange(false, std::memory_order_acquire)) {
-            ApplyDeferredJitterFlush(lastDrainMs);
+        if (const int flushRequest = jitterFlushRequest.exchange(0, std::memory_order_acquire); flushRequest != 0) {
+            ApplyDeferredJitterFlush(lastDrainMs, /*preserveSeekHint=*/flushRequest == 2);
+            drainBlockedSinceMs = 0;
+            noClockBlockedSinceMs = 0;
             pendingFrames.clear();
         }
 
@@ -1037,12 +1167,25 @@ auto cVaapiDecoder::Action() -> void {
                 jitterBuf.pop_front();
             }
             syncDropSinceLog += static_cast<int>(dropCount);
-            dsyslog("vaapivideo/decoder: jitterBuf overflow -- dropped %zu frame(s), cap=%zu", dropCount,
-                    DECODER_JITTERBUF_HARD_CAP);
+            // Rate-limit the spam: a sustained post-seek overflow can emit dozens of identical
+            // "dropped 2 frame(s)" lines per second. Accumulate the count and flush once per
+            // 500 ms so the diagnostic remains useful without flooding syslog.
+            jitterOverflowSinceLog += dropCount;
+            if (jitterOverflowLogGate.Elapsed() >= 500) {
+                dsyslog("vaapivideo/decoder: jitterBuf overflow -- dropped %zu frame(s), cap=%zu",
+                        jitterOverflowSinceLog, DECODER_JITTERBUF_HARD_CAP);
+                jitterOverflowSinceLog = 0;
+                jitterOverflowLogGate.Set();
+            }
         }
 
         // Bulk-drop catastrophically stale heads (post-seek, long decode stall, trick-exit backlog).
-        if (ap && !jitterBuf.empty()) {
+        // Skip while devicePaused: ALSA is dropped, GetClock() extrapolates forward for
+        // AUDIO_CLOCK_STALE_MS (1 s) before returning NOPTS, so the frozen head_pts appears
+        // ~200 ms "behind" each iteration -- the bulk-drop would then drain the entire pre-pause
+        // jitterBuf one frame at a time over the staleness window. The inner drain loop already
+        // holds for devicePaused (no submits), but only Bulk-drop runs outside that hold.
+        if (ap && !jitterBuf.empty() && !devicePaused.load(std::memory_order_acquire)) {
             SkipStaleJitterFrames(ap);
         }
 
@@ -1054,8 +1197,21 @@ auto cVaapiDecoder::Action() -> void {
         while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
             // Clear() / SetTrickSpeed(0) raced this iteration: abandon the stale jitterBuf to
             // avoid scanning out pre-Clear frames or burning the new freerun budget on them.
-            // The next iteration's jitterFlushPending consumption empties jitterBuf.
+            // The next iteration's jitterFlushRequest consumption empties jitterBuf.
             if (clearEpoch.load(std::memory_order_acquire) != iterationEpoch) [[unlikely]] {
+                break;
+            }
+            // Device paused (cVaapiDevice::Freeze): hold the drain so the head's PTS doesn't drift
+            // while ALSA is dropped. Without this hold, GetClock() goes stale ~1 s into the pause,
+            // the no-clock-freerun path below fires, frames are submitted at vsync rate, and on
+            // resume the head sits hundreds of ms ahead of the re-anchored audio clock -- the same
+            // video-ahead drain-stall loop the TS lookahead bug used to produce, just triggered by
+            // pause instead of by mux offset. Reset the stall/miss trackers so the pause duration
+            // doesn't surface as a spurious drain stall or miss spike when playback resumes.
+            if (devicePaused.load(std::memory_order_acquire)) [[unlikely]] {
+                drainBlockedSinceMs = 0;
+                noClockBlockedSinceMs = 0;
+                lastDrainMs = 0;
                 break;
             }
             const bool consumingDrop = pendingDrops > 0;
@@ -1067,7 +1223,34 @@ auto cVaapiDecoder::Action() -> void {
                 // freerun-on-no-clock path so video doesn't freeze when the audio clock
                 // is missing (track switch, ALSA reset, video-only stream).
                 const int64_t clock = ap->GetClock();
-                if (clock != AV_NOPTS_VALUE) {
+                if (clock == AV_NOPTS_VALUE) {
+                    // Post-Clear / post-FlushForSeek window: ap exists, audio anchor incoming.
+                    // Hold so freerun does not submit pre-anchor video at VSync rate and push
+                    // head far ahead of clock when audio finally anchors (visible as ~2 fps
+                    // jerky catch-up after a seek). Once the hold times out (stuck-NOPTS streams
+                    // -- video-only files routed through an open audio processor) noClockBlockedSinceMs
+                    // stays armed so subsequent iters fall straight through; jitterFlushRequest
+                    // and the else-branch reset re-arm the hold on the next Clear or clock anchor.
+                    //
+                    // Cap escape: a fast HW decoder (960p VP9 + fps=50 duplicator) can fill
+                    // jitterBuf past the 150-frame hard cap inside the no-clock hold window,
+                    // triggering a spam of "jitterBuf overflow -- dropped N" lines and losing
+                    // pre-target frames to the unconditional pop_front. Abandon the hold once
+                    // the buffer is near the cap so the no-clock freerun submits at VSync rate
+                    // and consumes frames as the decoder produces them.
+                    const uint64_t nowMs = cTimeMs::Now();
+                    if (noClockBlockedSinceMs == 0) {
+                        noClockBlockedSinceMs = nowMs;
+                    }
+                    const bool nearCap = jitterBuf.size() >= DECODER_JITTERBUF_HARD_CAP;
+                    if (!nearCap && nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
+                        break;
+                    }
+                    // Timeout reached (or cap escape): fall through to no-clock submit (NO reset,
+                    // so subsequent iters in the same stuck-NOPTS span do not re-hold and stutter
+                    // at ~2 fps).
+                } else {
+                    noClockBlockedSinceMs = 0;
                     const int64_t headPts = jitterBuf.front()->pts;
                     if (headPts != AV_NOPTS_VALUE) {
                         const int64_t latency = SyncLatency90k(ap);
@@ -1118,7 +1301,13 @@ auto cVaapiDecoder::Action() -> void {
                                     drainBlockedSinceMs = nowMs;
                                 }
                                 const uint64_t blockedMs = nowMs - drainBlockedSinceMs;
-                                if (blockedMs >= DECODER_DRAIN_STALL_MS) {
+                                // Only force freerun for a real future-head mismatch (outside the
+                                // soft corridor). dueIn within +/- 50 ms is normal post-seek
+                                // settling, and forcing an unpaced frame there only injects miss
+                                // count + sync log noise; the no-clock hold (1 s GetClock
+                                // staleness -> NOPTS -> DECODER_NO_CLOCK_HOLD_MS) still recovers
+                                // if the clock truly dies.
+                                if (dueIn > DECODER_SYNC_CORRIDOR_90K && blockedMs >= DECODER_DRAIN_STALL_MS) {
                                     dsyslog("vaapivideo/decoder: drain stalled %llums (dueIn=%+lldms buf=%zu) -- "
                                             "re-arming freerun",
                                             static_cast<unsigned long long>(blockedMs),
@@ -1153,6 +1342,11 @@ auto cVaapiDecoder::Action() -> void {
             jitterBuf.pop_front();
             (void)SyncAndSubmitFrame(std::move(drainFrame));
         }
+
+        // Publish the final post-iteration jitter depth so the mediaplayer demux thread
+        // can throttle on it. Last write of the iteration => captures push + drain in
+        // one snapshot; relaxed because the reader uses it as a soft signal only.
+        publishedJitterBufSize.store(jitterBuf.size(), std::memory_order_relaxed);
     }
 
     hasExited.store(true, std::memory_order_release);
@@ -1397,6 +1591,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 bool compactLog = false;
                 if (videoRectDirty.exchange(false, std::memory_order_acq_rel)) {
                     filterChain.Reset();
+                    compactLog = true;
+                }
+                // FlushForSeek requested a compact log on this rebuild (the chain parameters
+                // are unchanged across a seek so the full diagnostic is just noise; the new
+                // "filter rebuilt -> WxH" one-liner is enough to confirm the reset happened).
+                if (filterCompactRebuildPending.exchange(false, std::memory_order_acq_rel)) {
                     compactLog = true;
                 }
                 if (!filterChain.IsBuilt()) {
@@ -1666,13 +1866,131 @@ auto cVaapiDecoder::ResetSmoothedDelta() noexcept -> void {
     hardBehindDebounce = 0;
     catchingUp = false;
     catchUpDrops = 0;
+    stableDelta90k = AV_NOPTS_VALUE;
+    stableDeltaCapturedMs = 0;
+    // NOTE: lastCatchUpExitMs is intentionally NOT reset here. This function fires from many
+    // paths (no-clock freerun, hard-behind, catch-up entry, ...) and clearing the marker on
+    // each call would make the "sinceCatchUp" diagnostic always report 0. Cleared explicitly
+    // by Clear() / FlushForSeek (via the cVaapiDecoder member-state reset path) instead.
 }
 
-auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs) noexcept -> void {
+auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserveSeekHint) noexcept -> void {
+    // Fast-start hint: FlushForSeek requests carrying the converged smoothedDelta across the
+    // flush. The GPU-vs-audio-clock offset is a property of the pipeline (decode + VPP + KMS
+    // queue latency vs ALSA hw_ptr), unaffected by playback position, so the pre-seek
+    // steady-state is the right catch-up exit target AND the right EMA seed -- saving the
+    // ~50-frame warmup on every seek. Cleared by plain Clear() (channel switch / new file
+    // / device reset): different content can have different decode latency characteristics.
+    //
+    // preserveSeekHint travels with the flush request via jitterFlushRequest (0/1/2 encoding),
+    // not a separate atomic, so racing back-to-back Clear() / FlushForSeek() can't cross-
+    // pollinate the policy. Earlier design with a separate `preserveSeekHintOnFlush` atomic
+    // had a race: an in-flight older flush could consume the *next* FlushForSeek's preserve
+    // store before that FlushForSeek armed its own request, then the new request would run
+    // with preserve=false and drop the hint.
+    //
+    // Source priority: prefer stableDelta90k (pre-correction snapshot) over smoothedDelta90k.
+    // The soft-/hard-ahead path applies a predictive `-=` to smoothedDelta after every sleep,
+    // making it a transient value during the EMA recovery window (~3 s on low-fps content).
+    // A seek that lands inside that window would otherwise grab the mid-recovery value as the
+    // hint, biasing the post-seek EMA seed toward a temporary low. stableDelta is captured
+    // at the trigger site *before* the `-=`, so it always reflects the long-term offset that
+    // the controller had measured. Falls back to smoothedDelta when no correction has fired
+    // yet (no snapshot exists) -- in that case smoothedDelta itself is clean.
+    //
+    // Invalid-EMA preservation: when smoothedDeltaValid=false, we PRESERVE the existing
+    // seekHintDelta90k rather than overwriting it. Motivating case: a rapid back-to-back seek
+    // burst where flush N+1 fires before any frame reseeds the EMA from flush N's capture.
+    // Flush N captured a fresh valid hint, then its own ResetSmoothedDelta cleared the EMA --
+    // so at flush N+1 smoothedDeltaValid is false even though the stored hint is current.
+    // Without this guard, flush N+1 would overwrite the hint with AV_NOPTS_VALUE; the
+    // subsequent catch-up then ran without /hint and fell back to +halfFrame. Plain Clear()
+    // (content boundary) still drops the hint because preserveSeekHint=false on that request
+    // takes the outer `else` branch.
+    if (preserveSeekHint) {
+        if (smoothedDeltaValid) {
+            // Source selection. Prefer stableDelta90k only when it's *fresh* -- a snapshot
+            // older than DECODER_SYNC_HINT_MAX_AGE_MS predates the soft-correction cooldown
+            // window, which means no further correction has refreshed it. In that case the
+            // EMA has been quietly running on its own and smoothedDelta90k is the better
+            // signal; a single old snapshot from a different operating point shouldn't
+            // dominate every future seek.
+            const uint64_t nowMs = cTimeMs::Now();
+            const bool stableHintFresh = stableDelta90k != AV_NOPTS_VALUE && stableDeltaCapturedMs != 0 &&
+                                         nowMs - stableDeltaCapturedMs <= DECODER_SYNC_HINT_MAX_AGE_MS;
+            const int64_t rawHint90k = stableHintFresh ? stableDelta90k : smoothedDelta90k;
+            // Clamp at capture so catch-up target AND EMA seed see the same bounded value.
+            // If the unclamped hint exceeded +CORRIDOR, the EMA seed would make
+            // smoothedDeltaValid=true with a value that immediately trips the soft-ahead
+            // check on the very next frame -- effectively a double correction. Clamping
+            // here lands the seed at the corridor edge; natural pacing handles any further
+            // drift toward the true offset.
+            seekHintDelta90k =
+                std::clamp<int64_t>(rawHint90k, -DECODER_SYNC_CORRIDOR_90K + 1, DECODER_SYNC_CORRIDOR_90K);
+        }
+        // else: leave seekHintDelta90k untouched -- any prior valid hint is still current
+        // (rapid back-to-back seek burst where the EMA was reset before reseed).
+    } else {
+        seekHintDelta90k = AV_NOPTS_VALUE;
+        // Plain Clear() (content boundary): cancel any pending compact-log request that a
+        // preceding FlushForSeek may have left armed. Same race shape as the seek hint -- a
+        // FlushForSeek sets filterCompactRebuildPending=true, then a Clear() overrides the flush
+        // (jitterFlushRequest 2->1) before the decode thread rebuilds. Without this the
+        // channel-switch / new-content rebuild would emit the terse one-line "filter rebuilt"
+        // diagnostic instead of the full graph dump. Binding it to the flush policy here keeps
+        // the verbose diagnostic for real content boundaries.
+        filterCompactRebuildPending.store(false, std::memory_order_release);
+    }
     ResetSmoothedDelta();
     jitterBuf.clear();
     pendingDrops = 0;
     lastDrainMs = 0;
+    // Catch-up tracker is decode-thread-owned; cleared here (the decode-thread side of Clear /
+    // FlushForSeek) so the "sinceCatchUp" diagnostic only counts within a single playback
+    // session and doesn't carry a stale timestamp across a seek.
+    lastCatchUpExitMs = 0;
+    // Catch-up log-throttle state belongs to a single playback run; a flush is a content /
+    // position boundary, so any cycles aggregated from before the flush no longer describe
+    // the current decode pipeline. Without this reset the first post-flush "catch-up entered"
+    // emits a misleading "cycling settled" summary attributing pre-flush events (possibly from
+    // a different file, minutes ago) to the new session. Silent reset -- a leaked summary line
+    // is worse than dropping a few aggregate counts on the floor.
+    lastCatchUpEntryMs = 0;
+    suppressedCatchUpCycles = 0;
+    suppressedCatchUpDrops = 0;
+    suppressedCatchUpWallMs = 0;
+    nextCatchUpSummaryMs = 0;
+    catchUpLogThisCycle = false;
+}
+
+[[nodiscard]] auto cVaapiDecoder::BeginCatchUpLogCycle() noexcept -> bool {
+    const uint64_t nowMs = cTimeMs::Now();
+    // Cycling run detection keys off the gap to the *previous entry* (logged or suppressed),
+    // not the previous logged entry. Keying off the logged entry (the earlier design) forced a
+    // log every THROTTLE_MS and made the periodic "sustained" summary unreachable, because
+    // suppression reset before the longer summary interval could elapse.
+    const bool runActive = lastCatchUpEntryMs != 0 && (nowMs - lastCatchUpEntryMs) < DECODER_CATCHUP_LOG_THROTTLE_MS;
+    lastCatchUpEntryMs = nowMs;
+    if (runActive) {
+        // Inside a cycling run: suppress this entry (and its exit). The exit path aggregates
+        // the cycle and emits the periodic "sustained" summary.
+        catchUpLogThisCycle = false;
+        return false;
+    }
+    // Run boundary: either the first catch-up ever, or cycling stopped long enough that this is a
+    // fresh isolated event. If a run just ended, emit its final "settled" summary before logging
+    // this entry so the entry line marks the resumption of normal cadence.
+    if (suppressedCatchUpCycles > 0) {
+        isyslog("vaapivideo/decoder: catch-up cycling settled: %d additional cycles drops=%d wallSum=%llums",
+                suppressedCatchUpCycles, suppressedCatchUpDrops,
+                static_cast<unsigned long long>(suppressedCatchUpWallMs));
+        suppressedCatchUpCycles = 0;
+        suppressedCatchUpDrops = 0;
+        suppressedCatchUpWallMs = 0;
+    }
+    nextCatchUpSummaryMs = 0; // re-armed by the next run's first suppressed exit
+    catchUpLogThisCycle = true;
+    return true;
 }
 
 [[nodiscard]] auto cVaapiDecoder::SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame) -> bool {
@@ -1694,6 +2012,24 @@ auto cVaapiDecoder::UpdateSmoothedDelta(int64_t rawDelta90k) noexcept -> void {
     ++rawDeltaCountSinceLog;
 
     if (!smoothedDeltaValid) {
+        // Fast-start: a FlushForSeek (same session, same pipeline) has handed us the
+        // pre-seek converged offset. Seed the EMA directly and skip the 50-sample warmup --
+        // the catch-up controller can target the steady-state from the first frame.
+        //
+        // One-shot: clear the hint here so subsequent ResetSmoothedDelta paths (no-clock
+        // freerun, catch-up exit much later, hard-behind, etc.) warm up from real samples
+        // instead of re-applying the same stale pre-seek value forever. The catch-up
+        // *exit* before this point may have read the hint as its drop target, which is
+        // fine -- that's the same one shot, just a step earlier in the sequence.
+        if (seekHintDelta90k != AV_NOPTS_VALUE) {
+            smoothedDelta90k = seekHintDelta90k;
+            seekHintDelta90k = AV_NOPTS_VALUE;
+            smoothedDeltaValid = true;
+            warmupSampleCount = 0;
+            warmupSampleSum90k = 0;
+            emaResidual90k = 0;
+            return;
+        }
         warmupSampleSum90k += rawDelta90k;
         ++warmupSampleCount;
         if (warmupSampleCount < DECODER_SYNC_WARMUP_SAMPLES) {
@@ -1775,8 +2111,15 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         if (silent) {
             catchUpDrops += dropped;
         } else {
-            dsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu", dropped,
-                    static_cast<long long>(firstDelta90k / PTS_TICKS_PER_MS), jitterBuf.size());
+            // Time-since-catch-up-exit surfaces the cascade pattern: when stale-jitter fires
+            // within ~2 s of a catch-up exit, the GPU/audio drift is exceeding the catch-up
+            // follow-up margin and the system is stuck in a recovery loop. ms=0 means
+            // catch-up has not run yet this session.
+            const uint64_t sinceCatchUpMs = (lastCatchUpExitMs != 0) ? (cTimeMs::Now() - lastCatchUpExitMs) : 0;
+            dsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu "
+                    "sinceCatchUp=%llums",
+                    dropped, static_cast<long long>(firstDelta90k / PTS_TICKS_PER_MS), jitterBuf.size(),
+                    static_cast<unsigned long long>(sinceCatchUpMs));
         }
     }
 }
@@ -1878,13 +2221,76 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // ordinary jitterBuf depth -- the small permanent negative offset that may remain is well
         // below the lipsync percept threshold.
         if (rawDelta > -DECODER_SYNC_CORRIDOR_90K) {
-            dsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms", catchUpDrops,
-                    static_cast<unsigned long long>(cTimeMs::Now() - catchUpStartMs),
-                    static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+            // Target selection:
+            //   - With a fast-start hint (post-seek, same pipeline): use the converged pre-seek
+            //     offset directly. The GPU/audio offset doesn't change with playback position,
+            //     so landing right at the steady-state avoids any post-catch-up settling drift.
+            //   - Without a hint (channel switch / first play): aim head one halfFrame *past*
+            //     clock. Without the positive margin, any GPU/audio drift (drain rate slightly
+            //     < audio rate) immediately erodes the catch-up's progress: head drifts back
+            //     into the -HARD_THRESHOLD zone within a couple of seconds, SkipStaleJitterFrames
+            //     drops it, catch-up re-enters, repeat. Observed in the log as ~1 s cycles of
+            //     "stale-jitter / catch-up entered / catch-up complete" for 13 s after a seek,
+            //     with firstRaw improving only ~40 ms per second (= one 25 fps source frame).
+            //     Pushing head positive past clock buys ~30 ms of drift headroom per cycle.
+            const int64_t frameDur90k = static_cast<int64_t>(outputFrameDurationMs) * PTS_TICKS_PER_MS;
+            const int64_t halfFrame90k = frameDur90k / 2;
+            const bool haveHint = (seekHintDelta90k != AV_NOPTS_VALUE);
+            // Clamp the hint inside (-CORRIDOR, +CORRIDOR] -- the soft-corridor trip threshold.
+            // Lower bound stops a degenerate negative hint from re-entering the catch-up zone.
+            // Upper bound is CORRIDOR (not halfFrame): on low-fps content (e.g. 15 fps uneven
+            // cadence on 50 Hz refresh) the natural steady-state offset is well above halfFrame
+            // (~+60 ms with halfFrame=33 ms) because soft-ahead skipping is part of the
+            // pipeline's normal pacing. Clamping to halfFrame would land the post-catch-up
+            // state below the natural offset, forcing the EMA to drift back up over several
+            // seconds; CORRIDOR lets the hint reach the soft-ahead trip threshold where natural
+            // pacing resumes immediately. The cold-start fallback (no hint) still uses
+            // +halfFrame: without a measured offset we don't know the pipeline's true steady-state.
+            const int64_t hintClamped = haveHint ? std::clamp<int64_t>(seekHintDelta90k, -DECODER_SYNC_CORRIDOR_90K + 1,
+                                                                       DECODER_SYNC_CORRIDOR_90K)
+                                                 : halfFrame90k;
+            const int64_t targetRaw = haveHint ? hintClamped : halfFrame90k;
+            const int64_t shift = std::max<int64_t>(0, targetRaw - rawDelta);
+            // Bound the follow-up so a marginal-HW catch-up that can't reach the target doesn't
+            // burn dozens of frames at the corridor edge. 8 frames = 160 ms at 50 fps, comfortably
+            // covers the -CORRIDOR..+CORRIDOR swing (the clamp range above) without entering
+            // trick-mode territory.
+            const int followUpDrops = std::min<int>(8, static_cast<int>((shift + frameDur90k - 1) / frameDur90k));
+            const auto targetMs = static_cast<long long>(targetRaw / PTS_TICKS_PER_MS);
+            const uint64_t exitNowMs = cTimeMs::Now();
+            const uint64_t cycleWallMs = exitNowMs - catchUpStartMs;
+            if (catchUpLogThisCycle) {
+                dsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms "
+                        "follow-up=%d (target=%+lldms%s)",
+                        catchUpDrops, static_cast<unsigned long long>(cycleWallMs),
+                        static_cast<long long>(rawDelta / PTS_TICKS_PER_MS), followUpDrops, targetMs,
+                        haveHint ? "/hint" : "");
+            } else {
+                ++suppressedCatchUpCycles;
+                suppressedCatchUpDrops += catchUpDrops;
+                suppressedCatchUpWallMs += cycleWallMs;
+                if (nextCatchUpSummaryMs == 0) {
+                    // First suppression of this run -- schedule the periodic summary.
+                    nextCatchUpSummaryMs = exitNowMs + DECODER_CATCHUP_SUMMARY_INTERVAL_MS;
+                } else if (exitNowMs >= nextCatchUpSummaryMs) {
+                    // Run still going at the summary interval: emit a periodic "sustained" line and
+                    // reset the aggregate so the count reflects one interval, not the whole run.
+                    isyslog("vaapivideo/decoder: catch-up cycling sustained: %d cycles drops=%d wallSum=%llums "
+                            "in last %dms (decoder unable to keep up)",
+                            suppressedCatchUpCycles, suppressedCatchUpDrops,
+                            static_cast<unsigned long long>(suppressedCatchUpWallMs),
+                            DECODER_CATCHUP_SUMMARY_INTERVAL_MS);
+                    suppressedCatchUpCycles = 0;
+                    suppressedCatchUpDrops = 0;
+                    suppressedCatchUpWallMs = 0;
+                    nextCatchUpSummaryMs = exitNowMs + DECODER_CATCHUP_SUMMARY_INTERVAL_MS;
+                }
+            }
             catchingUp = false;
             catchUpDrops = 0;
-            ResetSmoothedDelta(); // warmup alone gates soft until EMA reseeds; no follow-up event needed.
-            pendingDrops = 0;
+            lastCatchUpExitMs = exitNowMs;
+            ResetSmoothedDelta();
+            pendingDrops = followUpDrops;
         } else {
             ++catchUpDrops;
             ++syncDropSinceLog;
@@ -1895,8 +2301,10 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpStartMs = cTimeMs::Now();
         catchUpDrops = 1;
         ++syncDropSinceLog;
-        dsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms",
-                static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        if (BeginCatchUpLogCycle()) {
+            dsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms",
+                    static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        }
         return true;
     } else if (!smoothedDeltaValid && rawDelta < -2 * DECODER_SYNC_CORRIDOR_90K) {
         // Pre-warmup raw-based entry: drains a stale pre-roll backlog before it poisons the EMA.
@@ -1904,17 +2312,21 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpStartMs = cTimeMs::Now();
         catchUpDrops = 1;
         ++syncDropSinceLog;
-        dsyslog("vaapivideo/decoder: catch-up entered (warmup) raw=%+lldms",
-                static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        if (BeginCatchUpLogCycle()) {
+            dsyslog("vaapivideo/decoder: catch-up entered (warmup) raw=%+lldms",
+                    static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        }
         return true;
     } else if (smoothedDeltaValid && smoothedDelta90k < -2 * DECODER_SYNC_CORRIDOR_90K) {
         catchingUp = true;
         catchUpStartMs = cTimeMs::Now();
         catchUpDrops = 1;
         ++syncDropSinceLog;
-        dsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
-                static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS),
-                static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        if (BeginCatchUpLogCycle()) {
+            dsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
+                    static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS),
+                    static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
+        }
         return true;
     }
 
@@ -2024,6 +2436,19 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // EMA feedback: subtract measured shift (elapsed - frameDur); std::max guards underflow.
         const auto elapsedMs = static_cast<int>(cTimeMs::Now() - preSleepMs);
         const int extraMs = std::max(0, elapsedMs - outputFrameDurationMs);
+        // Snapshot the *pre-correction* smoothedDelta as the canonical steady-state offset for
+        // seek-hint capture. The `-=` below predictively models the post-sleep raw delta, which
+        // makes smoothedDelta90k a transient value during the EMA recovery window (~3 s for a
+        // 15 fps source). A FlushForSeek that lands inside that window would otherwise grab the
+        // mid-recovery value as the hint and bias the post-seek EMA seed; capturing here
+        // preserves the steady-state value the controller had just acted on. The timestamp
+        // pairs with DECODER_SYNC_HINT_MAX_AGE_MS so the snapshot ages out if no further
+        // correction refreshes it -- a stale snapshot from a past operating point shouldn't
+        // override a currently-valid smoothedDelta.
+        if (smoothedDeltaValid) {
+            stableDelta90k = smoothedDelta90k;
+            stableDeltaCapturedMs = cTimeMs::Now();
+        }
         smoothedDelta90k -= static_cast<int64_t>(extraMs) * PTS_TICKS_PER_MS;
         // Suppress the next drain-loop miss check: the gap straddling this submit was a
         // deliberate hard-ahead / soft-ahead sleep, not upstream starvation.

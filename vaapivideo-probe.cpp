@@ -57,11 +57,17 @@ struct DrmDeviceDeleter {
 };
 } // namespace
 
-// Every (profile, required RT surface format) combination worth reporting.
-// Plugin-consumed rows mirror kVideoBackendTable (src/stream.h) and
-// ProbeGpuCaps (src/caps.cpp) so the output predicts runtime behavior exactly.
-// Informational rows cover profiles modern iGPUs advertise but the plugin does
-// not decode: VP9, HEVC range extensions (12-bit, 4:2:2, 4:4:4), and JPEG.
+// Every (profile, required RT surface format) combination worth reporting. The
+// pipeline is 4:2:0 only; non-4:2:0 profiles (VP9 Profile 1/3, AV1 Profile 1/2,
+// HEVC range extensions, JPEG, ...) are out of scope and not listed. The
+// plugin-consumed subset is determined by ProbeDecodeProfiles' switch below
+// (mirrors GpuCaps in src/caps.cpp + kVideoBackendTable in src/stream.h).
+//
+// Naming convention: where the same VAProfile shows up at two bit-depths
+// (AV1 Profile 0, VVC Main 10), the rows share the profile name and the
+// right column ("8-bit 4:2:0" vs "10-bit 4:2:0") disambiguates them. Where
+// the bit-depth is part of the official VAProfile name (H.264 High 10, HEVC
+// Main 10/12), it stays in the name.
 namespace {
 struct DecodeProbe {
     VAProfile profile;
@@ -70,28 +76,29 @@ struct DecodeProbe {
 };
 } // namespace
 static constexpr DecodeProbe kDecodeProbes[] = {
-    // --- Consumed by the plugin (must match kVideoBackendTable) ---
+    // MPEG-2
     {.profile = VAProfileMPEG2Simple, .rtFormat = VA_RT_FORMAT_YUV420, .name = "MPEG-2 Simple"},
     {.profile = VAProfileMPEG2Main, .rtFormat = VA_RT_FORMAT_YUV420, .name = "MPEG-2 Main"},
+    // H.264
     {.profile = VAProfileH264ConstrainedBaseline,
      .rtFormat = VA_RT_FORMAT_YUV420,
      .name = "H.264 Constrained Baseline"},
     {.profile = VAProfileH264Main, .rtFormat = VA_RT_FORMAT_YUV420, .name = "H.264 Main"},
     {.profile = VAProfileH264High, .rtFormat = VA_RT_FORMAT_YUV420, .name = "H.264 High"},
     {.profile = VAProfileH264High10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "H.264 High 10"},
+    // HEVC -- Main 12 is informational only (12-bit not in NV12/P010 pipeline).
     {.profile = VAProfileHEVCMain, .rtFormat = VA_RT_FORMAT_YUV420, .name = "HEVC Main"},
     {.profile = VAProfileHEVCMain10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "HEVC Main 10"},
-    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420, .name = "AV1 Profile 0 (8-bit)"},
-    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "AV1 Profile 0 (10-bit)"},
-    // --- Informational: iGPU can decode, plugin does not consume today ---
     {.profile = VAProfileHEVCMain12, .rtFormat = VA_RT_FORMAT_YUV420_12, .name = "HEVC Main 12"},
-    {.profile = VAProfileHEVCMain422_10, .rtFormat = VA_RT_FORMAT_YUV422_10, .name = "HEVC Main 4:2:2 10"},
-    {.profile = VAProfileHEVCMain422_12, .rtFormat = VA_RT_FORMAT_YUV422_12, .name = "HEVC Main 4:2:2 12"},
-    {.profile = VAProfileHEVCMain444, .rtFormat = VA_RT_FORMAT_YUV444, .name = "HEVC Main 4:4:4"},
-    {.profile = VAProfileHEVCMain444_10, .rtFormat = VA_RT_FORMAT_YUV444_10, .name = "HEVC Main 4:4:4 10"},
+    // AV1 -- Profile 1 / Profile 2 omitted: non-4:2:0 chroma.
+    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420, .name = "AV1 Profile 0"},
+    {.profile = VAProfileAV1Profile0, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "AV1 Profile 0"},
+    // VP9 -- Profile 1/3 are non-4:2:0 per spec; omitted.
     {.profile = VAProfileVP9Profile0, .rtFormat = VA_RT_FORMAT_YUV420, .name = "VP9 Profile 0"},
     {.profile = VAProfileVP9Profile2, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "VP9 Profile 2"},
-    {.profile = VAProfileJPEGBaseline, .rtFormat = VA_RT_FORMAT_YUV420, .name = "JPEG Baseline"},
+    // VVC / H.266 -- Main 10 profile decodes both 8-bit and 10-bit per spec.
+    {.profile = VAProfileVVCMain10, .rtFormat = VA_RT_FORMAT_YUV420, .name = "VVC / H.266 Main 10"},
+    {.profile = VAProfileVVCMain10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "VVC / H.266 Main 10"},
 };
 
 // General VPP filter types. Deinterlacing and HDR tone mapping are probed
@@ -184,18 +191,6 @@ static auto PrintCapability(const char *label, bool supported) -> void {
             return "10-bit 4:2:0";
         case VA_RT_FORMAT_YUV420_12:
             return "12-bit 4:2:0";
-        case VA_RT_FORMAT_YUV422:
-            return "8-bit  4:2:2";
-        case VA_RT_FORMAT_YUV422_10:
-            return "10-bit 4:2:2";
-        case VA_RT_FORMAT_YUV422_12:
-            return "12-bit 4:2:2";
-        case VA_RT_FORMAT_YUV444:
-            return "8-bit  4:4:4";
-        case VA_RT_FORMAT_YUV444_10:
-            return "10-bit 4:4:4";
-        case VA_RT_FORMAT_YUV444_12:
-            return "12-bit 4:4:4";
         default:
             return "?";
     }
@@ -205,7 +200,7 @@ static auto PrintCapability(const char *label, bool supported) -> void {
 // Thread-local buffer avoids heap allocation inside the probe loop.
 [[nodiscard]] static auto FormatProbeLabel(const DecodeProbe &row) -> const char * {
     static thread_local std::array<char, 64> buf{};
-    (void)std::snprintf(buf.data(), buf.size(), "%-28s (%s)", row.name, RtFormatLabel(row.rtFormat));
+    (void)std::snprintf(buf.data(), buf.size(), "%-29s (%s)", row.name, RtFormatLabel(row.rtFormat));
     return buf.data();
 }
 
@@ -252,10 +247,14 @@ struct DecodeSupport {
     bool mpeg2 = false;      ///< MPEG-2 Simple or Main (8-bit)
     bool h264 = false;       ///< H.264 CBP / Main / High (8-bit)
     bool h264High10 = false; ///< H.264 High 10 (10-bit)
-    bool hevc = false;       ///< HEVC Main (8-bit)
-    bool hevcMain10 = false; ///< HEVC Main 10 (10-bit)
+    bool hevc = false;       ///< HEVC Main / SccMain (8-bit 4:2:0)
+    bool hevcMain10 = false; ///< HEVC Main 10 / SccMain 10 (10-bit 4:2:0)
     bool av1 = false;        ///< AV1 Profile 0 (8-bit)
     bool av1Main10 = false;  ///< AV1 Profile 0 (10-bit)
+    bool vp9 = false;        ///< VP9 Profile 0 (8-bit)
+    bool vp9Profile2 = false;///< VP9 Profile 2 (10-bit)
+    bool vvc = false;        ///< VVC Main 10 at YUV420 (8-bit)
+    bool vvcMain10 = false;  ///< VVC Main 10 at YUV420_10 (10-bit)
 };
 } // namespace
 
@@ -288,7 +287,7 @@ struct DecodeSupport {
 
         if (hasRt) {
             // Mirrors GpuCaps flag-setting in ProbeGpuCaps (src/caps.cpp).
-            // Profiles not in this switch (VP9, HEVC RExt, JPEG) are informational.
+            // Profiles not in this switch (HEVC 12-bit) are informational only.
             switch (row.profile) {
                 case VAProfileMPEG2Simple:
                 case VAProfileMPEG2Main:
@@ -324,6 +323,19 @@ struct DecodeSupport {
                         result.av1Main10 = true;
                     } else {
                         result.av1 = true;
+                    }
+                    break;
+                case VAProfileVP9Profile0:
+                    result.vp9 = true;
+                    break;
+                case VAProfileVP9Profile2:
+                    result.vp9Profile2 = true;
+                    break;
+                case VAProfileVVCMain10:
+                    if (row.rtFormat == VA_RT_FORMAT_YUV420_10) {
+                        result.vvcMain10 = true;
+                    } else {
+                        result.vvc = true;
                     }
                     break;
                 default:

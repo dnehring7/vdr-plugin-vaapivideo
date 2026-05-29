@@ -57,6 +57,7 @@ extern "C" {
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
 #include <libavutil/channel_layout.h>
@@ -102,7 +103,7 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.5.8";
+inline constexpr const char *PLUGIN_VERSION = "1.6.0";
 
 // ============================================================================
 // === CONSTANTS ===
@@ -185,6 +186,13 @@ struct FreeAVCodecParserContext {
 /// Deleter for AVFilterGraph (avfilter_graph_free)
 struct FreeAVFilterGraph {
     auto operator()(AVFilterGraph *graph) const noexcept -> void { avfilter_graph_free(&graph); }
+};
+
+/// Deleter for AVFormatContext (avformat_close_input). Use with std::unique_ptr<AVFormatContext, FreeAVFormatContext>
+/// for the libavformat-based mediaplayer path. avformat_close_input is the canonical pairing for
+/// avformat_open_input; it nulls the local pointer too, hence the address-of.
+struct FreeAVFormatContext {
+    auto operator()(AVFormatContext *ctx) const noexcept -> void { avformat_close_input(&ctx); }
 };
 
 /// Deleter for AVFrame (av_frame_free)

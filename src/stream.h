@@ -31,22 +31,17 @@ enum class BitDepth : uint8_t {
     k10 = 1,
 };
 
-/// Chroma sub-sampling. VA driver and DRM plane layout support only 4:2:0 today;
-/// 4:2:2 / 4:4:4 are reserved for future SW-fallback codecs in the mediaplayer path.
-enum class ChromaFormat : uint8_t {
-    k420 = 0,
-    k422 = 1,
-    k444 = 2,
-};
-
 /// Video elementary stream descriptor: everything the decoder needs to select a
 /// backend and configure the filter chain. Populated by ProbeVideoSps() on the
 /// first access unit (PES path) or from AVCodecParameters (mediaplayer path).
 /// Numeric fields default to "unknown/unspecified"; hasSps distinguishes a
 /// partial guess from a validated parse.
+///
+/// Chroma sub-sampling is intentionally not tracked: the entire pipeline (VA
+/// surfaces, scale_vaapi output, DRM plane scanout) is 4:2:0 only. Streams
+/// with 4:2:2 / 4:4:4 chroma are out of scope.
 struct VideoStreamInfo {
     BitDepth bitDepth{BitDepth::k8};                               ///< Luma bit-depth (drives backend selection)
-    ChromaFormat chroma{ChromaFormat::k420};                       ///< Chroma sub-sampling
     AVCodecID codecId{AV_CODEC_ID_NONE};                           ///< FFmpeg codec id
     int codedHeight{0};                                            ///< Coded picture height (luma samples)
     int codedWidth{0};                                             ///< Coded picture width (luma samples)
@@ -56,6 +51,8 @@ struct VideoStreamInfo {
     AVColorTransferCharacteristic transfer{AVCOL_TRC_UNSPECIFIED}; ///< VUI transfer function
     const uint8_t *extradata{nullptr}; ///< Non-owning init data (SPS/PPS/VPS concat); nullptr on PES path
     int extradataSize{0};              ///< Byte length of @c extradata
+    int fpsDen{1};                     ///< Container-reported frame-rate denominator; 0 means unknown
+    int fpsNum{0};                     ///< Container-reported frame-rate numerator; 0 means unknown
     bool hasSps{false};                ///< True iff ProbeVideoSps parsed an authoritative in-band parameter set
     int level{0};                      ///< Codec level (level_idc or general_level_idc)
     int profile{AV_PROFILE_UNKNOWN};   ///< e.g. AV_PROFILE_HEVC_MAIN_10, AV_PROFILE_AV1_MAIN
@@ -86,7 +83,7 @@ struct VideoBackendCap {
     bool GpuCaps::*flag;
 };
 
-inline constexpr std::array<VideoBackendCap, 7> kVideoBackendTable{{
+inline constexpr std::array<VideoBackendCap, 11> kVideoBackendTable{{
     {.codecId = AV_CODEC_ID_MPEG2VIDEO,
      .profile = AV_PROFILE_UNKNOWN,
      .bitDepth = BitDepth::k8,
@@ -106,6 +103,16 @@ inline constexpr std::array<VideoBackendCap, 7> kVideoBackendTable{{
      .bitDepth = BitDepth::k10,
      .flag = &GpuCaps::hwAv1Main10},
     {.codecId = AV_CODEC_ID_AV1, .profile = AV_PROFILE_UNKNOWN, .bitDepth = BitDepth::k8, .flag = &GpuCaps::hwAv1},
+    {.codecId = AV_CODEC_ID_VP9,
+     .profile = AV_PROFILE_VP9_2,
+     .bitDepth = BitDepth::k10,
+     .flag = &GpuCaps::hwVp9Profile2},
+    {.codecId = AV_CODEC_ID_VP9, .profile = AV_PROFILE_UNKNOWN, .bitDepth = BitDepth::k8, .flag = &GpuCaps::hwVp9},
+    {.codecId = AV_CODEC_ID_VVC,
+     .profile = AV_PROFILE_UNKNOWN,
+     .bitDepth = BitDepth::k10,
+     .flag = &GpuCaps::hwVvcMain10},
+    {.codecId = AV_CODEC_ID_VVC, .profile = AV_PROFILE_UNKNOWN, .bitDepth = BitDepth::k8, .flag = &GpuCaps::hwVvc},
 }};
 
 /// Look up the GpuCaps member-pointer that gates hardware decode for @p info.
@@ -150,8 +157,8 @@ static_assert(std::ranges::all_of(kVideoBackendTable,
 [[nodiscard]] auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID;
 
 /// Minimal in-band parameter-set peek. Per-codec coverage:
-///   H.264  (NAL type 7):  profile / level / bit-depth / chroma
-///   HEVC   (NAL type 33): profile / level / bit-depth / chroma / coded size
+///   H.264  (NAL type 7):  profile / level / bit-depth
+///   HEVC   (NAL type 33): profile / level / bit-depth / coded size
 ///   MPEG-2 (start 0xB3):  coded size only
 /// VUI color metadata is not parsed. AV1 is not parsed (DVB does not carry it
 /// in-band; the mediaplayer path gets profile/bit-depth from AVCodecParameters).
@@ -163,15 +170,23 @@ static_assert(std::ranges::all_of(kVideoBackendTable,
 // === MEDIAPLAYER SEAM ===
 // ============================================================================
 
-/// Abstract input source for the decoder pipeline. Currently unused (no implementations
-/// or callers ship yet); declared here so a future cFfmpegMediaSource over libavformat
-/// can be added without reshuffling this header. The PES path in device.cpp continues
-/// to push raw bytes directly into cVaapiDecoder::EnqueueData / cAudioProcessor::Decode.
+/// Which tracked elementary stream a packet returned from IMediaSource::ReadPacket belongs to.
+/// Returned out-of-band so the consumer can dispatch the packet to the correct decoder/audio
+/// sink without inspecting AVPacket::stream_index (which is implementation-internal).
+enum class MediaPacketStream : uint8_t { Video, Audio };
+
+/// Abstract input source for the decoder pipeline. The PES path in device.cpp continues
+/// to push raw bytes directly into cVaapiDecoder::EnqueueData / cAudioProcessor::Decode;
+/// the mediaplayer path implements this interface over libavformat.
 ///
 /// Contract:
+///  - Packets are returned in demux order via a single cursor: no per-stream side queues,
+///    no artificial drops. Splitting reads across two methods is unsafe -- when one stream
+///    runs ahead of the other, buffered packets on the lagging side can be dropped, causing
+///    audible/visible gaps. Callers route the packet by inspecting the @p stream out-arg.
 ///  - AVPacket::pts is in the 90 kHz VDR domain, already rebased from the source timebase.
 ///  - AVPacket buffers are owned by the packet; consumer calls av_packet_unref.
-///  - Read*Packet may be called concurrently; implementations own the locking policy.
+///  - Callers serialize access; implementations need not be thread-safe.
 class IMediaSource {
   public:
     IMediaSource() = default;
@@ -181,12 +196,11 @@ class IMediaSource {
     auto operator=(const IMediaSource &) -> IMediaSource & = delete;
     auto operator=(IMediaSource &&) noexcept -> IMediaSource & = delete;
 
-    /// Pull one video packet. Returns 0 (success), AVERROR(EAGAIN) (not ready),
-    /// or AVERROR_EOF. @p out is populated by av_packet_ref; caller unrefs.
-    [[nodiscard]] virtual auto ReadVideoPacket(AVPacket *out) -> int = 0;
-
-    /// Pull one audio packet; same semantics as ReadVideoPacket.
-    [[nodiscard]] virtual auto ReadAudioPacket(AVPacket *out) -> int = 0;
+    /// Pull one tracked packet in demux order. Returns 0 on success, AVERROR(EAGAIN) when
+    /// no packet is available yet (network sources), or AVERROR_EOF at end of input.
+    /// On success, @p stream is set to indicate whether @p out is a video or audio packet.
+    /// Untracked streams (subtitles, data) are silently skipped.
+    [[nodiscard]] virtual auto ReadPacket(AVPacket *out, MediaPacketStream &stream) -> int = 0;
 
     /// Video stream descriptor. Stable after Open(); undefined before.
     [[nodiscard]] virtual auto VideoInfo() const noexcept -> const VideoStreamInfo & = 0;
@@ -194,9 +208,9 @@ class IMediaSource {
     /// Audio stream descriptor. Stable after Open(); undefined before.
     [[nodiscard]] virtual auto AudioInfo() const noexcept -> const AudioStreamInfo & = 0;
 
-    /// Drop buffered data (seek, channel switch, teardown). Safe to call concurrently
-    /// with Read*Packet(); implementations must cause those to return AVERROR(EAGAIN)
-    /// as soon as the flush takes effect.
+    /// Drop buffered data (seek, teardown). Safe to call concurrently with ReadPacket();
+    /// implementations must cause that call to return AVERROR(EAGAIN) or AVERROR_EOF as
+    /// soon as the flush takes effect.
     virtual auto Flush() -> void = 0;
 };
 

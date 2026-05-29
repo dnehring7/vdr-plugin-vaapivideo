@@ -76,7 +76,7 @@ class cVideoFilterChain {
         // --- Target surface ---
         uint32_t outputWidth{0};     ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout
         uint32_t outputHeight{0};    ///< Target video rect height
-        uint32_t outputRefreshHz{0}; ///< Used to decide whether to insert an fps upconvert filter
+        uint32_t outputRefreshHz{0}; ///< Used to decide whether to insert an exact-cadence fps duplicate filter
 
         // --- HDR decisions (resolved by caller before Build) ---
         bool hdrPassthrough{false}; ///< true -> emit P010 + BT.2020 color directives; false -> NV12 BT.709
@@ -120,6 +120,15 @@ class cVideoFilterChain {
     /// before Build() succeeds. Used by the A/V sync controller.
     [[nodiscard]] auto GetOutputFrameDurationMs() const noexcept -> int { return outputFrameDurationMs_; }
 
+    /// True iff the active chain contains a temporal filter whose internal state survives a
+    /// seek-sized PTS jump destructively. Currently only `fps=N` qualifies: with a source
+    /// rate below the display rate, that filter bridges the gap between previous_output_pts
+    /// and the first post-seek input by emitting many duplicate frames at stale PTS,
+    /// triggering long stale-jitter / catch-up cascades. bwdif / yadif retain at most 1-2
+    /// fields of pre-seek content and self-clear inside a filter window -- not flagged.
+    /// FlushForSeek consults this to decide whether to pay the ~100 ms filter-rebuild cost.
+    [[nodiscard]] auto HasFpsFilter() const noexcept -> bool { return hasFpsFilter_; }
+
   private:
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> filterGraph_;
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
@@ -127,6 +136,7 @@ class cVideoFilterChain {
     AVFilterContext *bufferSrcCtx_{};  ///< owned by filterGraph_; raw pointer valid only while filterGraph_ is live
     AVFilterContext *bufferSinkCtx_{}; ///< owned by filterGraph_; same lifetime constraint
     int outputFrameDurationMs_{20};    ///< 20 = 50 fps fallback; updated by Build()
+    bool hasFpsFilter_{false};         ///< true iff the active chain ends with `fps=N`; updated by Build() / Reset()
 };
 
 #endif // VDR_VAAPIVIDEO_FILTER_H

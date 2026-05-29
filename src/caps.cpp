@@ -312,15 +312,44 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
                         caps.hwAv1Main10 = true;
                     }
                     break;
+                case VAProfileVP9Profile0:
+                    if (!caps.hwVp9 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
+                        caps.hwVp9 = true;
+                    }
+                    break;
+                case VAProfileVP9Profile2:
+                    // Profile 2 is the 10/12-bit YUV 4:2:0 profile (HDR-capable VP9).
+                    if (!caps.hwVp9Profile2 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420_10)) {
+                        caps.hwVp9Profile2 = true;
+                    }
+                    break;
+                    // HEVC range extensions / SCC / 12-bit are out of scope: the pipeline is
+                    // 4:2:0 only and the scanout path doesn't ingest 12-bit P012 surfaces.
+                case VAProfileVVCMain10:
+                    // VVC / H.266 successor to HEVC. Per ITU-T H.266 the Main 10 profile
+                    // also accepts 8-bit streams, so probe YUV420 in addition to YUV420_10
+                    // and route via separate caps (mirrors AV1's hwAv1 / hwAv1Main10 split).
+                    // lavc gates the actual HW open via avcodec_get_hw_config; if the lavc
+                    // build doesn't ship vvc_vaapi yet, hwVvc/hwVvcMain10=true are harmless
+                    // (HW open returns false, decoder falls back to SW).
+                    if (!caps.hwVvc && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
+                        caps.hwVvc = true;
+                    }
+                    if (!caps.hwVvcMain10 && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420_10)) {
+                        caps.hwVvcMain10 = true;
+                    }
+                    break;
                 default:
                     break;
             }
         }
     }
 
-    isyslog("vaapivideo/caps: decode -- mpeg2=%s h264=%s/%s hevc=%s/%s av1=%s/%s", caps.hwMpeg2 ? "hw" : "sw",
-            caps.hwH264 ? "hw" : "sw", caps.hwH264High10 ? "hw10" : "sw10", caps.hwHevc ? "hw" : "sw",
-            caps.hwHevcMain10 ? "hw10" : "sw10", caps.hwAv1 ? "hw" : "sw", caps.hwAv1Main10 ? "hw10" : "sw10");
+    isyslog("vaapivideo/caps: decode -- mpeg2=%s h264=%s/%s hevc=%s/%s av1=%s/%s vp9=%s/%s vvc=%s/%s",
+            caps.hwMpeg2 ? "hw" : "sw", caps.hwH264 ? "hw" : "sw", caps.hwH264High10 ? "hw10" : "sw10",
+            caps.hwHevc ? "hw" : "sw", caps.hwHevcMain10 ? "hw10" : "sw10", caps.hwAv1 ? "hw" : "sw",
+            caps.hwAv1Main10 ? "hw10" : "sw10", caps.hwVp9 ? "hw" : "sw", caps.hwVp9Profile2 ? "hw10" : "sw10",
+            caps.hwVvc ? "hw" : "sw", caps.hwVvcMain10 ? "hw10" : "sw10");
 
     // vaQueryVideoProcFilters requires a live context (config + surface + context).
     // Build a minimal 64x64 one for the probe, destroyed explicitly before vaRaii runs.

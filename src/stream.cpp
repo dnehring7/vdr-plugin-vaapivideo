@@ -530,9 +530,11 @@ class BitReader {
     }
 }
 
-/// Parse H.264 SPS for profile / level / bit-depth / chroma. Extended fields
+/// Parse H.264 SPS for profile / level / bit-depth. Extended fields
 /// (chroma_format_idc, bit_depth_luma_minus8) are only present in profiles
-/// that HasH264ExtendedSpsFields() returns true for.
+/// that HasH264ExtendedSpsFields() returns true for; we still walk
+/// chroma_format_idc to advance the bit cursor past it, but the value is
+/// discarded -- the pipeline is 4:2:0 only.
 [[nodiscard]] auto ProbeH264Sps(std::span<const uint8_t> sps) noexcept -> VideoStreamInfo {
     VideoStreamInfo info;
     info.codecId = AV_CODEC_ID_H264;
@@ -563,22 +565,19 @@ class BitReader {
         if (br.Overran()) {
             return info;
         }
-        if (chromaFormatIdc <= 3) {
-            info.chroma = static_cast<ChromaFormat>(chromaFormatIdc > 0 ? chromaFormatIdc - 1 : 0);
-        }
         info.bitDepth = (bitDepthLumaMinus8 >= 2) ? BitDepth::k10 : BitDepth::k8;
         info.hasSps = true;
     } else {
         // Baseline/Main profiles are 8-bit 4:2:0 by spec; no extension fields to parse.
         info.bitDepth = BitDepth::k8;
-        info.chroma = ChromaFormat::k420;
         info.hasSps = true;
     }
 
     return info;
 }
 
-/// Parse HEVC SPS for profile / level / bit-depth / chroma / coded dimensions.
+/// Parse HEVC SPS for profile / level / bit-depth / coded dimensions. chroma_format_idc
+/// is walked only to advance the bit cursor past it -- the pipeline is 4:2:0 only.
 /// Walks profile_tier_level (H.265 sec.7.3.3) then seq_parameter_set_rbsp (sec.7.3.2.2.1).
 [[nodiscard]] auto ProbeHevcSps(std::span<const uint8_t> sps) noexcept -> VideoStreamInfo {
     VideoStreamInfo info;
@@ -645,9 +644,6 @@ class BitReader {
         return info;
     }
 
-    if (chromaFormatIdc <= 3) {
-        info.chroma = static_cast<ChromaFormat>(chromaFormatIdc > 0 ? chromaFormatIdc - 1 : 0);
-    }
     info.codedWidth = static_cast<int>(picWidth);
     info.codedHeight = static_cast<int>(picHeight);
     info.bitDepth = (bitDepthLumaMinus8 >= 2) ? BitDepth::k10 : BitDepth::k8;

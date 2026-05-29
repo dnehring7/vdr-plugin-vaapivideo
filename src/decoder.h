@@ -75,8 +75,9 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    auto Clear() -> void;      ///< Flush queued packets, codec buffers, and filter graph; resets A/V sync state.
-    auto DrainQueue() -> void; ///< Discard all queued packets without touching codec or filter state.
+    auto Clear() -> void;        ///< Flush queued packets, codec buffers, and filter graph; resets A/V sync state.
+    auto DrainQueue() -> void;   ///< Discard all queued packets without touching codec or filter state.
+    auto FlushForSeek() -> void; ///< Same as Clear() but keeps the filter graph alive (mediaplayer seek path).
     auto EnqueueData(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< PES path: parse raw NAL bytes via av_parser_parse2 and push complete AUs onto the queue.
     // [MEDIAPLAYER-SEAM] Currently unused: reserved for the libavformat-based mediaplayer path.
@@ -87,6 +88,9 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto GetLastPts() const noexcept
         -> int64_t; ///< PTS of the most recently decoded frame in 90 kHz ticks, or AV_NOPTS_VALUE.
                     ///< Includes catch-up-dropped frames (see PublishLastPts site in DecodeOnePacket).
+    [[nodiscard]] auto GetJitterBufSize() const noexcept -> size_t {
+        return publishedJitterBufSize.load(std::memory_order_relaxed);
+    } ///< Cross-thread snapshot of post-decode buffered frames.
     [[nodiscard]] auto GetQueueSize() const -> size_t;    ///< Packets waiting in the decode queue.
     [[nodiscard]] auto GetStreamAspect() const -> double; ///< Stream DAR (width x SAR), or 0.0 when closed.
     [[nodiscard]] auto GetStreamHeight() const -> int;    ///< Coded stream height, or 0 when closed.
@@ -104,7 +108,14 @@ class cVaapiDecoder : public cThread {
                  ///< Reuse requires matching codec ID, HW/SW choice, and extradata; anything else triggers teardown.
     auto NotifyAudioChange() -> void; ///< Arm freerun after an audio codec/track switch; audio clock is NOPTS briefly.
     auto SetAudioProcessor(cAudioProcessor *audio)
-        -> void;                         ///< Attach the A/V sync master clock. Stored as atomic pointer.
+        -> void; ///< Attach the A/V sync master clock. Stored as atomic pointer.
+    auto SetDevicePaused(bool paused) noexcept
+        -> void; ///< Mirror cVaapiDevice::Freeze() / Play() into the drain loop. While paused the drain HOLDS
+                 ///< the jitterBuf (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift while
+                 ///< the audio master clock is genuinely frozen (ALSA dropped). Without this the decoder's
+                 ///< no-clock-freerun fires when GetClock() goes stale and submits frames at vsync rate during
+                 ///< pause, leaving the head hundreds of ms ahead of the audio clock on resume -> persistent
+                 ///< video-ahead drain-stall loop that never recovers.
     auto SetLiveMode(bool live) -> void; ///< true = live TV (jitter buffer active); false = replay.
     auto RequestCodecDrain() -> void;    ///< Ask decode thread to drain B-frame reorder buffer (e.g. before still).
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
@@ -126,6 +137,10 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
+    auto ClearInternal(bool resetFilter, bool preserveSeekHint)
+        -> void; ///< Shared body of Clear() / FlushForSeek(). preserveSeekHint=true binds the seek-hint
+                 ///< preservation request directly to the jitter-flush request so a coalesced flush
+                 ///< observed by the decode thread always sees the matching policy (race-free).
     [[nodiscard]] auto CreateVaapiFrame(AVFrame *src) const
         -> std::unique_ptr<VaapiFrame>; ///< av_frame_clone() the filtered surface; extracts VASurfaceID from data[3].
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
@@ -168,8 +183,13 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Replay hard-ahead: block until audio clock reaches video PTS. Capped at delta/90 + 1 s, max 5 s.
     auto PublishLastPts(int64_t pts) noexcept
         -> void; ///< Decode thread only. Stores pts iff iterationEpoch matches clearEpoch (Clear-race guard).
-    auto ApplyDeferredJitterFlush(uint64_t &lastDrainMs) noexcept
-        -> void; ///< Consume a pending Clear(): reset EMA, drop jitterBuf, zero pendingDrops + lastDrainMs.
+    auto ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserveSeekHint) noexcept
+        -> void; ///< Consume a pending Clear() / FlushForSeek(): reset EMA, drop jitterBuf, zero pendingDrops
+                 ///< + lastDrainMs. preserveSeekHint comes from the flush request itself (not a separate
+                 ///< atomic) so racing flushes can't cross-pollinate the preserve policy.
+    [[nodiscard]] auto BeginCatchUpLogCycle() noexcept
+        -> bool; ///< Catch-up log throttle gate; flushes any pending "cycling settled" summary on the first
+                 ///< logged entry after a suppressed run. Returns true if this entry should be logged.
 
     // ========================================================================
     // === SYNCHRONIZATION ===
@@ -236,10 +256,17 @@ class cVaapiDecoder : public cThread {
     std::atomic<uint64_t> clearEpoch{0};     ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
     uint64_t iterationEpoch{0};              ///< Decode thread only. Snapshot of clearEpoch at each Action() iter top.
     std::atomic<bool> liveMode;              ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
+    std::atomic<bool> devicePaused{false};   ///< Mirrors cVaapiDevice::Freeze()/Play(). When true the drain loop holds
+                                             ///< (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift
+                                             ///< while ALSA is dropped and the audio master clock is genuinely frozen.
     std::atomic<bool> ready{false};          ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
     std::atomic<int> trickSpeed;             ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
     std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
                                              ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
+    std::atomic<bool> filterCompactRebuildPending{
+        false}; ///< Set by FlushForSeek to request a one-line "filter rebuilt" diagnostic on the
+                ///< next InitFilterGraph call instead of the full 3-line graph init dump.
+                ///< Consumed (exchanged to false) by the decode-thread filter-build path.
 
     // ========================================================================
     // === TRICK MODE ===
@@ -260,9 +287,20 @@ class cVaapiDecoder : public cThread {
     // Without it the due-gate holds until the audio clock is anchored and the screen stays black.
     std::atomic<int> freerunFrames{
         1}; ///< Bypass A/V sync for N frames. Set by Clear() / trick-exit / NotifyAudioChange().
-    std::atomic<bool> jitterFlushPending{
-        false};                       ///< Deferred Clear(): decode thread resets jitterBuf + EMA on next cycle.
-    std::atomic<bool> syncLogPending; ///< Force sync log on next frame regardless of timer.
+    std::atomic<int> jitterFlushRequest{
+        0}; ///< Deferred Clear() / FlushForSeek() request consumed by the decode thread:
+            ///<   0 = no flush pending,
+            ///<   1 = plain Clear()  -- drop seek-hint, content boundary,
+            ///<   2 = FlushForSeek() -- preserve seek-hint across the flush.
+            ///< The preserve policy is encoded *in* the request so back-to-back FlushForSeek /
+            ///< Clear() can't cross-pollinate (a stale flush observed by the decode thread always
+            ///< carries its originator's policy, never a later issuer's). Last writer wins, which
+            ///< is correct: Clear() after FlushForSeek dropping the hint = content boundary win;
+            ///< FlushForSeek after FlushForSeek = coalesced preserve.
+    std::atomic<size_t> publishedJitterBufSize{0}; ///< Cross-thread snapshot of jitterBuf.size() for backpressure.
+                                                   ///< Written by decode thread once per Action() iteration,
+                                                   ///< read by the mediaplayer demux thread.
+    std::atomic<bool> syncLogPending;              ///< Force sync log on next frame regardless of timer.
     cTimeMs nextSyncLog;              ///< Decode thread only. Deadline for the periodic sync-stats dsyslog.
     int drainMissCount{};             ///< Drain gaps > 2xframeDur since last sync log; indicates upstream starvation.
     int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log. Decode thread only.
@@ -280,12 +318,47 @@ class cVaapiDecoder : public cThread {
     int64_t emaResidual90k{};         ///< Integer EMA remainder: carries sub-sample rounding so the filter converges
                                       ///< exactly to the mean rather than stalling when |diff| < EMA_SAMPLES ticks.
     bool smoothedDeltaValid{false};   ///< True after warmup completes. Gates soft-corridor and catch-up (sustained).
+    int64_t seekHintDelta90k{AV_NOPTS_VALUE}; ///< One-shot fast-start hint: last converged smoothedDelta carried across
+                                              ///< a FlushForSeek. Used as the catch-up exit target AND as the EMA seed
+                                              ///< on the first valid post-seek sample, so playback resumes at the
+                                              ///< steady-state offset within milliseconds instead of waiting out the
+                                              ///< 50-sample warmup. Consumed (set back to AV_NOPTS_VALUE) once the EMA
+                                              ///< is seeded so subsequent controller resets warm up from real samples
+                                              ///< rather than re-applying the same stale value. Decode thread only.
+    int64_t stableDelta90k{
+        AV_NOPTS_VALUE};              ///< Pre-correction snapshot of smoothedDelta taken at each hard-/soft-ahead
+                                      ///< trigger, just before the post-sleep `smoothedDelta -= extraMs` feedback.
+                                      ///< Represents the long-term GPU-vs-audio offset that the EMA had converged
+                                      ///< to before the in-flight correction perturbed it. Used as the seek-hint
+                                      ///< source so the captured hint survives a FlushForSeek that lands inside
+                                      ///< the post-correction recovery window. AV_NOPTS_VALUE until the first
+                                      ///< trigger fires; cleared by ResetSmoothedDelta. Decode thread only.
+    uint64_t stableDeltaCapturedMs{}; ///< cTimeMs::Now() of the most recent stableDelta90k capture. Paired with
+                                      ///< DECODER_SYNC_HINT_MAX_AGE_MS so an old snapshot from a single past
+                                      ///< correction cannot dominate seeks long after the pipeline has settled at
+                                      ///< a different offset. 0 = no capture yet; reset by ResetSmoothedDelta.
     int hardAheadDebounce{};          ///< Consecutive rawDelta > HARD_THRESHOLD; 2-sample debounce before action.
     int hardBehindDebounce{};         ///< Consecutive rawDelta < -HARD_THRESHOLD; 2-sample debounce before action.
     bool catchingUp{};                ///< Bulk-dropping a catastrophic backlog (seek / startup stall).
     int catchUpDrops{};               ///< Frames silently dropped in the current catch-up pass.
     uint64_t catchUpStartMs{};        ///< cTimeMs::Now() at catch-up entry; reported at exit.
+    uint64_t lastCatchUpExitMs{};     ///< cTimeMs::Now() at catch-up exit; diagnostic for cascade detection.
     cTimeMs syncCooldown;             ///< Rate-limits soft corrections to once per DECODER_SYNC_COOLDOWN_MS.
+
+    // --- Catch-up log throttling ---
+    // Sustained catch-up cycling (e.g. VVC SW decode, or a marginal HW decoder dropping ~5%) emits one
+    // entry+exit pair per cycle, flooding syslog. Cycling is detected by inter-entry gap: two entries
+    // within DECODER_CATCHUP_LOG_THROTTLE_MS of each other are a "run". The first entry of a run logs
+    // normally; subsequent entries in the run are suppressed and aggregated into a periodic
+    // (DECODER_CATCHUP_SUMMARY_INTERVAL_MS) "sustained" summary while the run continues, plus a final
+    // "settled" summary when the gap exceeds the window (run ended). Controller behavior is unchanged.
+    uint64_t lastCatchUpEntryMs{};      ///< cTimeMs::Now() of the most recent catch-up entry (logged OR suppressed).
+                                        ///< Inter-entry gap vs DECODER_CATCHUP_LOG_THROTTLE_MS detects an active run.
+    bool catchUpLogThisCycle{false};    ///< Set at entry, consulted at exit so suppressed entries don't log their exit.
+    int suppressedCatchUpCycles{};      ///< Cycles aggregated since the run started (or last periodic summary).
+    int suppressedCatchUpDrops{};       ///< Cumulative dropped-frame count of those cycles.
+    uint64_t suppressedCatchUpWallMs{}; ///< Cumulative wall time spent inside those cycles.
+    uint64_t nextCatchUpSummaryMs{};    ///< cTimeMs::Now() at which the next periodic-during-run summary should fire.
 
     // ========================================================================
     // === JITTER BUFFER ===

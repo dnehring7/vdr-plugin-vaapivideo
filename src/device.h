@@ -22,6 +22,8 @@
 class cAudioProcessor;
 class cVaapiDecoder;
 class cVaapiDisplay;
+struct AudioStreamInfo;
+struct VideoStreamInfo;
 
 // ============================================================================
 // === STRUCTURES ===
@@ -151,6 +153,31 @@ class cVaapiDevice : public cDevice {
     auto MarkStartupComplete() noexcept -> void; ///< Called by the plugin once VDR startup has finished. Enables the
                                                  ///< MakePrimaryDevice() deferred-attach hook so a setup.conf-driven
                                                  ///< primary promotion during VDR bring-up does not defeat --detached.
+
+    // ========================================================================
+    // === MEDIAPLAYER FEED SURFACE ===
+    // ========================================================================
+    // Narrow, encapsulated entry points for the libavformat-based mediaplayer path
+    // (see src/mediaplayer.{h,cpp}). The PES path remains the only writer through
+    // PlayVideo/PlayAudio; these methods exist so the mediaplayer never touches the
+    // private decoder / audioProcessor pointers directly.
+    [[nodiscard]] auto OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
+        -> bool; ///< Opens video + audio codecs with full stream descriptors. Returns false iff either codec failed.
+    [[nodiscard]] auto SubmitVideoPacket(const AVPacket *packet)
+        -> bool; ///< Clones a pre-demuxed video AU onto the decoder queue. False when not Ready() or queue full;
+                 ///< caller must hold the packet and retry to avoid silently dropping AUs while the lookahead
+                 ///< throttle still advances as if they were accepted.
+    [[nodiscard]] auto SubmitAudioPacket(const AVPacket *packet)
+        -> bool; ///< Clones a pre-demuxed audio AU onto the audio queue. False when not Ready() or queue full.
+    auto ClearForMediaPlayer()
+        -> void; ///< Heavy flush: drops queues AND tears down the filter chain. Used at open/close of an entry.
+    auto FlushForSeek()
+        -> void; ///< Light flush: drops queues but keeps filter chain and swresample alive. Used at seek.
+    [[nodiscard]] auto IsMediaPlayerBackpressured() const noexcept
+        -> bool; ///< True iff either decoder or audio queue is at capacity. Mediaplayer demux thread polls this.
+    [[nodiscard]] auto GetAudioClock() const noexcept
+        -> int64_t; ///< Audio master clock in 90 kHz ticks, or AV_NOPTS_VALUE before audio anchors / after Clear().
+                    ///< Used by the mediaplayer demux to pace itself against wall-clock playback.
 
   protected:
     // ========================================================================

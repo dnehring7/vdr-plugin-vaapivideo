@@ -37,13 +37,17 @@ struct GpuCaps {
     // Each flag means: driver advertises VLD entrypoint AND the required RT surface
     // format for that profile. Both conditions are necessary; VLD alone is insufficient
     // if the driver won't allocate NV12/P010 surfaces for the filter chain.
-    bool hwMpeg2{};      ///< VAProfileMPEG2Simple or Main, VLD + YUV420
-    bool hwH264{};       ///< VAProfileH264High (or lower), VLD + YUV420 (8-bit)
-    bool hwH264High10{}; ///< VAProfileH264High10, VLD + YUV420_10 (10-bit)
-    bool hwHevc{};       ///< VAProfileHEVCMain, VLD + YUV420 (8-bit)
-    bool hwHevcMain10{}; ///< VAProfileHEVCMain10, VLD + YUV420_10 (10-bit / HDR prerequisite)
-    bool hwAv1{};        ///< VAProfileAV1Profile0, VLD + YUV420 (8-bit)
-    bool hwAv1Main10{};  ///< VAProfileAV1Profile0, VLD + YUV420_10 (10-bit)
+    bool hwMpeg2{};       ///< VAProfileMPEG2Simple or Main, VLD + YUV420
+    bool hwH264{};        ///< VAProfileH264High (or lower), VLD + YUV420 (8-bit)
+    bool hwH264High10{};  ///< VAProfileH264High10, VLD + YUV420_10 (10-bit)
+    bool hwHevc{};        ///< VAProfileHEVCMain, VLD + YUV420 (8-bit)
+    bool hwHevcMain10{};  ///< VAProfileHEVCMain10, VLD + YUV420_10 (10-bit / HDR prerequisite)
+    bool hwAv1{};         ///< VAProfileAV1Profile0, VLD + YUV420 (8-bit)
+    bool hwAv1Main10{};   ///< VAProfileAV1Profile0, VLD + YUV420_10 (10-bit)
+    bool hwVp9{};         ///< VAProfileVP9Profile0, VLD + YUV420 (8-bit)
+    bool hwVp9Profile2{}; ///< VAProfileVP9Profile2, VLD + YUV420_10 (10-bit)
+    bool hwVvc{};         ///< VAProfileVVCMain10, VLD + YUV420 (8-bit)
+    bool hwVvcMain10{};   ///< VAProfileVVCMain10, VLD + YUV420_10 (10-bit)
 
     // === VPP FILTERS ===
     bool vppP010{};              ///< Driver allocates P010 (YUV420_10) surfaces; HDR passthrough prerequisite

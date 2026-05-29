@@ -25,6 +25,7 @@
 #include "config.h"
 #include "decoder.h"
 #include "display.h"
+#include "mediaplayer.h"
 #include "osd.h"
 #include "pes.h"
 #include "stream.h"
@@ -447,14 +448,30 @@ auto cVaapiDevice::Freeze() -> void {
     // Does NOT reset sync EMA: that would cause a reseed transient on resume.
     if (decoder) [[likely]] {
         decoder->DrainQueue();
+        // Hold the drain so the jitterBuf head's PTS doesn't drift during the pause: ALSA is
+        // dropped below and WritePcmToAlsa stops, GetClock() goes stale within ~1 s, and the
+        // decoder's no-clock-freerun would otherwise submit frames at vsync rate -- leaving the
+        // head hundreds of ms ahead of the re-anchored audio clock on resume and triggering the
+        // post-resume drain-stall loop.
+        decoder->SetDevicePaused(true);
+    }
+    // Suppress the display's underrun ("queue empty Nms") log: with the decoder holding the drain,
+    // re-presents of the last frame are intentional, not a stall. Without this gate the per-pause
+    // syslog gains a stream of vsync-rate underrun lines until the display's 10 s IDLE_THRESHOLD
+    // catch-all kicks in (i.e. several entries per pause are typical).
+    if (display) [[likely]] {
+        display->SetDevicePaused(true);
     }
 
     // Drop ALSA buffers: ~100-200 ms of audio is already queued in the sink and would
-    // continue playing past the freeze without an explicit drain. DropOutput preserves the
-    // playback clock so the decoder stays paced and the display queue does not underrun on
-    // resume; using full Clear() here causes a video freerun and a starve log.
+    // continue playing past the freeze without an explicit drain. DropOutput preserves
+    // playbackPts; pauseClock=true additionally pins GetClock() so it does not extrapolate
+    // through ALSA silence (a short pause < AUDIO_CLOCK_STALE_MS would otherwise produce a
+    // fake-advanced clock on resume -> SkipStaleJitterFrames silently drops the preserved
+    // jitterBuf head = playback-position skip on un-pause). The pin lifts on the next ALSA
+    // write inside WritePcmToAlsa().
     if (audioProcessor) [[likely]] {
-        audioProcessor->DropOutput();
+        audioProcessor->DropOutput(/*pauseClock=*/true);
     }
 }
 
@@ -896,6 +913,16 @@ auto cVaapiDevice::Play() -> void {
     }
 
     paused.store(false, std::memory_order_relaxed);
+    // Release the drain-loop hold. The next WritePcmToAlsa anchors the clock and lifts the
+    // pause pin (Freeze() set clockPaused=true via DropOutput); until then GetClock() returns
+    // the pinned playbackPts so the drain due-gate stays stable across the resume window.
+    // Seek/startup NOPTS handling remains covered by DECODER_NO_CLOCK_HOLD_MS.
+    if (decoder) [[likely]] {
+        decoder->SetDevicePaused(false);
+    }
+    if (display) [[likely]] {
+        display->SetDevicePaused(false);
+    }
 }
 
 [[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar /*Id*/) -> int {
@@ -1190,7 +1217,20 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     }
 
     // Clear stale Freeze() flag first -- would otherwise block PlayVideo() in the new mode.
+    // Propagate the un-pause to decoder + display: VDR drives "exit playback while paused" as
+    // Blue/Stop -> SetPlayMode(pmNone) WITHOUT a prior Play(), so without this the drain hold
+    // set by Freeze() (decoder->devicePaused, display->devicePaused) stays asserted across the
+    // SetPlayMode transition. The next live-TV / replay session then feeds packets into the
+    // decoder, jitterBuf grows to its 150-frame hard cap, and every subsequent frame overflows
+    // (visible as "jitterBuf overflow -- dropped N" spam at ~50 fps with no picture on screen).
+    // Audio's clockPaused is cleared by the Clear() path below via ResetPlaybackClock().
     paused.store(false, std::memory_order_relaxed);
+    if (decoder) [[likely]] {
+        decoder->SetDevicePaused(false);
+    }
+    if (display) [[likely]] {
+        display->SetDevicePaused(false);
+    }
 
     switch (PlayMode) {
         case pmNone:
@@ -1440,6 +1480,169 @@ auto cVaapiDevice::SuspendHardware() -> void {
 }
 
 auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.store(true, std::memory_order_release); }
+
+// ============================================================================
+// === MEDIAPLAYER FEED SURFACE ===
+// ============================================================================
+
+[[nodiscard]] auto cVaapiDevice::OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
+    -> bool {
+    if (!Ready()) [[unlikely]] {
+        esyslog("vaapivideo/device: OpenForMediaPlayer rejected -- hardware not attached");
+        return false;
+    }
+    if (!decoder || !audioProcessor) [[unlikely]] {
+        esyslog("vaapivideo/device: OpenForMediaPlayer rejected -- subsystems missing");
+        return false;
+    }
+
+    // Mediaplayer paths are always replay -- no live-TV jitter buffer, no Transferring() race.
+    liveMode.store(false, std::memory_order_relaxed);
+    decoder->SetLiveMode(false);
+
+    // Skip the 2-of-2 codec-detection dance: the demuxer reported authoritative codec IDs.
+    videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    videoCodecCandidateCount.store(0, std::memory_order_relaxed);
+    audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+    audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+
+    if (!decoder->OpenCodecWithInfo(video)) [[unlikely]] {
+        esyslog("vaapivideo/device: OpenForMediaPlayer video codec %s open failed", avcodec_get_name(video.codecId));
+        return false;
+    }
+    videoCodecId.store(video.codecId, std::memory_order_relaxed);
+
+    if (audio.codecId != AV_CODEC_ID_NONE) {
+        if (!audioProcessor->OpenCodecWithInfo(audio)) [[unlikely]] {
+            esyslog("vaapivideo/device: OpenForMediaPlayer audio codec %s open failed",
+                    avcodec_get_name(audio.codecId));
+            return false;
+        }
+        audioCodecId.store(audio.codecId, std::memory_order_relaxed);
+        decoder->NotifyAudioChange();
+    } else {
+        // Video-only entry: drop any audio codec / clock state left over from a previous entry
+        // so the decoder enters freerun and does not try to lip-sync to the prior file's audio.
+        audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        audioProcessor->Clear();
+        decoder->NotifyAudioChange();
+    }
+
+    isyslog("vaapivideo/device: mediaplayer open -- video=%s audio=%s", avcodec_get_name(video.codecId),
+            audio.codecId == AV_CODEC_ID_NONE ? "none" : avcodec_get_name(audio.codecId));
+    return true;
+}
+
+[[nodiscard]] auto cVaapiDevice::SubmitVideoPacket(const AVPacket *packet) -> bool {
+    if (!Ready() || !decoder || decoder->IsQueueFull()) [[unlikely]] {
+        return false;
+    }
+    decoder->EnqueuePacket(packet);
+    return true;
+}
+
+[[nodiscard]] auto cVaapiDevice::SubmitAudioPacket(const AVPacket *packet) -> bool {
+    if (!Ready() || !audioProcessor || !audioProcessor->IsInitialized()) [[unlikely]] {
+        return false;
+    }
+    // Queue HIGHWATER is a pacing signal, not a hard failure. Returning false keeps the
+    // mediaplayer's packetPending=true so this already-demuxed audio packet is retried after
+    // the queue drains a slot; the shared demux cursor halts without dropping audio or
+    // falsely advancing latestAudioPts90k via the post-submit update in cVaapiPlayer::Action.
+    if (audioProcessor->GetQueueSize() >= MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER) {
+        return false;
+    }
+    return audioProcessor->EnqueuePacket(packet);
+}
+
+auto cVaapiDevice::ClearForMediaPlayer() -> void {
+    // Used at entry open/close (where codec params may change). Drops in-flight packets,
+    // tears down the filter chain, and lets the next frame rebuild it with new params.
+    // Codec contexts stay open and play-mode is unchanged.
+    if (display) [[likely]] {
+        display->BeginStreamSwitch();
+    }
+    if (decoder) [[likely]] {
+        decoder->Clear();
+    }
+    if (display) [[likely]] {
+        display->EndStreamSwitch();
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->Clear();
+    }
+}
+
+auto cVaapiDevice::FlushForSeek() -> void {
+    // Light flush for the mediaplayer's seek path: same flush semantics as
+    // ClearForMediaPlayer() (queues drained, codec buffers reset, ALSA drained, audio
+    // clock re-anchors on next frame) BUT the filter graph and swresample state are
+    // retained. Stream parameters do not change across a seek inside one file, so the
+    // ~100 ms rebuild plus its "VAAPI filter initialized" / "initialized swresample"
+    // log spam is pure overhead.
+    if (display) [[likely]] {
+        display->BeginStreamSwitch();
+    }
+    if (decoder) [[likely]] {
+        decoder->FlushForSeek();
+    }
+    if (display) [[likely]] {
+        display->EndStreamSwitch();
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->Clear();
+    }
+}
+
+[[nodiscard]] auto cVaapiDevice::IsMediaPlayerBackpressured() const noexcept -> bool {
+    const bool videoFull = decoder && decoder->IsQueueFull();
+    const size_t audioDepth = audioProcessor ? audioProcessor->GetQueueSize() : 0;
+    // Gates BOTH the audioHighwater pacing and the audioCanReanchor escape below. Without it,
+    // a video-only stream (no audio codec opened) reports audioDepth=0 forever -> audioCanReanchor
+    // would always be true and permanently disable the jitterFull pre-anchor backpressure, letting
+    // the decoder freerun-overrun the jitterBuf hard cap during startup.
+    const bool audioOpen = audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE;
+    // Audio queue HIGHWATER (not the AUDIO_QUEUE_CAPACITY hard cap). The PTS lookahead alone is a
+    // loose brake -- on TS where video PTS leads audio at the same demux cursor, the demuxer can
+    // pump enough audio to keep the latest_audio_PTS within 1 s of the clock while video stacks up
+    // and saturates the jitterBuf. Capping the audio packet queue at a small low-water depth (~10,
+    // mirroring VDR's replay HIGHWATER) paces the demuxer to audio consumption rate and shrinks
+    // both audio packet depth and the co-buffered video lead, keeping jitterBuf well below the cap.
+    const bool audioHighwater = audioOpen && audioDepth >= MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER;
+    // jitterBuf depth: guards ONLY the pre-anchor window (post-seek / startup) where the audio
+    // clock is still NOPTS, so the demuxer's lookahead throttle can't gate delivery and HW decode
+    // would overrun the jitterBuf hard cap (dropping ~30 frames per rapid-seek burst).
+    //
+    // Once the audio clock is live, this gate MUST be disabled: the demuxer is a single-cursor,
+    // demux-order pump, so any throttle stops BOTH streams. Asserting backpressure on video
+    // jitterBuf depth then starves the audio packet queue -> WritePcmToAlsa stops -> ALSA
+    // underruns -> the master clock stalls -> the video drain gate (dueIn vs clock) stalls ->
+    // jitterBuf stays full -> backpressure stays asserted. That positive-feedback starvation is
+    // the "stutters after a long seek and never recovers" bug. With a live clock the lookahead
+    // throttle (audio-referenced, self-releasing at the audio 1x consumption rate) is the correct
+    // and sufficient gate; the 150-frame hard cap remains the ultimate overflow backstop.
+    //
+    // Audio-reanchor escape: pause -> Play() drains the audio queue but preserves jitterBuf
+    // (decoder hold). On resume jitterFull would block the demuxer just when audio packets MUST
+    // flow to re-anchor the clock -- deadlock, since the gate stays asserted until the clock
+    // anchors and the clock can't anchor without audio. Yielding jitterFull while audio has room
+    // below HIGHWATER lets audio packets through; ALSA writes; clock anchors; the gate becomes
+    // moot. The audioHighwater gate above caps the co-pumped burst at ~10 audio packets (~250 ms).
+    // Video-only streams (audioOpen=false) cannot anchor an audio clock, so the escape stays
+    // disarmed and jitterFull bounds the decoder's pre-anchor depth.
+    const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
+    const bool audioCanReanchor = audioOpen && audioDepth < MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER;
+    const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
+                            decoder->GetJitterBufSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
+    return videoFull || audioHighwater || jitterFull;
+}
+
+[[nodiscard]] auto cVaapiDevice::GetAudioClock() const noexcept -> int64_t {
+    if (!audioProcessor) {
+        return AV_NOPTS_VALUE;
+    }
+    return audioProcessor->GetClock();
+}
 
 // ============================================================================
 // === INTERNAL METHODS ===

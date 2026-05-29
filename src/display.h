@@ -172,6 +172,12 @@ class cVaapiDisplay : public cThread {
     /// While set, the underrun detector ignores re-presents -- they reflect the sleep, not a stall.
     /// Decoder pairs each SleepMs with on/off so the suppression window matches the actual sleep.
     auto SetSyncSleeping(bool enable) noexcept -> void { syncSleeping.store(enable, std::memory_order_relaxed); }
+    /// Device is paused (cVaapiDevice::Freeze() / Play()): the decoder is intentionally holding
+    /// the drain so no fresh frames arrive. While set, the underrun detector ignores re-presents
+    /// so a pause does not spam "queue empty Nms; total=N" at vsync rate for the IDLE_THRESHOLD
+    /// window (the existing 10 s catch-all already handles longer pauses, but a normal pause is
+    /// short enough that the per-vsync log fires several times before the catch-all kicks in).
+    auto SetDevicePaused(bool enable) noexcept -> void { devicePaused.store(enable, std::memory_order_relaxed); }
     /// Hand a decoded frame to the display thread (single-slot queue).
     /// timeoutMs: -1 = block indefinitely (decoder's VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
@@ -364,6 +370,9 @@ class cVaapiDisplay : public cThread {
         false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses underrun log
     std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
                                            ///< suppresses underrun log so an intentional sleep doesn't fire it.
+    std::atomic<bool> devicePaused{false}; ///< Mirrors cVaapiDevice::Freeze()/Play(). Suppresses the underrun log
+                                           ///< during the pause window so re-presents of the last frame don't surface
+                                           ///< as "queue empty" at vsync rate.
     std::atomic<uint64_t> lastFrameCommitMs{0}; ///< Wall-clock ms of the most recent fresh-frame commit;
                                                 ///< 0 = inactive (post-Clear). Gates the underrun tracker.
     std::atomic<uint64_t> lastVSyncTimeMs{0};   ///< Wall-clock ms of the most recent page-flip event
