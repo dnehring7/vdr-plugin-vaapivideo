@@ -1171,6 +1171,89 @@ auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
     }
 }
 
+[[nodiscard]] auto cVaapiDevice::SetZoom(int stop) -> int {
+    // Crop is applied in the VPP chain; a stop change just needs a filter-graph rebuild, reusing
+    // the ScaleVideo() mechanism. zoomActive is read by the decoder when it rebuilds. Selecting a
+    // disabled (level 0) preset is treated as Off so the label/crop never claim a no-op zoom.
+    int clamped = std::clamp(stop, 0, CONFIG_ZOOM_PRESET_COUNT);
+    if (clamped > 0 && vaapiConfig.zoomLevel[clamped - 1].load(std::memory_order_relaxed) <= 0) {
+        clamped = 0;
+    }
+    const int previous = vaapiConfig.zoomActive.exchange(clamped, std::memory_order_relaxed);
+    if (previous != clamped) {
+        dsyslog("vaapivideo/device: zoom stop %d -> %d (rebuild)", previous, clamped);
+        if (decoder) {
+            decoder->RequestFilterRebuild();
+        }
+    }
+    return clamped;
+}
+
+// Next cycle stop after `current`, skipping disabled (level 0) presets. Off (stop 0) is always a
+// valid stop, so the loop always terminates; returns `current` only when every level is disabled.
+static auto NextZoomStop(int current) -> int {
+    for (int step = 1; step <= CONFIG_ZOOM_PRESET_COUNT + 1; ++step) {
+        const int cand = (current + step) % (CONFIG_ZOOM_PRESET_COUNT + 1);
+        if (cand == 0 || vaapiConfig.zoomLevel[cand - 1].load(std::memory_order_relaxed) > 0) {
+            return cand;
+        }
+    }
+    return current; // unreachable: Off is always a stop
+}
+
+[[nodiscard]] auto cVaapiDevice::CycleZoom() -> int {
+    // Advance to the next stop, skipping disabled (level 0) presets so a single configured level
+    // still cycles Off <-> that level. CAS so two callers (replay ProcessKey on the main thread,
+    // ZOOM next on the SVDRP thread) can't both read the same stop and collapse into one step.
+    int current = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
+    int next = NextZoomStop(current);
+    while (!vaapiConfig.zoomActive.compare_exchange_weak(current, next, std::memory_order_relaxed)) {
+        next = NextZoomStop(current); // compare_exchange_weak refreshed `current`
+    }
+    if (next != current) {
+        dsyslog("vaapivideo/device: zoom stop %d -> %d (rebuild)", current, next);
+        if (decoder) {
+            decoder->RequestFilterRebuild();
+        }
+    }
+    return next;
+}
+
+auto cVaapiDevice::RefreshZoom() -> void {
+    // Setup-menu edited the crop values of the live preset: request a rebuild WITHOUT touching
+    // zoomActive, so a concurrent CycleZoom()/SetZoom() selection can't be reverted by a stale snapshot.
+    const int stop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
+    if (stop < 1 || stop > CONFIG_ZOOM_PRESET_COUNT ||
+        vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    dsyslog("vaapivideo/device: zoom stop %d refresh (rebuild)", stop);
+    if (decoder) {
+        decoder->RequestFilterRebuild();
+    }
+}
+
+auto cVaapiDevice::ResetZoom() -> void {
+    // Content change: drop to Off. The incoming stream rebuilds its own graph (reading zoomActive),
+    // so no explicit RequestFilterRebuild here -- and decoder may be mid-teardown on some callers.
+    const int previous = vaapiConfig.zoomActive.exchange(0, std::memory_order_relaxed);
+    if (previous != 0) {
+        dsyslog("vaapivideo/device: zoom reset to off (was stop %d)", previous);
+    }
+}
+
+[[nodiscard]] auto cVaapiDevice::ZoomStatusLabel() const -> std::string {
+    const int stop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
+    if (stop < 1 || stop > CONFIG_ZOOM_PRESET_COUNT) {
+        return "Zoom: off";
+    }
+    const int level = vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed);
+    if (level <= 0) {
+        return "Zoom: off";
+    }
+    return std::format("Zoom {}: +{:.1f}%", stop, static_cast<double>(level) / 10.0);
+}
+
 auto cVaapiDevice::SetAudioTrackDevice(eTrackType /*Type*/) -> void {
     // Fires AFTER currentAudioTrack is assigned, so the read in the handler is reliable.
     // In practice only reached when no cPlayer is attached (live=cTransfer,
@@ -1252,6 +1335,9 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // Reset dedup so the new channel's first audio-track hook re-detects.
             lastHandledAudioTrack = ttNone;
             lastHandledAudioPid = 0;
+            // Reset transient zoom BEFORE Clear() so any post-clear rebuild observes Off, never the
+            // old content's stop. Manual zoom is a per-content choice -- drop it on every change.
+            ResetZoom();
             Clear();
             // User opt-in: paint black during channel-switch gap instead of holding the
             // previous channel's last frame until the new one decodes its first frame.
@@ -1263,6 +1349,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
         case pmAudioOnlyBlack:
             // Radio: paint black so DRM scanout doesn't hold the previous channel's picture.
             radioBlackPending.store(false, std::memory_order_relaxed);
+            ResetZoom(); // Audio-only is still a content change; keep transient-zoom semantics.
             Clear();
             SubmitBlackFrame();
             break;
@@ -1270,6 +1357,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
         case pmVideoOnly:
             // Codec state already clean (VDR always emits pmNone before pmAudioVideo).
             // liveMode is latched on the first PES in PlayVideo/PlayAudio.
+            ResetZoom(); // Before Clear(): belt-and-braces so a new stream starts at Off even if pmNone was skipped.
             Clear();
             // 3 s grace: if no video arrives, PlayAudio() paints black (radio channel).
             radioBlackTimer.Set(3000);
@@ -1499,6 +1587,7 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
     // Mediaplayer paths are always replay -- no live-TV jitter buffer, no Transferring() race.
     liveMode.store(false, std::memory_order_relaxed);
     decoder->SetLiveMode(false);
+    ResetZoom(); // Each opened file/URL starts unzoomed; the codec-open below rebuilds the graph.
 
     // Skip the 2-of-2 codec-detection dance: the demuxer reported authoritative codec IDs.
     videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -1709,6 +1798,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     dsyslog("vaapivideo/device: pre-cached OSD size %dx%d", osdWidth, osdHeight);
 
     initState.store(2, std::memory_order_release);
+    ResetZoom(); // Fresh hardware (plugin start or SVDRP ATTA) always begins at Off.
     isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
     // Foreground VDR's VT so KBD receives keys after startup / SVDRP ATTA. Non-fatal.

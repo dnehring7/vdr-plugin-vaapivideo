@@ -330,6 +330,7 @@ that start VDR before a user session claims the console.
 | `Audio Passthrough`              | auto / on / off  | IEC61937 passthrough policy (see below)                                                              |
 | `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
+| `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–4): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -337,12 +338,10 @@ to **0 ms** — adjust only if a residual offset is visible after the controller
 has settled. See [AVSYNC.md](AVSYNC.md) for the full sign convention and tuning
 guidance.
 
-`Clear display on channel switch` defaults to **off**: on `SetPlayMode(pmNone)`
-the DRM scanout keeps the last decoded frame until the new channel produces
-its first picture. Enable it to blank the screen between channels — the plugin
-submits a BT.709 TV-range black VAAPI surface through the normal display path
-right after the teardown. Radio (`pmAudioOnly`) always paints black and is not
-affected by this setting.
+`Clear display on channel switch` defaults to **off**: the screen keeps the last
+decoded frame until the new channel produces its first picture. Enable it to
+blank the screen between channels instead. Radio channels always blank,
+regardless of this setting.
 
 `Audio Passthrough` defaults to **auto**: the plugin reads the HDMI sink's ELD
 at startup and forwards a compressed codec as IEC61937 only when the sink
@@ -369,6 +368,45 @@ Changes to this setting only take effect when the audio device is reopened —
 i.e. on the next channel switch or codec change. Switch channels once after
 leaving the setup menu to activate the new mode.
 
+### Manual zoom
+
+Four **zoom levels** let you magnify the picture to fill the screen — useful for
+cropping away the black bars that broadcasters bake into the frame (2.39:1 scope,
+2.00:1, and similar). Each level is a **zoom-in factor**: the picture is enlarged
+uniformly (aspect preserved) and the overflow is cropped equally off all sides.
+The value is in tenths-of-a-percent of enlargement, so `344` = **+34.4%** (the
+picture is 1.34× its size). The crop is rounded to the nearest 2-pixel-aligned
+rectangle (NV12/P010 chroma alignment), so the realised factor matches the
+configured one to within a pixel; a residual ≤1% gap to a full-screen fit is
+absorbed by a single uniform stretch (imperceptible — genuine letterbox is far
+larger and stays untouched). Out of the box, level 1 is **+34.4%** (fills 2.39:1
+CinemaScope) and level 2 **+12.5%** (fills 2.00:1) on a 16:9 screen; levels 3–4
+are off. The maximum is **+49.9%** (1.5×).
+
+Cycling steps **Off → 1 → 2 → 3 → 4 → Off**, but **levels set to 0 are skipped**, so
+if you only want one zoom level, set the other three to `0` and the key toggles
+Off ↔ that level. The active stop is **transient and personal**: it is never written
+to `setup.conf` and resets to **Off** automatically on every content change (plugin
+start, SVDRP `ATTA`, channel switch / replay start, and each mediaplayer file). Only
+the four level *definitions* persist.
+
+Cycling the zoom:
+
+- **Mediaplayer replay** — the **Blue** key cycles zoom and flashes the new level
+  on the OSD.
+- **Live TV** — VDR routes no live-TV keypresses to output plugins, so the plugin's
+  single main-menu hook (`@vaapivideo`) does it. It always opens a two-line menu —
+  **Zoom** (OK cycles one stop and closes the menu, flashing the new level) and
+  **Mediaplayer** (OK opens the browser) — so one hook reaches both. Bind a key to it
+  in `keymacros.conf`; VDR can append the follow-up keypresses, giving you one key per
+  action:
+
+      Blue      @vaapivideo Ok          # open menu, cycle zoom, menu closes itself
+      Yellow    @vaapivideo Down Ok     # open menu, go to Mediaplayer, open browser
+
+  Or just `Blue @vaapivideo` to open the menu and navigate by hand. The
+  `PLUG vaapivideo ZOOM [next|0-4]` SVDRP command remains available for scripting.
+
 ### SVDRP commands
 
 | Command                        | Description                                                |
@@ -378,6 +416,7 @@ leaving the setup menu to activate the new mode.
 | `PLUG vaapivideo DETA`         | Detach from DRM/VAAPI hardware (release for other apps)    |
 | `PLUG vaapivideo ATTA`         | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 | `PLUG vaapivideo PLAY <uri>`   | Start mediaplayer on a file, URL, or `.m3u/.m3u8` playlist |
+| `PLUG vaapivideo ZOOM [next\|0-4]` | Cycle manual zoom (`next`) or select a stop (0 = off, 1–4 = preset) |
 
 DETA hands the display to another application (an external player, a
 diagnostic tool, etc.) and ATTA reclaims it without restarting VDR. When the
@@ -575,9 +614,11 @@ passthrough work identically to the live-TV path.
 - **SVDRP**: `PLUG vaapivideo PLAY <uri>` — `<uri>` is a local path, an
   http(s) / ftp URL, or a local `.m3u/.m3u8` playlist.
 - **Remote key**: bind a button on your remote to launch the file
-  browser via VDR's `keymacros.conf`:
+  browser via VDR's `keymacros.conf`. `@vaapivideo` opens the two-line
+  quick menu (Zoom / Mediaplayer); append `Down Ok` to jump straight to
+  the browser:
 
-      User1   @vaapivideo
+      User1   @vaapivideo Down Ok
 
   Then assign your remote's button to `User1` in `remote.conf` (or via
   *Setup → Remote control → Learning*). Pressing it opens the file
@@ -593,8 +634,9 @@ passthrough work identically to the live-TV path.
 | `Pause` / `Down`           | Toggle pause                 |
 | `Left` / `Right`           | Seek −/+ 10 s                |
 | `Green` / `Yellow`         | Seek −/+ 60 s                |
+| `Blue`                     | Cycle manual zoom (Off → 1–4)|
 | `Next`                     | Skip to next playlist entry  |
-| `Blue` / `Back` / `Stop`   | Exit playback                |
+| `Back` / `Stop`            | Exit playback                |
 
 Rapid key repeats sum: pressing `Right` three times before the demuxer
 services the first one lands at +30 s, not +10 s.
@@ -616,27 +658,17 @@ paths and URLs are taken verbatim. HLS manifests over http(s) are
 deliberately *not* parsed locally — they are forwarded to libavformat
 instead.
 
-### Pause and seek
+### Seeking
 
-Pause routes through `cDevice::Freeze() / Play()` so the audio master
-clock halts together with the demux thread. Seek calls
-`av_seek_frame(AVSEEK_FLAG_BACKWARD)` on the video stream and then
-flushes the decoder packet queue and audio
-(`cVaapiDevice::FlushForSeek`) so playback resumes at the keyframe
-nearest the requested offset. The VAAPI filter chain and swresample
-state are intentionally preserved across the seek — stream parameters
-do not change, so rebuilding them would only add ~100 ms of latency
-per seek. The A/V sync controller re-anchors on the next packet.
+Seeking lands on the keyframe at or before the requested position, so the resume
+point may be a second or two earlier than the exact offset.
 
-### Frame-rate conversion
+### Frame-rate handling
 
-Source frame rates that do not match the display refresh rate are
-resampled in the VAAPI filter graph by an `fps=<display>` node so the
-decoder runs at source rate rather than at the display's vsync
-backpressure. Without it, video-only playback would drift off real
-time (60 fps source on a 50 Hz display would otherwise play at 83 %,
-24 fps at 208 %). The filter is nearest-neighbor: duplicate frames for
-source-below-display, drop frames for source-above-display.
+Source frame rates that differ from the display refresh rate are matched to the
+display so playback always runs at real-time speed (otherwise a 60 fps source on
+a 50 Hz panel would play too slow, a 24 fps source too fast). Frames are
+duplicated or dropped as needed — there is no motion interpolation.
 
 
 ## Roadmap

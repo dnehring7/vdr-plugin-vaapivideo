@@ -87,6 +87,10 @@ class cVideoFilterChain {
         bool hasSharpness{false};         ///< sharpness_vaapi is available on this device
         std::string_view deinterlaceMode; ///< "motion_adaptive" / "bob" / ...; empty = skip HW deint
 
+        // --- Manual zoom (symmetric crop before scale) ---
+        double cropH{0.0}; ///< Per-side horizontal crop fraction (decoder derives it from the zoom-in factor); 0 = none
+        double cropV{0.0}; ///< Per-side vertical crop fraction (decoder derives it from the zoom-in factor); 0 = none
+
         // --- Playback mode flags ---
         bool trickMode{false};    ///< Trick speed: use minimal chain + bob deint (no priming delay)
         bool stillPicture{false}; ///< Single I-frame: skip temporal deinterlace (would never flush)

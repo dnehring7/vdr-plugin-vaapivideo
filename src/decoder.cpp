@@ -1718,6 +1718,19 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
     params.compactLog = compactLog;
+    // Manual zoom: resolve the active cycle stop (0 = Off) to an equal per-side crop fraction. The
+    // level is a zoom-in factor in tenths-of-% (344 = +34.4% = magnification z=1.344); the per-side
+    // crop that yields that magnification once the kept region refills the screen is (1 - 1/z)/2.
+    const int zoomStop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
+    if (zoomStop >= 1 && zoomStop <= CONFIG_ZOOM_PRESET_COUNT) {
+        const int level = vaapiConfig.zoomLevel[zoomStop - 1].load(std::memory_order_relaxed);
+        if (level > 0) {
+            const double z = 1.0 + (static_cast<double>(level) / 1000.0);
+            const double cropFraction = (1.0 - (1.0 / z)) / 2.0;
+            params.cropH = cropFraction;
+            params.cropV = cropFraction;
+        }
+    }
 
     if (!filterChain.Build(firstFrame, params)) {
         return false;

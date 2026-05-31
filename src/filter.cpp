@@ -184,8 +184,38 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const int sarNum = firstFrame->sample_aspect_ratio.num > 0 ? firstFrame->sample_aspect_ratio.num : 1;
     const int sarDen = firstFrame->sample_aspect_ratio.den > 0 ? firstFrame->sample_aspect_ratio.den : 1;
 
-    const uint64_t darNum = static_cast<uint64_t>(srcWidth) * static_cast<uint64_t>(sarNum);
-    const uint64_t darDen = static_cast<uint64_t>(srcHeight) * static_cast<uint64_t>(sarDen);
+    // Manual zoom: symmetrically crop the source (cropH/cropV per side) before scaling so baked-in
+    // black bars can be removed. Every dimension fed to crop/scale_vaapi must be even -- NV12/P010 are
+    // 4:2:0, so an odd width/height/offset would split a 2x2-subsampled chroma sample. Offsets are
+    // even-aligned and clamped so the kept region stays >= 2 px; the cropped dimensions are then
+    // masked even too (a no-op for the always-even 4:2:0 source, but it removes the dependency on it).
+    // SAR is unchanged by cropping, so the DAR below uses the cropped luma dimensions and the existing
+    // letterbox/pillarbox fit fills the rect.
+    // cropH/cropV arrive as per-side crop fractions (the decoder derives them from the zoom-in
+    // factor). Clamp to a hard geometric safety: 0..0.499, just shy of the degenerate 0.5. The config
+    // ceiling (+49.9% zoom-in) maps to only ~0.167, so this never alters a configured value.
+    const double cropFracH = std::clamp(params.cropH, 0.0, 0.499);
+    const double cropFracV = std::clamp(params.cropV, 0.0, 0.499);
+    bool wantCrop = cropFracH > 0.0 || cropFracV > 0.0;
+    auto croppedW = static_cast<uint32_t>(srcWidth);
+    auto croppedH = static_cast<uint32_t>(srcHeight);
+    uint32_t cropOffX = 0;
+    uint32_t cropOffY = 0;
+    if (wantCrop) {
+        const auto sourceW = static_cast<uint32_t>(srcWidth);
+        const auto sourceH = static_cast<uint32_t>(srcHeight);
+        const uint32_t maxCropX = sourceW > 2U ? (((sourceW - 2U) / 2U) & ~1U) : 0U;
+        const uint32_t maxCropY = sourceH > 2U ? (((sourceH - 2U) / 2U) & ~1U) : 0U;
+        cropOffX = std::min(static_cast<uint32_t>(static_cast<double>(sourceW) * cropFracH) & ~1U, maxCropX);
+        cropOffY = std::min(static_cast<uint32_t>(static_cast<double>(sourceH) * cropFracV) & ~1U, maxCropY);
+        croppedW = std::max((sourceW - (2U * cropOffX)) & ~1U, 2U);
+        croppedH = std::max((sourceH - (2U * cropOffY)) & ~1U, 2U);
+        // Sub-px crop that rounded down to nothing: treat as no crop so we skip the round trip below.
+        wantCrop = cropOffX > 0U || cropOffY > 0U;
+    }
+
+    const uint64_t darNum = static_cast<uint64_t>(croppedW) * static_cast<uint64_t>(sarNum);
+    const uint64_t darDen = static_cast<uint64_t>(croppedH) * static_cast<uint64_t>(sarDen);
 
     uint32_t filterWidth = dstWidth;
     uint32_t filterHeight = dstHeight;
@@ -204,6 +234,17 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     filterWidth = std::max(filterWidth & ~1U, 2U);
     filterHeight = std::max(filterHeight & ~1U, 2U);
 
+    // Snap to the exact rect when the fit lands within ~1%: integer crop-offset / aspect rounding
+    // otherwise leaves a 2-6 px black sliver on an image that should fill the screen (most visibly a
+    // zoomed 16:9 source -> 1920x1076 instead of 1920x1080). The implied <=1% stretch is invisible;
+    // genuine letterbox/pillarbox (4:3, scope, ...) is far larger than 1% and stays untouched.
+    if (dstWidth - filterWidth <= dstWidth / 100) {
+        filterWidth = dstWidth;
+    }
+    if (dstHeight - filterHeight <= dstHeight / 100) {
+        filterHeight = dstHeight;
+    }
+
     // UHD: GPU already saturated by 4K decode/scale; skip denoise/sharpen to avoid stutter.
     // MPEG-2 SD: DCT-block and analog-tape artefacts warrant heavier processing.
     // H.264/H.265 HD: lighter touch preserves encoder-intended detail.
@@ -220,8 +261,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         }
     }
 
-    const bool needsResize =
-        (filterWidth != static_cast<uint32_t>(srcWidth) || filterHeight != static_cast<uint32_t>(srcHeight));
+    // Compare against the cropped dimensions: those are what scale_vaapi actually receives.
+    const bool needsResize = (filterWidth != croppedW || filterHeight != croppedH);
 
     // HDR path: P010 (10-bit packed) preserves bit depth through VPP; NV12 would clip to 8-bit.
     // scaleColorArgs is appended after ':' (resize) or after '=' (no-resize); no leading separator.
@@ -267,9 +308,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const int outputFps = ratesDiffer ? displayFps : naturalOutputFps;
 
     // Filter chain (comma-joined, built dynamically from flags above):
-    //   SW decode: [bwdif|yadif] -> [hqdn3d for MPEG-2 w/o HW denoise] -> format -> hwupload ->
+    //   SW decode: [bwdif|yadif] -> [hqdn3d for MPEG-2 w/o HW denoise] -> format -> [crop] -> hwupload ->
     //              [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
-    //   HW decode: [deinterlace_vaapi] -> [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
+    //   HW decode: [deinterlace_vaapi] -> [denoise_vaapi] -> [crop] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
+    // [crop] only when a manual-zoom preset is active. HW decode passes crop metadata to scale_vaapi
+    // (one GPU pass, zero-copy); SW decode crops in system memory before hwupload.
     // scale_vaapi is always present: it normalizes pixel format and colorimetry regardless of resize.
     // Denoise / sharpness run on the GPU (denoise_vaapi / sharpness_vaapi) whenever VPP exposes them,
     // so they never compete with a CPU-bound SW decoder (libdav1d 1080p50 etc). CPU hqdn3d is only
@@ -278,6 +321,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // perceived quality. For modern codecs (H.264/HEVC/AV1) without HW denoise we skip denoise
     // entirely -- not worth the CPU cost on an already-saturated decoder thread.
     std::vector<std::string> filters;
+    const auto addCropFilter = [&filters, croppedW, croppedH, cropOffX, cropOffY]() -> void {
+        filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
+    };
 
     // Still picture: skip the temporal deinterlacer entirely -- VAAPI VPP buffers one field pair
     // for motion estimation and never flushes it on EOS, so a lone I-frame would be swallowed.
@@ -305,6 +351,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             filters.emplace_back("hqdn3d=5");
         }
         filters.push_back(std::format("format={}", pixFmt));
+        // SW decode: crop the system-memory frame before uploading so only the kept region is
+        // uploaded and zoom adds no GPU readback.
+        if (wantCrop) {
+            addCropFilter();
+        }
         filters.emplace_back("hwupload");
     } else {
         if (isInterlaced && !params.stillPicture && !params.deinterlaceMode.empty()) {
@@ -324,7 +375,20 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
     }
 
-    if (needsResize) {
+    // HW decode: crop only stores AVFrame::crop_* metadata on a VAAPI surface. The scale_vaapi below
+    // consumes it as the VPP surface_region in the same GPU pass -- as long as that pass actually runs
+    // VPP and isn't elided to a passthrough. The format/range options in scaleColorArgs keep it on the
+    // VPP path (verified even when the conversion is a runtime no-op), and needsExplicitScaleSize keeps
+    // explicit w/h; a bare scale_vaapi (no options, output == surface size) would drop the crop, so we
+    // never emit one while cropping. SW decode already cropped in system memory before hwupload.
+    if (wantCrop && !isSoftwareDecode) {
+        addCropFilter();
+    }
+
+    // Hardware crop does not change the input link dimensions, so force an explicit-size scale even
+    // when the kept region already matches the target (keeps VPP doing real work that reads the crop).
+    const bool needsExplicitScaleSize = needsResize || (wantCrop && !isSoftwareDecode);
+    if (needsExplicitScaleSize) {
         const char *scaleMode = isUhd ? "" : ":mode=hq"; // bicubic (hq) too expensive at 4K
         filters.push_back(
             std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleMode, scaleColorArgs));
@@ -504,7 +568,13 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     outputFrameDurationMs_ = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20; // 20 ms = 50 fps fallback
 
     if (compactLog) {
-        dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
+        if (wantCrop) {
+            // Zoom-driven rebuild: show the crop so the active zoom is verifiable in the log.
+            dsyslog("vaapivideo/filter: rebuilt -> %ux%u (zoom crop=%u:%u:%u:%u)", filterWidth, filterHeight, croppedW,
+                    croppedH, cropOffX, cropOffY);
+        } else {
+            dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
+        }
     } else {
         const char *cadenceTag = "";
         if (ratesDiffer) {
@@ -517,6 +587,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
                 filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "", cadenceTag, pixFmt,
                 params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
+        // Full chain only on the verbose (Clear / channel-switch) path; the compact zoom rebuild
+        // above already prints the crop, which is the useful debug signal for a ScaleVideo rebuild.
         dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
     }
     return true;

@@ -107,6 +107,14 @@ enum class HdrMode : uint8_t {
 }
 
 // ============================================================================
+// === ZOOM BOUNDS ===
+// ============================================================================
+
+inline constexpr int CONFIG_ZOOM_PRESET_COUNT = 4; ///< Editable zoom levels; cycling skips 0 and adds an Off stop
+inline constexpr int CONFIG_ZOOM_LEVEL_MIN = 0;   ///< Min zoom-in factor (tenths-of-%, 0 = disabled / skipped in cycle)
+inline constexpr int CONFIG_ZOOM_LEVEL_MAX = 499; ///< Max zoom-in factor (tenths-of-%, = +49.9% / 1.499x)
+
+// ============================================================================
 // === PLUGIN CONFIGURATION ===
 // ============================================================================
 
@@ -121,6 +129,14 @@ struct VaapiConfig {
     std::atomic<int> passthroughLatency{0};        ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
+    std::atomic<int> zoomActive{
+        0}; ///< Runtime cycle stop (0=Off, 1..ZOOM_PRESET_COUNT=level); transient, never persisted
+    // A zoom level is a zoom-in factor in tenths-of-% (344 = +34.4%, the picture enlarged 1.344x);
+    // the equal per-side crop that yields it is derived in the decoder, and the kept region refills
+    // the screen (aspect preserved). 0 disables a level and skips it while cycling. Defaults fill the
+    // two common theatrical ratios on a 16:9 screen -- 1 = 2.39:1 scope (+34.4%), 2 = 2.00:1 (+12.5%);
+    // 3-4 off.
+    std::atomic<int> zoomLevel[CONFIG_ZOOM_PRESET_COUNT]{344, 125, 0, 0};
 
     [[nodiscard]] auto GetSummary() const -> std::string; ///< One-line human-readable snapshot for logging
     [[nodiscard]] auto SetupParse(const char *name, const char *value)

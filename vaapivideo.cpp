@@ -32,10 +32,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -54,9 +56,11 @@ extern "C" {
 #include <vdr/channels.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
+#include <vdr/keys.h>
 #include <vdr/menuitems.h>
 #include <vdr/osdbase.h>
 #include <vdr/plugin.h>
+#include <vdr/skins.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
@@ -92,6 +96,15 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // Use "off"/"on" labels to match the string-select items above; default is "no"/"yes".
         Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, tr("off"),
                                   tr("on")));
+        // Manual zoom levels: each is a zoom-in factor in tenths-of-% (344 == +34.4% enlargement),
+        // applied as an equal crop on all sides; 0 disables the level (skipped while cycling). The
+        // active stop is transient and not edited here. cMenuEditItem strdup()s its label, so the
+        // temporary cString is safe.
+        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
+            editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
+            Add(new cMenuEditIntItem(*cString::sprintf(tr("Zoom level %d (0.1%% larger, 0=off)"), i + 1),
+                                     &editZoomLevel[i], CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX));
+        }
     }
 
   protected:
@@ -106,6 +119,32 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SetupStore("PassthroughMode", editPassthroughMode);
         SetupStore("HdrMode", editHdrMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
+        // Decide whether the *live* level actually changed BEFORE overwriting the atomics -- only
+        // then is a filter rebuild warranted (a bare setup OK must not glitch the picture).
+        const int activeZoom = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
+        bool activePresetChanged = false;
+        if (activeZoom >= 1 && activeZoom <= CONFIG_ZOOM_PRESET_COUNT) {
+            activePresetChanged =
+                editZoomLevel[activeZoom - 1] != vaapiConfig.zoomLevel[activeZoom - 1].load(std::memory_order_relaxed);
+        }
+        // Persist only the level definitions; zoomActive is intentionally not stored (transient).
+        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
+            vaapiConfig.zoomLevel[i].store(editZoomLevel[i], std::memory_order_relaxed);
+            SetupStore(*cString::sprintf("Zoom%d", i + 1), editZoomLevel[i]);
+        }
+        // Re-apply only when the live preset's level changed, so the picture updates now instead of
+        // waiting for the next zoom/content event. If the live preset was just disabled (set to 0),
+        // turn zoom off rather than refresh a no-op crop. (This page is a separate class from the
+        // plugin, so reach the device via the primary-device registry.)
+        if (activePresetChanged) {
+            if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
+                if (editZoomLevel[activeZoom - 1] <= 0) {
+                    (void)device->SetZoom(0);
+                } else {
+                    device->RefreshZoom();
+                }
+            }
+        }
     }
 
   private:
@@ -132,6 +171,53 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
     int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
     int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
+    int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Scratch copies of per-preset zoom level (tenths-of-%).
+};
+
+// ============================================================================
+// === cVaapiQuickMenu ===
+// ============================================================================
+
+/// The plugin's main menu: a two-line menu always showing both entries. OK on line 1 cycles the zoom
+/// one stop and closes the OSD immediately (flash the new stop on the skin) -- a one-shot toggle, no
+/// lingering menu; OK on line 2 opens the mediaplayer. This is how the single @vaapivideo main-menu
+/// hook reaches both actions.
+class cVaapiQuickMenu : public cOsdMenu {
+  public:
+    cVaapiQuickMenu(cVaapiDevice *device, std::string mediaDir)
+        : cOsdMenu(tr("VAAPI Video")), device_(device), mediaDir_(std::move(mediaDir)) {
+        AddItems();
+    }
+
+    [[nodiscard]] auto ProcessKey(eKeys key) -> eOSState override {
+        const eOSState state = cOsdMenu::ProcessKey(key); // handles Up/Down/Back
+        if (state == osUnknown && (key & ~k_Repeat) == kOk) {
+            if (Current() == 0) { // Zoom line: cycle one stop and leave the menu
+                if (device_ == nullptr || !device_->IsReady()) {
+                    Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+                } else {
+                    (void)device_->CycleZoom();
+                    const std::string label = device_->ZoomStatusLabel();
+                    Skins.QueueMessage(mtInfo, label.c_str());
+                }
+                return osEnd;
+            }
+            return AddSubMenu(new cVaapiFileBrowser(mediaDir_)); // Mediaplayer line
+        }
+        return state;
+    }
+
+  private:
+    auto AddItems() -> void {
+        const int current = Current();
+        Clear();
+        Add(new cOsdItem(device_ != nullptr ? device_->ZoomStatusLabel().c_str() : "Zoom: off"));
+        Add(new cOsdItem(tr("Mediaplayer")));
+        SetCurrent(Get(current < 0 ? 0 : current));
+    }
+
+    cVaapiDevice *device_; ///< Borrowed; for CycleZoom() / ZoomStatusLabel().
+    std::string mediaDir_; ///< Browser root for the mediaplayer item.
 };
 
 // ============================================================================
@@ -257,12 +343,13 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
 
 auto cVaapiVideoPlugin::Housekeeping() -> void {}
 
-auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("Mediaplayer"); }
+auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("VAAPI Video"); }
 
 auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
-    // Browser uses the configured initial directory; the user navigates from there.
-    // Constructor falls back to "/" if the string is empty.
-    return new cVaapiFileBrowser(isempty(*mediaDir) ? std::string{"/"} : std::string{*mediaDir});
+    // Always the quick menu: line 1 cycles zoom, line 2 opens the mediaplayer. One @vaapivideo hook
+    // exposes both. The dir falls back to "/" if empty.
+    std::string dir = isempty(*mediaDir) ? std::string{"/"} : std::string{*mediaDir};
+    return new cVaapiQuickMenu(vaapiDevice, std::move(dir));
 }
 
 auto cVaapiVideoPlugin::Initialize() -> bool {
@@ -469,8 +556,7 @@ auto cVaapiVideoPlugin::Stop() -> void {
     isyslog("vaapivideo: plugin stopped");
 }
 
-auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const char *option, int &replyCode)
-    -> cString {
+auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, int &replyCode) -> cString {
     // SVDRP reply codes: 900=success, 550=action not taken, 500=unknown command.
 
     if (strcasecmp(command, "DETA") == 0) {
@@ -582,17 +668,53 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, [[maybe_unused]] const
         return cString::sprintf("Playing %s", option);
     }
 
+    if (strcasecmp(command, "ZOOM") == 0) {
+        if (!vaapiDevice || !vaapiDevice->IsReady()) {
+            replyCode = 550;
+            return "VAAPI device not ready";
+        }
+        // No arg or "next" cycles; a number selects a stop directly (0 = Off, 1..N = preset).
+        if (option == nullptr || *option == '\0' || strcasecmp(option, "next") == 0) {
+            (void)vaapiDevice->CycleZoom();
+        } else {
+            int parsed{};
+            const auto *end = option + std::strlen(option);
+            const auto [ptr, ec] = std::from_chars(option, end, parsed);
+            if (ec != std::errc{} || ptr != end || parsed < 0 || parsed > CONFIG_ZOOM_PRESET_COUNT) {
+                replyCode = 550;
+                return cString::sprintf("ZOOM needs 'next' or 0-%d", CONFIG_ZOOM_PRESET_COUNT);
+            }
+            if (parsed > 0 && vaapiConfig.zoomLevel[parsed - 1].load(std::memory_order_relaxed) <= 0) {
+                replyCode = 550;
+                return cString::sprintf("Zoom stop %d is disabled (level 0)", parsed);
+            }
+            (void)vaapiDevice->SetZoom(parsed);
+        }
+        // Flash the new stop on the OSD too: live-TV zoom is driven via this command (a key bound to
+        // `svdrpsend ... ZOOM next`), so the SVDRP reply alone would leave the viewer no feedback.
+        // QueueMessage is the thread-safe, deferred variant -- safe to call from the SVDRP thread.
+        const std::string label = vaapiDevice->ZoomStatusLabel();
+        Skins.QueueMessage(mtInfo, label.c_str());
+        replyCode = 900;
+        return cString::sprintf("%s", label.c_str());
+    }
+
     replyCode = 500;
     return {"Unknown SVDRP command"};
 }
 
 auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
+    // Built once; *zoomHelp stays valid for the array's lifetime because the cString is static.
+    static const cString zoomHelp = cString::sprintf(
+        "ZOOM [next|0-%d]\n    Cycle manual zoom or pick a stop (0=off, 1-%d=preset). Resets on content change.",
+        CONFIG_ZOOM_PRESET_COUNT, CONFIG_ZOOM_PRESET_COUNT);
     static const char *const kHelpPages[] = {
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.",
         "CONFIG\n    Display current configuration settings.",
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
+        *zoomHelp,
         nullptr};
     // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
     // both pointee levels are read-only at the call site, so stripping the inner const is safe.

@@ -1299,8 +1299,9 @@ auto cVaapiControl::RefreshReplayBar() -> void {
     //   Pause / Down    toggle pause
     //   Left  / Right   short seek (-/+ 10 s)
     //   Green / Yellow  long  seek (-/+ 60 s)
+    //   Blue            cycle manual zoom (Off -> 1 -> .. -> N -> Off)
     //   Next            advance playlist
-    //   Blue / Back / Stop  exit
+    //   Back / Stop     exit
     if (!player) {
         return osEnd;
     }
@@ -1360,10 +1361,22 @@ auto cVaapiControl::RefreshReplayBar() -> void {
             ShowReplayBar();
             return osContinue;
 
-        case kBlue:
+        case kBlue: {
+            // Cycle the manual zoom (Off -> 1 -> .. -> N -> Off) and flash the new stop on the OSD.
+            auto *vaapiDev = FindPrimaryVaapiDevice();
+            if (vaapiDev == nullptr || !vaapiDev->IsReady()) {
+                Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+            } else {
+                const int stop = vaapiDev->CycleZoom();
+                dsyslog("vaapivideo/mediaplayer: key Blue -- zoom cycle to stop %d", stop);
+                Skins.QueueMessage(mtInfo, vaapiDev->ZoomStatusLabel().c_str());
+            }
+            return osContinue;
+        }
+
         case kBack:
         case kStop:
-            dsyslog("vaapivideo/mediaplayer: key Blue/Back/Stop -- exit playback");
+            dsyslog("vaapivideo/mediaplayer: key Back/Stop -- exit playback");
             return osEnd;
 
         default:

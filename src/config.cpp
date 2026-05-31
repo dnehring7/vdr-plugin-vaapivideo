@@ -121,12 +121,23 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
+    // Zoom levels are stored in tenths-of-% zoom-in factor; render as a human-readable list.
+    std::string zoom;
+    for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
+        const int level = zoomLevel[i].load(std::memory_order_relaxed);
+        if (level <= 0) {
+            zoom += std::format("{}{}=off", i == 0 ? "" : " ", i + 1);
+        } else {
+            zoom += std::format("{}{}=+{:.1f}%", i == 0 ? "" : " ", i + 1, static_cast<double>(level) / 10.0);
+        }
+    }
     return std::format(
-        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}",
+        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}, Zoom "
+        "levels (0=off): {}",
         pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
         PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
         HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off");
+        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", zoom);
 }
 
 namespace {
@@ -154,6 +165,32 @@ namespace {
     const int previous = target.load(std::memory_order_relaxed);
     if (previous != parsed) {
         dsyslog("vaapivideo/config: %s updated from %d to %d ms", key, previous, parsed);
+    }
+    target.store(parsed, std::memory_order_relaxed);
+    return true;
+}
+
+/// Parse a per-preset zoom level (tenths-of-% zoom-in factor) into @p target after range-checking
+/// to [CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX]. Mirrors ParseLatencyValue: relaxed store (the
+/// decoder re-reads on every filter rebuild) and log-only-on-change.
+[[nodiscard]] auto ParseZoomLevelValue(const char *key, const char *value, std::atomic<int> &target) -> bool {
+    int parsed{};
+    const auto *end = value + std::strlen(value);
+    const auto [ptr, ec] = std::from_chars(value, end, parsed);
+
+    if (ec != std::errc{} || ptr != end) {
+        esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
+        return false;
+    }
+    if (parsed < CONFIG_ZOOM_LEVEL_MIN || parsed > CONFIG_ZOOM_LEVEL_MAX) {
+        esyslog("vaapivideo/config: %s %d outside valid range [%d,%d]", key, parsed, CONFIG_ZOOM_LEVEL_MIN,
+                CONFIG_ZOOM_LEVEL_MAX);
+        return false;
+    }
+
+    const int previous = target.load(std::memory_order_relaxed);
+    if (previous != parsed) {
+        dsyslog("vaapivideo/config: %s updated from %d to %d (tenths-of-%%)", key, previous, parsed);
     }
     target.store(parsed, std::memory_order_relaxed);
     return true;
@@ -230,6 +267,15 @@ namespace {
             dsyslog("vaapivideo/config: ClearOnChannelSwitch updated from %d to %d", previous ? 1 : 0, parsed ? 1 : 0);
         }
         return true;
+    }
+    // Per-preset zoom level (tenths-of-% zoom-in factor). Keys mirror the SetupStore() loop in
+    // vaapivideo.cpp and scale with CONFIG_ZOOM_PRESET_COUNT. The active cycle stop (zoomActive) is
+    // intentionally NOT parsed/stored: zoom is transient and must reset to Off on every restart.
+    for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
+        const std::string levelKey = std::format("Zoom{}", i + 1);
+        if (key == levelKey) {
+            return ParseZoomLevelValue(levelKey.c_str(), value, zoomLevel[i]);
+        }
     }
 
     return false; // Unknown key: silently ignore so older/newer setup.conf entries don't break load.
