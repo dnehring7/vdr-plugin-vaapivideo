@@ -80,9 +80,12 @@ CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 #   export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:detect_deadlocks=1:report_thread_leaks=1:history_size=7:symbolize=1"
 #   export LD_PRELOAD="/usr/lib64/libtsan.so.2"
 
-# Development Flags (uncomment for development builds)
-#CXXFLAGS += -pedantic-errors -Wall -Wextra
-#CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
+# Development warnings: lenient by default (safe for packaging); enable with `make DEV_WARNINGS=1`.
+DEV_WARNINGS ?= 0
+ifeq ($(DEV_WARNINGS),1)
+CXXFLAGS += -pedantic-errors -Wall -Wextra
+CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
+endif
 
 # libstdc++ debug mode — bounds checking on iterators, vectors, strings
 # WARNING: changes ABI; VDR and all plugins must be recompiled with this flag

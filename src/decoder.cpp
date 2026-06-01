@@ -837,6 +837,11 @@ auto cVaapiDecoder::SetAudioProcessor(cAudioProcessor *audio) -> void {
     audioProcessor.store(audio, std::memory_order_release);
 }
 
+auto cVaapiDecoder::SetLoopTickCallback(std::function<void()> callback) -> void {
+    // Set once before Initialize() starts the thread, so the decode loop reads it without a lock.
+    loopTickCallback = std::move(callback);
+}
+
 auto cVaapiDecoder::SetDevicePaused(bool paused) noexcept -> void {
     // Flips the drain-loop hold gate. See decoder.h declaration for the rationale; the read
     // site lives at the top of the drain `while` in Action().
@@ -993,6 +998,13 @@ auto cVaapiDecoder::Action() -> void {
     size_t jitterOverflowSinceLog{}; ///< Sum of frames dropped since the last overflow log line.
 
     while (!stopping.load(std::memory_order_acquire)) {
+        // Device hook ticked every iteration -- including the ~10 ms idle waits when no packets
+        // arrive -- so the device gets a reliable tick even on a scrambled channel that delivers no
+        // PES. No decoder lock is held here; the callback is a cheap no-op unless armed.
+        if (loopTickCallback) {
+            loopTickCallback();
+        }
+
         // Snapshot for this iteration. Drain loops and PublishLastPts() abort on mismatch with
         // clearEpoch so a Clear() / SetTrickSpeed(0) racing this iteration doesn't submit stale
         // frames or publish stale pts.

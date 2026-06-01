@@ -217,6 +217,24 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     [[nodiscard]] auto AttachHardware() -> bool; ///< Open DRM/VAAPI and start decoder/display/audio; shared by
                                                  ///< Initialize() and Attach(). Guarded by initState CAS.
+    [[nodiscard]] auto BuildRadioText(uint32_t &presentEventId) const
+        -> std::string; ///< Compose the radio splash text (channel name + present EPG title) and report the present
+                        ///< event id (0 = none). Takes VDR's Channels/Schedules read locks; empty text => plain black.
+    auto RefreshRadioSplash(bool force)
+        -> void; ///< (Re)render the radio splash: build text, submit a black frame, and record the depicted EPG event.
+                 ///< force=true always paints (channel entry); force=false paints only when the present event changed.
+    auto ResetNoVideoMonitors() noexcept
+        -> void; ///< Clear all radio-splash + encrypted-notice state; call on every lifecycle boundary.
+    auto CheckEncryptionTimeout()
+        -> void; ///< Driven by the decode loop's per-iteration tick (so it ticks even when a scrambled channel
+                 ///< delivers no PES): once the grace elapses with nothing decoding, show the encrypted notice
+                 ///< (TV or radio). Cheap no-op until armed by pmAudioVideo/pmAudioOnly.
+    auto ShowEncryptedScreen()
+        -> void; ///< Paint "Channel N - <name> / encrypted" over black when the current channel is encrypted (Ca != 0)
+                 ///< and its primary content (video for TV, audio for radio) is not decoding; no-op otherwise.
+    [[nodiscard]] auto CurrentChannelIsEncrypted() const
+        -> bool; ///< True iff the current channel carries a CA id; lets the radio path defer encrypted channels to the
+                 ///< encrypted watchdog instead of painting a (silent) radio splash over them.
     auto HandleAudioTrackChange(const char *reason, bool enteringDolby)
         -> void; ///< Log + re-detect audio on track change. @p enteringDolby works around VDR firing the hook
                  ///< BEFORE assigning currentAudioTrack from SetDigitalAudioDevice(true).
@@ -227,11 +245,13 @@ class cVaapiDevice : public cDevice {
     auto ResetAudioCodecState() -> void; ///< Drop the cached audio codec id and any in-flight 2-of-2 confirmation state
                                          ///< so the next PlayAudio() packet re-runs codec detection
     [[nodiscard]] auto SelectDrmConnector()
-        -> bool;                     ///< Scan connectors, pick a display mode, and store crtcId/connectorId
-    auto Stop() -> void;             ///< Shut down decoder, display, and audio in dependency order
-    auto SubmitBlackFrame() -> void; ///< Allocate a VAAPI NV12 black surface and submit it through the display pipeline
-    auto SuspendHardware() -> void;  ///< Release DRM/VAAPI/ALSA/OSD without touching cControl or VT;
-                                     ///< shared by Detach() (SVDRP DETA) and SetPlayMode(pmExtern).
+        -> bool;         ///< Scan connectors, pick a display mode, and store crtcId/connectorId
+    auto Stop() -> void; ///< Shut down decoder, display, and audio in dependency order
+    [[nodiscard]] auto SubmitBlackFrame(std::string_view centerText = {})
+        -> bool; ///< Submit a VAAPI NV12 black surface (optional centered text baked into the luma plane);
+                 ///< false means it never reached the display queue (the caller may retry).
+    auto SuspendHardware() -> void; ///< Release DRM/VAAPI/ALSA/OSD without touching cControl or VT;
+                                    ///< shared by Detach() (SVDRP DETA) and SetPlayMode(pmExtern).
 
     // ========================================================================
     // === STATE ===
@@ -264,8 +284,17 @@ class cVaapiDevice : public cDevice {
     bool inStillPicture{false};                                   ///< Re-entry guard for cDevice::StillPicture
     std::atomic<bool> radioBlackPending{false};                   ///< Awaiting radio-only channel detection
     cTimeMs radioBlackTimer;                                      ///< Radio-mode detection timeout
-    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
-    VaapiContext vaapi{};                                         ///< Shared VAAPI context
+    std::atomic<bool> radioSplashActive{false}; ///< A refreshable radio (no-video) splash is on screen
+    std::atomic<uint32_t> radioSplashEventId{
+        0}; ///< EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
+
+    cTimeMs radioSplashPoll;                   ///< Next EPG re-check; touched only on the PlayAudio thread
+    std::atomic<bool> encryptedPending{false}; ///< Armed on pmAudioVideo; monitors for an undecodable (encrypted) video
+                                               ///< stream. One-shot: cleared when video decodes, when the notice fires,
+                                               ///< or on the next SetPlayMode.
+    cTimeMs encryptedTimer;                    ///< Grace period before declaring a non-decoding channel encrypted
+    std::atomic<int> trickSpeed;               ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};                      ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
     std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec

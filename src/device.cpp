@@ -41,6 +41,7 @@
 #include <cstring>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -90,7 +91,12 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/channels.h>
+#include <vdr/config.h>
 #include <vdr/device.h>
+#include <vdr/epg.h>
+#include <vdr/font.h>
+#include <vdr/i18n.h>
 #include <vdr/osd.h>
 #include <vdr/player.h>
 #include <vdr/thread.h>
@@ -104,6 +110,22 @@ extern "C" {
 /// ~320 ms at AC-3 32 ms framing. Shallow cap prevents tail-drops that would create PTS
 /// gaps and derail A/V sync long after the drop event.
 static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
+
+/// How often PlayAudio re-checks the present EPG event while a radio splash is on screen. Program
+/// boundaries land on minute scales, so a couple of seconds is responsive without taxing the
+/// Schedules read-lock on the audio thread.
+static constexpr int RADIO_SPLASH_POLL_MS = 2000;
+
+/// radioSplashEventId cache sentinels. DVB event ids are 16-bit, so top-of-range uint32 values can
+/// never collide with a real id. EMPTY_TEXT = "a blank frame is queued" (distinct from EPG event 0,
+/// so a blank->caption transition still repaints). DIRTY = "force a repaint next poll" -- published
+/// before a forced submit so that, if the submit fails, the poll retries instead of matching the key.
+static constexpr uint32_t RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
+static constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
+
+/// Grace period after a channel switch before a video stream that never decodes is declared
+/// encrypted/undecodable and the on-screen notice is shown. Matches the radio black-frame delay.
+static constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
@@ -240,27 +262,245 @@ DrmDevices::~DrmDevices() noexcept {
 // === VAAPI DEVICE CLASS ===
 // ============================================================================
 
-auto cVaapiDevice::SubmitBlackFrame() -> void {
-    // Clears residual scanout on radio channels, hardware reinit, and opt-in channel switch.
-    // Uses a one-shot hw_frames_ctx so it works before the decoder pipeline is up.
-    if (!display || !vaapi.hwDeviceRef) [[unlikely]] {
+namespace {
+
+constexpr uint8_t SPLASH_LUMA_BLACK = 16;  ///< NV12 TV-range black (matches SubmitBlackFrame fill).
+constexpr uint8_t SPLASH_LUMA_WHITE = 235; ///< NV12 TV-range white for fully-covered glyph pixels.
+
+/// Bake optional centered caption text into NV12 luma (chroma stays neutral, so glyphs render gray);
+/// '\n' splits into block-centered lines. CPU-only. Safe off the main thread (radio/encrypted paths):
+/// cFont::CreateFont() yields a self-contained font with its own FT_Library/FT_Face, sharing no global
+/// FreeType state with VDR's OSD fonts -- so do not be tempted to cache/share one instance.
+auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
+    if (text.empty() || nv12 == nullptr || nv12->data[0] == nullptr) [[unlikely]] {
+        return;
+    }
+    const int w = nv12->width;
+    const int h = nv12->height;
+
+    // Scale with output height; SD modes still need a readable floor.
+    const int fontHeight = std::max(24, h / 24);
+    const std::unique_ptr<cFont> font{cFont::CreateFont(Setup.FontOsd, fontHeight)};
+    if (!font) [[unlikely]] {
+        esyslog("vaapivideo/device: splash font creation failed");
+        return;
+    }
+    const int lineHeight = font->Height();
+    if (lineHeight <= 0) [[unlikely]] {
         return;
     }
 
-    // Stage SDR HDR state before submitting: if the connector was left in HDR mode the sink
-    // would interpret SDR NV12 as BT.2020 PQ/HLG (crushed blacks, wrong colors). The atomic
-    // commit clears HDR_OUTPUT_METADATA / Colorspace / BT.2020 COLOR_ENCODING together with
-    // the black framebuffer. Normal SDR staging via the decoder is bypassed on all these
-    // call sites, so it must be done explicitly here.
-    display->SetHdrOutputState(HdrStreamInfo{});
+    // DrawText is single-line; count lines up front to vertically center the whole block.
+    const auto lineCount = static_cast<int>(std::ranges::count(text, '\n')) + 1;
+    int lineY = (h - (lineHeight * lineCount)) / 2;
+
+    for (size_t start = 0;;) {
+        const size_t nl = text.find('\n', start);
+        const std::string line{text.substr(start, (nl == std::string_view::npos ? text.size() : nl) - start)};
+        if (const int fullW = font->Width(line.c_str()); fullW > 0) {
+            // Clip an over-long line (long channel/EPG title) to the frame; DrawText's Width cap ends
+            // on a whole glyph rather than mid-character.
+            const int drawW = std::min(fullW, w);
+            cBitmap bm(drawW, lineHeight, 8); // 8bpp == the full 256-level antialiasing ramp
+            // Keep untouched pixels transparent; else DrawText's first Index() call claims palette
+            // slot 0 for a glyph color and the index-0 background would inherit it.
+            bm.DrawRectangle(0, 0, drawW - 1, lineHeight - 1, clrTransparent);
+            font->DrawText(&bm, 0, 0, line.c_str(), clrWhite, clrTransparent, drawW);
+
+            // startX >= 0 and startX + drawW <= w, so every dstX below is in-frame without clamping.
+            const int startX = (w - drawW) / 2;
+            for (int gy = 0; gy < lineHeight; ++gy) {
+                const int dstY = lineY + gy;
+                if (dstY < 0 || dstY >= h) { // a tall multi-line block can overflow the frame
+                    continue;
+                }
+                uint8_t *row = nv12->data[0] + (static_cast<ptrdiff_t>(dstY) * nv12->linesize[0]);
+                for (int gx = 0; gx < drawW; ++gx) {
+                    // Alpha is the glyph's antialiased coverage -> use it as the luma weight; UV stays neutral.
+                    const auto alpha = static_cast<uint8_t>((bm.GetColor(gx, gy) >> 24) & 0xFFU);
+                    if (alpha == 0) {
+                        continue;
+                    }
+                    row[startX + gx] = static_cast<uint8_t>(SPLASH_LUMA_BLACK +
+                                                            ((alpha * (SPLASH_LUMA_WHITE - SPLASH_LUMA_BLACK)) / 255));
+                }
+            }
+        }
+        lineY += lineHeight;
+        if (nl == std::string_view::npos) {
+            break;
+        }
+        start = nl + 1;
+    }
+}
+
+/// First splash line shared by the radio and encrypted screens: "Channel N - Name" (or "Channel N"
+/// when the name is missing), so both notices read consistently. Caller must hold LOCK_CHANNELS_READ.
+[[nodiscard]] auto FormatChannelLine(const cChannel &channel) -> std::string {
+    const char *name = channel.Name();
+    return (name != nullptr && *name != '\0') ? std::format("{} {} - {}", tr("Channel"), channel.Number(), name)
+                                              : std::format("{} {}", tr("Channel"), channel.Number());
+}
+
+} // namespace
+
+[[nodiscard]] auto cVaapiDevice::BuildRadioText(uint32_t &presentEventId) const -> std::string {
+    // Radio splash content: "Channel N - Name" on line 1, the present EPG event "start-end title" on
+    // line 2. Runs on the caller's thread (PlayAudio / SetPlayMode); takes VDR's list locks in the
+    // canonical order
+    // (Channels before Schedules) and copies the strings out before the locks drop. Reports the
+    // present event id (0 = none) so the caller can detect a program change. Returns empty -- a plain
+    // black frame -- during replay or when no channel/EPG is available.
+    presentEventId = 0;
+    std::string text;
+    // Channel name / EPG are meaningful only for live broadcast; during replay CurrentChannel() is a
+    // stale live channel, so fall back to a plain black frame. On a live-radio entry where liveMode
+    // is not yet latched, the 2 s PlayAudio poll fills the caption in once the first PES arrives.
+    if (!liveMode.load(std::memory_order_relaxed)) {
+        return text;
+    }
+    LOCK_CHANNELS_READ;
+    const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel());
+    if (channel == nullptr) [[unlikely]] {
+        return text;
+    }
+    text = FormatChannelLine(*channel); // line 1, consistent with the encrypted notice
+
+    LOCK_SCHEDULES_READ;
+    if (const cSchedule *schedule = Schedules->GetSchedule(channel); schedule != nullptr) {
+        if (const cEvent *present = schedule->GetPresentEvent(); present != nullptr) {
+            presentEventId = present->EventID();
+            if (const char *title = present->Title(); title != nullptr && *title != '\0') {
+                // Line 2: "11:00-12:00 Title" -- the present event's schedule plus title. GetTimeString()
+                // honours the user's 12/24 h setting; the cString temporaries live through the format call.
+                const cString start = present->GetTimeString();
+                const cString end = present->GetEndTimeString();
+                text += std::format("\n{}-{} {}", *start, *end, title);
+            }
+        }
+    }
+    return text;
+}
+
+auto cVaapiDevice::RefreshRadioSplash(bool force) -> void {
+    // force=true clears stale scanout on radio entry (main thread); the poll (audio thread) repaints
+    // only when the cached key changes. Cross-thread state rides the atomics; SubmitBlackFrame is
+    // serialized internally via vaDriverMutex.
+    uint32_t presentEventId = 0;
+    const std::string text = BuildRadioText(presentEventId);
+    const uint32_t splashEventId = text.empty() ? RADIO_SPLASH_EMPTY_TEXT_ID : presentEventId;
+    if (force) {
+        // Publish DIRTY (never equal to any real splashEventId) so that if this forced submit fails,
+        // the next poll still repaints instead of matching the key and returning early.
+        radioSplashActive.store(true, std::memory_order_relaxed);
+        radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
+    } else if (splashEventId == radioSplashEventId.load(std::memory_order_relaxed)) {
+        return; // nothing changed since the last paint
+    }
+    // Publish the depicted key only once the frame actually queued, so a failed submit stays DIRTY.
+    if (SubmitBlackFrame(text)) {
+        radioSplashEventId.store(splashEventId, std::memory_order_relaxed);
+    }
+}
+
+auto cVaapiDevice::CheckEncryptionTimeout() -> void {
+    // Driven by the decode loop's per-iteration tick (decoder.SetLoopTickCallback), which keeps
+    // firing on the ~10 ms idle waits even when a fully scrambled channel delivers no PES at all --
+    // the case PlayAudio/PlayVideo never see. The leading load short-circuits the unarmed case.
+    if (!encryptedPending.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // Plainly decoding (both audio and video up) -> not stuck, disarm. A channel missing one (radio
+    // with no video, or scrambled-video + FTA-audio) is decided by ShowEncryptedScreen at the timer.
+    if (videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE &&
+        audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE) {
+        encryptedPending.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (!encryptedTimer.TimedOut()) {
+        return; // still inside the grace period
+    }
+    // Only live broadcast can be encrypted (a recording just fails to decode, and CurrentChannel()
+    // would be a stale live channel during replay).
+    if (!Transferring()) {
+        encryptedPending.store(false, std::memory_order_relaxed);
+        return;
+    }
+    // Claim the one-shot, then paint. No further monitoring needed: once the stream descrambles,
+    // PlayVideo's codec detection decodes it and those frames overwrite the notice on screen.
+    if (encryptedPending.exchange(false, std::memory_order_relaxed)) {
+        ShowEncryptedScreen();
+    }
+}
+
+auto cVaapiDevice::ShowEncryptedScreen() -> void {
+    // Show the notice for any encrypted channel (Ca != 0) whose primary content is not decoding:
+    // a TV channel hinges on video, a radio channel (no video PID) on audio. An FTA channel (Ca 0),
+    // or one that actually decodes (it is decryptable), is not our case -- the codec state is the
+    // reliable discriminator, computed here under the channel lock.
+    std::string text;
+    int number = 0;
+    {
+        LOCK_CHANNELS_READ;
+        const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel());
+        if (channel == nullptr) {
+            dsyslog("vaapivideo/device: encrypted watchdog -- no current channel, skipping");
+            return;
+        }
+        number = channel->Number();
+        const int vpid = channel->Vpid();
+        const int caId = channel->Ca();
+        if (caId == 0) {
+            dsyslog("vaapivideo/device: encrypted watchdog -- channel %d is FTA (ca=0), skipping", number);
+            return;
+        }
+        const bool decoding = (vpid != 0) ? (videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE)
+                                          : (audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE);
+        if (decoding) {
+            dsyslog("vaapivideo/device: encrypted watchdog -- channel %d decrypts (vpid=%d), skipping", number, vpid);
+            return;
+        }
+        text = std::format("{}\n{}", FormatChannelLine(*channel), tr("encrypted"));
+    }
+    isyslog("vaapivideo/device: channel %d encrypted/undecodable -- showing notice", number);
+    // Take ownership of the screen: stop the radio poll repainting its splash over the notice.
+    radioSplashActive.store(false, std::memory_order_relaxed);
+    static_cast<void>(SubmitBlackFrame(text)); // one-shot notice; a transient submit failure just skips it
+}
+
+[[nodiscard]] auto cVaapiDevice::CurrentChannelIsEncrypted() const -> bool {
+    LOCK_CHANNELS_READ;
+    const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel());
+    return channel != nullptr && channel->Ca() != 0;
+}
+
+auto cVaapiDevice::ResetNoVideoMonitors() noexcept -> void {
+    // Single funnel for tearing down both no-video screens (radio splash + encrypted notice) on every
+    // lifecycle boundary, so no path forgets a field. DIRTY makes the next radio entry repaint.
+    radioBlackPending.store(false, std::memory_order_relaxed);
+    radioSplashActive.store(false, std::memory_order_relaxed);
+    radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
+    encryptedPending.store(false, std::memory_order_relaxed);
+}
+
+auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
+    // One black frame (optional caption) straight to the display, bypassing the decoder. Uses a
+    // one-shot hw_frames_ctx because these paths run before/without the decoder's frame pool.
+    // False if the frame never queued.
+    if (!display || !vaapi.hwDeviceRef) [[unlikely]] {
+        return false;
+    }
 
     const auto w = static_cast<int>(display->GetOutputWidth());
     const auto h = static_cast<int>(display->GetOutputHeight());
+    if (w <= 0 || h <= 0) [[unlikely]] { // no mode set yet: nothing valid to allocate or draw into
+        return false;
+    }
 
     std::unique_ptr<AVBufferRef, FreeAVBufferRef> framesRef{av_hwframe_ctx_alloc(vaapi.hwDeviceRef)};
     if (!framesRef) [[unlikely]] {
         esyslog("vaapivideo/device: black frame hw_frames_ctx alloc failed");
-        return;
+        return false;
     }
     // FFmpeg ABI: AVBufferRef::data points to a typed payload (here AVHWFramesContext) per the
     // hwframe context contract -- the cast is the documented access pattern.
@@ -271,24 +511,36 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
     ctx->width = w;
     ctx->height = h;
     ctx->initial_pool_size = 1;
-    if (av_hwframe_ctx_init(framesRef.get()) < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: black frame hw_frames_ctx init failed");
-        return;
-    }
 
     // SW staging frame uploaded to a single VAAPI surface via av_hwframe_transfer_data.
     std::unique_ptr<AVFrame, FreeAVFrame> hwFrame{av_frame_alloc()};
     std::unique_ptr<AVFrame, FreeAVFrame> swFrame{av_frame_alloc()};
-    if (!hwFrame || !swFrame || av_hwframe_get_buffer(framesRef.get(), hwFrame.get(), 0) < 0) [[unlikely]] {
+    if (!hwFrame || !swFrame) [[unlikely]] {
         esyslog("vaapivideo/device: black frame surface alloc failed");
-        return;
+        return false;
     }
+
+    // vaDriverMutex: hw_frames_ctx_init + get_buffer create/reserve a VAAPI surface, which
+    // races the display thread's av_hwframe_map and the decoder's VPP on the iHD driver (not
+    // thread-safe on a shared VADisplay). Serialize like MapVaapiFrame / the decoder paths do.
+    {
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        if (av_hwframe_ctx_init(framesRef.get()) < 0) [[unlikely]] {
+            esyslog("vaapivideo/device: black frame hw_frames_ctx init failed");
+            return false;
+        }
+        if (av_hwframe_get_buffer(framesRef.get(), hwFrame.get(), 0) < 0) [[unlikely]] {
+            esyslog("vaapivideo/device: black frame surface alloc failed");
+            return false;
+        }
+    }
+
     swFrame->format = AV_PIX_FMT_NV12;
     swFrame->width = w;
     swFrame->height = h;
     if (av_frame_get_buffer(swFrame.get(), 0) < 0) [[unlikely]] {
         esyslog("vaapivideo/device: black frame sw buffer alloc failed");
-        return;
+        return false;
     }
 
     // BT.709 TV-range "black": Y=16, UV=128. Y=0 would clip below black on TV-range
@@ -296,9 +548,18 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
     const auto rows = static_cast<size_t>(h);
     std::memset(swFrame->data[0], 16, static_cast<size_t>(swFrame->linesize[0]) * rows);
     std::memset(swFrame->data[1], 128, static_cast<size_t>(swFrame->linesize[1]) * (rows / 2));
-    if (av_hwframe_transfer_data(hwFrame.get(), swFrame.get(), 0) < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: black frame upload failed");
-        return;
+
+    // Optional centered splash text, baked into the luma plane (CPU-only, no VA driver calls).
+    DrawCenteredLuma(swFrame.get(), centerText);
+
+    // vaDriverMutex again: the upload is a VA driver call with the same race surface as above.
+    // Released before SubmitFrame so the display thread can take the mutex to drain the queue.
+    {
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        if (av_hwframe_transfer_data(hwFrame.get(), swFrame.get(), 0) < 0) [[unlikely]] {
+            esyslog("vaapivideo/device: black frame upload failed");
+            return false;
+        }
     }
 
     // Submit through the normal display path: modeset / DRM plane state mirrors a real frame.
@@ -307,7 +568,31 @@ auto cVaapiDevice::SubmitBlackFrame() -> void {
     // FFmpeg VAAPI ABI: data[3] holds the VASurfaceID directly, cast through uintptr_t.
     frame->vaSurfaceId = static_cast<VASurfaceID>(
         reinterpret_cast<uintptr_t>(frame->avFrame->data[3])); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-    static_cast<void>(display->SubmitFrame(std::move(frame), 100));
+    // Stage SDR with the commit (only now that a frame is ready): the decoder's normal SDR staging is
+    // bypassed here, so without this an HDR-left connector would read this NV12 black as BT.2020
+    // PQ/HLG (crushed blacks). The display thread applies the staged state atomically with this frame.
+    display->SetHdrOutputState(HdrStreamInfo{});
+    const bool queued = display->SubmitFrame(std::move(frame), 100);
+    // Debug aid: trace every black-frame submission (startup splash, radio, encrypted, channel-switch
+    // clear) and whether it reached the display queue. Flatten the caption to one line -- newlines/runs
+    // of whitespace become a single space -- so multi-line captions stay on one log line.
+    std::string logCaption;
+    logCaption.reserve(centerText.size());
+    for (const char c : centerText) {
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+            if (!logCaption.empty() && logCaption.back() != ' ') {
+                logCaption += ' ';
+            }
+        } else {
+            logCaption += c;
+        }
+    }
+    while (!logCaption.empty() && logCaption.back() == ' ') {
+        logCaption.pop_back();
+    }
+    dsyslog("vaapivideo/device: black frame %dx%d caption=\"%s\" -> queued=%s", w, h,
+            logCaption.empty() ? "(none)" : logCaption.c_str(), queued ? "yes" : "no");
+    return queued;
 }
 
 cVaapiDevice::cVaapiDevice() {
@@ -1002,9 +1287,26 @@ auto cVaapiDevice::Play() -> void {
     if (radioBlackPending.load(std::memory_order_relaxed) && radioBlackTimer.TimedOut()) [[unlikely]] {
         radioBlackPending.store(false, std::memory_order_relaxed);
         if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
-            isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
-            SubmitBlackFrame();
+            // An encrypted channel with no video is owned by the encrypted watchdog (which shows the
+            // "encrypted" notice); painting a silent radio splash here would race and flicker with it.
+            if (CurrentChannelIsEncrypted()) {
+                dsyslog("vaapivideo/device: no video on encrypted channel -- deferring to encrypted watchdog");
+            } else {
+                isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
+                RefreshRadioSplash(/*force=*/true);
+                radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+            }
         }
+    }
+
+    // Radio splash refresh: while a no-video splash is up, re-render when the present EPG event
+    // changes so the on-screen "now playing" stays current. Throttled and confined to this audio
+    // thread (radioSplashPoll is not shared). The videoCodecId gate drops out of radio mode the
+    // moment a channel starts sending video -- the decoder then owns the scanout.
+    if (radioSplashActive.load(std::memory_order_relaxed) &&
+        videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && radioSplashPoll.TimedOut()) [[unlikely]] {
+        radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+        RefreshRadioSplash(/*force=*/false);
     }
 
     // Replay backpressure: cap queue to avoid tail-drops that create PTS gaps. Live: always accept.
@@ -1031,6 +1333,10 @@ auto cVaapiDevice::Play() -> void {
     }
 
     radioBlackPending.store(false, std::memory_order_relaxed);
+    // Any video PES (even scrambled) ends radio-splash ownership now, before the codec opens -- else
+    // the audio-thread poll could repaint the radio splash over a late video stream or the just-shown
+    // encrypted notice during the codec-detection window.
+    radioSplashActive.store(false, std::memory_order_relaxed);
 
     const auto pes = ParsePes({Data, static_cast<size_t>(Length)});
     if (!pes.isVideo || pes.payloadSize == 0) [[unlikely]] {
@@ -1095,6 +1401,7 @@ auto cVaapiDevice::Play() -> void {
         }
 
         videoCodecId.store(detectedCodec, std::memory_order_relaxed);
+        ResetNoVideoMonitors(); // video now decodes: neither no-video screen may repaint over it
         isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
     }
 
@@ -1320,7 +1627,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // Capture previous video codec BEFORE clearing: PlayVideo's 2-of-2 guard uses it
             // to reject stale TS-buffer bytes after the switch. Audio path runs the guard
             // unconditionally so it doesn't need a previous-codec capture.
-            radioBlackPending.store(false, std::memory_order_relaxed);
+            ResetNoVideoMonitors();
             previousVideoCodec.store(videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed),
                                      std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
@@ -1342,28 +1649,43 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // User opt-in: paint black during channel-switch gap instead of holding the
             // previous channel's last frame until the new one decodes its first frame.
             if (vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed)) {
-                SubmitBlackFrame();
+                static_cast<void>(SubmitBlackFrame());
             }
             break;
         case pmAudioOnly:
         case pmAudioOnlyBlack:
-            // Radio: paint black so DRM scanout doesn't hold the previous channel's picture.
-            radioBlackPending.store(false, std::memory_order_relaxed);
-            ResetZoom(); // Audio-only is still a content change; keep transient-zoom semantics.
+            // Radio: paint channel name + present EPG title over black so DRM scanout doesn't hold
+            // the previous channel's picture; PlayAudio keeps it current as the program changes.
+            ResetNoVideoMonitors(); // RefreshRadioSplash below re-arms radioSplashActive for this channel
+            ResetZoom();            // Audio-only is still a content change; keep transient-zoom semantics.
             Clear();
-            SubmitBlackFrame();
+            // Encrypted radio: arm the watchdog too, so a scrambled audio-only channel that never
+            // decodes gets the "encrypted" notice instead of a silent radio splash.
+            encryptedTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
+            encryptedPending.store(true, std::memory_order_relaxed);
+            // Poll deadline is left to the PlayAudio thread (which owns radioSplashPoll); its first
+            // refresh after entry recomputes the same event and no-ops, then arms the 2 s cadence.
+            RefreshRadioSplash(/*force=*/true);
             break;
         case pmAudioVideo:
         case pmVideoOnly:
             // Codec state already clean (VDR always emits pmNone before pmAudioVideo).
             // liveMode is latched on the first PES in PlayVideo/PlayAudio.
+            ResetNoVideoMonitors(); // a video stream is starting; re-armed below for the no-video grace
             ResetZoom(); // Before Clear(): belt-and-braces so a new stream starts at Off even if pmNone was skipped.
             Clear();
             // 3 s grace: if no video arrives, PlayAudio() paints black (radio channel).
             radioBlackTimer.Set(3000);
             radioBlackPending.store(true, std::memory_order_relaxed);
+            // Same grace for the encrypted-channel notice: armed unconditionally, it self-cancels
+            // when a codec opens and only paints if the channel turns out encrypted with a video PID.
+            encryptedTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
+            encryptedPending.store(true, std::memory_order_relaxed);
+            dsyslog("vaapivideo/device: pmAudioVideo -- armed no-video watchdogs (grace %d ms)",
+                    ENCRYPTED_NOTICE_DELAY_MS);
             break;
         default:
+            ResetNoVideoMonitors(); // pmExtern / unknown: not our scanout
             break;
     }
     return true;
@@ -1529,6 +1851,9 @@ auto cVaapiDevice::SuspendHardware() -> void {
     previousVideoCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     videoCodecCandidateCount.store(0, std::memory_order_relaxed);
+    // The no-video monitors are not cleared via SetPlayMode on the SVDRP DETA path, so reset them
+    // here too -- otherwise a stale splash flag could fire against the next attached stream.
+    ResetNoVideoMonitors();
     ResetAudioCodecState();
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
@@ -1584,7 +1909,9 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
         return false;
     }
 
-    // Mediaplayer paths are always replay -- no live-TV jitter buffer, no Transferring() race.
+    // Mediaplayer paths are always replay -- no live-TV jitter buffer, no Transferring() race. Drop
+    // any leftover no-video monitors from a prior live channel so they cannot fire over playback.
+    ResetNoVideoMonitors();
     liveMode.store(false, std::memory_order_relaxed);
     decoder->SetLiveMode(false);
     ResetZoom(); // Each opened file/URL starts unzoomed; the codec-open below rebuilds the graph.
@@ -1777,6 +2104,10 @@ auto cVaapiDevice::FlushForSeek() -> void {
 
     // Decoder starts codec-less; PlayVideo() opens the codec on the first PES.
     decoder = std::make_unique<cVaapiDecoder>(display.get(), &vaapi);
+    // Drive the encrypted-channel watchdog off the decode loop's idle tick: a fully scrambled channel
+    // delivers no PES to PlayAudio/PlayVideo, but the decode thread still wakes ~every 10 ms with an
+    // empty queue. Set before Initialize() starts that thread. CheckEncryptionTimeout no-ops unless armed.
+    decoder->SetLoopTickCallback([this] { CheckEncryptionTimeout(); });
     if (!decoder->Initialize()) [[unlikely]] {
         esyslog("vaapivideo/device: decoder initialization failed");
         decoder.reset();
@@ -1800,6 +2131,13 @@ auto cVaapiDevice::FlushForSeek() -> void {
     initState.store(2, std::memory_order_release);
     ResetZoom(); // Fresh hardware (plugin start or SVDRP ATTA) always begins at Off.
     isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
+
+    // Startup splash: cover the console immediately with a black frame and a centered title.
+    // Safe here -- display is ready and the decoder is codec-less/idle, and SubmitBlackFrame now
+    // serializes its VAAPI calls under vaDriverMutex (the race that hung the old startup call).
+    dsyslog("vaapivideo/device: showing startup splash");
+    const bool splashShown = SubmitBlackFrame(tr("VDR with vaapivideo is getting ready..."));
+    dsyslog("vaapivideo/device: startup splash %s", splashShown ? "submitted" : "FAILED");
 
     // Foreground VDR's VT so KBD receives keys after startup / SVDRP ATTA. Non-fatal.
     (void)ActivateOwnVt();

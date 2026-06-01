@@ -13,6 +13,7 @@
 #include "stream.h"
 
 #include <deque>
+#include <functional>
 
 // VDR
 #pragma GCC diagnostic push
@@ -109,6 +110,10 @@ class cVaapiDecoder : public cThread {
     auto NotifyAudioChange() -> void; ///< Arm freerun after an audio codec/track switch; audio clock is NOPTS briefly.
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the A/V sync master clock. Stored as atomic pointer.
+    auto SetLoopTickCallback(std::function<void()> callback)
+        -> void; ///< Called once per decode-loop iteration (incl. the ~10 ms idle ticks when no packets arrive),
+                 ///< giving the device a thread that ticks even when a scrambled channel delivers no PES. Must be
+                 ///< set before Initialize() starts the thread.
     auto SetDevicePaused(bool paused) noexcept
         -> void; ///< Mirror cVaapiDevice::Freeze() / Play() into the drain loop. While paused the drain HOLDS
                  ///< the jitterBuf (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift while
@@ -211,9 +216,10 @@ class cVaapiDecoder : public cThread {
     // === REFERENCES ===
     // ========================================================================
     std::atomic<cAudioProcessor *> audioProcessor{
-        nullptr};               ///< A/V sync master clock. Written by main thread, read by decode thread.
-    cVaapiDisplay *display;     ///< Receives completed VaapiFrames via SubmitFrame().
-    VaapiContext *vaapiContext; ///< Shared VAAPI hw_device_ctx and GpuCaps.
+        nullptr};                           ///< A/V sync master clock. Written by main thread, read by decode thread.
+    cVaapiDisplay *display;                 ///< Receives completed VaapiFrames via SubmitFrame().
+    VaapiContext *vaapiContext;             ///< Shared VAAPI hw_device_ctx and GpuCaps.
+    std::function<void()> loopTickCallback; ///< Per-iteration device hook; set before Initialize(), then read-only.
 
     // ========================================================================
     // === FFMPEG STATE ===

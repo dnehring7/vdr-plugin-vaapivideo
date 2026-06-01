@@ -209,11 +209,11 @@ class cVaapiQuickMenu : public cOsdMenu {
 
   private:
     auto AddItems() -> void {
-        const int current = Current();
+        const int currentItem = Current();
         Clear();
         Add(new cOsdItem(device_ != nullptr ? device_->ZoomStatusLabel().c_str() : "Zoom: off"));
         Add(new cOsdItem(tr("Mediaplayer")));
-        SetCurrent(Get(current < 0 ? 0 : current));
+        SetCurrent(Get(currentItem < 0 ? 0 : currentItem));
     }
 
     cVaapiDevice *device_; ///< Borrowed; for CycleZoom() / ZoomStatusLabel().
