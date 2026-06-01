@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -79,6 +80,7 @@ extern "C" {
 #include <vdr/menu.h>
 #include <vdr/osdbase.h>
 #include <vdr/player.h>
+#include <vdr/remote.h>
 #include <vdr/skins.h>
 #include <vdr/status.h>
 #include <vdr/thread.h>
@@ -403,6 +405,33 @@ auto StartPlayback(std::vector<PlaylistEntry> entries) -> bool {
     // cControl::Launch takes ownership and destroys via cControl::Shutdown / next Launch.
     cControl::Launch(new cVaapiControl(std::move(entries)));
     return true;
+}
+
+// One-shot "return to browser" target. Set on Stop/EOF, consumed by MainMenuAction(); both run on
+// the VDR main thread (never concurrent), so no lock is needed.
+[[nodiscard]] static auto PendingBrowserReturn() -> std::optional<std::string> & {
+    static std::optional<std::string> pending;
+    return pending;
+}
+
+auto RequestReturnToBrowser(std::string jumpToPath) -> void {
+    PendingBrowserReturn() = std::move(jumpToPath);
+    // CallPlugin queues a k_Plugin key -> MainMenuAction() next main-loop pass. Fails only if another
+    // plugin call is pending; drop our request then so an unrelated menu open won't show the browser.
+    if (!cRemote::CallPlugin(PLUGIN_NAME)) [[unlikely]] {
+        esyslog("vaapivideo/mediaplayer: CallPlugin busy -- cannot reopen file browser");
+        PendingBrowserReturn().reset();
+    }
+}
+
+auto TakeReturnToBrowser() -> std::optional<std::string> {
+    auto &pending = PendingBrowserReturn();
+    if (!pending.has_value()) {
+        return std::nullopt;
+    }
+    std::optional<std::string> result = std::move(pending);
+    pending.reset();
+    return result;
 }
 
 // ============================================================================
@@ -881,6 +910,19 @@ auto cVaapiPlayer::Next() -> void {
     return (idx < playlist.size()) ? playlist.at(idx).title : std::string{};
 }
 
+[[nodiscard]] auto cVaapiPlayer::CurrentUri() const -> std::string {
+    // Unlocked read like Title() (`playlist` is fixed after construction). Clamp the index: EOF
+    // leaves it one past the end, so a Stop after a file finishes still resolves to that file.
+    if (playlist.empty()) {
+        return {};
+    }
+    size_t idx = currentIndex.load(std::memory_order_relaxed);
+    if (idx >= playlist.size()) {
+        idx = playlist.size() - 1;
+    }
+    return playlist.at(idx).uri;
+}
+
 [[nodiscard]] auto cVaapiPlayer::FramesPerSecond() -> double {
     // Skins use this for the ".ff" frame-count suffix; fall back to cPlayer's default 25.
     const cMutexLock lock(&sourceMutex);
@@ -1306,6 +1348,8 @@ auto cVaapiControl::RefreshReplayBar() -> void {
         return osEnd;
     }
     if (player->IsFinished()) {
+        // EOF / failed open: reopen the browser instead of dropping to live TV, like Stop below.
+        RequestReturnToBrowser(player->CurrentUri());
         return osEnd;
     }
 
@@ -1376,7 +1420,10 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 
         case kBack:
         case kStop:
-            dsyslog("vaapivideo/mediaplayer: key Back/Stop -- exit playback");
+            // Reopen the browser at the played file instead of live TV; URLs / non-selectable
+            // paths fall back to the media-dir in cVaapiFileBrowser.
+            dsyslog("vaapivideo/mediaplayer: key Back/Stop -- return to file browser");
+            RequestReturnToBrowser(player->CurrentUri());
             return osEnd;
 
         default:
@@ -1388,11 +1435,36 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 // === cVaapiFileBrowser ===
 // ============================================================================
 
-cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir) : cOsdMenu("") {
+cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir, const std::string &selectPath) : cOsdMenu("") {
     if (startDir.empty()) {
         startDir = "/";
     }
+    // Jump back to a specific file (Stop from replay): open its parent dir, cursor on it. A URL or a
+    // non-selectable path isn't browseable -- fall back to the start folder (svdrpsend / URL case).
+    if (!selectPath.empty() && !HasUrlScheme(selectPath)) {
+        std::error_code ec;
+        const std::string parent = Dirname(selectPath);
+        if (std::filesystem::is_regular_file(selectPath, ec) && !ec && std::filesystem::is_directory(parent, ec) &&
+            !ec) {
+            LoadDirectory(parent);
+            if (SelectEntryByName(Basename(selectPath))) {
+                return;
+            }
+        }
+    }
     LoadDirectory(startDir);
+}
+
+auto cVaapiFileBrowser::SelectEntryByName(std::string_view name) -> bool {
+    // entries[] index == menu index (built in Add() order). Re-Display() to repaint the highlight.
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries.at(i).name == name) {
+            SetCurrent(Get(static_cast<int>(i)));
+            Display();
+            return true;
+        }
+    }
+    return false;
 }
 
 auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
@@ -1531,6 +1603,12 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
             return osContinue;
         }
         return osBack;
+    }
+
+    // Stop leaves the browser outright (osEnd -> live TV) from any depth, vs. walking kBack to the
+    // root. Intercepted before the base, which swallows kStop.
+    if ((Key & ~k_Repeat) == kStop) {
+        return osEnd;
     }
 
     // Let the base menu handle navigation keys (Up/Down/PageUp/PageDown) first. We only

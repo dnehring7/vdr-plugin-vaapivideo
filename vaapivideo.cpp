@@ -35,6 +35,7 @@
 #include <charconv>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -346,9 +347,14 @@ auto cVaapiVideoPlugin::Housekeeping() -> void {}
 auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("VAAPI Video"); }
 
 auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
-    // Always the quick menu: line 1 cycles zoom, line 2 opens the mediaplayer. One @vaapivideo hook
-    // exposes both. The dir falls back to "/" if empty.
+    // The dir falls back to "/" if empty.
     std::string dir = isempty(*mediaDir) ? std::string{"/"} : std::string{*mediaDir};
+    // A pending return-to-browser (Stop in the replay control, or a file ended) opens the browser at
+    // the played file instead of the quick menu; the browser falls back to `dir` if unreachable.
+    if (auto jumpTo = TakeReturnToBrowser(); jumpTo.has_value()) {
+        return new cVaapiFileBrowser(std::move(dir), *jumpTo);
+    }
+    // Otherwise the quick menu (line 1 zoom, line 2 mediaplayer); one @vaapivideo hook exposes both.
     return new cVaapiQuickMenu(vaapiDevice, std::move(dir));
 }
 

@@ -103,13 +103,14 @@ extern "C" {
 // ============================================================================
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
-inline constexpr const char *PLUGIN_VERSION = "1.6.0";
+inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
+inline constexpr const char *PLUGIN_VERSION = "1.6.1;
 
-// ============================================================================
-// === CONSTANTS ===
-// ============================================================================
+    // ============================================================================
+    // === CONSTANTS ===
+    // ============================================================================
 
-inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (ms)
+    inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (ms)
 
 // ============================================================================
 // === HDR STREAM CLASSIFICATION ===

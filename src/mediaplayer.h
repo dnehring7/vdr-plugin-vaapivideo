@@ -14,7 +14,8 @@
  * so pause/seek route through cDevice::Freeze() and cVaapiDevice::ClearForMediaPlayer().
  *
  * Entry points:
- *   - main menu     -> cVaapiFileBrowser (returned from MainMenuAction)
+ *   - main menu     -> cVaapiQuickMenu -> cVaapiFileBrowser
+ *   - replay end    -> MainMenuAction reopens cVaapiFileBrowser via pending return state
  *   - SVDRP PLAY    -> StartPlayback(...) launches cVaapiControl
  *
  * Threading: the demux thread is the only writer for the source FIFO; the player
@@ -31,6 +32,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -131,6 +133,15 @@ struct PlaylistEntry {
 /// Wraps cControl::Launch(); does not block. Returns false iff there is no primary
 /// vaapivideo device to attach to.
 auto StartPlayback(std::vector<PlaylistEntry> entries) -> bool;
+
+/// Ask the file browser to reopen (instead of live TV) on VDR's next main-menu hook, cursor on
+/// @p jumpToPath -- or the media-dir root when that path is a URL/unreachable. Wraps
+/// cRemote::CallPlugin(); call before returning osEnd. VDR main thread only.
+auto RequestReturnToBrowser(std::string jumpToPath) -> void;
+
+/// Consume a pending RequestReturnToBrowser(): the jump-to path if one was set (and clear it), else
+/// std::nullopt. MainMenuAction() uses it to choose the browser over the quick menu.
+[[nodiscard]] auto TakeReturnToBrowser() -> std::optional<std::string>;
 
 // ============================================================================
 // === MEDIA SOURCE ===
@@ -237,6 +248,9 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     auto Seek(int64_t deltaMs) -> void; ///< Relative seek; deltaMs may be negative
     auto Next() -> void;                ///< Skip to next playlist entry, if any
     [[nodiscard]] auto Title() const -> std::string;
+    /// URI of the current entry (clamped to the last on EOF, so Stop after a file ends still
+    /// resolves to it). Empty only for an empty playlist. Used by cVaapiControl to reopen the browser.
+    [[nodiscard]] auto CurrentUri() const -> std::string;
     /// True once playback can no longer continue: natural EOF, fatal open failure, or shutdown.
     /// cVaapiControl uses this to exit on its next key event.
     [[nodiscard]] auto IsFinished() const noexcept -> bool {
@@ -360,7 +374,9 @@ class cVaapiControl final : public cControl {
 /// playlists. kOk enters a directory or launches playback. kBack pops to parent.
 class cVaapiFileBrowser final : public cOsdMenu {
   public:
-    explicit cVaapiFileBrowser(std::string startDir);
+    /// @p startDir is the root / fallback (the -m media-dir). When @p selectPath is a reachable local
+    /// file, open its parent dir with the cursor on it; otherwise fall back to @p startDir.
+    explicit cVaapiFileBrowser(std::string startDir, const std::string &selectPath = {});
     ~cVaapiFileBrowser() noexcept override = default;
     cVaapiFileBrowser(const cVaapiFileBrowser &) = delete;
     cVaapiFileBrowser(cVaapiFileBrowser &&) noexcept = delete;
@@ -377,6 +393,8 @@ class cVaapiFileBrowser final : public cOsdMenu {
     };
 
     auto LoadDirectory(const std::string &dir) -> void;
+    /// Move the cursor to the entry whose basename matches @p name and redraw; false if none match.
+    [[nodiscard]] auto SelectEntryByName(std::string_view name) -> bool;
     [[nodiscard]] auto SelectedEntry() const -> const BrowserEntry *;
     [[nodiscard]] auto BuildFullPath(const BrowserEntry &entry) const -> std::string;
 

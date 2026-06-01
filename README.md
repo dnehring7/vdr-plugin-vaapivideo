@@ -636,7 +636,7 @@ passthrough work identically to the live-TV path.
 | `Green` / `Yellow`         | Seek −/+ 60 s                |
 | `Blue`                     | Cycle manual zoom (Off → 1–4)|
 | `Next`                     | Skip to next playlist entry  |
-| `Back` / `Stop`            | Exit playback                |
+| `Back` / `Stop`            | Return to the file browser   |
 
 Rapid key repeats sum: pressing `Right` three times before the demuxer
 services the first one lands at +30 s, not +10 s.
@@ -647,6 +647,10 @@ The browser filters its listing to `.mp4 .mkv .avi .mov .ts .m4v .webm`
 plus `.m3u/.m3u8`. The filter is for usability only; `PLUG vaapivideo
 PLAY` via SVDRP accepts any URI libavformat can open. Audio-only
 formats are not supported — the source requires a video stream.
+
+After playback ends, or when leaving playback with `Back` / `Stop`, the browser
+reopens at the played local file. URLs and non-selectable paths fall back to `--media-dir`.
+Inside the browser, `Back` moves to the parent directory and `Stop` exits to live TV.
 
 ### Playlist format
 
