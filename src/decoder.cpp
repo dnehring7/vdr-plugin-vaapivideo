@@ -1253,6 +1253,7 @@ auto cVaapiDecoder::Action() -> void {
 
         // --- Decode ---
         pendingFrames.clear();
+        bool drainedCodecAtEof = false;
 
         // codecMutex scoped to decode only; released before the handoff push so Clear() /
         // SetTrickSpeed() on other threads don't stall behind it. The producedEpoch is snapshotted
@@ -1318,6 +1319,7 @@ auto cVaapiDecoder::Action() -> void {
         // The decode thread may consume the packet before RequestCodecDrain sets the flag;
         // checking here (after the decode step) catches both orderings.
         if (codecDrainPending.exchange(false, std::memory_order_acquire)) {
+            drainedCodecAtEof = true;
             const cMutexLock decodeLock(&codecMutex);
             const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
             const size_t firstProducedIndex = pendingFrames.size();
@@ -1353,6 +1355,7 @@ auto cVaapiDecoder::Action() -> void {
         // handoffMutex is a strict leaf, so this never blocks Clear()/EnqueueData().
         if (!pendingFrames.empty()) {
             const cMutexLock hl(&handoffMutex);
+            size_t retainedNewFrames = pendingFrames.size();
             for (auto &frame : pendingFrames) {
                 handoffQueue.push_back(std::move(frame));
             }
@@ -1361,6 +1364,9 @@ auto cVaapiDecoder::Action() -> void {
             // stays bounded. (jitterOverflowSinceLog/Gate are decode-thread locals.)
             if (handoffQueue.size() > DECODER_RESERVE_HARD_CAP) [[unlikely]] {
                 const size_t dropCount = handoffQueue.size() - DECODER_RESERVE_HARD_CAP;
+                // Worst-case for the EOS bridge below: assume drops reach the just-pushed frames.
+                // (Unreachable during the EOF drain, which keeps the reserve below the cap.)
+                retainedNewFrames = (dropCount >= retainedNewFrames) ? 0 : retainedNewFrames - dropCount;
                 for (size_t i = 0; i < dropCount; ++i) {
                     handoffQueue.pop_front();
                 }
@@ -1371,6 +1377,13 @@ auto cVaapiDecoder::Action() -> void {
                     jitterOverflowSinceLog = 0;
                     jitterOverflowLogGate.Set();
                 }
+            }
+            // EOS-drain bridge: codecDrainPending is already cleared but the present thread only
+            // republishes the reserve total next iteration, so a mediaplayer drain poll in that gap
+            // could read a premature 0 and tear down before these final frames present. Bump the
+            // count now (under handoffMutex, serialized with that store; transient over-count is safe).
+            if (drainedCodecAtEof && retainedNewFrames > 0) {
+                publishedDecodedReserveSize.fetch_add(retainedNewFrames, std::memory_order_relaxed);
             }
             handoffCondition.Broadcast();
         }

@@ -1061,6 +1061,56 @@ auto cVaapiPlayer::LogStatus() -> void {
             StateName(state.load(std::memory_order_acquire)), posMs, totalMs, idx + 1, totalCount, lookaheadMs);
 }
 
+auto cVaapiPlayer::DrainTailAtEof() -> void {
+    auto *vaapiDev = FindPrimaryVaapiDevice();
+    if (vaapiDev == nullptr) {
+        return;
+    }
+    // Bail the instant the user wants something else, so a held tail can't delay it. Pause matters
+    // most: it stops the presenter, so depth freezes and the stall watchdog would otherwise advance
+    // the playlist behind the user's back -- instead Action()'s pause branch holds and the drain
+    // resumes when EOF is re-detected on Play.
+    const auto aborted = [this]() noexcept -> bool {
+        return stopping.load(std::memory_order_acquire) || paused.load(std::memory_order_acquire) ||
+               seekPending.load(std::memory_order_acquire) || nextRequested.load(std::memory_order_acquire);
+    };
+    // Wait for depthFn to reach 0, bailing on user command, hard timeout, or stall. A real-time
+    // presenter advances every frame, so no decrease within STALL_MS means a wedged pipeline.
+    const auto drainUntilEmpty = [&](auto &&depthFn) noexcept -> void {
+        const cTimeMs cap(MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS);
+        cTimeMs sinceProgress;
+        size_t lastDepth = SIZE_MAX;
+        while (true) {
+            const size_t depth = depthFn();
+            if (depth == 0) {
+                return;
+            }
+            // Reset on ANY decrease vs the previous reading, not a lifetime low: phase 2's codec drain
+            // can RAISE depth (tail flushed into the reserve), and a lifetime-min tracker would then
+            // read the legitimate drain that follows as a stall and cut the tail early.
+            if (depth < lastDepth) {
+                sinceProgress.Set();
+            }
+            lastDepth = depth;
+            if (aborted() || cap.TimedOut() ||
+                sinceProgress.Elapsed() > static_cast<uint64_t>(MEDIAPLAYER_EOF_DRAIN_STALL_MS)) {
+                return;
+            }
+            cCondWait::SleepMs(MEDIAPLAYER_BACKPRESSURE_SLEEP_MS);
+        }
+    };
+
+    // Phase 1: feed every queued packet into the codec first. A codec flush with packets still
+    // queued re-arms mid-stream, leaving the rest undecodable until the next I-frame (lost tail).
+    drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->MediaPlayerDecodeQueueDepth(); });
+    if (aborted()) {
+        return;
+    }
+    // Phase 2: flush the reorder tail into the reserve, then drain it to the screen at real-time pace.
+    vaapiDev->RequestMediaPlayerEosDrain();
+    drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->MediaPlayerBufferedDepth(); });
+}
+
 auto cVaapiPlayer::AdvancePlaylist() -> void {
     const size_t next = currentIndex.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (next >= playlist.size()) {
@@ -1248,6 +1298,17 @@ auto cVaapiPlayer::Action() -> void {
         }
 
         if (advanceAfterUnlock) {
+            // Natural EOF: present the buffered tail before teardown so playback runs to the real end.
+            DrainTailAtEof();
+            if (stopping.load(std::memory_order_acquire)) {
+                break;
+            }
+            // The drain bailed on a user command: let the loop top service it instead of advancing
+            // (pause holds; a seek resets eofReached; the tail re-drains once EOF is hit again).
+            if (paused.load(std::memory_order_acquire) || seekPending.load(std::memory_order_acquire) ||
+                nextRequested.load(std::memory_order_acquire)) {
+                continue;
+            }
             AdvancePlaylist();
             if (state.load(std::memory_order_acquire) == State::Eof) {
                 break;

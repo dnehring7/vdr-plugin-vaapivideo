@@ -2057,6 +2057,33 @@ auto cVaapiDevice::ClearForMediaPlayer() -> void {
     }
 }
 
+auto cVaapiDevice::RequestMediaPlayerEosDrain() -> void {
+    if (decoder) [[likely]] {
+        decoder->RequestCodecDrain();
+    }
+}
+
+[[nodiscard]] auto cVaapiDevice::MediaPlayerDecodeQueueDepth() const noexcept -> size_t {
+    return decoder ? decoder->GetQueueSize() : 0;
+}
+
+[[nodiscard]] auto cVaapiDevice::MediaPlayerBufferedDepth() const noexcept -> size_t {
+    if (!decoder) {
+        return 0;
+    }
+    // decode queue + decoded reserve + audio pending work. The pending-drain flag bridges the gap
+    // between RequestMediaPlayerEosDrain() and the reorder tail landing in the reserve, so the
+    // drain wait can't read a premature zero.
+    size_t depth = decoder->GetQueueSize() + decoder->GetDecodedReserveSize();
+    if (decoder->IsCodecDrainPending()) {
+        ++depth;
+    }
+    if (audioProcessor) {
+        depth += audioProcessor->GetPendingWorkSize();
+    }
+    return depth;
+}
+
 auto cVaapiDevice::FlushForSeek() -> void {
     // Light flush for the mediaplayer's seek path: same flush semantics as
     // ClearForMediaPlayer() (queues drained, codec buffers reset, ALSA drained, audio

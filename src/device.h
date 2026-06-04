@@ -186,6 +186,15 @@ class cVaapiDevice : public cDevice {
                  ///< (HardwareReady()) or the queue is full.
     auto ClearForMediaPlayer()
         -> void; ///< Heavy flush: drops queues AND tears down the filter chain. Used at open/close of an entry.
+    auto RequestMediaPlayerEosDrain()
+        -> void; ///< Flush the codec reorder buffer + temporal-filter hold into the present reserve. Call only once
+                 ///< the decode queue is drained (MediaPlayerDecodeQueueDepth()): a mid-queue flush re-arms the
+                 ///< codec, leaving the remaining non-keyframe packets undecodable until the next I-frame.
+    [[nodiscard]] auto MediaPlayerDecodeQueueDepth() const noexcept
+        -> size_t; ///< Packets still waiting in the decode queue (0 when closed). Mediaplayer EOS-drain phase 1.
+    [[nodiscard]] auto MediaPlayerBufferedDepth() const noexcept
+        -> size_t; ///< Total un-presented work: decode queue + decoded reserve + audio pending work + pending codec
+                   ///< drain. Mediaplayer EOS-drain phase 2 waits for this to reach 0 before teardown.
     auto FlushForSeek()
         -> void; ///< Light flush: drops queues but keeps filter chain and swresample alive. Used at seek.
     [[nodiscard]] auto IsMediaPlayerBackpressured() const noexcept

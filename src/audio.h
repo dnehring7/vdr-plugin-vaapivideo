@@ -87,6 +87,9 @@ class cAudioProcessor : public cThread {
         -> bool;                                    ///< True when the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const -> bool; ///< True when the packet queue has reached AUDIO_QUEUE_CAPACITY
     [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Current number of packets in the decode queue
+    [[nodiscard]] auto GetPendingWorkSize() const
+        -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The mediaplayer EOS drain needs this, not
+                   ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper around SetStreamParams() for simple codec+rate+channels changes
     [[nodiscard]] auto OpenCodecWithInfo(const AudioStreamInfo &info)
@@ -200,8 +203,10 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PACKET QUEUE ===
     // ========================================================================
-    cCondVar packetCondition;           ///< Wakes Action() on enqueue
-    std::queue<AVPacket *> packetQueue; ///< Compressed packets awaiting decode
+    cCondVar packetCondition;                ///< Wakes Action() on enqueue
+    std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
+                                             ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
+    std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
 
     // ========================================================================
     // === PCM CLOCK ===
@@ -211,6 +216,10 @@ class cAudioProcessor : public cThread {
     std::atomic<uint64_t> lastClockUpdateMs{0};        ///< cTimeMs::Now() at last publish; 0 = never written
     std::atomic<int64_t> pcmNextPts{AV_NOPTS_VALUE};   ///< DVB-anchored 90 kHz PTS for next ALSA write
     std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE};  ///< Estimated PTS at DAC output
+    std::atomic<bool> outputDropped{false};            ///< snd_pcm_drop emptied ALSA but pcmNextPts/playbackPts were
+                                                       ///< kept (Mute/Freeze/trick). Stops GetPendingWorkSize() from
+                                                       ///< reading that preserved clock as a phantom ALSA tail.
+                                                       ///< Cleared by ResetPlaybackClock() / next WritePcmToAlsa().
     mutable std::atomic<bool> clockStaleLogged{false}; ///< Edge-trigger flag for the GetClock() stale-age diagnostic;
                                                        ///< set when GetClock() first returns NOPTS due to age, cleared
                                                        ///< on the next valid read. Prevents log spam at 50 Hz polling.

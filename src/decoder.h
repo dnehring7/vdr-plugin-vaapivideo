@@ -126,6 +126,10 @@ class cVaapiDecoder : public cThread {
                  ///< video-ahead drain-stall loop that never recovers.
     auto SetLiveMode(bool live) -> void; ///< true = live TV (jitter buffer active); false = replay.
     auto RequestCodecDrain() -> void;    ///< Ask decode thread to drain B-frame reorder buffer (e.g. before still).
+    [[nodiscard]] auto IsCodecDrainPending() const noexcept -> bool {
+        return codecDrainPending.load(std::memory_order_acquire);
+    } ///< True until the decode thread consumes the drain. Keeps the mediaplayer EOS wait alive until
+      ///< the reorder-buffer tail has been pushed to the reserve.
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
     auto RequestFilterRebuild()

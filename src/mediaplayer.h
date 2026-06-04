@@ -106,6 +106,15 @@ inline constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = 100;
 inline constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 inline constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
 
+/// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof). At EOF the decode queue (~4 s @ 50 fps)
+/// and present reserve (~3 s) still hold unseen frames; immediate teardown cuts playback seconds
+/// short -- worst on video-only clips, where no audio clock throttles the demuxer so both buffers
+/// fill to their caps. The drain flushes that tail at real-time pace first.
+///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown; covers the ~7 s worst case.
+///   - STALL_MS: bail when depth stops shrinking (wedged pipeline). Must exceed one frame interval.
+inline constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
+inline constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
+
 // ============================================================================
 // === PLAYLIST HELPERS ===
 // ============================================================================
@@ -289,6 +298,11 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// (startup, post-seek, no device) -- callers must skip the comparison in that case.
     [[nodiscard]] auto Lookahead90k(const cVaapiDevice *vaapiDev) const noexcept -> int64_t;
     auto PerformSeek(int64_t deltaMs) -> void;
+    /// Block until the decode + present pipeline has flushed the buffered end-of-stream tail to the
+    /// screen, so a natural EOF does not cut playback short. Returns early if the user issues
+    /// stop / pause / seek / next during the wait, or if the pipeline stalls. Demux thread only;
+    /// called before AdvancePlaylist() tears the entry down. See MEDIAPLAYER_EOF_DRAIN_* .
+    auto DrainTailAtEof() -> void;
     auto AdvancePlaylist() -> void;
     auto LogStatus() -> void; ///< Periodic mediaplayer dsyslog (state + position + lookahead).
 

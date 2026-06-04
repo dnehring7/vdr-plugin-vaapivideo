@@ -303,6 +303,31 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     return packetQueue.size();
 }
 
+[[nodiscard]] auto cAudioProcessor::GetPendingWorkSize() const -> size_t {
+    size_t depth = 0;
+    {
+        const cMutexLock lock(mutex.get());
+        depth = packetQueue.size();
+    }
+    // Queue reads 0 while Action() still holds a popped packet mid-handoff to ALSA.
+    if (packetInFlight.load(std::memory_order_acquire)) {
+        ++depth;
+    }
+    // After DropOutput() (Mute/Freeze/trick) ALSA is empty but pcmNextPts/clock are preserved, so the
+    // clock < pcmNextPts tail estimate would report a phantom tail that never drains.
+    if (!outputDropped.load(std::memory_order_acquire)) {
+        // clock (DAC position) < end-of-queued-ALSA PTS => samples still unplayed.
+        const int64_t endPts = pcmNextPts.load(std::memory_order_acquire);
+        if (endPts != AV_NOPTS_VALUE) {
+            const int64_t clock = GetClock();
+            if (clock != AV_NOPTS_VALUE && clock < endPts) {
+                ++depth;
+            }
+        }
+    }
+    return depth;
+}
+
 [[nodiscard]] auto cAudioProcessor::IsQueueFull() const -> bool {
     const cMutexLock lock(mutex.get());
     return packetQueue.size() >= AUDIO_QUEUE_CAPACITY;
@@ -545,6 +570,9 @@ auto cAudioProcessor::DropOutput(bool pauseClock) -> void {
         (void)snd_pcm_prepare(alsaHandle);
     }
     alsaErrorCount.store(0, std::memory_order_relaxed);
+    // pcmNextPts/playbackPts survive the drop, so flag it: else GetPendingWorkSize() reads the
+    // preserved clock as a still-draining tail. Cleared by the next WritePcmToAlsa/ResetPlaybackClock.
+    outputDropped.store(true, std::memory_order_release);
     clearGeneration.fetch_add(1, std::memory_order_release);
     DrainPacketQueue();
     if (pauseClock) {
@@ -565,6 +593,7 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
     playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     lastClockUpdateMs.store(0, std::memory_order_relaxed);
     clockSequence.fetch_add(1, std::memory_order_release);
+    outputDropped.store(false, std::memory_order_release);
     pcmNextPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     // Reset content boundary: clear any pause pin so the new timeline doesn't inherit it.
     clockPaused.store(false, std::memory_order_release);
@@ -594,6 +623,9 @@ auto cAudioProcessor::Action() -> void {
 
             packet.reset(packetQueue.front());
             packetQueue.pop();
+            // Latch under the mutex so GetPendingWorkSize() never sees empty-queue + no-in-flight
+            // while this iteration is still draining the packet to ALSA.
+            packetInFlight.store(true, std::memory_order_release);
             passthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
             // Snapshot clearGeneration under the mutex so it pairs atomically with the pop.
             // DecodeToPcm()/passthrough re-check it later to drop packets whose bytes
@@ -605,6 +637,7 @@ auto cAudioProcessor::Action() -> void {
         // An old-era PTS would silently anchor the new-era timeline, causing
         // WritePcmToAlsa() to publish a bogus playbackPts on the next valid packet.
         if (clearGeneration.load(std::memory_order_acquire) != generationAtDequeue) {
+            packetInFlight.store(false, std::memory_order_release);
             continue;
         }
 
@@ -648,6 +681,7 @@ auto cAudioProcessor::Action() -> void {
             // can be freed mid-write. WritePcmToAlsa nests recursively.
             const cMutexLock lock(mutex.get());
             if (clearGeneration.load(std::memory_order_acquire) != generationAtDequeue) {
+                packetInFlight.store(false, std::memory_order_release);
                 continue;
             }
             const auto burst = WrapIec61937(packet->data, packet->size);
@@ -660,6 +694,7 @@ auto cAudioProcessor::Action() -> void {
         } else {
             (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), pts, generationAtDequeue);
         }
+        packetInFlight.store(false, std::memory_order_release);
     }
 
     hasExited.store(true, std::memory_order_release);
@@ -1572,6 +1607,8 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     if (!WriteToAlsa(data)) {
         return false;
     }
+    // Bytes queued again (even on the NOPTS/zero-frame early-out below): the ALSA tail is real now.
+    outputDropped.store(false, std::memory_order_release);
 
     const unsigned rate = alsaSampleRate.load(std::memory_order_relaxed);
     if (startPts90k == AV_NOPTS_VALUE || frames == 0U || rate == 0U) {
