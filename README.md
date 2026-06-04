@@ -336,7 +336,7 @@ that start VDR before a user session claims the console.
 | `Audio Passthrough`              | auto / on / off  | IEC61937 passthrough policy (see below)                                                              |
 | `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
-| `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–4): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
+| `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–5): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -376,7 +376,7 @@ leaving the setup menu to activate the new mode.
 
 ### Manual zoom
 
-Four **zoom levels** let you magnify the picture to fill the screen — useful for
+Five **zoom levels** let you magnify the picture to fill the screen — useful for
 cropping away the black bars that broadcasters bake into the frame (2.39:1 scope,
 2.00:1, and similar). Each level is a **zoom-in factor**: the picture is enlarged
 uniformly (aspect preserved) and the overflow is cropped equally off all sides.
@@ -386,15 +386,15 @@ rectangle (NV12/P010 chroma alignment), so the realised factor matches the
 configured one to within a pixel; a residual ≤1% gap to a full-screen fit is
 absorbed by a single uniform stretch (imperceptible — genuine letterbox is far
 larger and stays untouched). Out of the box, level 1 is **+34.4%** (fills 2.39:1
-CinemaScope) and level 2 **+12.5%** (fills 2.00:1) on a 16:9 screen; levels 3–4
+CinemaScope) and level 2 **+12.5%** (fills 2.00:1) on a 16:9 screen; levels 3–5
 are off. The maximum is **+49.9%** (1.5×).
 
-Cycling steps **Off → 1 → 2 → 3 → 4 → Off**, but **levels set to 0 are skipped**, so
-if you only want one zoom level, set the other three to `0` and the key toggles
+Cycling steps **Off → 1 → 2 → 3 → 4 → 5 → Off**, but **levels set to 0 are skipped**, so
+if you only want one zoom level, set the other four to `0` and the key toggles
 Off ↔ that level. The active stop is **transient and personal**: it is never written
 to `setup.conf` and resets to **Off** automatically on every content change (plugin
 start, SVDRP `ATTA`, channel switch / replay start, and each mediaplayer file). Only
-the four level *definitions* persist.
+the five level *definitions* persist.
 
 Cycling the zoom:
 
@@ -411,7 +411,7 @@ Cycling the zoom:
       Yellow    @vaapivideo Down Ok     # open menu, go to Mediaplayer, open browser
 
   Or just `Blue @vaapivideo` to open the menu and navigate by hand. The
-  `PLUG vaapivideo ZOOM [next|0-4]` SVDRP command remains available for scripting.
+  `PLUG vaapivideo ZOOM [next|0-5]` SVDRP command remains available for scripting.
 
 ### SVDRP commands
 
@@ -422,7 +422,7 @@ Cycling the zoom:
 | `PLUG vaapivideo DETA`         | Detach from DRM/VAAPI hardware (release for other apps)    |
 | `PLUG vaapivideo ATTA`         | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 | `PLUG vaapivideo PLAY <uri>`   | Start mediaplayer on a file, URL, or `.m3u/.m3u8` playlist |
-| `PLUG vaapivideo ZOOM [next\|0-4]` | Cycle manual zoom (`next`) or select a stop (0 = off, 1–4 = preset) |
+| `PLUG vaapivideo ZOOM [next\|0-5]` | Cycle manual zoom (`next`) or select a stop (0 = off, 1–5 = preset) |
 
 DETA hands the display to another application (an external player, a
 diagnostic tool, etc.) and ATTA reclaims it without restarting VDR. When the
@@ -640,7 +640,7 @@ passthrough work identically to the live-TV path.
 | `Pause` / `Down`           | Toggle pause                 |
 | `Left` / `Right`           | Seek −/+ 10 s                |
 | `Green` / `Yellow`         | Seek −/+ 60 s                |
-| `Blue`                     | Cycle manual zoom (Off → 1–4)|
+| `Blue`                     | Cycle manual zoom (Off → 1–5)|
 | `Next`                     | Skip to next playlist entry  |
 | `Back` / `Stop`            | Return to the file browser   |
 
