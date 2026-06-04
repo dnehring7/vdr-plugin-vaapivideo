@@ -308,15 +308,18 @@ auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
     size_t bestPos = 0;
     int bestHits = 0;
 
-    const auto consider = [&](AVCodecID id, bool ok, const CodecEvidence &ev) noexcept -> void {
+    // Local glue: fold one candidate into the running best (more distinct NAL types wins; on a tie the
+    // later buffer position wins). Captures the accumulators so the calls read as `consider(id, ok, ev)`.
+    const auto consider = [&best, &bestPos, &bestHits](AVCodecID id, bool ok,
+                                                       const CodecEvidence &ev) noexcept -> void {
         if (!ok) {
             return;
         }
-        const int h = std::popcount(ev.seenMask);
-        if (best == AV_CODEC_ID_NONE || h > bestHits || (h == bestHits && ev.lastPos > bestPos)) {
+        const int hits = std::popcount(ev.seenMask);
+        if (best == AV_CODEC_ID_NONE || hits > bestHits || (hits == bestHits && ev.lastPos > bestPos)) {
             best = id;
             bestPos = ev.lastPos;
-            bestHits = h;
+            bestHits = hits;
         }
     };
 

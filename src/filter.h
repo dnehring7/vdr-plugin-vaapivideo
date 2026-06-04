@@ -18,6 +18,8 @@
 #include "common.h"
 #include "stream.h"
 
+#include <string>
+
 // ============================================================================
 // === FRAME CLASSIFICATION HELPERS ===
 // ============================================================================
@@ -134,6 +136,11 @@ class cVideoFilterChain {
     [[nodiscard]] auto HasFpsFilter() const noexcept -> bool { return hasFpsFilter_; }
 
   private:
+    /// Drop a partially-built graph and return false. Used on every Build() failure path; does NOT
+    /// touch previousFilterGraph_ (that slot owns the last good graph whose hw_frames_ctx keeps
+    /// in-flight VPP surfaces PRIME-exportable -- routing through Reset() would clobber it).
+    [[nodiscard]] auto FailBuild() noexcept -> bool;
+
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> filterGraph_;
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
         previousFilterGraph_;          ///< keep-alive: released after display maps its surfaces
@@ -141,6 +148,9 @@ class cVideoFilterChain {
     AVFilterContext *bufferSinkCtx_{}; ///< owned by filterGraph_; same lifetime constraint
     int outputFrameDurationMs_{20};    ///< 20 = 50 fps fallback; updated by Build()
     bool hasFpsFilter_{false};         ///< true iff the active chain ends with `fps=N`; updated by Build() / Reset()
+    std::string lastLoggedChain_;      ///< Last chain string logged by Build(); identical rebuilds (every trick-mode
+                                  ///< GOP flush) are logged once, not per rebuild -- see Build()'s diagnostic block.
+    std::string lastLoggedSourceArgs_; ///< Last buffer-source args logged; suppresses the identical source re-log too.
 };
 
 #endif // VDR_VAAPIVIDEO_FILTER_H

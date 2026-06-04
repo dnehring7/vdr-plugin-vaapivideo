@@ -136,20 +136,17 @@ namespace {
 
 } // namespace
 
+auto cVideoFilterChain::FailBuild() noexcept -> bool {
+    bufferSrcCtx_ = nullptr;
+    bufferSinkCtx_ = nullptr;
+    filterGraph_.reset();
+    return false;
+}
+
 auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) -> bool {
     if (filterGraph_) {
         return true;
     }
-
-    // Drop a partially-built graph without touching previousFilterGraph_: that slot
-    // owns the last good graph whose hw_frames_ctx keeps in-flight VPP surfaces
-    // PRIME-exportable. Routing through Reset() would clobber it and break export.
-    const auto failBuild = [&]() noexcept -> bool {
-        bufferSrcCtx_ = nullptr;
-        bufferSinkCtx_ = nullptr;
-        filterGraph_.reset();
-        return false;
-    };
 
     if (!firstFrame) [[unlikely]] {
         esyslog("vaapivideo/filter: no first frame for filter setup");
@@ -321,7 +318,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // perceived quality. For modern codecs (H.264/HEVC/AV1) without HW denoise we skip denoise
     // entirely -- not worth the CPU cost on an already-saturated decoder thread.
     std::vector<std::string> filters;
-    const auto addCropFilter = [&filters, croppedW, croppedH, cropOffX, cropOffY]() -> void {
+    // Local glue: append the manual-zoom crop node (even-aligned dims/offsets computed above). Capturing
+    // the crop geometry lets the two call sites below read as a plain `appendCropFilter()`.
+    const auto appendCropFilter = [&filters, croppedW, croppedH, cropOffX, cropOffY]() -> void {
         filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
     };
 
@@ -354,7 +353,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         // SW decode: crop the system-memory frame before uploading so only the kept region is
         // uploaded and zoom adds no GPU readback.
         if (wantCrop) {
-            addCropFilter();
+            appendCropFilter();
         }
         filters.emplace_back("hwupload");
     } else {
@@ -382,7 +381,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // explicit w/h; a bare scale_vaapi (no options, output == surface size) would drop the crop, so we
     // never emit one while cropping. SW decode already cropped in system memory before hwupload.
     if (wantCrop && !isSoftwareDecode) {
-        addCropFilter();
+        appendCropFilter();
     }
 
     // Hardware crop does not change the input link dimensions, so force an explicit-size scale even
@@ -428,7 +427,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         std::format("video_size={}x{}:pix_fmt={}:time_base=1/{}:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
                     srcHeight, static_cast<int>(srcPixFmt), PTSTICKS, sarNum, sarDen, fpsNum, fpsDen);
 
-    if (!compactLog) {
+    // Only when the source args actually change. A trick-mode rebuild flushes and re-creates an
+    // identical graph on every GOP seek -- logging each one floods the journal with no new signal.
+    if (!compactLog && bufferSrcArgs != lastLoggedSourceArgs_) {
         dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
     }
 
@@ -437,25 +438,25 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     bufferSrcCtx_ = avfilter_graph_alloc_filter(filterGraph_.get(), avfilter_get_by_name("buffer"), "in");
     if (!bufferSrcCtx_) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to allocate buffer source filter");
-        return failBuild();
+        return FailBuild();
     }
 
     if (!isSoftwareDecode) {
         if (!params.hwFramesCtx) [[unlikely]] {
             esyslog("vaapivideo/filter: hw decode requires hw_frames_ctx");
-            return failBuild();
+            return FailBuild();
         }
         AVBufferSrcParameters *hwFramesParams = av_buffersrc_parameters_alloc();
         if (!hwFramesParams) [[unlikely]] {
             esyslog("vaapivideo/filter: failed to allocate buffer source parameters");
-            return failBuild();
+            return FailBuild();
         }
 
         hwFramesParams->hw_frames_ctx = av_buffer_ref(params.hwFramesCtx);
         if (!hwFramesParams->hw_frames_ctx) [[unlikely]] {
             esyslog("vaapivideo/filter: av_buffer_ref(hw_frames_ctx) failed");
             av_free(hwFramesParams);
-            return failBuild();
+            return FailBuild();
         }
         const int setRet = av_buffersrc_parameters_set(bufferSrcCtx_, hwFramesParams);
         // av_buffersrc_parameters_set makes its own internal ref; caller must unref unconditionally
@@ -464,21 +465,21 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         av_free(hwFramesParams);
         if (setRet < 0) [[unlikely]] {
             esyslog("vaapivideo/filter: av_buffersrc_parameters_set failed: %s", FmtErr(setRet).data());
-            return failBuild();
+            return FailBuild();
         }
     }
 
     int ret = avfilter_init_str(bufferSrcCtx_, bufferSrcArgs.c_str());
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to init buffer source '%s': %s", bufferSrcArgs.c_str(), FmtErr(ret).data());
-        return failBuild();
+        return FailBuild();
     }
 
     ret = avfilter_graph_create_filter(&bufferSinkCtx_, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr,
                                        filterGraph_.get());
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to create buffer sink: %s", FmtErr(ret).data());
-        return failBuild();
+        return FailBuild();
     }
 
     // Segment API (not parse_ptr) because FFmpeg 8.x hwupload_init() rejects a filter with
@@ -490,7 +491,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     ret = avfilter_graph_segment_parse(filterGraph_.get(), filterChain.c_str(), 0, &segment);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to parse filter chain '%s': %s", filterChain.c_str(), FmtErr(ret).data());
-        return failBuild();
+        return FailBuild();
     }
 
     ret = avfilter_graph_segment_create_filters(segment, 0);
@@ -498,7 +499,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         esyslog("vaapivideo/filter: failed to create segment filters '%s': %s", filterChain.c_str(),
                 FmtErr(ret).data());
         avfilter_graph_segment_free(&segment);
-        return failBuild();
+        return FailBuild();
     }
 
     // Attach hw_device_ctx to every newly created filter (skip the externally allocated
@@ -516,7 +517,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         if (!filterCtx->hw_device_ctx) [[unlikely]] {
             esyslog("vaapivideo/filter: av_buffer_ref(hwDeviceRef) failed for '%s'", filterCtx->name);
             avfilter_graph_segment_free(&segment);
-            return failBuild();
+            return FailBuild();
         }
     }
 
@@ -528,7 +529,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         avfilter_inout_free(&segmentInputs);
         avfilter_inout_free(&segmentOutputs);
         avfilter_graph_segment_free(&segment);
-        return failBuild();
+        return FailBuild();
     }
 
     // segmentInputs  = unlinked input pads of the chain head  -> wire buffersrc into them.
@@ -538,7 +539,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         avfilter_inout_free(&segmentInputs);
         avfilter_inout_free(&segmentOutputs);
         avfilter_graph_segment_free(&segment);
-        return failBuild();
+        return FailBuild();
     }
 
     // avfilter_link takes pad indices as unsigned; AVFilterInOut stores them as int. Cast
@@ -555,14 +556,14 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to link buffersrc/buffersink to chain '%s': %s", filterChain.c_str(),
                 FmtErr(ret).data());
-        return failBuild();
+        return FailBuild();
     }
 
     ret = avfilter_graph_config(filterGraph_.get(), nullptr);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to configure filter graph '%s': %s", filterChain.c_str(),
                 FmtErr(ret).data());
-        return failBuild();
+        return FailBuild();
     }
 
     outputFrameDurationMs_ = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20; // 20 ms = 50 fps fallback
@@ -575,7 +576,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         } else {
             dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
         }
-    } else {
+    } else if (filterChain != lastLoggedChain_) {
+        // Verbose diagnostic only when the chain actually changes. Trick play rebuilds an identical
+        // graph on every GOP seek; logging each is pure noise (same chain). A real change -- channel
+        // switch, trick<->normal, resolution / HDR change -- alters the chain string and still logs.
         const char *cadenceTag = "";
         if (ratesDiffer) {
             if (outputRateNum < displayRateInSourceDen) {
@@ -587,10 +591,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
                 filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "", cadenceTag, pixFmt,
                 params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
-        // Full chain only on the verbose (Clear / channel-switch) path; the compact zoom rebuild
-        // above already prints the crop, which is the useful debug signal for a ScaleVideo rebuild.
         dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
     }
+
+    // Remember what was built so the next identical rebuild (trick GOP flush) stays silent.
+    lastLoggedSourceArgs_ = bufferSrcArgs;
+    lastLoggedChain_ = filterChain;
     return true;
 }
 

@@ -642,20 +642,36 @@ cVaapiDevice::~cVaapiDevice() noexcept {
     return Ready() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
 }
 
+constexpr uint64_t DEVICE_CLEAR_LOG_COOLDOWN_MS =
+    1000; ///< Min spacing between Clear() diagnostic logs; collapses a scrub/seek Clear() burst to ~1 line/s.
+
 auto cVaapiDevice::Clear() -> void {
     // Diagnostic: log thread + inter-call delta to diagnose unexpected Clear() bursts.
     // Expected callers: cDvbPlayer::Empty() (pause/play/trick/goto) and
     // cTransfer::Receive() (live-TV retry exhaustion). Rapid-fire calls outside those
     // paths should be traceable via the logged thread name.
+    //
+    // Rate-limited: a progress-bar scrub / seek auto-repeat fires one Clear() per jump (~80 in a
+    // burst). Log isolated Clear()s in full immediately (the gate is open after a quiet gap); during a
+    // burst, emit one line per DEVICE_CLEAR_LOG_COOLDOWN_MS carrying the coalesced count so the burst
+    // stays diagnosable (thread + magnitude) without 80 near-identical lines.
     const auto nowMs = cTimeMs::Now();
     const uint64_t prevMs = lastClearMs.exchange(nowMs, std::memory_order_relaxed);
-    std::array<char, 16> threadName{};
-    (void)pthread_getname_np(pthread_self(), threadName.data(), threadName.size());
-    if (prevMs == 0) {
-        dsyslog("vaapivideo/device: Clear() thread='%s' (first call)", threadName.data());
-    } else {
-        dsyslog("vaapivideo/device: Clear() thread='%s' delta=%llums", threadName.data(),
-                static_cast<unsigned long long>(nowMs - prevMs));
+    clearsSinceLog.fetch_add(1, std::memory_order_relaxed);
+    if (prevMs == 0 || nowMs - lastClearLogMs.load(std::memory_order_relaxed) >= DEVICE_CLEAR_LOG_COOLDOWN_MS) {
+        std::array<char, 16> threadName{};
+        (void)pthread_getname_np(pthread_self(), threadName.data(), threadName.size());
+        const unsigned coalesced = clearsSinceLog.exchange(0, std::memory_order_relaxed);
+        if (prevMs == 0) {
+            dsyslog("vaapivideo/device: Clear() thread='%s' (first call)", threadName.data());
+        } else if (coalesced > 1) {
+            dsyslog("vaapivideo/device: Clear() thread='%s' delta=%llums (+%u more coalesced)", threadName.data(),
+                    static_cast<unsigned long long>(nowMs - prevMs), coalesced - 1);
+        } else {
+            dsyslog("vaapivideo/device: Clear() thread='%s' delta=%llums", threadName.data(),
+                    static_cast<unsigned long long>(nowMs - prevMs));
+        }
+        lastClearLogMs.store(nowMs, std::memory_order_relaxed);
     }
 
     cDevice::Clear();
@@ -1256,10 +1272,17 @@ auto cVaapiDevice::Play() -> void {
             audioCodecCandidate.store(detectedCodec, std::memory_order_relaxed);
             audioCodecCandidateCount.store(1, std::memory_order_relaxed);
         }
+        // A scrub seek resets audioCodecId on every Clear() (the audi-N track-switch path above), so the
+        // same codec re-confirms constantly. Gate the awaiting/confirmed logs on an ACTUAL change from the
+        // last confirmed codec: previousAudioCodec survives Clear(), and SetPlayMode(pmNone) clears it so a
+        // fresh session still logs once. The 2-of-2 detection itself always runs -- only the logging is gated.
+        const bool codecChanged = detectedCodec != previousAudioCodec.load(std::memory_order_relaxed);
         const int candidateCount = audioCodecCandidateCount.load(std::memory_order_relaxed);
         if (candidateCount < 2) {
-            dsyslog("vaapivideo/device: audio codec %s -- awaiting confirmation (%d/2)",
-                    avcodec_get_name(detectedCodec), candidateCount);
+            if (codecChanged) {
+                dsyslog("vaapivideo/device: audio codec %s -- awaiting confirmation (%d/2)",
+                        avcodec_get_name(detectedCodec), candidateCount);
+            }
             return Length;
         }
 
@@ -1272,8 +1295,11 @@ auto cVaapiDevice::Play() -> void {
         }
 
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
-        isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s)", avcodec_get_name(detectedCodec),
-                isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
+        previousAudioCodec.store(detectedCodec, std::memory_order_relaxed);
+        if (codecChanged) {
+            isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s)", avcodec_get_name(detectedCodec),
+                    isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
+        }
 
         // Mirrors HandleAudioTrackChange: re-arms freerun so a cold-VPP stall can't anchor
         // sync to a clock that ran ~5 s ahead while the GPU loaded firmware on first use.
@@ -1423,6 +1449,15 @@ auto cVaapiDevice::Play() -> void {
     return Length;
 }
 
+[[nodiscard]] auto cVaapiDevice::HasFeedSpace(int currentSpeed) const -> bool {
+    // Trick: also gate on the per-frame pacing timer to avoid burst-feeding past display rate.
+    if (currentSpeed != 0) {
+        return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
+    }
+    return !decoder->IsQueueFull() &&
+           (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_REPLAY_QUEUE_HIGHWATER);
+}
+
 [[nodiscard]] auto cVaapiDevice::Poll(cPoller & /*Poller*/, int TimeoutMs) -> bool {
     if (!decoder) [[unlikely]] {
         return true;
@@ -1435,16 +1470,7 @@ auto cVaapiDevice::Play() -> void {
 
     const int currentSpeed = trickSpeed.load(std::memory_order_relaxed);
 
-    auto hasSpace = [&]() -> bool {
-        // Trick: also gate on per-frame pacing timer to avoid burst-feeding past display rate.
-        if (currentSpeed != 0) {
-            return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
-        }
-        return !decoder->IsQueueFull() &&
-               (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_REPLAY_QUEUE_HIGHWATER);
-    };
-
-    if (hasSpace()) {
+    if (HasFeedSpace(currentSpeed)) {
         return true;
     }
 
@@ -1452,10 +1478,10 @@ auto cVaapiDevice::Play() -> void {
     // which adds a full MainLoopInterval (~100 ms) per cycle and visibly slows startup/seek.
     if (TimeoutMs > 0) {
         const cTimeMs timeout(TimeoutMs);
-        while (!hasSpace() && !timeout.TimedOut()) {
+        while (!HasFeedSpace(currentSpeed) && !timeout.TimedOut()) {
             cCondWait::SleepMs(5);
         }
-        return hasSpace();
+        return HasFeedSpace(currentSpeed);
     }
 
     return false;
@@ -1630,6 +1656,9 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             ResetNoVideoMonitors();
             previousVideoCodec.store(videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed),
                                      std::memory_order_relaxed);
+            // Drop the audio log-dedup baseline so the next session logs its codec once (scrub Clear()s
+            // keep it, suppressing the per-seek re-confirm spam; a real session boundary re-arms the log).
+            previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
             if (decoder) [[likely]] {
@@ -2049,7 +2078,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
     const bool audioCanReanchor = audioOpen && audioDepth < MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER;
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
-                            decoder->GetJitterBufSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
+                            decoder->GetDecodedReserveSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;
 }
 
@@ -2107,7 +2136,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Drive the encrypted-channel watchdog off the decode loop's idle tick: a fully scrambled channel
     // delivers no PES to PlayAudio/PlayVideo, but the decode thread still wakes ~every 10 ms with an
     // empty queue. Set before Initialize() starts that thread. CheckEncryptionTimeout no-ops unless armed.
-    decoder->SetLoopTickCallback([this] { CheckEncryptionTimeout(); });
+    decoder->SetLoopTickCallback([this]() -> void { CheckEncryptionTimeout(); });
     if (!decoder->Initialize()) [[unlikely]] {
         esyslog("vaapivideo/device: decoder initialization failed");
         decoder.reset();
@@ -2324,6 +2353,91 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     audioCodecCandidateCount.store(0, std::memory_order_relaxed);
 }
 
+// SelectDrmConnector() helper: validate one connector and, when it carries the wanted mode, latch the
+// chosen mode + CRTC + connector into the device. Pulled out of the two connector loops so the same
+// logic serves the fast cached pass and the slow full-probe pass. Mode priority: exact (w,h,rate) match
+// (operator wins); else, only when allowModeFallback, the driver PREFERRED mode then the first listed.
+// allowModeFallback=false (cached pass) accepts only an exact match, so a partial cached mode list can't
+// lock in preferred/first before the full EDID probe finds the operator-selected mode.
+[[nodiscard]] auto cVaapiDevice::TryAcceptConnector(drmModeConnector *connector, bool allowModeFallback,
+                                                    drmModeRes *resources) -> bool {
+    const auto targetWidth = vaapiConfig.display.GetWidth();
+    const auto targetHeight = vaapiConfig.display.GetHeight();
+    const auto targetRate = vaapiConfig.display.GetRefreshRate();
+
+    if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
+        return false;
+    }
+
+    // Build the kernel-style name (e.g. "HDMI-A-1", "DP-2"). Always computed -- used
+    // both for the user-supplied filter (when set) and to populate connectorName below
+    // for SVDRP DeviceName() / sticky re-selection across DETA/ATTA cycles.
+    const char *typeName = drmModeGetConnectorTypeName(connector->connector_type);
+    const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
+    if (!connectorName.empty() && name != connectorName) {
+        dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
+        return false;
+    }
+
+    bool modeFound = false;
+    for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
+        const auto &mode = connector->modes[modeIdx];
+        if (mode.hdisplay == targetWidth && mode.vdisplay == targetHeight && mode.vrefresh == targetRate) {
+            activeMode = mode;
+            modeFound = true;
+            break;
+        }
+    }
+    if (!modeFound) {
+        if (!allowModeFallback) {
+            return false;
+        }
+        for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
+            if (connector->modes[modeIdx].type & DRM_MODE_TYPE_PREFERRED) {
+                activeMode = connector->modes[modeIdx];
+                modeFound = true;
+                break;
+            }
+        }
+        if (!modeFound) {
+            activeMode = connector->modes[0];
+        }
+    }
+
+    uint32_t localCrtc = 0;
+    std::unique_ptr<drmModeObjectProperties, FreeDrmObjectProperties> props{
+        drmModeObjectGetProperties(drmFd, connector->connector_id, DRM_MODE_OBJECT_CONNECTOR)};
+    if (props) {
+        for (uint32_t propIdx = 0; propIdx < props->count_props; ++propIdx) {
+            std::unique_ptr<drmModePropertyRes, FreeDrmProperty> prop{drmModeGetProperty(drmFd, props->props[propIdx])};
+            // Use CRTC_ID atomic property, not legacy encoder_id walk: the legacy path
+            // can return a stale CRTC on atomic drivers.
+            if (prop && std::strcmp(prop->name, "CRTC_ID") == 0) {
+                localCrtc = static_cast<uint32_t>(props->prop_values[propIdx]);
+                break;
+            }
+        }
+    }
+    if (localCrtc == 0 && resources->count_crtcs > 0) {
+        localCrtc = resources->crtcs[0];
+    }
+    if (localCrtc == 0) {
+        return false;
+    }
+
+    crtcId = localCrtc;
+    connectorId = connector->connector_id;
+    // Latch the chosen connector once. Sticky on subsequent re-attaches (operator
+    // expectation: a DETA/ATTA cycle keeps the same output). Also surfaces in
+    // SVDRP PRIM/LSTD via DeviceName().
+    if (connectorName.empty()) {
+        connectorName = name;
+    }
+    isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
+            activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
+    return true;
+}
+
 [[nodiscard]] auto cVaapiDevice::SelectDrmConnector() -> bool {
 
     if (drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) [[unlikely]] {
@@ -2344,103 +2458,13 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
         return false;
     }
 
-    const auto targetWidth = vaapiConfig.display.GetWidth();
-    const auto targetHeight = vaapiConfig.display.GetHeight();
-    const auto targetRate = vaapiConfig.display.GetRefreshRate();
-
-    // Mode selection priority:
-    //   1. exact (width, height, refresh) match against the plugin config -- operator wins
-    //   2. driver's PREFERRED mode (typically the panel's native mode)
-    //   3. first listed mode (the connector won't expose any if nothing is connected)
-
-    // Acceptance check for one connector. Returns true if the connector is accepted and
-    // crtcId/connectorId/activeMode have been latched. Pulled out of the loop so the same
-    // logic serves the fast cached pass and the slow full-probe fallback below.
-    // allowModeFallback=false (cached pass): accept only an exact (w,h,rate) match, so a
-    // partial cached mode list doesn't lock in preferred/first before the full EDID probe
-    // gets a chance to find the operator-selected mode.
-    const auto tryAccept = [&](drmModeConnector *connector, bool allowModeFallback) -> bool {
-        if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
-            return false;
-        }
-
-        // Build the kernel-style name (e.g. "HDMI-A-1", "DP-2"). Always computed -- used
-        // both for the user-supplied filter (when set) and to populate connectorName below
-        // for SVDRP DeviceName() / sticky re-selection across DETA/ATTA cycles.
-        const char *typeName = drmModeGetConnectorTypeName(connector->connector_type);
-        const auto name = std::format("{}-{}", typeName ? typeName : "Unknown", connector->connector_type_id);
-        if (!connectorName.empty() && name != connectorName) {
-            dsyslog("vaapivideo/device: skipping connector %s (want %s)", name.c_str(), connectorName.c_str());
-            return false;
-        }
-
-        bool modeFound = false;
-        for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
-            const auto &mode = connector->modes[modeIdx];
-            if (mode.hdisplay == targetWidth && mode.vdisplay == targetHeight && mode.vrefresh == targetRate) {
-                activeMode = mode;
-                modeFound = true;
-                break;
-            }
-        }
-        if (!modeFound) {
-            if (!allowModeFallback) {
-                return false;
-            }
-            for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
-                if (connector->modes[modeIdx].type & DRM_MODE_TYPE_PREFERRED) {
-                    activeMode = connector->modes[modeIdx];
-                    modeFound = true;
-                    break;
-                }
-            }
-            if (!modeFound) {
-                activeMode = connector->modes[0];
-            }
-        }
-
-        uint32_t localCrtc = 0;
-        std::unique_ptr<drmModeObjectProperties, FreeDrmObjectProperties> props{
-            drmModeObjectGetProperties(drmFd, connector->connector_id, DRM_MODE_OBJECT_CONNECTOR)};
-        if (props) {
-            for (uint32_t propIdx = 0; propIdx < props->count_props; ++propIdx) {
-                std::unique_ptr<drmModePropertyRes, FreeDrmProperty> prop{
-                    drmModeGetProperty(drmFd, props->props[propIdx])};
-                // Use CRTC_ID atomic property, not legacy encoder_id walk: the legacy path
-                // can return a stale CRTC on atomic drivers.
-                if (prop && std::strcmp(prop->name, "CRTC_ID") == 0) {
-                    localCrtc = static_cast<uint32_t>(props->prop_values[propIdx]);
-                    break;
-                }
-            }
-        }
-        if (localCrtc == 0 && resources->count_crtcs > 0) {
-            localCrtc = resources->crtcs[0];
-        }
-        if (localCrtc == 0) {
-            return false;
-        }
-
-        crtcId = localCrtc;
-        connectorId = connector->connector_id;
-        // Latch the chosen connector once. Sticky on subsequent re-attaches (operator
-        // expectation: a DETA/ATTA cycle keeps the same output). Also surfaces in
-        // SVDRP PRIM/LSTD via DeviceName().
-        if (connectorName.empty()) {
-            connectorName = name;
-        }
-        isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
-                activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
-        return true;
-    };
-
     // Pass 1: cached state (no DDC). drmModeGetConnector() forces a fresh probe -- 100-500 ms
     // per disconnected port, seconds on a CEC-standby sink. On boxes with 6-8 connectors that
     // stacks up to the reported "60 s startup". Boot-probe / hot-plug cache suffices normally.
     for (int i = 0; i < resources->count_connectors; ++i) {
         const std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
             drmModeGetConnectorCurrent(drmFd, resources->connectors[i])};
-        if (tryAccept(connector.get(), false)) {
+        if (TryAcceptConnector(connector.get(), false, resources.get())) {
             return true;
         }
     }
@@ -2464,7 +2488,7 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
         }
         const std::unique_ptr<drmModeConnector, FreeDrmConnector> connector{
             drmModeGetConnector(drmFd, resources->connectors[i])};
-        if (tryAccept(connector.get(), true)) {
+        if (TryAcceptConnector(connector.get(), true, resources.get())) {
             return true;
         }
     }

@@ -225,6 +225,9 @@ class cVaapiDevice : public cDevice {
                  ///< force=true always paints (channel entry); force=false paints only when the present event changed.
     auto ResetNoVideoMonitors() noexcept
         -> void; ///< Clear all radio-splash + encrypted-notice state; call on every lifecycle boundary.
+    [[nodiscard]] auto HasFeedSpace(int currentSpeed) const
+        -> bool; ///< Poll() gate: true when the decoder can accept another packet. Trick mode (currentSpeed != 0)
+                 ///< also gates on the per-frame pacing timer; normal replay gates on the packet + audio highwater.
     auto CheckEncryptionTimeout()
         -> void; ///< Driven by the decode loop's per-iteration tick (so it ticks even when a scrambled channel
                  ///< delivers no PES): once the grace elapses with nothing decoding, show the encrypted notice
@@ -245,7 +248,10 @@ class cVaapiDevice : public cDevice {
     auto ResetAudioCodecState() -> void; ///< Drop the cached audio codec id and any in-flight 2-of-2 confirmation state
                                          ///< so the next PlayAudio() packet re-runs codec detection
     [[nodiscard]] auto SelectDrmConnector()
-        -> bool;         ///< Scan connectors, pick a display mode, and store crtcId/connectorId
+        -> bool; ///< Scan connectors, pick a display mode, and store crtcId/connectorId
+    [[nodiscard]] auto TryAcceptConnector(drmModeConnector *connector, bool allowModeFallback, drmModeRes *resources)
+        -> bool; ///< SelectDrmConnector() helper: validate one connector, pick its mode (exact; else, when
+                 ///< allowModeFallback, PREFERRED then first) and latch activeMode/crtcId/connectorId/connectorName.
     auto Stop() -> void; ///< Shut down decoder, display, and audio in dependency order
     [[nodiscard]] auto SubmitBlackFrame(std::string_view centerText = {})
         -> bool; ///< Submit a VAAPI NV12 black surface (optional centered text baked into the luma plane);
@@ -276,15 +282,20 @@ class cVaapiDevice : public cDevice {
     int osdWidth{};                                               ///< Cached display width (px)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
-    std::atomic<uint64_t> lastClearMs{0};                         ///< Last Clear() timestamp (diagnostic)
-    eTrackType lastHandledAudioTrack{ttNone};                     ///< (with lastHandledAudioPid) dedup track-change
-    uint16_t lastHandledAudioPid{};                               ///<   hooks during PMT churn
-    std::atomic<bool> paused;                                     ///< True while frozen via Freeze()
-    std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE};  ///< Previous channel's video codec (stale guard)
-    bool inStillPicture{false};                                   ///< Re-entry guard for cDevice::StillPicture
-    std::atomic<bool> radioBlackPending{false};                   ///< Awaiting radio-only channel detection
-    cTimeMs radioBlackTimer;                                      ///< Radio-mode detection timeout
-    std::atomic<bool> radioSplashActive{false}; ///< A refreshable radio (no-video) splash is on screen
+    std::atomic<unsigned> clearsSinceLog{0};                      ///< Clear()s coalesced since the last burst log
+    std::atomic<uint64_t> lastClearLogMs{0};  ///< Walltime of the last Clear() diagnostic log (rate-limit)
+    std::atomic<uint64_t> lastClearMs{0};     ///< Last Clear() timestamp (diagnostic)
+    eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
+    uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
+    std::atomic<bool> paused;                 ///< True while frozen via Freeze()
+    std::atomic<AVCodecID> previousAudioCodec{
+        AV_CODEC_ID_NONE}; ///< Last confirmed audio codec; survives Clear() so a
+                           ///< same-codec re-detect after a scrub seek logs nothing
+    std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE}; ///< Previous channel's video codec (stale guard)
+    bool inStillPicture{false};                                  ///< Re-entry guard for cDevice::StillPicture
+    std::atomic<bool> radioBlackPending{false};                  ///< Awaiting radio-only channel detection
+    cTimeMs radioBlackTimer;                                     ///< Radio-mode detection timeout
+    std::atomic<bool> radioSplashActive{false};                  ///< A refreshable radio (no-video) splash is on screen
     std::atomic<uint32_t> radioSplashEventId{
         0}; ///< EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
 

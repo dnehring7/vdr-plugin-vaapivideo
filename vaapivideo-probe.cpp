@@ -12,6 +12,8 @@
  *   H.264   (Constrained Baseline, Main, High, High 10) -- HD broadcast
  *   HEVC    (Main 8-bit, Main10 10-bit)             -- UHD + HDR
  *   AV1     (Profile 0, 8-bit + 10-bit)             -- streaming / mediaplayer
+ *   VP9     (Profile 0, Profile 2)                  -- streaming / mediaplayer
+ *   VVC     (H.266 Main 10, 8-bit + 10-bit)         -- next-gen broadcast
  *
  * Each profile is tested against the exact surface format it requires
  * (YUV420 for 8-bit, YUV420_10 for 10-bit). VPP filters, HDR tone mapping,

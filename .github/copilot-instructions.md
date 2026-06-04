@@ -26,6 +26,18 @@ Build: `make` | Lint: `make lint` (bear + clang-tidy) | Format: `make indent`.
 - Section rulers: `// === LABEL ===`.
 - Hints: `[[unlikely]]` on error paths, `[[likely]]` on hot paths, early returns.
 
+## Lambdas vs named helpers
+
+Lambdas for local mechanics; named helpers for domain behavior.
+
+- Lambda = short local glue: predicates, algorithm / `std::function` callbacks, IIFE const-init.
+  e.g. `const auto kind = [&]{ ...; return k; }();`
+- Named fn (static free / member) when the body names a real operation, mutates members, takes a
+  lock, calls a C API, encodes thread-ownership, runs >~15 lines, or is reused.
+  e.g. `ResolvePendingTrickExit()`, `SubmitTrickFrame()`.
+- Don't wrap a one-shot expression in a lambda. Snapshot an atomic into a `const` for a
+  scope-stable value (a re-reading lambda reloads each call).
+
 ## Thread-safety
 
 VDR's `Running()` is **not** thread-safe. Use `std::atomic<bool> stopping` / `hasExited` with `acquire`/`release`. Mirror existing `Shutdown()` patterns.

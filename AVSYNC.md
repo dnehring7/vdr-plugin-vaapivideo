@@ -12,10 +12,14 @@ Without active correction, lip-sync drifts by milliseconds per minute.
 ```
 DVB live / replay (PCR)   ─┐
                            ├─▶ 90 kHz PTS ─┬─ audio → ALSA ring → DAC ── GetClock() ── master
-Mediaplayer (libavformat) ─┘               └─ video → decoder → filter → jitterBuf → SyncAndSubmitFrame
-                                                                                          │
-                                                                                          ▼
-                                                                          pendingFrames (DISPLAY_PRERENDER_SLOTS = 6) → display thread → KMS commit
+Mediaplayer (libavformat) ─┘               └─ video
+                                                │
+        DECODE thread (Action):         decode → VPP filter → handoffQueue   (epoch-stamped)
+                                                │
+        PRESENT thread (PresentAction): handoffQueue → jitterBuf → due-gate → SyncAndSubmitFrame
+                                                │              (decode-ahead reserve = jitterBuf + handoffQueue)
+                                                ▼
+        pendingFrames (DISPLAY_PRERENDER_SLOTS = 8) → display thread → KMS commit
 ```
 
 The controller is **input-path-agnostic**: VDR's PES path and the
@@ -43,9 +47,14 @@ Three invariants:
    commands: **`Clear()`** flushes ALSA and resets the playback clock
    (seek / channel change); **`DropOutput()`** flushes ALSA + decode
    queue but preserves the playback clock — used from Mute / Freeze /
-   SetTrickSpeed, where the stream is paused but not abandoned. A full
-   `Clear()` in those paths would null `GetClock()`, force the decoder
-   into freerun, and tick a display underrun on resume. The audio
+   SetTrickSpeed, where the stream is paused but not abandoned. Freeze
+   passes `pauseClock=true`, which additionally *pins* `GetClock()` so it
+   cannot extrapolate through ALSA silence and fake-advance the clock
+   across the pause (a fake-advanced clock on resume would drop the
+   preserved `jitterBuf` head via `SkipStaleJitterFrames`); the pin lifts
+   on the next `WritePcmToAlsa()`. A full `Clear()` in those paths would
+   null `GetClock()`, force the decoder into freerun, and tick a display
+   underrun on resume. The audio
    thread additionally auto-resets the clock on any decoded-PTS jump
    >5 s (channel switch, seek, wrap) so external paths that bypass
    `Clear()` still re-anchor.
@@ -55,23 +64,94 @@ Three invariants:
    channel switches and avoids the feedback-loop instabilities of
    software audio resampling.
 
-3. **Video output cadence is uniform for exact-ratio sources.** The filter
-   graph appends `fps=<displayFps>` only when the source rate divides the
-   display rate evenly (rational test `displayHz × sourceDen mod sourceNum == 0`),
-   so 25p→50, 24p→48, and 25i-deinterlaced (50fps via `rate=field`) and
-   native 50p all reach `SyncAndSubmitFrame` at the same cadence and one
-   controller regime fits them. Uneven ratios (15→50, 24→50, 30000/1001→60)
-   are left to natural VSync re-presentation — `fps=` would only do
-   nearest-neighbor duplicate/drop producing the same uneven cadence the
-   display does anyway, so we save a filter node. No motion interpolation
-   exists in the VAAPI VPP chain.
+3. **Video is producer-paced to the display rate.** The filter graph
+   appends `fps=<displayFps>` whenever the post-deinterlace output rate
+   differs from the display rate (rational test
+   `outputRateNum ≠ displayHz × outputRateDen`) — for *any* ratio, exact
+   or not. The node paces the *decoder* at source rate by buffering its
+   output up/down to the display rate, so source-rate consumption tracks
+   real time; without it the decoder is paced only by `SubmitFrame`'s
+   VSync backpressure (= display rate) and drifts (60→50 consumes source
+   at 83%, 24→50 at 208%). On audio-clocked paths the due-gate would
+   eventually correct that via catch-up drops / re-presents, but
+   **video-only** playback (HDR demo files, etc.) depends entirely on
+   `fps`; adding it on audio-clocked paths too is harmless and removes the
+   routine source>display catch-up-drop log churn. The filter is
+   nearest-neighbor (duplicate for source<display, decimate for
+   source>display) — no motion interpolation exists in the VAAPI VPP
+   chain. Sources already at the display rate (native 50p, 25i→50 via
+   `rate=field`) skip the node. Either way every frame reaches
+   `SyncAndSubmitFrame` at one cadence, so a single controller regime fits all.
+
+## Decode / present decouple
+
+Decode and presentation run on **two threads** so a slow VPP step never stalls
+the screen. A 4K interlaced → 2160p upscale can spike to ~80 ms — far longer
+than the 20 ms frame period — and SW decoders (libdav1d) add their own per-frame
+variance. If the thread filtering the next frame also has to submit the current
+one on time, that spike surfaces as a dropped frame.
+
+- **Decode thread** (`cVaapiDecoder::Action`): pulls packets, runs VAAPI/SW
+  decode + the VPP filter graph, and pushes each finished frame onto
+  `handoffQueue`. Never touches the audio clock or the sync controller.
+- **Present thread** (`PresentAction`, a nested `cPresenter : cThread` declared
+  last so it is destroyed first): splices `handoffQueue` into its private
+  `jitterBuf`, runs the due-gated drain, and calls `SyncAndSubmitFrame` at the
+  audio-synced cadence — while the decode thread is already filtering the next
+  frame.
+
+The two are joined by a bounded **blocking** handoff: `handoffMutex` (a strict
+leaf lock), with `handoffCondition` waking the present thread and `handoffNotFull`
+waking the decode thread. When `handoffQueue` reaches `DECODER_RESERVE_HARD_CAP`
+the decode thread *waits* rather than dropping — the upstream packet queue (and
+through it VDR's own flow control) stays authoritative, so backpressure is never
+resolved by discarding already-decoded frames.
+
+### Decode-ahead reserve
+
+`jitterBuf` (present side) + `handoffQueue` (handoff) together form the
+**decode-ahead reserve**. In steady replay the decoder runs ~2 s ahead, so a
+multi-second VPP stall drains the reserve instead of the screen. This is the
+deep, low-frequency cushion; the 8-slot display prerender (below) is the
+shallow, per-frame one — two buffers at different timescales. The total depth is
+published as `publishedDecodedReserveSize` (read via `GetDecodedReserveSize()`)
+so the mediaplayer backpressures its demux on the *whole* reserve, not one stage.
+
+### Generation epochs
+
+Because the present thread holds frames the decode thread produced earlier, a
+`Clear()` / seek / trick transition must invalidate in-flight frames without a
+lock handshake. A single atomic `clearEpoch` is the generation counter:
+
+- `Clear()`, `FlushForSeek()`, `SetTrickSpeed(0)`, and the deferred trick-exit
+  (`ResolvePendingTrickExit`) bump `clearEpoch`.
+- The decode thread stamps each frame's `producedEpoch` from `clearEpoch` at
+  production.
+- The present thread snapshots `presentEpoch = clearEpoch` once per iteration and
+  discards any frame with `producedEpoch < presentEpoch` (a superseded
+  generation) — at the splice and again in a front-purge — so stale frames
+  self-discard regardless of the race timing between decode, present, and the
+  control thread. Other cross-thread control changes are applied at the top of
+  `PresentAction` via atomics (e.g. `jitterFlushRequest`), never by reaching into
+  present-thread state from another thread.
+
+Lock order is unchanged — `codecMutex → parserMutex → packetMutex`, with
+`handoffMutex` a strict leaf that never nests another lock — so the second thread
+adds no new ordering edges. `jitterBuf` and the sync controller stay
+present-thread-private (no lock).
 
 ## Filter pipeline
 
 ```
-SW decode: [bwdif] → [hqdn3d] → format=nv12 → hwupload → scale_vaapi → [sharpness_vaapi] [→ fps]
-HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
+SW decode: [bwdif|yadif] → [hqdn3d] → format=nv12 → [crop] → hwupload → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
+HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → [crop] → scale_vaapi → [sharpness_vaapi] [→ fps]
 ```
+
+Bracketed nodes are conditional: `[bwdif|yadif]` on interlaced input
+(`yadif`/`bob` in trick / still mode), `[hqdn3d]`/`[denoise_vaapi]`/`[sharpness_vaapi]`
+on codec + GPU-VPP availability, `[crop]` only while a manual-zoom preset
+is active, and `[fps]` per invariant 3. `scale_vaapi` is always present
+(it normalizes pixel format + colorimetry even when not resizing).
 
 `fps` is metadata-only in FFmpeg (`AVFILTER_FLAG_METADATA_ONLY`), so it
 duplicates `AVFrame` references without touching pixels. Placement at the
@@ -122,6 +202,19 @@ but tracks sustained drift; the time constant is `1 / α` samples (~1 s
 `ResetSmoothedDelta()` clears warmup, EMA, residual, hard-debounce counters
 and catch-up state in one call. Called on channel switch, hard-behind fire,
 catch-up exit, and `WaitForAudioCatchUp`.
+
+**Fast-start seed.** A `FlushForSeek()` (same stream, same pipeline — see
+[Lifecycle](#lifecycle)) carries the pre-seek converged delta across the
+flush as `seekHintDelta90k` and seeds the EMA from it on the first
+post-seek frame, skipping the 50-sample warmup. The GPU-vs-audio offset is
+a property of the pipeline (decode + VPP + KMS latency vs ALSA hw_ptr), not
+the playback position, so the pre-seek steady state is the right seed and
+the right catch-up exit target. The hint is captured as the *pre-correction*
+`stableDelta90k` (a sleep's predictive EMA bump makes the live value
+transient during recovery), clamped into the soft corridor, and ages out
+after `DECODER_SYNC_HINT_MAX_AGE_MS` so a stale snapshot can't dominate.
+Plain `Clear()` (content boundary) drops the hint — different content can
+have different decode latency.
 
 ## Correction regimes
 
@@ -208,8 +301,14 @@ above `−CORRIDOR`. Two log lines bracket the pass:
 
 ```
 vaapivideo/decoder: catch-up entered (spike|warmup|sustained) raw=-2738ms
-vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms
+vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms follow-up=4 (target=+10ms)
 ```
+
+When catch-up *cycles* (e.g. a VVC SW decode that can't sustain real
+time), those per-pass lines are throttled to one per
+`DECODER_CATCHUP_LOG_THROTTLE_MS = 2 s`; the suppressed cycles are folded
+into a periodic `catch-up cycling sustained: N cycles …` line and a final
+`catch-up cycling settled: …` when the cycling stops.
 
 Entry threshold (−100 ms) and exit threshold (−50 ms) give at least
 `CORRIDOR` of hysteresis, well above single-sample jitter. The exit at
@@ -224,9 +323,13 @@ newly decoded frame. The small permanent negative offset that may
 remain after exit is well below the 80 ms lipsync percept threshold.
 
 `SkipStaleJitterFrames()` lifts its "keep ≥ 1" guard while catching up,
-since the kept frame would be dropped next iteration anyway. On exit
-the EMA is reset, `pendingDrops` is cleared, and the exiting frame is
-submitted normally.
+since the kept frame would be dropped next iteration anyway. On exit the
+EMA is reset and the exiting frame is submitted normally; a small
+**follow-up drop burst** (≤ 8 frames, via `pendingDrops`) is armed to push
+the head a touch past the clock (or to the seek hint, when one exists) —
+but only when `jitterBuf` actually holds enough cached frames to satisfy
+it cheaply. On a drained, marginal-VPP pipeline each follow-up drop would
+instead wait a full VPP cycle and never gain ground, so it is skipped there.
 
 The **warmup entry** is the post-Clear safety net. After `Clear()` the
 EMA is reset and the first 50 samples seed the next mean. If the input
@@ -237,27 +340,34 @@ they reach the EMA accumulator.
 
 ## Jitter buffer (unified drain)
 
-The video drain is unified across live and replay: both push decoded
-frames onto `jitterBuf` (`std::deque`) and pop when due.
+The video drain is unified across live and replay and runs on the **present
+thread** (see [Decode / present decouple](#decode--present-decouple)): each
+iteration splices the decode thread's `handoffQueue` into the private `jitterBuf`
+(`std::deque`) and pops when due.
 
 ```
-push: pendingFrames → jitterBuf
-runaway guard: if size > JITTERBUF_HARD_CAP, drop oldest down to cap
+splice: handoffQueue → jitterBuf      (drop frames with producedEpoch < presentEpoch)
+front-purge: drop jitterBuf heads with producedEpoch < presentEpoch
+runaway guard: if jitterBuf > RESERVE_HARD_CAP, drop oldest down to cap
 SkipStaleJitterFrames(): bulk-drop heads more than HARD_THRESHOLD behind clock
 loop:
-  dueIn = headPts − GetClock() − latency
-  if dueIn > FUTURE_MAX:                 drop head; continue   // PTS discontinuity
-  if dueIn > halfFrame:
-      if PendingDepth() == 0 && dueIn ≤ halfFrame + prefillMargin:
-          submit (pre-fill)                                    // absorb phase drift
-      else if (now − lastDrainMs) > STALL_MS:
-          re-arm freerun; continue                             // anti-stall watchdog
-      else:
-          break                                                // hold buffer
-  else:                                  SyncAndSubmitFrame(head)
+  if devicePaused && !trick:            break                  // Freeze: hold, clock pinned
+  if trick || freerun || pendingDrops || !ap:  SyncAndSubmitFrame(head)  // clock due-gate bypassed
+  clock = GetClock()
+  if clock == NOPTS:                                            // audio not yet anchored
+      hold ≤ NO_CLOCK_HOLD_MS (escape if jitterBuf near cap), else no-clock freerun submit
+  dueIn = headPts − clock − latency
+  wake  = PresentWakeThreshold90k()     // frameDur if prerender empty (pre-fill), else halfFrame
+  if dueIn > wake:
+      if dueIn > FUTURE_MAX:            drop head; continue     // PTS discontinuity
+      else if dueIn > CORRIDOR && blockedMs ≥ reArmMs:
+          re-arm one freerun frame; continue                   // re-anchor crawl
+      else:                            break                    // hold; head not yet due
+  else:                                SyncAndSubmitFrame(head)
+// reArmMs = REANCHOR_MS (100 ms) once crawling or dueIn > REANCHOR_GAP (750 ms), else STALL_MS (500 ms)
 ```
 
-The drain has three independent guards against startup / re-anchor stalls:
+The drain has four guards against startup / re-anchor / pause stalls:
 
 - **`FUTURE_MAX` (`DECODER_DRAIN_FUTURE_MAX_MS = 3 s`).** Drops heads
   sitting more than 3 s ahead of the audio clock as PTS discontinuities
@@ -265,23 +375,51 @@ The drain has three independent guards against startup / re-anchor stalls:
   Waiting for the gate to clear naturally would look like a multi-second
   startup freeze. Smaller future offsets remain paced normally.
 
-- **`STALL_MS` (`DECODER_DRAIN_STALL_MS = 500 ms`).** Walltime watchdog
-  for the case `FUTURE_MAX` misses: a steady gap that stays just under
-  3 s never trips the drop, and during EMA warmup no per-frame log
-  fires, so the pipeline would silently sit in the gate for tens of
-  seconds. When no frame has reached `SyncAndSubmitFrame` for
-  `STALL_MS` while `jitterBuf` is non-empty, the watchdog re-arms one
-  freerun frame (`freerunFrames.store(1)`) and continues — the next
-  iteration's `canFreerun` re-read submits the head unpaced. The
-  catch-up state machine inside `SyncAndSubmitFrame` cleans up any
-  residual on the very next frame. Each fire emits one log line:
-  `vaapivideo/decoder: drain stalled 514ms (dueIn=+31ms buf=20) -- re-arming freerun`.
+- **Re-anchor crawl (`DECODER_DRAIN_STALL_MS = 500 ms`,
+  `DECODER_DRAIN_REANCHOR_MS = 100 ms`, `DECODER_DRAIN_REANCHOR_GAP_90K = 750 ms`).**
+  Walltime watchdog for the case `FUTURE_MAX` misses: a head sitting more
+  than `CORRIDOR` (50 ms) but under 3 s ahead of the clock — a post-seek /
+  trick-exit re-anchor where the freshly anchored clock has to advance to
+  meet the head — never trips the drop, and during EMA warmup no per-frame
+  log fires, so the pipeline would silently sit in the gate. When the head
+  has been blocked that way for the re-arm window, the watchdog re-arms
+  one freerun frame (`freerunFrames.store(1)`) and continues — the next
+  iteration submits it unpaced, advancing the head one frame toward the
+  clock; the catch-up state machine in `SyncAndSubmitFrame` mops up any
+  residual. The *first* fire waits the long `STALL_MS` so a transient hold
+  that self-resolves doesn't force a freerun; once a crawl is confirmed
+  (or the gap is a large unambiguous re-anchor, `dueIn > REANCHOR_GAP_90K`,
+  head ~1.5–2 s ahead) it re-arms every `REANCHOR_MS` (~10 fps) so the
+  crawl-to-alignment is smooth motion, not a ~2 fps slideshow. Logs once
+  on entry — `re-anchoring video to audio (dueIn=… buf=…) -- crawling
+  until aligned`, throttled to once per `DECODER_REANCHOR_LOG_COOLDOWN_MS
+  = 2 s` across a Clear/scrub burst — and once on completion: `re-anchored
+  (buf=…) -- resuming paced playback`.
 
-- **`JITTERBUF_HARD_CAP` (`DECODER_JITTERBUF_HARD_CAP = 150`, ~3 s @ 50 fps).**
-  Drop-oldest runaway guard for the case both gates above miss
+- **No-clock hold (`DECODER_NO_CLOCK_HOLD_MS = 1.5 s`).** While
+  `GetClock()` is NOPTS (audio priming after `Clear()` / seek) the drain
+  *holds* a non-empty `jitterBuf` rather than freerunning pre-anchor video
+  at VSync rate — which would land the head far ahead of the clock the
+  moment audio anchors and hand it straight to the re-anchor crawl. A
+  near-cap escape submits anyway if `jitterBuf` approaches
+  `RESERVE_HARD_CAP`, so a fast HW decoder can't overflow waiting for an
+  audio anchor that never comes (video-only stream). Covers the
+  mux-interleave seek offset — a TS seek can land on a keyframe up to ~1 s
+  ahead of the target audio.
+
+- **`RESERVE_HARD_CAP` (`DECODER_RESERVE_HARD_CAP = 150`, ~3 s @ 50 fps).**
+  Drop-oldest runaway guard for the case the gates above miss
   (`SkipStaleJitterFrames` only drops heads *behind* the clock, so PTS
   marching ahead with a valid clock could grow `jitterBuf` without
-  bound). Drop-oldest preserves the closest-to-due tail.
+  bound). Drop-oldest preserves the closest-to-due tail. The same cap
+  bounds each stage of the decode-ahead reserve: the decode thread also
+  drop-oldest-trims `handoffQueue` if the present thread stalls past it
+  (normally it backpressures there long before — see the decouple section).
+
+`Freeze()` (pause) holds the drain directly: while `devicePaused` and not
+in trick play the loop breaks without submitting, so the head's PTS can't
+drift against the pinned-but-static audio clock (see [Architecture](#architecture)
+invariant 1). Resume (`Play()`) lifts the hold and the pin together.
 
 The **pre-fill bypass** submits the head up to one prefillMargin early
 when the display prerender queue is empty, keeping `PendingDepth()` at
@@ -305,8 +443,8 @@ backlog.
 The due check is bypassed for:
 
 - **Freerun** (`freerunFrames > 0` after `Clear()`, trick exit, audio
-  codec change, **stall-watchdog re-arm**) — gives an instant first
-  picture, or a re-anchor after a startup stall.
+  codec change, **re-anchor crawl re-arm**) — gives an instant first
+  picture, or advances the head one frame per iteration during a re-anchor crawl.
 - **`pendingDrops`** from a soft-behind burst — one drop per drain
   iteration until exhausted.
 
@@ -347,18 +485,23 @@ non-zero `aq` indicates the audio decoder is falling behind real-time
 
 ## Display prerender
 
-`SyncAndSubmitFrame` hands the chosen frame to
+`SyncAndSubmitFrame` (on the present thread) hands the chosen frame to
 `cVaapiDisplay::SubmitFrame`, which pushes onto `pendingFrames` (a
-`std::deque`, depth `DISPLAY_PRERENDER_SLOTS = 6`). The display thread
+`std::deque`, depth `DISPLAY_PRERENDER_SLOTS = 8`). The display thread
 pops one per VSync, maps via VAAPI→PRIME, and commits via DRM atomic.
 `SubmitFrame` **blocks** when all slots are full — this is the VSync
-backpressure that paces the decoder to the display refresh rate.
+backpressure that paces the present thread (and through the handoff, the
+decoder) to the display refresh rate.
 
-The 6-slot depth (= 120 ms tolerance @ 50 fps) is sized to absorb a
-single UHD VPP / memory-bandwidth spike (observed ~80 ms in replay on
-1280×720 → 3840×2160 upscale) without draining the cache and forcing
-a re-present. FHD never fills past 1–2 slots, so the extra depth is a
-no-op there; the lipsync pipeline is delayed in lockstep with audio,
+This prerender is the **shallow, per-frame** cushion — distinct from the
+deeper decode-ahead reserve upstream (see [Decode / present
+decouple](#decode--present-decouple)). The 8-slot depth (= 160 ms tolerance
+@ 50 fps) is sized to absorb a single UHD VPP / memory-bandwidth spike
+(observed ~80 ms in replay on 1280×720 → 3840×2160 upscale) plus the
+per-frame variance of CPU-side SW decoders (libdav1d 1080p50 spikes
+30–40 ms on complex frames) without draining the cache and forcing a
+re-present. FHD HW paths never fill past 1–2 slots, so the extra depth is
+a no-op there; the lipsync pipeline is delayed in lockstep with audio,
 not just video, so the extra slots do not shift `rawDelta`.
 
 ### Queue underrun detection
@@ -391,7 +534,7 @@ trick / sync-sleep / warmup grace):
    iteration.
 
 `thresholdMs = (DISPLAY_PRERENDER_SLOTS + 2) × vsyncMs` — at 50 Hz that's
-`8 × 20 ms = 160 ms`. The `+2` margin gives one VSync of natural absorption
+`10 × 20 ms = 200 ms`. The `+2` margin gives one VSync of natural absorption
 by the prerender depth plus one more so a single hiccup doesn't trip.
 
 On the next fresh commit:
@@ -400,9 +543,10 @@ On the next fresh commit:
 - `gapStartMs` and `peakGapMs` reset; the streak ends.
 
 Onset is rate-limited to once per `UNDERRUN_LOG_COOLDOWN_MS = 2 s`.
-`isClearing`, `inTrick`, and `inSyncSleep` each force `gapStartMs = 0`
-so a deliberate hard-ahead sleep (up to 500 ms) or trick hold
-(60–2000 ms) does not surface its own duration as a fake underrun.
+`isClearing`, `inTrick`, `inSyncSleep`, and `inPause` (device frozen) each
+force `gapStartMs = 0` so a deliberate hard-ahead sleep (up to 500 ms),
+trick hold (60–2000 ms), or pause does not surface its own duration as a
+fake underrun.
 
 ### Warmup grace
 
@@ -425,7 +569,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 
 - Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
 - Freerun window after `Clear()`, trick exit, `NotifyAudioChange()`, or
-  the drain stall-watchdog re-arm.
+  a drain re-anchor crawl re-arm.
 - Radio mode / NOPTS frame (no audio processor or no PTS to align on).
 - Audio not yet running (`GetClock()` is NOPTS until the first
   `WritePcmToAlsa()` fires).
@@ -436,7 +580,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | ------------------------------ | ------------------ | ---------- | ------------------------------ |
 | Plugin start                   | invalid            | —          | empty                          |
 | Channel switch (`Clear()`)     | reset              | unchanged  | flushed; freerun armed         |
-| Drain stall-watchdog fire      | unchanged          | unchanged  | unchanged; freerun re-armed    |
+| Drain re-anchor crawl re-arm   | unchanged          | unchanged  | unchanged; one freerun frame re-armed |
 | Catch-up enter                 | (drops silent)     | unchanged  | drained silently to alignment  |
 | Catch-up exit                  | reset              | unchanged  | one frame submitted normally   |
 | Soft drop                      | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
@@ -444,6 +588,9 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | Hard-behind                    | reset              | unchanged  | N frames dropped               |
 | Hard-ahead (replay)            | reset              | armed      | unchanged                      |
 | Hard-ahead (live)              | `−= measured`      | armed      | unchanged                      |
+| Trick entry (FF/REW/slow)      | reset              | unchanged  | reserve purged (generation bump); paced by `SubmitTrickFrame`, no freerun |
+| Trick exit → normal (`Play`)   | reset              | unchanged  | reserve purged (generation bump); freerun armed |
+| Pause / resume (`Freeze`/`Play`) | unchanged        | unchanged  | held (drain stops); audio clock pinned, no drops |
 | Audio codec / track change     | unchanged          | unchanged  | preserved; freerun armed       |
 | Mediaplayer seek               | reset              | unchanged  | flushed; freerun armed; filter graph **preserved** |
 | Mediaplayer playlist advance   | reset (on reopen)  | unchanged  | flushed; freerun armed; filter graph rebuilt        |
@@ -493,9 +640,10 @@ ALSA-cushion-driven; replay cold start: ~40–60; replay post-Clear: ~0).
 Each soft / hard event also emits a per-event `dsyslog` line naming the
 cause (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead
 replay`, `hard-behind`, `stale-jitter bulk`, `catch-up
-entered (spike|warmup|sustained)`, `catch-up complete`, `drain
-stalled … re-arming freerun`) for "why did this fire?" without waiting
-for the next periodic line.
+entered (spike|warmup|sustained)`, `catch-up complete`, `head too far in
+future … dropping`, `re-anchoring video to audio … crawling until
+aligned`, `re-anchored … resuming paced playback`) for "why did this
+fire?" without waiting for the next periodic line.
 
 ### Steady-state offset
 
@@ -529,9 +677,9 @@ earlier vs audio).
 ## Constants
 
 File-scope constants live in [src/decoder.cpp](src/decoder.cpp),
-[src/audio.cpp](src/audio.cpp), and [src/config.h](src/config.h); each
-carries a `///<` comment with purpose and unit. Constants marked
-*(local)* live inside the function that uses them.
+[src/decoder.h](src/decoder.h), [src/audio.cpp](src/audio.cpp), and
+[src/config.h](src/config.h); each carries a `///<` comment with purpose and
+unit. Constants marked *(local)* live inside the function that uses them.
 
 Naming conventions:
 
@@ -548,22 +696,28 @@ Naming conventions:
 | `AUDIO_CLOCK_STALE_MS`              | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
 | `AUDIO_QUEUE_CAPACITY`              | 300   | Audio packet queue depth (~10 s AC-3); sized for slow-start decoders |
 | `DECODER_QUEUE_CAPACITY`            | 200   | Video packet queue depth (~4 s @ 50 fps) |
-| `DECODER_JITTERBUF_HARD_CAP`        | 150   | Decoded-frame backlog cap (~3 s @ 50 fps); drop-oldest runaway guard |
+| `DECODER_RESERVE_HARD_CAP`          | 150   | Per-stage cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~3 s @ 50 fps each); decode-side backpressure / present-side drop-oldest runaway guard |
+| `DECODER_TRICK_QUEUE_DEPTH`         | 1     | Handoff reserve depth while trick play is active (Poll() throttles the producer; overflow drops incoming) |
+| `DECODER_TRICK_HOLD_MS`             | 20    | Base per-frame hold for slow trick (~one field period @ 50 Hz); fast trick scales it by the speed multiplier |
 | `DECODER_SYNC_CORRIDOR_90K`         | 4500  | Soft corridor half-width (= 50 ms × PTS_TICKS_PER_MS); below lipsync percept threshold |
 | `DECODER_SYNC_HARD_THRESHOLD_90K`   | 18000 | Hard-transient threshold (= 200 ms × PTS_TICKS_PER_MS); 2× = catch-up spike entry |
 | `DECODER_SYNC_MAX_CORRECTION_MS`    | 200   | Soft-event cap (matches HARD_THRESHOLD) so one event fully closes corridor |
 | `DECODER_SYNC_HARD_AHEAD_MAX_MS`    | 500   | Live hard-ahead sleep cap (ms) |
 | `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard before the normal due-gate wait |
-| `DECODER_DRAIN_STALL_MS`            | 500   | Anti-stall watchdog: re-arm freerun if drain has not fired this long |
+| `DECODER_DRAIN_STALL_MS`            | 500   | Re-anchor crawl first-fire delay: re-arm one freerun frame after the head has held > CORRIDOR ahead of clock this long |
+| `DECODER_DRAIN_REANCHOR_MS`         | 100   | Re-anchor crawl cadence once confirmed (~10 fps) so post-seek alignment is smooth motion, not a slideshow |
+| `DECODER_DRAIN_REANCHOR_GAP_90K`    | 67500 | Future-head gap (= 750 ms × PTS_TICKS_PER_MS) that skips the STALL_MS first-fire and crawls immediately (unambiguous re-anchor) |
+| `DECODER_REANCHOR_LOG_COOLDOWN_MS`  | 2000  | Min spacing between "re-anchoring" onset logs (collapses a Clear/scrub burst to one line) |
+| `DECODER_NO_CLOCK_HOLD_MS`          | 1500  | Walltime the present drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before falling back to no-clock freerun (covers the mux-interleave seek offset) |
 | `DECODER_SYNC_COOLDOWN_MS`          | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
 | `DECODER_SYNC_EMA_SAMPLES`          | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
 | `DECODER_SYNC_WARMUP_SAMPLES`       | 50    | Samples averaged before EMA seed (~1 s @ 50 fps) |
 | `DECODER_SYNC_FREERUN_FRAMES`       | 1     | Unpaced frames after sync-disrupting events |
 | `DECODER_SYNC_LOG_INTERVAL_MS`      | 2000  | Periodic sync diagnostic interval (ms) |
-| `DISPLAY_PRERENDER_SLOTS`             | 6     | Decoder→display handoff queue depth (= 120 ms tolerance @ 50 fps); absorbs UHD VPP / memory-bandwidth spikes |
+| `DISPLAY_PRERENDER_SLOTS`             | 8     | Present→display prerender queue depth (= 160 ms tolerance @ 50 fps); absorbs a UHD VPP / memory-bandwidth spike plus SW-decoder per-frame variance |
 | `ACTIVE_WINDOW_MS` *(local)*          | 500   | Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log itself) |
 | `IDLE_THRESHOLD_MS` *(local)*         | 10000 | Wall-clock streak length beyond which a re-present gap is treated as paused / stopped (peak cleared) |
 | `UNDERRUN_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between underrun-onset dsyslog lines |
 | `WARMUP_GRACE_MS` *(local)*           | 3000  | Post-idle grace suppressing underrun logs while pipeline anchors |
-| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 8     | `(PRERENDER_SLOTS + 2)`; `thresholdMs = THRESHOLD_VSYNCS × vsyncMs` is the wall-clock gap that trips a log |
+| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 10    | `(PRERENDER_SLOTS + 2)`; `thresholdMs = THRESHOLD_VSYNCS × vsyncMs` is the wall-clock gap that trips a log |
 | `PAGE_FLIP_STUCK_MS` *(local)*        | 200   | Stuck-flip watchdog: force-clear `isFlipPending` if the kernel swallows the page-flip event |

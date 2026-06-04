@@ -67,13 +67,19 @@ pre-framed access units straight into the decoder via a narrow feed surface
 (`SubmitVideoPacket` / `SubmitAudioPacket`). Codec selection, HDR routing, A/V
 sync — all path-agnostic.
 
+Inside `cVaapiDecoder`, decode and presentation run on **separate threads**: the
+decode thread filters frames into a decode-ahead reserve, and a presentation
+thread drains that reserve at the audio-synced cadence, so a slow 4K VPP step
+spends the reserve instead of stalling the screen. See
+[AVSYNC.md → Decode / present decouple](AVSYNC.md#decode--present-decouple).
+
 ### Source layout
 
 | File                  | Responsibility                                                                        |
 |-----------------------|---------------------------------------------------------------------------------------|
 | `vaapivideo.cpp`      | Plugin entry point, VDR lifecycle, setup menu, SVDRP, main-menu hook                  |
 | `src/device.cpp`      | VDR device integration, PES routing, hardware init/teardown, mediaplayer feed surface |
-| `src/decoder.cpp`     | VAAPI decode + A/V sync controller                                                    |
+| `src/decoder.cpp`     | Decoupled VAAPI decode + presentation threads, A/V sync controller                     |
 | `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
 | `src/display.cpp`     | DRM atomic modesetting, PRIME import, page-flip thread                                |
 | `src/audio.cpp`       | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe                                |
@@ -509,7 +515,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
 sync diagnostics; the periodic `sync d=… avg=…` line is described in
-[AVSYNC.md](AVSYNC.md#log-format).
+[AVSYNC.md](AVSYNC.md#diagnostic-log).
 
 
 ## Development
