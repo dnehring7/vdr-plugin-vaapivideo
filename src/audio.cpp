@@ -201,11 +201,11 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // balloons. Return AV_NOPTS_VALUE after AUDIO_CLOCK_STALE_MS to force video freerun;
     // lipsync re-anchors at the next valid write.
     //
-    // Seqlock read of the (playbackPts, lastClockUpdateMs) pair. A single acquire on one
-    // atomic only guards one direction of the load-pair race; a torn read (old stamp +
-    // new pts) biases extrapolation by a full ALSA period. Retry until two loads of an
-    // even sequence match. The writer's critical section is snd_pcm_delay() + four
-    // atomic stores, so the odd-sequence window is microseconds.
+    // Seqlock read of the (playbackPts, lastClockUpdateMs) pair: retry until two even sequence loads
+    // match. Both fences are load-bearing -- seq1's acquire stops the data loads from hoisting above
+    // it, and the acquire fence below stops them from sinking past seq2. Without that fence the
+    // compiler (even on x86) may move the relaxed loads after seq2, letting a torn snapshot pass the
+    // seq1==seq2 check and bias GetClock() by a full ALSA period. (Boehm's seqlock hazard.)
     uint64_t lastMs = 0;
     int64_t pts = AV_NOPTS_VALUE;
     while (true) {
@@ -215,7 +215,9 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         }
         lastMs = lastClockUpdateMs.load(std::memory_order_relaxed);
         pts = playbackPts.load(std::memory_order_relaxed);
-        const uint32_t seq2 = clockSequence.load(std::memory_order_acquire);
+        std::atomic_thread_fence(std::memory_order_acquire); // orders the data loads before seq2
+
+        const uint32_t seq2 = clockSequence.load(std::memory_order_relaxed);
         if (seq1 == seq2) {
             break;
         }

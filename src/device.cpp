@@ -639,7 +639,7 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 }
 
 [[nodiscard]] auto cVaapiDevice::CanScaleVideo(const cRect &rect, int /*alignment*/) -> cRect {
-    return Ready() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
+    return HardwareReady() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
 }
 
 constexpr uint64_t DEVICE_CLEAR_LOG_COOLDOWN_MS =
@@ -781,21 +781,25 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
     //   1. cached  -- normal hot path after display init.
     //   2. live    -- first post-init call populates the cache.
     //   3. config  -- pre-init fallback (NOT cached; real display may appear later).
-    if (osdWidth > 0 && osdHeight > 0 && display) [[likely]] {
-        Width = osdWidth;
-        Height = osdHeight;
-        PixelAspect = display->GetAspectRatio();
-        return;
-    }
-
-    if (display && display->IsInitialized()) {
-        osdWidth = static_cast<int>(display->GetOutputWidth());
-        osdHeight = static_cast<int>(display->GetOutputHeight());
-        Width = osdWidth;
-        Height = osdHeight;
-        PixelAspect = display->GetAspectRatio();
-        dsyslog("vaapivideo/device: OSD size cached: %dx%d aspect=%.3f", Width, Height, PixelAspect);
-        return;
+    // Gate the display-touching tiers on HardwareReady() (the acquire paired with AttachHardware()'s
+    // SVDRP-thread publish): a skin repaint here must not race a half-built display. Until ready, use
+    // the config tier.
+    if (HardwareReady() && display) [[likely]] {
+        if (osdWidth > 0 && osdHeight > 0) [[likely]] {
+            Width = osdWidth;
+            Height = osdHeight;
+            PixelAspect = display->GetAspectRatio();
+            return;
+        }
+        if (display->IsInitialized()) {
+            osdWidth = static_cast<int>(display->GetOutputWidth());
+            osdHeight = static_cast<int>(display->GetOutputHeight());
+            Width = osdWidth;
+            Height = osdHeight;
+            PixelAspect = display->GetAspectRatio();
+            dsyslog("vaapivideo/device: OSD size cached: %dx%d aspect=%.3f", Width, Height, PixelAspect);
+            return;
+        }
     }
 
     Width = static_cast<int>(vaapiConfig.display.GetWidth());
@@ -1044,7 +1048,7 @@ namespace {
 } // namespace
 
 [[nodiscard]] auto cVaapiDevice::GrabImage(int &Size, bool Jpeg, int Quality, int SizeX, int SizeY) -> uchar * {
-    if (!Ready() || !display) [[unlikely]] {
+    if (!HardwareReady() || !display) [[unlikely]] {
         esyslog("vaapivideo/device: GrabImage - device not ready");
         return nullptr;
     }
@@ -1139,7 +1143,11 @@ namespace {
     return MakePnm(rgb24.get(), Size);
 }
 
-[[nodiscard]] auto cVaapiDevice::HasDecoder() const -> bool { return decoder && decoder->IsReady(); }
+[[nodiscard]] auto cVaapiDevice::HasDecoder() const -> bool {
+    // HardwareReady() first: it is the acquire that makes the cross-thread `decoder` read race-free
+    // (VDR/GetVideoSize poll this from the main thread vs the SVDRP-thread attach publish).
+    return HardwareReady() && decoder && decoder->IsReady();
+}
 
 [[nodiscard]] auto cVaapiDevice::HasIBPTrickSpeed() -> bool { return true; }
 
@@ -1194,9 +1202,9 @@ auto cVaapiDevice::Mute() -> void {
     cDevice::Mute();
 
     // DropOutput silences the sink without nulling the playback clock; full Clear() here would
-    // null GetClock() and cause a video freerun + display underrun for every OSD-mediated mute
-    // (some skins toggle mute on menu open/close).
-    if (audioProcessor) [[likely]] {
+    // null GetClock() and cause a video freerun + display underrun for every OSD-mediated mute.
+    // HardwareReady()-gated: skins can mute on menu open/close (main thread) during an in-flight ATTA.
+    if (HardwareReady() && audioProcessor) [[likely]] {
         audioProcessor->DropOutput();
     }
 }
@@ -1487,10 +1495,18 @@ auto cVaapiDevice::Play() -> void {
     return false;
 }
 
-[[nodiscard]] auto cVaapiDevice::Ready() -> bool { return initState.load(std::memory_order_acquire) == 2; }
+[[nodiscard]] auto cVaapiDevice::Ready() -> bool {
+    // VDR override, polled ONLY by cDevice::WaitForAllDevicesReady() (30 s cap) at startup, which
+    // blocks bring-up until every device is ready. A --detached device never attaches during startup,
+    // so gating on initState==2 pinned it for the full timeout. A deliberately-detached device is done
+    // with startup -> report ready; only an in-progress attach (initState==1) is genuinely not-ready.
+    // Hardware-dependent paths use HardwareReady()/IsReady(), never this override.
+    return initState.load(std::memory_order_acquire) != 1;
+}
 
 auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
-    if (!display) [[unlikely]] {
+    // HardwareReady()-gated: skindesigner can drive ScaleVideo() (main thread) during an in-flight ATTA.
+    if (!HardwareReady() || !display) [[unlikely]] {
         return;
     }
     // On dim change, the decoder rebuilds the VPP chain to emit fbs pre-sized for the new rect.
@@ -1515,7 +1531,9 @@ auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
     const int previous = vaapiConfig.zoomActive.exchange(clamped, std::memory_order_relaxed);
     if (previous != clamped) {
         dsyslog("vaapivideo/device: zoom stop %d -> %d (rebuild)", previous, clamped);
-        if (decoder) {
+        // zoomActive (set above) persists regardless; HardwareReady()-gate the decoder read so a zoom
+        // key during an in-flight ATTA can't touch a half-published decoder.
+        if (HardwareReady() && decoder) {
             decoder->RequestFilterRebuild();
         }
     }
@@ -1545,7 +1563,7 @@ static auto NextZoomStop(int current) -> int {
     }
     if (next != current) {
         dsyslog("vaapivideo/device: zoom stop %d -> %d (rebuild)", current, next);
-        if (decoder) {
+        if (HardwareReady() && decoder) { // acquire-gate the decoder read against an in-flight ATTA
             decoder->RequestFilterRebuild();
         }
     }
@@ -1561,7 +1579,7 @@ auto cVaapiDevice::RefreshZoom() -> void {
         return;
     }
     dsyslog("vaapivideo/device: zoom stop %d refresh (rebuild)", stop);
-    if (decoder) {
+    if (HardwareReady() && decoder) { // acquire-gate the decoder read against an in-flight ATTA
         decoder->RequestFilterRebuild();
     }
 }
@@ -1721,7 +1739,8 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
 }
 
 auto cVaapiDevice::SetVolumeDevice(int Volume) -> void {
-    if (audioProcessor) [[likely]] {
+    // HardwareReady()-gated: VDR-core volume path runs on the main thread during an in-flight ATTA.
+    if (HardwareReady() && audioProcessor) [[likely]] {
         audioProcessor->SetVolume(Volume);
     }
 }
@@ -1853,6 +1872,13 @@ auto cVaapiDevice::Detach() -> bool {
 
 auto cVaapiDevice::SuspendHardware() -> void {
     // Hardware-only release; callers add cControl::Shutdown / LeaveOwnVt as appropriate.
+
+    // Teardown barrier: leave "ready" up front so HardwareReady() turns false for the whole teardown
+    // and the main-thread OSD/skin readers stop dereferencing display/decoder/audioProcessor before
+    // Stop() frees them (symmetric with AttachHardware()'s release publish). Use 1, not 0: a racing
+    // AttachHardware() CAS expects 0, so 1 keeps it rejected. The terminal store(0) below finalizes.
+    initState.store(1, std::memory_order_release);
+
     DetachAllReceivers();
 
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
@@ -1891,6 +1917,18 @@ auto cVaapiDevice::SuspendHardware() -> void {
     lastHandledAudioPid = 0;
     osdWidth = 0;
     osdHeight = 0;
+
+    // Drop an auto-detected connector so the next attach re-selects against the current topology
+    // (sticky auto-latching would hard-fail a re-attach if the sink moved). A -c connector stays pinned.
+    if (!connectorUserSupplied) {
+        connectorName.clear();
+    }
+
+    // Reset the Clear()-diagnostic baseline so the next attach's first Clear() logs as "(first call)".
+    lastClearMs.store(0, std::memory_order_relaxed);
+    lastClearLogMs.store(0, std::memory_order_relaxed);
+    clearsSinceLog.store(0, std::memory_order_relaxed);
+
     initState.store(0, std::memory_order_release);
 }
 
@@ -1906,6 +1944,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
     drmPath = drmDevicePath;
     audioDevice = audioDevicePath;
     connectorName = connectorNameFilter;
+    connectorUserSupplied = !connectorNameFilter.empty(); // -c pins the connector; auto-latch is transient per attach
 
     if (deferred) {
         // Stay in state 0: hardware opens on first primary-device promotion after startup,
@@ -1929,7 +1968,7 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
 
 [[nodiscard]] auto cVaapiDevice::OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
     -> bool {
-    if (!Ready()) [[unlikely]] {
+    if (!HardwareReady()) [[unlikely]] {
         esyslog("vaapivideo/device: OpenForMediaPlayer rejected -- hardware not attached");
         return false;
     }
@@ -1979,7 +2018,7 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
 }
 
 [[nodiscard]] auto cVaapiDevice::SubmitVideoPacket(const AVPacket *packet) -> bool {
-    if (!Ready() || !decoder || decoder->IsQueueFull()) [[unlikely]] {
+    if (!HardwareReady() || !decoder || decoder->IsQueueFull()) [[unlikely]] {
         return false;
     }
     decoder->EnqueuePacket(packet);
@@ -1987,7 +2026,7 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
 }
 
 [[nodiscard]] auto cVaapiDevice::SubmitAudioPacket(const AVPacket *packet) -> bool {
-    if (!Ready() || !audioProcessor || !audioProcessor->IsInitialized()) [[unlikely]] {
+    if (!HardwareReady() || !audioProcessor || !audioProcessor->IsInitialized()) [[unlikely]] {
         return false;
     }
     // Queue HIGHWATER is a pacing signal, not a hard failure. Returning false keeps the
@@ -2094,8 +2133,14 @@ auto cVaapiDevice::FlushForSeek() -> void {
 // ============================================================================
 
 [[nodiscard]] auto cVaapiDevice::AttachHardware() -> bool {
-    // State: 0 (detached) -> 1 (in-progress) -> 2 (ready). All callers run on VDR's main
-    // thread; the CAS rejects double-attach defensively rather than guarding a data race.
+    // State: 0 (detached) -> 1 (in-progress) -> 2 (ready); the CAS rejects double-attach. NOT
+    // main-thread-only: Initialize() runs this on the main thread, SVDRP ATTA on the SVDRP handler
+    // thread (a cThread), a primary promotion via MakePrimaryDevice(). The subsystem pointers and
+    // osdWidth/osdHeight written below are published by the terminal initState.store(2, release);
+    // non-player main-thread readers (GetOsdSize/HasDecoder/ScaleVideo/Mute/...) must take the
+    // matching acquire via HardwareReady() first. The player path (SetPlayMode/Clear/PlayVideo/...)
+    // is reached only after ATTA returns through cControl, which supplies its own happens-before.
+    // Every failure rollback below also stores 0 with release, so all initState transitions publish.
     int expected = 0;
     if (!initState.compare_exchange_strong(expected, 1)) [[unlikely]] {
         esyslog("vaapivideo/device: AttachHardware rejected -- already attached (state=%d)", expected);
@@ -2104,7 +2149,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
 
     if (!OpenHardware()) [[unlikely]] {
         esyslog("vaapivideo/device: hardware initialization failed");
-        initState.store(0, std::memory_order_relaxed);
+        initState.store(0, std::memory_order_release);
         return false;
     }
 
@@ -2116,7 +2161,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
         esyslog("vaapivideo/device: audio initialization failed");
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0, std::memory_order_relaxed);
+        initState.store(0, std::memory_order_release);
         return false;
     }
 
@@ -2127,7 +2172,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
         audioProcessor->Shutdown();
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0, std::memory_order_relaxed);
+        initState.store(0, std::memory_order_release);
         return false;
     }
 
@@ -2145,7 +2190,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
         audioProcessor->Shutdown();
         audioProcessor.reset();
         ReleaseHardware();
-        initState.store(0, std::memory_order_relaxed);
+        initState.store(0, std::memory_order_release);
         return false;
     }
 

@@ -123,7 +123,13 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto HasDecoder() const -> bool override; ///< True when a VAAPI codec context is open and ready
     [[nodiscard]] auto HasIBPTrickSpeed()
         -> bool override; ///< Always true: all I/B/P frame types are submitted in trick mode
-    [[nodiscard]] auto IsReady() -> bool { return Ready(); } ///< Public accessor for protected Ready()
+    [[nodiscard]] auto HardwareReady() const noexcept -> bool {
+        return initState.load(std::memory_order_acquire) == 2;
+    } ///< True once hardware is attached and decoder/display/audio are live -- the plugin's real
+      ///< "usable" gate (and the acquire for those subsystem pointers); distinct from the Ready() override.
+    [[nodiscard]] auto IsReady() const noexcept -> bool {
+        return HardwareReady();
+    } ///< Public "hardware attached" accessor (SVDRP ATTA/DETA, mediaplayer, services).
     auto Mute() -> void override; ///< Drop pending audio frames (hardware mute handled by VDR)
     auto Play() -> void override; ///< Resume normal playback: clear trick speed and unpause
     [[nodiscard]] auto Poll(cPoller &Poller, int TimeoutMs = 0)
@@ -172,11 +178,12 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
         -> bool; ///< Opens video + audio codecs with full stream descriptors. Returns false iff either codec failed.
     [[nodiscard]] auto SubmitVideoPacket(const AVPacket *packet)
-        -> bool; ///< Clones a pre-demuxed video AU onto the decoder queue. False when not Ready() or queue full;
-                 ///< caller must hold the packet and retry to avoid silently dropping AUs while the lookahead
-                 ///< throttle still advances as if they were accepted.
+        -> bool; ///< Clones a pre-demuxed video AU onto the decoder queue. False when hardware is not attached
+                 ///< (HardwareReady()) or the queue is full; caller must hold the packet and retry to avoid
+                 ///< silently dropping AUs while the lookahead throttle still advances as if they were accepted.
     [[nodiscard]] auto SubmitAudioPacket(const AVPacket *packet)
-        -> bool; ///< Clones a pre-demuxed audio AU onto the audio queue. False when not Ready() or queue full.
+        -> bool; ///< Clones a pre-demuxed audio AU onto the audio queue. False when hardware is not attached
+                 ///< (HardwareReady()) or the queue is full.
     auto ClearForMediaPlayer()
         -> void; ///< Heavy flush: drops queues AND tears down the filter chain. Used at open/close of an entry.
     auto FlushForSeek()
@@ -197,8 +204,10 @@ class cVaapiDevice : public cDevice {
         -> int override; ///< Demux one audio PES packet and enqueue for decoding
     [[nodiscard]] auto PlayVideo(const uchar *Data, int Length)
         -> int override;                         ///< Demux one video PES packet and enqueue for decoding
-    [[nodiscard]] auto Ready() -> bool override; ///< True once DRM/VAAPI/ALSA hardware is attached and the
-                                                 ///< decoder, display, and audio subsystems are initialized
+    [[nodiscard]] auto Ready() -> bool override; ///< VDR startup-readiness, polled only by
+                                                 ///< WaitForAllDevicesReady() (30 s cap). Ready when attached OR
+                                                 ///< deliberately --detached, so a deferred device doesn't pin
+                                                 ///< startup. Use HardwareReady()/IsReady() for hardware state.
     auto SetAudioTrackDevice(eTrackType Type)
         -> void override; ///< Reset audio codec state and flush on track switch (live TV path)
     auto SetDigitalAudioDevice(bool On)
@@ -262,24 +271,26 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    drmModeModeInfo activeMode{};                                 ///< Selected DRM display mode
-    std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE};        ///< Active audio codec
-    std::string audioDevice;                                      ///< ALSA device name
-    std::unique_ptr<cAudioProcessor> audioProcessor;              ///< Threaded ALSA renderer
-    uint32_t connectorId{};                                       ///< DRM connector ID
-    std::string connectorName;                                    ///< User-requested connector; empty = auto
-    uint32_t crtcId{};                                            ///< DRM CRTC ID
-    std::unique_ptr<cVaapiDecoder> decoder;                       ///< Threaded VAAPI decoder
-    std::unique_ptr<cVaapiDisplay> display;                       ///< DRM page-flip display manager
-    int drmFd{-1};                                                ///< DRM primary node fd
-    std::string drmPath;                                          ///< DRM primary device path
-    std::atomic<int> initState;                                   ///< 0=detached, 1=pending, 2=ready
-    std::atomic<bool> externActive{false};                        ///< True between SetPlayMode(pmExtern) and the next
-                                                                  ///< SetPlayMode call; gates the resume-Attach path.
-    std::atomic<bool> startupComplete{false};                     ///< Gates deferred-attach against --detached
-    std::atomic<bool> liveMode;                                   ///< True in Transfer Mode (live TV)
-    int osdHeight{};                                              ///< Cached display height (px)
-    int osdWidth{};                                               ///< Cached display width (px)
+    drmModeModeInfo activeMode{};                          ///< Selected DRM display mode
+    std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE}; ///< Active audio codec
+    std::string audioDevice;                               ///< ALSA device name
+    std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
+    uint32_t connectorId{};                                ///< DRM connector ID
+    std::string connectorName;                             ///< Selected connector: -c or auto-latched; empty = auto
+    bool connectorUserSupplied{false};                     ///< connectorName came from -c (sticky); auto-latched
+                                                           ///< names are cleared on Suspend to re-select on re-attach
+    uint32_t crtcId{};                                     ///< DRM CRTC ID
+    std::unique_ptr<cVaapiDecoder> decoder;                ///< Threaded VAAPI decoder
+    std::unique_ptr<cVaapiDisplay> display;                ///< DRM page-flip display manager
+    int drmFd{-1};                                         ///< DRM primary node fd
+    std::string drmPath;                                   ///< DRM primary device path
+    std::atomic<int> initState;                            ///< 0=detached, 1=pending, 2=ready
+    std::atomic<bool> externActive{false};                 ///< True between SetPlayMode(pmExtern) and the next
+                                                           ///< SetPlayMode call; gates the resume-Attach path.
+    std::atomic<bool> startupComplete{false};              ///< Gates deferred-attach against --detached
+    std::atomic<bool> liveMode;                            ///< True in Transfer Mode (live TV)
+    int osdHeight{};                                       ///< Cached display height (px)
+    int osdWidth{};                                        ///< Cached display width (px)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
     std::atomic<unsigned> clearsSinceLog{0};                      ///< Clear()s coalesced since the last burst log

@@ -1641,9 +1641,13 @@ auto cVaapiDecoder::PresentAction() -> void {
             // post-trick drain isn't flagged either. A sync-correction sleep (hard-ahead / soft-ahead
             // / WaitForAudioCatchUp) inside the previous SyncAndSubmitFrame causes the same big gap,
             // so consume sleptInLastSubmit to skip exactly one miss. (inTrick computed above.)
+            // Exclude the re-anchor crawl for the same reason: it forces a freerun frame every
+            // DECODER_DRAIN_REANCHOR_MS (~10 fps) on purpose, so each crawl drain lands past 2*frameDur
+            // -- controller-driven pacing, not starvation. Otherwise a re-anchor inflates miss by ~one
+            // per 100 ms of crawl (the spurious miss=8..10 on the first post-attach sync line).
             const bool consumedSleep = std::exchange(sleptInLastSubmit, false);
             const uint64_t nowMs = cTimeMs::Now();
-            if (!inTrick && !consumedSleep && lastDrainMs > 0 &&
+            if (!inTrick && !consumedSleep && !reanchorActive && lastDrainMs > 0 &&
                 static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs.load(std::memory_order_relaxed) * 2) {
                 ++drainMissCount;
             }
