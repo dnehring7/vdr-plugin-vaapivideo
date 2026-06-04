@@ -244,6 +244,19 @@ constexpr std::array<std::string_view, 4> kUrlSchemes{{"file://", "http://", "ht
     return cString::sprintf("%d:%02d:%02d", sec / 3600, (sec / 60) % 60, sec % 60);
 }
 
+/// Format a byte count as a whole number of MiB (rounded to nearest), labelled "MB".
+/// Used by the file browser to annotate each media file. A non-empty file never
+/// rounds to "0 MB": sub-half-MiB sizes are floored up to "1 MB" so the column
+/// always reflects that there is content.
+[[nodiscard]] auto FormatSizeMb(std::uintmax_t bytes) -> cString {
+    constexpr std::uintmax_t BYTES_PER_MIB = 1024U * 1024U;
+    std::uintmax_t mib = (bytes + (BYTES_PER_MIB / 2)) / BYTES_PER_MIB;
+    if (mib == 0 && bytes > 0) {
+        mib = 1;
+    }
+    return cString::sprintf("%ju MB", mib);
+}
+
 [[nodiscard]] auto Trim(std::string_view s) -> std::string_view {
     constexpr std::string_view kWhitespace = " \t\r\n";
     const auto start = s.find_first_not_of(kWhitespace);
@@ -1492,9 +1505,9 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
     if (d == nullptr) {
         esyslog("vaapivideo/mediaplayer: opendir(%s): %s", currentDir.c_str(), std::strerror(errno));
     } else {
-        std::vector<std::string> dirs;
-        std::vector<std::string> files;
-        std::vector<std::string> playlists;
+        std::vector<BrowserEntry> dirs;
+        std::vector<BrowserEntry> files;
+        std::vector<BrowserEntry> playlists;
 
         while (true) {
             errno = 0;
@@ -1502,7 +1515,7 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
             if (de == nullptr) {
                 break;
             }
-            const std::string name = de->d_name;
+            std::string name = de->d_name;
             if (name.empty() || name.front() == '.') {
                 continue;
             }
@@ -1518,12 +1531,17 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
                 continue;
             }
             if (fileStatus.type() == std::filesystem::file_type::directory) {
-                dirs.push_back(name);
+                dirs.push_back({.kind = EntryKind::Directory, .name = std::move(name)});
             } else if (fileStatus.type() == std::filesystem::file_type::regular) {
+                // file_size() is a separate query that can fail independently of status() (e.g. a
+                // race with deletion); fall back to 0 so the entry still lists, just without a size.
+                std::error_code sizeEc;
+                const std::uintmax_t bytes = std::filesystem::file_size(full, sizeEc);
+                const std::uintmax_t size = sizeEc ? 0 : bytes;
                 if (IsPlaylistUri(name)) {
-                    playlists.push_back(name);
+                    playlists.push_back({.kind = EntryKind::Playlist, .name = std::move(name), .size = size});
                 } else if (IsMediaUri(name)) {
-                    files.push_back(name);
+                    files.push_back({.kind = EntryKind::File, .name = std::move(name), .size = size});
                 }
             }
         }
@@ -1539,18 +1557,19 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
         // std::sort (not std::ranges::sort) because the latter trips some IDE/IntelliSense
         // parsers on libstdc++'s sortable-concept resolution. clang-tidy modernize-use-ranges
         // would prefer the ranges form; suppressed here for that reason.
-        std::sort(dirs.begin(), dirs.end());           // NOLINT(modernize-use-ranges)
-        std::sort(playlists.begin(), playlists.end()); // NOLINT(modernize-use-ranges)
-        std::sort(files.begin(), files.end());         // NOLINT(modernize-use-ranges)
+        const auto byName = [](const BrowserEntry &a, const BrowserEntry &b) -> bool { return a.name < b.name; };
+        std::sort(dirs.begin(), dirs.end(), byName);           // NOLINT(modernize-use-ranges)
+        std::sort(playlists.begin(), playlists.end(), byName); // NOLINT(modernize-use-ranges)
+        std::sort(files.begin(), files.end(), byName);         // NOLINT(modernize-use-ranges)
 
-        for (auto &n : dirs) {
-            entries.push_back({.kind = EntryKind::Directory, .name = std::move(n)});
+        for (auto &e : dirs) {
+            entries.push_back(std::move(e));
         }
-        for (auto &n : playlists) {
-            entries.push_back({.kind = EntryKind::Playlist, .name = std::move(n)});
+        for (auto &e : playlists) {
+            entries.push_back(std::move(e));
         }
-        for (auto &n : files) {
-            entries.push_back({.kind = EntryKind::File, .name = std::move(n)});
+        for (auto &e : files) {
+            entries.push_back(std::move(e));
         }
     }
 
@@ -1567,7 +1586,9 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
                 label = cString::sprintf("# %s", entry.name.c_str());
                 break;
             case EntryKind::File:
-                label = cString::sprintf("%s", entry.name.c_str());
+                // Size appended inline (not a \t column): without SetCols the skin draws only the
+                // first tab-column, so a tabbed size would be invisible. Inline always renders.
+                label = cString::sprintf("%s  (%s)", entry.name.c_str(), *FormatSizeMb(entry.size));
                 break;
         }
         Add(new cOsdItem(label, osUnknown));

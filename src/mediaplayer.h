@@ -31,6 +31,7 @@
 #include "stream.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -389,7 +390,8 @@ class cVaapiFileBrowser final : public cOsdMenu {
     enum class EntryKind : uint8_t { Parent, Directory, File, Playlist };
     struct BrowserEntry {
         EntryKind kind;
-        std::string name; ///< Display name (basename only)
+        std::string name;       ///< Display name (basename only)
+        std::uintmax_t size{0}; ///< File size in bytes; 0 / unused for Parent and Directory
     };
 
     auto LoadDirectory(const std::string &dir) -> void;
