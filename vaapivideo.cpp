@@ -79,12 +79,46 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
           editHdrMode(
               std::clamp(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed)), 0, kHdrModeCount - 1)),
+          editLowPerfDeintMax(
+              std::clamp(vaapiConfig.lowPerfDeintMax.load(std::memory_order_relaxed), 0, kDeintMaxCount - 1)),
+          editLowPerfDisableDenoise(vaapiConfig.lowPerfDisableDenoise.load(std::memory_order_relaxed) ? 1 : 0),
+          editLowPerfDisableHqScaling(vaapiConfig.lowPerfDisableHqScaling.load(std::memory_order_relaxed) ? 1 : 0),
+          editLowPerfDisableSharpening(vaapiConfig.lowPerfDisableSharpening.load(std::memory_order_relaxed) ? 1 : 0),
+          editLowPerfEnabled(vaapiConfig.lowPerfEnabled.load(std::memory_order_relaxed) ? 1 : 0),
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
           // Clamp so cMenuEditStraItem never indexes past kPassthroughModeLabels.
           editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
                                          0, kPassthroughModeCount - 1)),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)) {
         SetSection(tr("VAAPI Video"));
+        // Snapshot the zoom scratch once here (not in BuildMenu) so a low-perf toggle rebuild keeps
+        // any pending zoom edits instead of reloading them from the atomics.
+        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
+            editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
+        }
+        BuildMenu();
+    }
+
+    // Rebuild the page in place when the low-perf master toggle flips so the sub-knobs appear/vanish.
+    auto ProcessKey(eKeys key) -> eOSState override {
+        const int wasEnabled = editLowPerfEnabled;
+        const eOSState state = cMenuSetupPage::ProcessKey(key);
+        // osContinue == an in-place edit (left/right), so the page stays open: reveal/hide the sub-knobs.
+        // The initial build is drawn by VDR; this mid-session rebuild must Display() itself.
+        if (state == osContinue && editLowPerfEnabled != wasEnabled) {
+            BuildMenu();
+            Display();
+        }
+        return state;
+    }
+
+  protected:
+    // (Re)build the item list from the scratch values: once at construction (VDR draws it) and again on
+    // each low-perf toggle to reveal/hide the sub-knobs. Preserves the cursor; caller does the Display().
+    // cMenuEditItem strdup()s its label, so the temporary cString labels are safe.
+    auto BuildMenu() -> void {
+        const int currentItem = Current();
+        Clear();
         // Separate A/V offsets for PCM and IEC61937 passthrough paths; bounds from config.h
         // keep the menu and setup.conf parser in sync.
         Add(new cMenuEditIntItem(tr("PCM Audio Latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
@@ -99,27 +133,65 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                   tr("on")));
         // Manual zoom levels: each is a zoom-in factor in tenths-of-% (344 == +34.4% enlargement),
         // applied as an equal crop on all sides; 0 disables the level (skipped while cycling). The
-        // active stop is transient and not edited here. cMenuEditItem strdup()s its label, so the
-        // temporary cString is safe.
+        // active stop is transient and not edited here.
         for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
-            editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
             Add(new cMenuEditIntItem(*cString::sprintf(tr("Zoom level %d (0.1%% larger, 0=off)"), i + 1),
                                      &editZoomLevel[i], CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX));
         }
+        // Master toggle revealing four VPP cost knobs; enabling it disables nothing until a knob moves.
+        Add(new cMenuEditBoolItem(tr("Low-performance hardware"), &editLowPerfEnabled, tr("off"), tr("on")));
+        if (editLowPerfEnabled != 0) {
+            Add(new cMenuEditStraItem(*cString::sprintf("  %s", tr("Max deinterlacer")), &editLowPerfDeintMax,
+                                      kDeintMaxCount, kDeintMaxLabels.data()));
+            Add(new cMenuEditBoolItem(*cString::sprintf("  %s", tr("Disable HQ scaling")), &editLowPerfDisableHqScaling,
+                                      tr("off"), tr("on")));
+            Add(new cMenuEditBoolItem(*cString::sprintf("  %s", tr("Disable sharpening")),
+                                      &editLowPerfDisableSharpening, tr("off"), tr("on")));
+            Add(new cMenuEditBoolItem(*cString::sprintf("  %s", tr("Disable denoising")), &editLowPerfDisableDenoise,
+                                      tr("off"), tr("on")));
+        }
+        SetCurrent(Get(currentItem < 0 ? 0 : currentItem));
     }
 
-  protected:
     auto Store() -> void override {
+        // Compare the EFFECTIVE policy (knobs gated by the master, exactly as decoder.cpp reads them),
+        // not the raw stored values: enabling the master with all defaults, or editing a sub-knob the
+        // gate ignores, leaves BuildParams identical and must not trigger a (glitchy) live rebuild.
+        const bool oldLowPerfOn = vaapiConfig.lowPerfEnabled.load(std::memory_order_relaxed);
+        const bool newLowPerfOn = editLowPerfEnabled != 0;
+        const auto gatedRank = [](bool on, int rank) -> int { return on ? rank : 0; };
+        const auto gatedFlag = [](bool on, bool flag) -> bool { return on && flag; };
+        const bool lowPerfChanged =
+            gatedRank(oldLowPerfOn, vaapiConfig.lowPerfDeintMax.load(std::memory_order_relaxed)) !=
+                gatedRank(newLowPerfOn, editLowPerfDeintMax) ||
+            gatedFlag(oldLowPerfOn, vaapiConfig.lowPerfDisableHqScaling.load(std::memory_order_relaxed)) !=
+                gatedFlag(newLowPerfOn, editLowPerfDisableHqScaling != 0) ||
+            gatedFlag(oldLowPerfOn, vaapiConfig.lowPerfDisableSharpening.load(std::memory_order_relaxed)) !=
+                gatedFlag(newLowPerfOn, editLowPerfDisableSharpening != 0) ||
+            gatedFlag(oldLowPerfOn, vaapiConfig.lowPerfDisableDenoise.load(std::memory_order_relaxed)) !=
+                gatedFlag(newLowPerfOn, editLowPerfDisableDenoise != 0);
+
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
         vaapiConfig.hdrMode.store(static_cast<HdrMode>(editHdrMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
+        vaapiConfig.lowPerfEnabled.store(editLowPerfEnabled != 0, std::memory_order_relaxed);
+        vaapiConfig.lowPerfDeintMax.store(editLowPerfDeintMax, std::memory_order_relaxed);
+        vaapiConfig.lowPerfDisableHqScaling.store(editLowPerfDisableHqScaling != 0, std::memory_order_relaxed);
+        vaapiConfig.lowPerfDisableSharpening.store(editLowPerfDisableSharpening != 0, std::memory_order_relaxed);
+        vaapiConfig.lowPerfDisableDenoise.store(editLowPerfDisableDenoise != 0, std::memory_order_relaxed);
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
         SetupStore("PassthroughMode", editPassthroughMode);
         SetupStore("HdrMode", editHdrMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
+        // Low-performance-hardware knobs; applied by the policy rebuild below, or any later filter rebuild.
+        SetupStore("LowPerfEnabled", editLowPerfEnabled);
+        SetupStore("LowPerfDeintMax", editLowPerfDeintMax);
+        SetupStore("LowPerfDisableHqScaling", editLowPerfDisableHqScaling);
+        SetupStore("LowPerfDisableSharpening", editLowPerfDisableSharpening);
+        SetupStore("LowPerfDisableDenoise", editLowPerfDisableDenoise);
         // Decide whether the *live* level actually changed BEFORE overwriting the atomics -- only
         // then is a filter rebuild warranted (a bare setup OK must not glitch the picture).
         const int activeZoom = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
@@ -146,6 +218,12 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                 }
             }
         }
+        // Reuse the zoom rebuild path so the low-perf switch takes effect on leaving the menu.
+        if (lowPerfChanged) {
+            if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
+                device->RefreshVideoFilters();
+            }
+        }
     }
 
   private:
@@ -167,11 +245,22 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kHdrModeCount = static_cast<int>(kHdrModeLabels.size());
 
-    int editClearOnChannelSwitch; ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
-    int editHdrMode;              ///< Scratch copy of hdrMode as int (index into kHdrModeLabels).
-    int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
-    int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
-    int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
+    // Short UI labels for the deinterlacer-cap straight item; order matches DeintMode (index round-tripped
+    // through setup.conf as LowPerfDeintMax). Distinct from the ffmpeg mode strings the filter chain emits.
+    static constexpr std::array<const char *, CONFIG_DEINT_MODE_COUNT> kDeintMaxLabels{"MCDI (max)", "MADI", "Weave",
+                                                                                       "Bob"};
+    static constexpr int kDeintMaxCount = static_cast<int>(kDeintMaxLabels.size());
+
+    int editClearOnChannelSwitch;     ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
+    int editHdrMode;                  ///< Scratch copy of hdrMode as int (index into kHdrModeLabels).
+    int editLowPerfDeintMax;          ///< Scratch copy of lowPerfDeintMax (index into kDeintMaxLabels / DeintMode).
+    int editLowPerfDisableDenoise;    ///< Scratch copy of lowPerfDisableDenoise (0/1).
+    int editLowPerfDisableHqScaling;  ///< Scratch copy of lowPerfDisableHqScaling (0/1).
+    int editLowPerfDisableSharpening; ///< Scratch copy of lowPerfDisableSharpening (0/1).
+    int editLowPerfEnabled;           ///< Scratch copy of lowPerfEnabled (0/1); gates the four knobs above.
+    int editPassthroughLatency;       ///< Scratch copy of passthroughLatency; not committed until Store().
+    int editPassthroughMode;          ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
+    int editPcmLatency;               ///< Scratch copy of pcmLatency; not committed until Store().
     int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Scratch copies of per-preset zoom level (tenths-of-%).
 };
 
@@ -639,7 +728,7 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
                                 height, vaapiConfig.display.GetRefreshRate());
     }
 
-    if (strcasecmp(command, "CONFIG") == 0) {
+    if (strcasecmp(command, "CONF") == 0) {
         replyCode = 900;
         return cString::sprintf("Configuration:\n%s", vaapiConfig.GetSummary().c_str());
     }
@@ -718,7 +807,7 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.",
-        "CONFIG\n    Display current configuration settings.",
+        "CONF\n    Display current configuration settings.",
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
         *zoomHelp,
         nullptr};

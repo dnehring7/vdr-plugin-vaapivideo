@@ -131,13 +131,22 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
             zoom += std::format("{}{}=+{:.1f}%", i == 0 ? "" : " ", i + 1, static_cast<double>(level) / 10.0);
         }
     }
+    // Low-performance-hardware: render the active knobs only when the master gate is on.
+    std::string lowPerf = "off";
+    if (lowPerfEnabled.load(std::memory_order_relaxed)) {
+        lowPerf = std::format("deint<={} hqscale={} sharpen={} denoise={}",
+                              DeintModeName(static_cast<DeintMode>(lowPerfDeintMax.load(std::memory_order_relaxed))),
+                              lowPerfDisableHqScaling.load(std::memory_order_relaxed) ? "off" : "on",
+                              lowPerfDisableSharpening.load(std::memory_order_relaxed) ? "off" : "on",
+                              lowPerfDisableDenoise.load(std::memory_order_relaxed) ? "off" : "on");
+    }
     return std::format(
-        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}, Zoom "
-        "levels (0=off): {}",
+        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}, "
+        "Low-perf HW: {}, Zoom levels (0=off): {}",
         pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
         PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
         HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", zoom);
+        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", lowPerf, zoom);
 }
 
 namespace {
@@ -191,6 +200,27 @@ namespace {
     const int previous = target.load(std::memory_order_relaxed);
     if (previous != parsed) {
         dsyslog("vaapivideo/config: %s updated from %d to %d (tenths-of-%%)", key, previous, parsed);
+    }
+    target.store(parsed, std::memory_order_relaxed);
+    return true;
+}
+
+/// Parse VDR's canonical 0/1 boolean encoding into @p target. Relaxed store + log-only-on-change,
+/// matching the other parsers; shared by the low-performance-hardware disable flags.
+[[nodiscard]] auto ParseBoolValue(const char *key, const char *value, std::atomic<bool> &target) -> bool {
+    const std::string_view v{value};
+    bool parsed{};
+    if (v == "0") {
+        parsed = false;
+    } else if (v == "1") {
+        parsed = true;
+    } else {
+        esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
+        return false;
+    }
+    const bool previous = target.load(std::memory_order_relaxed);
+    if (previous != parsed) {
+        dsyslog("vaapivideo/config: %s updated from %d to %d", key, previous ? 1 : 0, parsed ? 1 : 0);
     }
     target.store(parsed, std::memory_order_relaxed);
     return true;
@@ -250,21 +280,34 @@ namespace {
         return true;
     }
     if (key == "ClearOnChannelSwitch") {
-        // Accept VDR's canonical 0/1 encoding for booleans; anything else is a malformed entry.
-        const std::string_view v{value};
-        bool parsed{};
-        if (v == "0") {
-            parsed = false;
-        } else if (v == "1") {
-            parsed = true;
-        } else {
-            esyslog("vaapivideo/config: invalid ClearOnChannelSwitch value '%s'", value);
+        return ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);
+    }
+    if (key == "LowPerfEnabled") {
+        return ParseBoolValue("LowPerfEnabled", value, lowPerfEnabled);
+    }
+    if (key == "LowPerfDisableDenoise") {
+        return ParseBoolValue("LowPerfDisableDenoise", value, lowPerfDisableDenoise);
+    }
+    if (key == "LowPerfDisableHqScaling") {
+        return ParseBoolValue("LowPerfDisableHqScaling", value, lowPerfDisableHqScaling);
+    }
+    if (key == "LowPerfDisableSharpening") {
+        return ParseBoolValue("LowPerfDisableSharpening", value, lowPerfDisableSharpening);
+    }
+    if (key == "LowPerfDeintMax") {
+        // Encoded as the DeintMode index (written by cMenuEditStraItem). Range [0, count-1] is
+        // contiguous so a single bounds check suffices.
+        int parsed{};
+        const auto *end = value + std::strlen(value);
+        const auto [ptr, ec] = std::from_chars(value, end, parsed);
+        if (ec != std::errc{} || ptr != end || parsed < 0 || parsed >= CONFIG_DEINT_MODE_COUNT) {
+            esyslog("vaapivideo/config: invalid LowPerfDeintMax value '%s'", value);
             return false;
         }
-        const bool previous = clearOnChannelSwitch.load(std::memory_order_relaxed);
-        clearOnChannelSwitch.store(parsed, std::memory_order_relaxed);
+        const int previous = lowPerfDeintMax.exchange(parsed, std::memory_order_relaxed);
         if (previous != parsed) {
-            dsyslog("vaapivideo/config: ClearOnChannelSwitch updated from %d to %d", previous ? 1 : 0, parsed ? 1 : 0);
+            dsyslog("vaapivideo/config: LowPerfDeintMax updated from %s to %s",
+                    DeintModeName(static_cast<DeintMode>(previous)), DeintModeName(static_cast<DeintMode>(parsed)));
         }
         return true;
     }

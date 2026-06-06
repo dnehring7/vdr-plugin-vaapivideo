@@ -2100,6 +2100,14 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.hasDenoise = vaapiContext->caps.vppDenoise;
     params.hasSharpness = vaapiContext->caps.vppSharpness;
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;
+    params.deinterlaceModeMask = vaapiContext->caps.deinterlaceModeMask;
+    // Gate the low-perf knobs on the master switch; off leaves the fields at no-op defaults.
+    if (vaapiConfig.lowPerfEnabled.load(std::memory_order_relaxed)) {
+        params.deinterlaceMaxRank = vaapiConfig.lowPerfDeintMax.load(std::memory_order_relaxed);
+        params.disableDenoise = vaapiConfig.lowPerfDisableDenoise.load(std::memory_order_relaxed);
+        params.disableHqScaling = vaapiConfig.lowPerfDisableHqScaling.load(std::memory_order_relaxed);
+        params.disableSharpness = vaapiConfig.lowPerfDisableSharpening.load(std::memory_order_relaxed);
+    }
     params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
     params.compactLog = compactLog;

@@ -107,6 +107,40 @@ enum class HdrMode : uint8_t {
 }
 
 // ============================================================================
+// === LOW-PERFORMANCE-HARDWARE MODE ===
+// ============================================================================
+
+/// Deinterlacer quality ceiling for low-performance-hardware mode. Numbered by descending
+/// quality so the numeric value IS the rank (lower = better); the filter chain clamps the
+/// GPU's best mode to no better than this. Numeric values are part of the setup.conf wire
+/// format -- do not renumber. Quality order matches caps.cpp's deinterlace probe.
+enum class DeintMode : uint8_t {
+    MotionCompensated = 0, ///< MCDI -- highest quality (default cap = no effective limit)
+    MotionAdaptive = 1,    ///< MADI
+    Weave = 2,             ///< field weave
+    Bob = 3,               ///< line doubling -- lowest cost
+};
+
+inline constexpr int CONFIG_DEINT_MODE_COUNT = 4; ///< Number of DeintMode values; bounds the cap menu/parse
+
+/// ffmpeg deinterlace_vaapi mode string for a DeintMode. Single source of truth shared by
+/// filter.cpp (clamp + filter emit) and config.cpp (logging); mirrors the kDeintModes names
+/// in caps.cpp.
+[[nodiscard]] constexpr auto DeintModeName(DeintMode mode) noexcept -> const char * {
+    switch (mode) {
+        case DeintMode::MotionCompensated:
+            return "motion_compensated";
+        case DeintMode::MotionAdaptive:
+            return "motion_adaptive";
+        case DeintMode::Weave:
+            return "weave";
+        case DeintMode::Bob:
+            return "bob";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
 // === ZOOM BOUNDS ===
 // ============================================================================
 
@@ -126,7 +160,13 @@ struct VaapiConfig {
     std::atomic<bool> clearOnChannelSwitch{false}; ///< Black frame on channel switch instead of leaving the last frame
     DisplayConfig display;                         ///< Display geometry; init-time only, not thread-safe after that
     std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< Re-read on every codec change / filter-graph rebuild
-    std::atomic<int> passthroughLatency{0};        ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
+    // Low-performance-hardware knobs: ignored unless lowPerfEnabled; re-read on every filter-graph rebuild.
+    std::atomic<int> lowPerfDeintMax{0};               ///< DeintMode index ceiling (0=MCDI ⇒ no limit); see DeintMode
+    std::atomic<bool> lowPerfDisableDenoise{false};    ///< Skip denoise_vaapi / MPEG-2 hqdn3d fallback in the chain
+    std::atomic<bool> lowPerfDisableHqScaling{false};  ///< Drop scale_vaapi :mode=hq (bicubic) even on non-UHD
+    std::atomic<bool> lowPerfDisableSharpening{false}; ///< Skip sharpness_vaapi in the chain
+    std::atomic<bool> lowPerfEnabled{false};           ///< Master gate; when off the four knobs above are no-ops
+    std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
     std::atomic<int> zoomActive{

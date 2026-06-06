@@ -50,10 +50,12 @@ struct GpuCaps {
     bool hwVvcMain10{};   ///< VAProfileVVCMain10, VLD + YUV420_10 (10-bit)
 
     // === VPP FILTERS ===
-    bool vppP010{};              ///< Driver allocates P010 (YUV420_10) surfaces; HDR passthrough prerequisite
-    bool vppDenoise{};           ///< VAProcFilterNoiseReduction available
-    bool vppSharpness{};         ///< VAProcFilterSharpening available
-    std::string deinterlaceMode; ///< Best VAProcDeinterlacing mode name for deinterlace_vaapi; "" = none
+    bool vppP010{};                 ///< Driver allocates P010 (YUV420_10) surfaces; HDR passthrough prerequisite
+    bool vppDenoise{};              ///< VAProcFilterNoiseReduction available
+    bool vppSharpness{};            ///< VAProcFilterSharpening available
+    std::string deinterlaceMode;    ///< Best VAProcDeinterlacing mode name for deinterlace_vaapi; "" = none
+    unsigned deinterlaceModeMask{}; ///< Bit (1u<<DeintMode) set per supported mode; lets the low-perf cap pick
+                                    ///< only modes the driver actually advertises (some iHD GPUs expose just one)
 
     // === DIAGNOSTICS ===
     std::string vendorName; ///< vaQueryVendorString output; logged at startup only

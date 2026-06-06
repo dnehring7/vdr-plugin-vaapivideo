@@ -8,6 +8,7 @@
 #include "filter.h"
 
 #include "common.h"
+#include "config.h"
 
 // C++ Standard Library
 #include <algorithm>
@@ -132,6 +133,31 @@ namespace {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buf{};
     av_make_error_string(buf.data(), buf.size(), ret);
     return buf;
+}
+
+/// Resolve the deinterlacer under the low-perf cap, choosing ONLY modes the driver advertises in
+/// @p supportedMask -- emitting an unadvertised mode makes VAAPI reject the whole graph (some iHD GPUs
+/// expose just motion_compensated). The DeintMode value is its rank (lower = better); see config.h.
+[[nodiscard]] auto ClampDeinterlaceMode(std::string_view gpuMode, int capRank, unsigned supportedMask)
+    -> std::string_view {
+    const int cap = std::clamp(capRank, 0, CONFIG_DEINT_MODE_COUNT - 1);
+    if (cap == 0 || supportedMask == 0) {
+        return gpuMode; // MCDI never limits; an empty mask means we can't safely pick a mode
+    }
+    const auto isSupported = [supportedMask](int rank) -> bool {
+        return (supportedMask & (1U << static_cast<unsigned>(rank))) != 0;
+    };
+    for (int rank = cap; rank < CONFIG_DEINT_MODE_COUNT; ++rank) { // best supported mode no better than the cap
+        if (isSupported(rank)) {
+            return DeintModeName(static_cast<DeintMode>(rank));
+        }
+    }
+    for (int rank = CONFIG_DEINT_MODE_COUNT - 1; rank >= 0; --rank) { // cap unreachable: cheapest mode on offer
+        if (isSupported(rank)) {
+            return DeintModeName(static_cast<DeintMode>(rank));
+        }
+    }
+    return gpuMode;
 }
 
 } // namespace
@@ -331,7 +357,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Both modes also skip denoise/sharpness: quality irrelevant at trick speeds, and still frames
     // are typically JPEG-style I-frames where spatial filters add no value.
     const bool useSimpleDeinterlace = params.trickMode || params.stillPicture;
-    const bool wantDenoise = !useSimpleDeinterlace && denoiseLevel > 0;
+    const bool wantDenoise = !useSimpleDeinterlace && denoiseLevel > 0 && !params.disableDenoise;
 
     if (isSoftwareDecode) {
         if (isInterlaced && !params.stillPicture) {
@@ -363,7 +389,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 // priming buffer that motion_adaptive requires and never drains at trick speeds.
                 filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame");
             } else {
-                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", params.deinterlaceMode));
+                // Low-perf cap (no-op at default); only ever emits a driver-supported mode.
+                const std::string_view deintMode =
+                    ClampDeinterlaceMode(params.deinterlaceMode, params.deinterlaceMaxRank, params.deinterlaceModeMask);
+                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", deintMode));
             }
         }
     }
@@ -388,14 +417,15 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // when the kept region already matches the target (keeps VPP doing real work that reads the crop).
     const bool needsExplicitScaleSize = needsResize || (wantCrop && !isSoftwareDecode);
     if (needsExplicitScaleSize) {
-        const char *scaleMode = isUhd ? "" : ":mode=hq"; // bicubic (hq) too expensive at 4K
+        // bicubic (hq) too expensive at 4K; the low-perf knob drops it on non-UHD too.
+        const char *scaleMode = (isUhd || params.disableHqScaling) ? "" : ":mode=hq";
         filters.push_back(
             std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleMode, scaleColorArgs));
     } else {
         filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
     }
 
-    if (!useSimpleDeinterlace && sharpnessLevel > 0 && params.hasSharpness) {
+    if (!useSimpleDeinterlace && sharpnessLevel > 0 && params.hasSharpness && !params.disableSharpness) {
         filters.push_back(std::format("sharpness_vaapi=sharpness={}", sharpnessLevel));
     }
 

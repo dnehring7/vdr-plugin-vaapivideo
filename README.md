@@ -337,6 +337,11 @@ that start VDR before a user session claims the console.
 | `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 | `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–5): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
+| `Low-performance hardware`       | off / on         | Master gate for the filter-cost limits below; the four sub-items appear only when this is **on** (see [Low-performance hardware](#low-performance-hardware)) |
+| `  Max deinterlacer`             | MCDI / MADI / Weave / Bob | Cap HW deinterlacing quality to no better than the selected mode (`MCDI` = no limit)        |
+| `  Disable HQ scaling`           | off / on         | Drop `scale_vaapi:mode=hq` (bicubic) on non-UHD content                                              |
+| `  Disable sharpening`           | off / on         | Skip `sharpness_vaapi`                                                                               |
+| `  Disable denoising`            | off / on         | Skip `denoise_vaapi` (and the MPEG-2 `hqdn3d` software fallback)                                     |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -413,12 +418,40 @@ Cycling the zoom:
   Or just `Blue @vaapivideo` to open the menu and navigate by hand. The
   `PLUG vaapivideo ZOOM [next|0-5]` SVDRP command remains available for scripting.
 
+### Low-performance hardware
+
+On weaker GPUs the VAAPI post-processing chain — motion-compensated deinterlace,
+bicubic (`mode=hq`) scaling, sharpening, denoising — can saturate the hardware and
+cause stutter. `Low-performance hardware` defaults to **off**. The master toggle is
+always shown, but its four sub-items appear only once you enable it, and enabling it
+on its own changes **nothing** until you adjust a knob. Each knob trims one stage of
+the chain:
+
+- **Max deinterlacer** caps HW deinterlacing to no better than the chosen mode
+  (quality order `MCDI` > `MADI` > `Weave` > `Bob`). The cap is a ceiling and only
+  ever selects a mode the driver actually advertises: it picks the best supported
+  mode no better than the cap, and if the driver exposes only modes better than the
+  cap (some iHD GPUs advertise just `motion_compensated`) it keeps the cheapest
+  supported one rather than emit a mode VAAPI would reject. `MCDI` (the default)
+  never limits. The advertised set is logged at startup (`vaapivideo/caps: VPP …
+  deinterlace=…`).
+- **Disable HQ scaling** drops the bicubic `mode=hq` flag from `scale_vaapi` on
+  non-UHD content (UHD already skips it). Scaling still happens, just cheaper.
+- **Disable sharpening** removes the `sharpness_vaapi` stage.
+- **Disable denoising** removes `denoise_vaapi` (and the MPEG-2-only `hqdn3d`
+  software fallback used on GPUs without HW denoise).
+
+Unlike audio passthrough, these apply to **live playback immediately**: on leaving
+the setup menu the plugin rebuilds the filter graph (the same path a zoom edit
+uses), so there is no need to switch channels. The knobs only ever affect the
+video filter chain — decoding, audio, HDR, and zoom are untouched.
+
 ### SVDRP commands
 
 | Command                        | Description                                                |
 |--------------------------------|------------------------------------------------------------|
 | `PLUG vaapivideo STAT`         | Device status, active resolution, refresh rate             |
-| `PLUG vaapivideo CONFIG`       | Current configuration summary                              |
+| `PLUG vaapivideo CONF`         | Current configuration summary                              |
 | `PLUG vaapivideo DETA`         | Detach from DRM/VAAPI hardware (release for other apps)    |
 | `PLUG vaapivideo ATTA`         | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 | `PLUG vaapivideo PLAY <uri>`   | Start mediaplayer on a file, URL, or `.m3u/.m3u8` playlist |
