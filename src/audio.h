@@ -99,7 +99,9 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Mediaplayer path: clones a pre-demuxed AU onto the audio queue. Returns false on
                  ///< capacity overflow; caller is expected to back off and retry.
     auto SetVolume(int vol)
-        -> void;             ///< PCM volume in range [0, 255]; 0 = mute, 255 = full scale; skipped for passthrough
+        -> void; ///< Volume in range [0, 255]; 255 = unity, 0 = mute. Applied per write in WriteToAlsa(): 0 inserts
+                 ///< digital silence on both paths (zeroed PCM samples / zeroed IEC61937 burst), intermediate
+                 ///< values scale PCM only. ALSA stays clocked, so the playback clock does not freerun while muted.
     auto Shutdown() -> void; ///< Stops the processing thread and closes ALSA + decoder + parser. Idempotent;
                              ///< called by the destructor. Initialize()'s device-swap path calls CloseDevice()
                              ///< directly instead, keeping the thread alive across the swap.
@@ -256,7 +258,8 @@ class cAudioProcessor : public cThread {
     mutable std::unique_ptr<cMutex> mutex; ///< Serializes ALSA handle, packet queue, decoder state, and seqlock writes
     std::atomic<bool> stopping{
         false};                   ///< Signals Action() to exit; also set on fatal ALSA error to mark processor unusable
-    std::atomic<int> volume{255}; ///< PCM volume scale applied in WriteToAlsa(); 0 = mute, 255 = unity
+    std::atomic<int> volume{255}; ///< Volume applied in WriteToAlsa(); 255 = unity, 0 = mute (zero-filled output on
+                                  ///< both PCM and passthrough), intermediate values scale PCM samples only
 
     // ========================================================================
     // === TIMING ===

@@ -1201,9 +1201,11 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
 auto cVaapiDevice::Mute() -> void {
     cDevice::Mute();
 
-    // DropOutput silences the sink without nulling the playback clock; full Clear() here would
-    // null GetClock() and cause a video freerun + display underrun for every OSD-mediated mute.
-    // HardwareReady()-gated: skins can mute on menu open/close (main thread) during an in-flight ATTA.
+    // DropOutput silences the queued tail without nulling the playback clock; the persistent mute
+    // case is handled by SetVolumeDevice(0) (VDR's mute key drives that path, not this override).
+    // Full Clear() here would null GetClock() and cause a video freerun + display underrun for
+    // every OSD-mediated mute. HardwareReady()-gated: skins can mute on menu open/close (main
+    // thread) during an in-flight ATTA.
     if (HardwareReady() && audioProcessor) [[likely]] {
         audioProcessor->DropOutput();
     }

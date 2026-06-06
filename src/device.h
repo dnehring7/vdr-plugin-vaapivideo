@@ -130,7 +130,8 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto IsReady() const noexcept -> bool {
         return HardwareReady();
     } ///< Public "hardware attached" accessor (SVDRP ATTA/DETA, mediaplayer, services).
-    auto Mute() -> void override; ///< Drop pending audio frames (hardware mute handled by VDR)
+    auto Mute() -> void override; ///< Drop the already-queued audio tail (DropOutput); persistent mute is driven
+                                  ///< by VDR through SetVolumeDevice(0), not this rarely-invoked override
     auto Play() -> void override; ///< Resume normal playback: clear trick speed and unpause
     [[nodiscard]] auto Poll(cPoller &Poller, int TimeoutMs = 0)
         -> bool override; ///< Return true when at least one queue has space for more data
@@ -227,7 +228,9 @@ class cVaapiDevice : public cDevice {
                           ///< has a dedicated dolby walk-around for this; see its implementation.
     [[nodiscard]] auto SetPlayMode(ePlayMode PlayMode)
         -> bool override;                              ///< Reset state machine and flush on mode transitions
-    auto SetVolumeDevice(int Volume) -> void override; ///< Forward PCM volume [0..255] to ALSA renderer
+    auto SetVolumeDevice(int Volume) -> void override; ///< Forward VDR volume [0..255] to ALSA renderer; 0 inserts
+                                                       ///< digital silence on both PCM and passthrough,
+                                                       ///< intermediate values scale PCM only
 
   private:
     // ========================================================================

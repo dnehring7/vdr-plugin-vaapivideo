@@ -478,7 +478,17 @@ auto cAudioProcessor::SetVolume(int vol) -> void {
     const int clampedVol = std::clamp(vol, 0, 255);
     const int oldVol = volume.exchange(clampedVol, std::memory_order_relaxed);
     if (oldVol != clampedVol) {
-        dsyslog("vaapivideo/audio: SetVolume(%d) %s", clampedVol, clampedVol == 0 ? "[muted]" : "");
+        // Mute/unmute apply in WriteToAlsa(), which reads `volume` per write: 0 writes digital
+        // silence (zeroed PCM samples / passthrough burst) instead of stopping output, so ALSA
+        // stays clocked and GetClock() does not freerun. The ~AUDIO_ALSA_BUFFER_MS already queued
+        // in the ring plays out first, so silence begins after that latency.
+        const char *tag = "";
+        if (clampedVol == 0) {
+            tag = " [muted]";
+        } else if (oldVol == 0) {
+            tag = " [unmuted]";
+        }
+        dsyslog("vaapivideo/audio: SetVolume(%d)%s", clampedVol, tag);
     }
 }
 
@@ -1666,22 +1676,24 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const bool passthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
     std::vector<uint8_t> scaledBuffer;
 
-    if (!passthrough && currentVolume != 255) {
-        if (currentVolume == 0) {
-            scaledBuffer.assign(data.size(), 0);
-        } else {
-            // Format is always S16LE (ConfigureAlsaParams() locks it), so the int16_t
-            // reinterpret is safe. Volume scaling is skipped for passthrough bursts.
-            scaledBuffer.resize(data.size());
-            const auto *src =
-                reinterpret_cast<const int16_t *>(data.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            auto *dst =
-                reinterpret_cast<int16_t *>(scaledBuffer.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            const size_t samples = data.size() / sizeof(int16_t);
+    if (currentVolume == 0) {
+        // Mute: write digital silence on both paths -- zeroed S16LE samples (PCM) or a zeroed
+        // IEC61937 burst (passthrough, which the receiver renders as silence). Same length as the
+        // real data, so ALSA stays clocked and the playback clock keeps advancing. Matches softhdcuvid.
+        scaledBuffer.assign(data.size(), 0);
+        data = std::span<const uint8_t>(scaledBuffer.data(), scaledBuffer.size());
+    } else if (!passthrough && currentVolume != 255) {
+        // PCM partial attenuation. Format is always S16LE (ConfigureAlsaParams() locks it), so the
+        // int16_t reinterpret is safe. Passthrough is never scaled (only muted, handled above).
+        scaledBuffer.resize(data.size());
+        const auto *src =
+            reinterpret_cast<const int16_t *>(data.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        auto *dst =
+            reinterpret_cast<int16_t *>(scaledBuffer.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        const size_t samples = data.size() / sizeof(int16_t);
 
-            for (size_t i = 0; i < samples; ++i) {
-                dst[i] = static_cast<int16_t>((src[i] * currentVolume) / 255);
-            }
+        for (size_t i = 0; i < samples; ++i) {
+            dst[i] = static_cast<int16_t>((src[i] * currentVolume) / 255);
         }
         data = std::span<const uint8_t>(scaledBuffer.data(), scaledBuffer.size());
     }
