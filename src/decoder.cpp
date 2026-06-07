@@ -144,44 +144,12 @@ constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
           ///< handled at the source (cVaapiMediaSource::PopulateStreamInfo picks ptsOrigin = max of
           ///< per-stream start_times so both streams begin at rebased PTS 0 together), so the
           ///< threshold only needs to catch genuine discontinuities, not normal startup offsets.
-constexpr uint64_t DECODER_DRAIN_STALL_MS =
-    500; ///< Walltime budget for the future-head gate to clear naturally before the FIRST forced freerun.
-         ///< After this the audio clock is anchored to a different domain than the incoming video PTS
-         ///< (post-Clear / ATTA / PCR break) and waiting only extends the startup black screen. The long
-         ///< first delay filters transient holds; the re-anchor crawl below then uses the shorter cadence.
-constexpr uint64_t DECODER_DRAIN_REANCHOR_MS =
-    100; ///< Re-arm cadence once a re-anchor is confirmed (head stuck ahead, clock catching up): force one
-         ///< freerun frame every ~100 ms (~10 fps) instead of every 500 ms (~2 fps) so the post-seek
-         ///< crawl-to-alignment is smooth motion rather than a visible slideshow. Steady state never reaches
-         ///< this -- the drained head sits at dueIn~=0, so the watchdog only engages during re-anchor.
-constexpr int64_t DECODER_DRAIN_REANCHOR_GAP_90K =
-    750 *
-    PTS_TICKS_PER_MS; ///< Future-head gap above which the FIRST forced freerun skips the long
-                      ///< DECODER_DRAIN_STALL_MS first-fire and starts the crawl at the DECODER_DRAIN_REANCHOR_MS
-                      ///< cadence immediately. A gap this large is an unambiguous post-Clear/seek/trick-exit
-                      ///< re-anchor (head lands ~1.5-2 s ahead of the freshly anchored clock) that cannot
-                      ///< self-resolve, so the 500 ms first-fire there is pure transition freeze. Smaller gaps
-                      ///< (steady-play clock jitter that may settle on its own) keep the long guard. Comfortably
-                      ///< above the worst legitimate live-switch offset seen (~300 ms), below replay seeks (~1.8 s+).
-constexpr uint64_t DECODER_REANCHOR_LOG_COOLDOWN_MS =
-    2000; ///< Min spacing between "re-anchoring" onset logs. A VDR REW->PLAY->REW / scrub burst fires a Clear
-          ///< every ~250 ms, and since DECODER_DRAIN_REANCHOR_GAP_90K now starts the crawl immediately on each,
-          ///< the onset would otherwise log once per Clear (~7 lines/burst). Collapsing to one line per burst keeps
-          ///< the prompt-crawl behaviour while the journal stays readable; reset on a genuine re-anchor completion
-          ///< so a distinct later transition still logs its own onset.
 constexpr uint64_t DECODER_NO_CLOCK_HOLD_MS =
-    1500; ///< Walltime the drain holds (jitterBuf non-empty, ap non-null, GetClock()=NOPTS) before
-          ///< falling back to no-clock freerun. TS seeks can land on a video keyframe up to ~1 s
-          ///< ahead of the target audio (the mux interleave offset documented around
-          ///< MEDIAPLAYER_MAX_LOOKAHEAD_90K); a 500 ms hold expired before audio anchored and let
-          ///< freerun submit pre-anchor video at VSync rate, putting the head that far ahead of
-          ///< clock on anchor -- which the due-gate then has to crawl out at the re-anchor cadence
-          ///< (DECODER_DRAIN_REANCHOR_MS). Holding keeps frames in jitterBuf so the post-anchor catch-up
-          ///< can drop the pre-target excess in one burst instead.
-          ///< Bounded so video-only streams (ap non-null but no audio writes will ever occur) do
-          ///< not freeze indefinitely; the nearCap escape below additionally bypasses the hold if
-          ///< jitterBuf hits the 150-frame cap, so a fast HW decoder cannot stall waiting for an
-          ///< audio anchor that will never come.
+    1500; ///< Walltime the drain holds the first frame still (jitterBuf non-empty, ap non-null,
+          ///< GetClock()=NOPTS) waiting for the audio clock to anchor before falling back to no-clock
+          ///< freerun. Keeps post-seek frames buffered so the head doesn't run ahead of the clock at
+          ///< VSync rate. Bounded so a video-only stream (ap non-null, no audio anchor ever) does not
+          ///< freeze forever; the nearCap escape additionally bypasses it if jitterBuf hits the cap.
 constexpr int VDR_SLOW_REVERSE_SPEED_MULT =
     12; ///< VDR dvbplayer.c SPEED_MULT. Slow FORWARD passes the bare slowdown factor (2/4/8); slow REVERSE
         ///< passes slowdown * this, clamped to MAX_VIDEO_SLOWMOTION (24/48/96 -> 63). Divided back out in
@@ -1400,11 +1368,7 @@ auto cVaapiDecoder::Action() -> void {
 auto cVaapiDecoder::PresentAction() -> void {
     dsyslog("vaapivideo/present: thread started");
 
-    uint64_t drainBlockedSinceMs{0};   ///< Walltime of first consecutive due-gate block; 0 = not blocked.
-    uint64_t noClockBlockedSinceMs{0}; ///< Walltime of first consecutive no-clock hold; 0 = not blocked.
-    bool reanchorActive{false};        ///< In the post-seek video-ahead crawl: forces freerun at the faster
-                                       ///< DECODER_DRAIN_REANCHOR_MS cadence and gates the once-per-episode log.
-    cTimeMs reanchorLogCooldown(0);    ///< Throttles the "re-anchoring" onset log across a Clear burst; 0 = log now.
+    uint64_t noClockBlockedSinceMs{0}; ///< Walltime of the first no-clock hold; 0 = not holding.
     uint64_t lastDrainMs{0};
     cTimeMs jitterOverflowLogGate;   ///< Rate-limits the "jitterBuf overflow" syslog spam.
     size_t jitterOverflowSinceLog{}; ///< Frames dropped by the runaway guard since the last overflow log.
@@ -1417,9 +1381,7 @@ auto cVaapiDecoder::PresentAction() -> void {
         // drain-loop epoch break.
         if (const int flushRequest = jitterFlushRequest.exchange(0, std::memory_order_acquire); flushRequest != 0) {
             ApplyDeferredJitterFlush(lastDrainMs, /*preserveSeekHint=*/flushRequest == 2);
-            drainBlockedSinceMs = 0;
             noClockBlockedSinceMs = 0;
-            reanchorActive = false; // a Clear/seek starts a fresh re-anchor episode
         }
         presentEpoch = clearEpoch.load(std::memory_order_acquire);
 
@@ -1505,10 +1467,6 @@ auto cVaapiDecoder::PresentAction() -> void {
             SkipStaleJitterFrames(ap);
         }
 
-        if (jitterBuf.empty()) {
-            drainBlockedSinceMs = 0;
-        }
-
         // Freerun and pendingDrops (soft-behind burst) bypass the due-gate.
         while (!jitterBuf.empty() && !stopping.load(std::memory_order_relaxed)) {
             // Clear() / SetTrickSpeed(0) raced this iteration: abandon the stale jitterBuf to
@@ -1534,7 +1492,6 @@ auto cVaapiDecoder::PresentAction() -> void {
             // but those frames must still be paced out by SubmitTrickFrame -- holding here is exactly
             // what froze slow motion, while fast trick (no preceding Freeze) kept working.
             if (devicePaused.load(std::memory_order_acquire) && !inTrick) [[unlikely]] {
-                drainBlockedSinceMs = 0;
                 noClockBlockedSinceMs = 0;
                 lastDrainMs = 0;
                 break;
@@ -1543,26 +1500,16 @@ auto cVaapiDecoder::PresentAction() -> void {
             const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
 
             if (!inTrick && !consumingDrop && !canFreerun && ap) {
-                // Normal path: with a valid clock, hold until head PTS is due.
-                // No clock / no audio processor falls through to SyncAndSubmitFrame()'s
-                // freerun-on-no-clock path so video doesn't freeze when the audio clock
-                // is missing (track switch, ALSA reset, video-only stream).
+                // With a valid clock, hold until the head PTS is due. A missing clock (track switch,
+                // ALSA reset, video-only stream) falls through to SyncAndSubmitFrame()'s no-clock freerun.
                 const int64_t clock = ap->GetClock();
                 if (clock == AV_NOPTS_VALUE) {
-                    // Post-Clear / post-FlushForSeek window: ap exists, audio anchor incoming.
-                    // Hold so freerun does not submit pre-anchor video at VSync rate and push
-                    // head far ahead of clock when audio finally anchors (visible as ~2 fps
-                    // jerky catch-up after a seek). Once the hold times out (stuck-NOPTS streams
-                    // -- video-only files routed through an open audio processor) noClockBlockedSinceMs
-                    // stays armed so subsequent iters fall straight through; jitterFlushRequest
-                    // and the else-branch reset re-arm the hold on the next Clear or clock anchor.
-                    //
-                    // Cap escape: a fast HW decoder (960p VP9 + fps=50 duplicator) can fill
-                    // jitterBuf past the 150-frame hard cap inside the no-clock hold window,
-                    // triggering a spam of "jitterBuf overflow -- dropped N" lines and losing
-                    // pre-target frames to the unconditional pop_front. Abandon the hold once
-                    // the buffer is near the cap so the no-clock freerun submits at VSync rate
-                    // and consumes frames as the decoder produces them.
+                    // Post-Clear/seek window, audio anchor incoming: hold so freerun does not submit
+                    // pre-anchor video at VSync rate and leave the head far ahead of the clock once audio
+                    // anchors. After DECODER_NO_CLOCK_HOLD_MS -- or once jitterBuf nears the cap, which a
+                    // fast HW decoder would otherwise overflow during the hold -- fall through to no-clock
+                    // submit WITHOUT resetting noClockBlockedSinceMs, so a stuck-NOPTS stream doesn't
+                    // re-hold and stutter; jitterFlushRequest / the clock-valid else-branch re-arm it.
                     const uint64_t nowMs = cTimeMs::Now();
                     if (noClockBlockedSinceMs == 0) {
                         noClockBlockedSinceMs = nowMs;
@@ -1571,9 +1518,6 @@ auto cVaapiDecoder::PresentAction() -> void {
                     if (!nearCap && nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
                         break;
                     }
-                    // Timeout reached (or cap escape): fall through to no-clock submit (NO reset,
-                    // so subsequent iters in the same stuck-NOPTS span do not re-hold and stutter
-                    // at ~2 fps).
                 } else {
                     noClockBlockedSinceMs = 0;
                     const int64_t headPts = jitterBuf.front()->pts;
@@ -1584,64 +1528,22 @@ auto cVaapiDecoder::PresentAction() -> void {
                         // audio-clock vs VSync phase drift). PresentWakeThreshold90k() is the single
                         // source of truth shared with the waitMs sleep below, so the two can't disagree.
                         if (dueIn > PresentWakeThreshold90k()) {
-                            // Magnitude guard: head sitting >DECODER_DRAIN_FUTURE_MAX_MS ahead of
-                            // audio_clock is a real PTS discontinuity (post-ATTA anchor mismatch,
-                            // broadcast PCR break). Drop immediately; catch-up handles the residual.
+                            // Magnitude guard: head >DECODER_DRAIN_FUTURE_MAX_MS ahead of the clock is a
+                            // real PTS discontinuity (post-ATTA anchor mismatch, broadcast PCR break), not
+                            // a normal startup offset -- drop it; catch-up handles the residual.
                             if (dueIn > DECODER_DRAIN_FUTURE_MAX_MS * PTS_TICKS_PER_MS) {
                                 dsyslog(
                                     "vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- dropping",
                                     static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
-                                drainBlockedSinceMs = 0;
                                 jitterBuf.pop_front();
                                 continue; // re-check new head
                             }
-                            // Stall watchdog: track walltime since the due-gate first started blocking
-                            // the head. If this exceeds DECODER_DRAIN_STALL_MS while jitterBuf is
-                            // non-empty, the audio clock anchored to a domain incompatible with the
-                            // incoming video PTS (the 3 s future-head guard above only fires for a
-                            // single discontinuity, not for a steady gap that stays just under the
-                            // threshold). Re-arm one freerun frame so the next iteration submits unpaced
-                            // and the controller re-anchors; catch-up handles any residual. Tracked
-                            // independently of lastDrainMs so a post-Clear stall (where
-                            // ApplyDeferredJitterFlush zeros lastDrainMs) is still measured from the
-                            // first actual block.
-                            const uint64_t nowMs = cTimeMs::Now();
-                            if (drainBlockedSinceMs == 0) {
-                                drainBlockedSinceMs = nowMs;
-                            }
-                            const uint64_t blockedMs = nowMs - drainBlockedSinceMs;
-                            // Only force freerun for a real future-head mismatch (outside the soft
-                            // corridor). dueIn within +/- 50 ms is normal post-seek settling, and
-                            // forcing an unpaced frame there only injects miss count + sync log noise;
-                            // the no-clock hold (1 s GetClock staleness -> NOPTS ->
-                            // DECODER_NO_CLOCK_HOLD_MS) still recovers if the clock truly dies.
-                            // First fire normally waits the long DECODER_DRAIN_STALL_MS so a transient hold
-                            // that self-resolves (steady-play clock jitter) doesn't spuriously force a freerun;
-                            // the confirmed crawl then uses the shorter DECODER_DRAIN_REANCHOR_MS (~10 fps) for
-                            // smooth catch-up. But a LARGE future-head gap is an unambiguous post-Clear/seek/
-                            // trick-exit re-anchor (head ~1.5-2 s ahead of the freshly anchored clock, cannot
-                            // self-resolve): waiting the long first-fire there only extends the transition freeze
-                            // (~860 ms of empty display queue measured), so start the crawl immediately. Log once
-                            // on entry, once on exit (at the resuming drain below).
-                            const bool bigGap = dueIn > DECODER_DRAIN_REANCHOR_GAP_90K;
-                            const uint64_t reArmMs =
-                                (reanchorActive || bigGap) ? DECODER_DRAIN_REANCHOR_MS : DECODER_DRAIN_STALL_MS;
-                            if (dueIn > DECODER_SYNC_CORRIDOR_90K && blockedMs >= reArmMs) {
-                                if (!reanchorActive) {
-                                    reanchorActive = true;
-                                    // Throttled: a Clear burst restarts the crawl on every Clear, but the onset
-                                    // is logged at most once per DECODER_REANCHOR_LOG_COOLDOWN_MS so the journal
-                                    // shows one line per burst, not one per Clear.
-                                    if (reanchorLogCooldown.TimedOut()) {
-                                        dsyslog("vaapivideo/decoder: re-anchoring video to audio (dueIn=%+lldms "
-                                                "buf=%zu) -- crawling until aligned",
-                                                static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
-                                        reanchorLogCooldown.Set(DECODER_REANCHOR_LOG_COOLDOWN_MS);
-                                    }
-                                }
-                                freerunFrames.store(1, std::memory_order_relaxed);
-                                drainBlockedSinceMs = 0;
-                                continue; // re-evaluate with canFreerun=true on the next iter
+                            // Head ahead of the clock: hold (still frame) until it is due, no crawl --
+                            // the one post-Clear freerun frame is already shown, so this freezes on it
+                            // until audio catches up. A long hold (outside the corridor) zeroes
+                            // lastDrainMs so the resume drain isn't flagged a starvation miss.
+                            if (dueIn > DECODER_SYNC_CORRIDOR_90K) {
+                                lastDrainMs = 0;
                             }
                             break;
                         }
@@ -1649,29 +1551,17 @@ auto cVaapiDecoder::PresentAction() -> void {
                 }
             }
 
-            // Trick play paces frames at the trick hold (60-2000 ms), well above the 2*frameDur
-            // miss threshold. Don't count those as drain misses and reset lastDrainMs so the first
-            // post-trick drain isn't flagged either. A sync-correction sleep (hard-ahead / soft-ahead
-            // / WaitForAudioCatchUp) inside the previous SyncAndSubmitFrame causes the same big gap,
-            // so consume sleptInLastSubmit to skip exactly one miss. (inTrick computed above.)
-            // Exclude the re-anchor crawl for the same reason: it forces a freerun frame every
-            // DECODER_DRAIN_REANCHOR_MS (~10 fps) on purpose, so each crawl drain lands past 2*frameDur
-            // -- controller-driven pacing, not starvation. Otherwise a re-anchor inflates miss by ~one
-            // per 100 ms of crawl (the spurious miss=8..10 on the first post-attach sync line).
+            // Trick play paces frames at the trick hold (60-2000 ms), well above the 2*frameDur miss
+            // threshold -- don't count those as drain misses, and reset lastDrainMs so the first
+            // post-trick drain isn't flagged either. A sync-correction sleep (hard/soft-ahead,
+            // WaitForAudioCatchUp) in the previous SyncAndSubmitFrame causes the same big gap, so
+            // consume sleptInLastSubmit to skip exactly one miss. A still-frame hold resume also
+            // carries lastDrainMs==0 (zeroed by the hold above), so the `> 0` guard skips it too.
             const bool consumedSleep = std::exchange(sleptInLastSubmit, false);
             const uint64_t nowMs = cTimeMs::Now();
-            if (!inTrick && !consumedSleep && !reanchorActive && lastDrainMs > 0 &&
+            if (!inTrick && !consumedSleep && lastDrainMs > 0 &&
                 static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs.load(std::memory_order_relaxed) * 2) {
                 ++drainMissCount;
-            }
-            drainBlockedSinceMs = 0;
-            if (reanchorActive && !canFreerun) {
-                // A genuinely-due drain (not a forced freerun frame) means the head finally caught the
-                // clock: the re-anchor crawl is over. Resume normal paced playback. Clear the onset-log
-                // cooldown so a distinct later transition logs its own onset immediately.
-                reanchorActive = false;
-                reanchorLogCooldown.Set(0);
-                dsyslog("vaapivideo/decoder: re-anchored (buf=%zu) -- resuming paced playback", jitterBuf.size());
             }
             lastDrainMs = inTrick ? 0 : nowMs;
 
@@ -1773,11 +1663,23 @@ auto cVaapiDecoder::PresentAction() -> void {
     return vaapiFrame;
 }
 
-auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
-    // SD DVB streams routinely omit color_description; BT.470BG (PAL) prevents desaturation by scale_vaapi.
-    if (decodedFrame->colorspace == AVCOL_SPC_UNSPECIFIED && decodedFrame->height <= 576) {
-        decodedFrame->colorspace = AVCOL_SPC_BT470BG;
+// SD DVB streams routinely omit color_description: default BT.470BG (PAL) primaries AND limited (MPEG)
+// range so scale_vaapi's BT.709/tv conversion neither desaturates the colour nor washes out the levels.
+// SD video -- MPEG-2 and SD H.264 alike -- is BT.601 limited-range by convention.
+static auto ApplySdColorDefaults(AVFrame *frame) noexcept -> void {
+    if (frame->height > 576) {
+        return;
     }
+    if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+        frame->colorspace = AVCOL_SPC_BT470BG;
+    }
+    if (frame->color_range == AVCOL_RANGE_UNSPECIFIED) {
+        frame->color_range = AVCOL_RANGE_MPEG;
+    }
+}
+
+auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
+    ApplySdColorDefaults(decodedFrame.get());
 
     const int64_t sourcePts = decodedFrame->pts;
     const size_t prevOutCount = outFrames.size();
@@ -1892,10 +1794,13 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             if (ret < 0 && ret != AVERROR_EOF) [[unlikely]] {
                 // Hard failure (corrupt HEVC NAL etc.): flush + reset graph so the next IDR recovers cleanly.
                 // vaDriverMutex: avcodec_flush_buffers touches the VA driver; races av_hwframe_map on iHD.
+                // Mark the rebuild compact: the chain is unchanged across a recovery, so a corruption
+                // burst logs one "filter rebuilt" line per reset, not the full 3-line diagnostic.
                 dsyslog("vaapivideo/decoder: send_packet failed: %s -- flushing for recovery", AvErr(ret).data());
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
                 avcodec_flush_buffers(codecCtx.get());
                 filterChain.Reset();
+                filterCompactRebuildPending.store(true, std::memory_order_release);
                 return anyFrameDecoded;
             }
             packetSent = true; // success or EOF; don't retry
@@ -1914,6 +1819,14 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             }
 
             receivedThisIteration = true;
+
+            // Drop concealment frames: on a corrupt stream the AMD VAAPI h264 decoder emits a
+            // full-green frame (zeroed chroma) that the still-frame hold would freeze on. Skip it to
+            // keep the last good picture; clean streams never set these flags.
+            if (decodedFrame->decode_error_flags != 0 || (decodedFrame->flags & AV_FRAME_FLAG_CORRUPT) != 0)
+                [[unlikely]] {
+                continue; // re-check the receive queue for the next (hopefully clean) frame
+            }
 
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
@@ -1947,11 +1860,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 }
             }
 
-            // SD DVB streams omit color_description; default to BT.470BG (PAL) so
-            // scale_vaapi's BT.709 conversion doesn't desaturate the output.
-            if (decodedFrame->colorspace == AVCOL_SPC_UNSPECIFIED && decodedFrame->height <= 576) {
-                decodedFrame->colorspace = AVCOL_SPC_BT470BG;
-            }
+            ApplySdColorDefaults(decodedFrame.get());
 
             // (The old "catch-up fast path" that skipped the VPP chain for soon-to-be-dropped frames
             // lived here. It read the controller's `catchingUp` flag and mutated catchUpDrops/

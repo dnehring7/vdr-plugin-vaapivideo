@@ -453,13 +453,22 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     // Use numeric pix_fmt: symbolic aliases for HW formats differ across FFmpeg versions.
     // time_base = 1/PTSTICKS matches the 90 kHz domain that stream.cpp rescales every packet into.
-    const std::string bufferSrcArgs =
+    // colorspace/range only when tagged: an "unknown" buffersrc trips FFmpeg's "changing properties on
+    // the fly" warning on the first tagged frame and leaves scale_vaapi no input matrix. Unspecified is
+    // already the default, so omit it (matches the device.cpp software-scaler).
+    std::string bufferSrcArgs =
         std::format("video_size={}x{}:pix_fmt={}:time_base=1/{}:pixel_aspect={}/{}:frame_rate={}/{}", srcWidth,
                     srcHeight, static_cast<int>(srcPixFmt), PTSTICKS, sarNum, sarDen, fpsNum, fpsDen);
+    if (firstFrame->colorspace != AVCOL_SPC_UNSPECIFIED) {
+        bufferSrcArgs += std::format(":colorspace={}", static_cast<int>(firstFrame->colorspace));
+    }
+    if (firstFrame->color_range != AVCOL_RANGE_UNSPECIFIED) {
+        bufferSrcArgs += std::format(":range={}", static_cast<int>(firstFrame->color_range));
+    }
 
-    // Only when the source args actually change. A trick-mode rebuild flushes and re-creates an
-    // identical graph on every GOP seek -- logging each one floods the journal with no new signal.
-    if (!compactLog && bufferSrcArgs != lastLoggedSourceArgs_) {
+    // compactLog is the sole gate -- don't also dedup identical args, or a same-format channel
+    // switch (trick/zoom set compactLog) would never surface its settings.
+    if (!compactLog) {
         dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
     }
 
@@ -606,10 +615,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         } else {
             dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
         }
-    } else if (filterChain != lastLoggedChain_) {
-        // Verbose diagnostic only when the chain actually changes. Trick play rebuilds an identical
-        // graph on every GOP seek; logging each is pure noise (same chain). A real change -- channel
-        // switch, trick<->normal, resolution / HDR change -- alters the chain string and still logs.
+    } else {
+        // Non-compact => Clear / channel switch (trick/zoom set compactLog). Log it even when the
+        // chain is byte-for-byte identical, so every switch surfaces its settings.
         const char *cadenceTag = "";
         if (ratesDiffer) {
             if (outputRateNum < displayRateInSourceDen) {
@@ -624,9 +632,6 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
     }
 
-    // Remember what was built so the next identical rebuild (trick GOP flush) stays silent.
-    lastLoggedSourceArgs_ = bufferSrcArgs;
-    lastLoggedChain_ = filterChain;
     return true;
 }
 

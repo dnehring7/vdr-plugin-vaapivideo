@@ -169,19 +169,13 @@ namespace {
         return false;
     }
 
-    // Log only on a real change; setup.conf reload at startup calls SetupParse() for
-    // every key, so logging unconditionally floods the journal with "X to X" lines.
-    const int previous = target.load(std::memory_order_relaxed);
-    if (previous != parsed) {
-        dsyslog("vaapivideo/config: %s updated from %d to %d ms", key, previous, parsed);
-    }
     target.store(parsed, std::memory_order_relaxed);
     return true;
 }
 
 /// Parse a per-preset zoom level (tenths-of-% zoom-in factor) into @p target after range-checking
 /// to [CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX]. Mirrors ParseLatencyValue: relaxed store (the
-/// decoder re-reads on every filter rebuild) and log-only-on-change.
+/// decoder re-reads on every filter rebuild).
 [[nodiscard]] auto ParseZoomLevelValue(const char *key, const char *value, std::atomic<int> &target) -> bool {
     int parsed{};
     const auto *end = value + std::strlen(value);
@@ -197,16 +191,12 @@ namespace {
         return false;
     }
 
-    const int previous = target.load(std::memory_order_relaxed);
-    if (previous != parsed) {
-        dsyslog("vaapivideo/config: %s updated from %d to %d (tenths-of-%%)", key, previous, parsed);
-    }
     target.store(parsed, std::memory_order_relaxed);
     return true;
 }
 
-/// Parse VDR's canonical 0/1 boolean encoding into @p target. Relaxed store + log-only-on-change,
-/// matching the other parsers; shared by the low-performance-hardware disable flags.
+/// Parse VDR's canonical 0/1 boolean encoding into @p target. Relaxed store, matching the other
+/// parsers; shared by the low-performance-hardware disable flags.
 [[nodiscard]] auto ParseBoolValue(const char *key, const char *value, std::atomic<bool> &target) -> bool {
     const std::string_view v{value};
     bool parsed{};
@@ -217,10 +207,6 @@ namespace {
     } else {
         esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
         return false;
-    }
-    const bool previous = target.load(std::memory_order_relaxed);
-    if (previous != parsed) {
-        dsyslog("vaapivideo/config: %s updated from %d to %d", key, previous ? 1 : 0, parsed ? 1 : 0);
     }
     target.store(parsed, std::memory_order_relaxed);
     return true;
@@ -253,12 +239,7 @@ namespace {
             esyslog("vaapivideo/config: invalid PassthroughMode value '%s'", value);
             return false;
         }
-        const auto mode = static_cast<PassthroughMode>(parsed);
-        const auto previous = passthroughMode.exchange(mode, std::memory_order_relaxed);
-        if (previous != mode) {
-            dsyslog("vaapivideo/config: PassthroughMode updated from %s to %s", PassthroughModeName(previous),
-                    PassthroughModeName(mode));
-        }
+        passthroughMode.store(static_cast<PassthroughMode>(parsed), std::memory_order_relaxed);
         return true;
     }
     if (key == "HdrMode") {
@@ -272,11 +253,7 @@ namespace {
             esyslog("vaapivideo/config: invalid HdrMode value '%s'", value);
             return false;
         }
-        const auto mode = static_cast<HdrMode>(parsed);
-        const auto previous = hdrMode.exchange(mode, std::memory_order_relaxed);
-        if (previous != mode) {
-            dsyslog("vaapivideo/config: HdrMode updated from %s to %s", HdrModeName(previous), HdrModeName(mode));
-        }
+        hdrMode.store(static_cast<HdrMode>(parsed), std::memory_order_relaxed);
         return true;
     }
     if (key == "ClearOnChannelSwitch") {
@@ -304,11 +281,7 @@ namespace {
             esyslog("vaapivideo/config: invalid LowPerfDeintMax value '%s'", value);
             return false;
         }
-        const int previous = lowPerfDeintMax.exchange(parsed, std::memory_order_relaxed);
-        if (previous != parsed) {
-            dsyslog("vaapivideo/config: LowPerfDeintMax updated from %s to %s",
-                    DeintModeName(static_cast<DeintMode>(previous)), DeintModeName(static_cast<DeintMode>(parsed)));
-        }
+        lowPerfDeintMax.store(parsed, std::memory_order_relaxed);
         return true;
     }
     // Per-preset zoom level (tenths-of-% zoom-in factor). Keys mirror the SetupStore() loop in

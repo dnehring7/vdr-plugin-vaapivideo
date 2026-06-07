@@ -360,14 +360,11 @@ loop:
   wake  = PresentWakeThreshold90k()     // frameDur if prerender empty (pre-fill), else halfFrame
   if dueIn > wake:
       if dueIn > FUTURE_MAX:            drop head; continue     // PTS discontinuity
-      else if dueIn > CORRIDOR && blockedMs ≥ reArmMs:
-          re-arm one freerun frame; continue                   // re-anchor crawl
-      else:                            break                    // hold; head not yet due
+      else:                            break                    // hold (still frame) until due
   else:                                SyncAndSubmitFrame(head)
-// reArmMs = REANCHOR_MS (100 ms) once crawling or dueIn > REANCHOR_GAP (750 ms), else STALL_MS (500 ms)
 ```
 
-The drain has four guards against startup / re-anchor / pause stalls:
+The drain has three guards against startup / re-anchor / pause stalls:
 
 - **`FUTURE_MAX` (`DECODER_DRAIN_FUTURE_MAX_MS = 3 s`).** Drops heads
   sitting more than 3 s ahead of the audio clock as PTS discontinuities
@@ -375,32 +372,21 @@ The drain has four guards against startup / re-anchor / pause stalls:
   Waiting for the gate to clear naturally would look like a multi-second
   startup freeze. Smaller future offsets remain paced normally.
 
-- **Re-anchor crawl (`DECODER_DRAIN_STALL_MS = 500 ms`,
-  `DECODER_DRAIN_REANCHOR_MS = 100 ms`, `DECODER_DRAIN_REANCHOR_GAP_90K = 750 ms`).**
-  Walltime watchdog for the case `FUTURE_MAX` misses: a head sitting more
-  than `CORRIDOR` (50 ms) but under 3 s ahead of the clock — a post-seek /
-  trick-exit re-anchor where the freshly anchored clock has to advance to
-  meet the head — never trips the drop, and during EMA warmup no per-frame
-  log fires, so the pipeline would silently sit in the gate. When the head
-  has been blocked that way for the re-arm window, the watchdog re-arms
-  one freerun frame (`freerunFrames.store(1)`) and continues — the next
-  iteration submits it unpaced, advancing the head one frame toward the
-  clock; the catch-up state machine in `SyncAndSubmitFrame` mops up any
-  residual. The *first* fire waits the long `STALL_MS` so a transient hold
-  that self-resolves doesn't force a freerun; once a crawl is confirmed
-  (or the gap is a large unambiguous re-anchor, `dueIn > REANCHOR_GAP_90K`,
-  head ~1.5–2 s ahead) it re-arms every `REANCHOR_MS` (~10 fps) so the
-  crawl-to-alignment is smooth motion, not a ~2 fps slideshow. Logs once
-  on entry — `re-anchoring video to audio (dueIn=… buf=…) -- crawling
-  until aligned`, throttled to once per `DECODER_REANCHOR_LOG_COOLDOWN_MS
-  = 2 s` across a Clear/scrub burst — and once on completion: `re-anchored
-  (buf=…) -- resuming paced playback`.
+- **Still-frame hold.** A head sitting more than `CORRIDOR` (50 ms) but
+  under 3 s ahead of the clock — a post-seek / trick-exit re-anchor where
+  the freshly anchored clock must advance to meet the head — is simply
+  held: the drain breaks without submitting, so the single freerun frame
+  already shown after the `Clear()` stays on screen as a still picture
+  until the clock reaches its PTS. Each frame is then released exactly when
+  due, so the transition is a brief freeze, not a crawl. A hold outside the
+  corridor zeroes `lastDrainMs` so the resume drain isn't counted as a
+  starvation miss.
 
 - **No-clock hold (`DECODER_NO_CLOCK_HOLD_MS = 1.5 s`).** While
   `GetClock()` is NOPTS (audio priming after `Clear()` / seek) the drain
   *holds* a non-empty `jitterBuf` rather than freerunning pre-anchor video
   at VSync rate — which would land the head far ahead of the clock the
-  moment audio anchors and hand it straight to the re-anchor crawl. A
+  moment audio anchors. A
   near-cap escape submits anyway if `jitterBuf` approaches
   `RESERVE_HARD_CAP`, so a fast HW decoder can't overflow waiting for an
   audio anchor that never comes (video-only stream). Covers the
@@ -443,8 +429,8 @@ backlog.
 The due check is bypassed for:
 
 - **Freerun** (`freerunFrames > 0` after `Clear()`, trick exit, audio
-  codec change, **re-anchor crawl re-arm**) — gives an instant first
-  picture, or advances the head one frame per iteration during a re-anchor crawl.
+  codec change) — gives an instant first picture; the still-frame hold
+  then freezes that one unpaced frame until the clock syncs.
 - **`pendingDrops`** from a soft-behind burst — one drop per drain
   iteration until exhausted.
 
@@ -568,8 +554,7 @@ itself (that gate is `IDLE_THRESHOLD_MS`).
 The sync gate is bypassed (frame submitted unpaced) in:
 
 - Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
-- Freerun window after `Clear()`, trick exit, `NotifyAudioChange()`, or
-  a drain re-anchor crawl re-arm.
+- Freerun window after `Clear()`, trick exit, or `NotifyAudioChange()`.
 - Radio mode / NOPTS frame (no audio processor or no PTS to align on).
 - Audio not yet running (`GetClock()` is NOPTS until the first
   `WritePcmToAlsa()` fires).
@@ -580,7 +565,6 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | ------------------------------ | ------------------ | ---------- | ------------------------------ |
 | Plugin start                   | invalid            | —          | empty                          |
 | Channel switch (`Clear()`)     | reset              | unchanged  | flushed; freerun armed         |
-| Drain re-anchor crawl re-arm   | unchanged          | unchanged  | unchanged; one freerun frame re-armed |
 | Catch-up enter                 | (drops silent)     | unchanged  | drained silently to alignment  |
 | Catch-up exit                  | reset              | unchanged  | one frame submitted normally   |
 | Soft drop                      | reset              | armed      | N frames dropped (one now, N−1 burst via `pendingDrops`, one per drain iteration) |
@@ -641,9 +625,8 @@ Each soft / hard event also emits a per-event `dsyslog` line naming the
 cause (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead
 replay`, `hard-behind`, `stale-jitter bulk`, `catch-up
 entered (spike|warmup|sustained)`, `catch-up complete`, `head too far in
-future … dropping`, `re-anchoring video to audio … crawling until
-aligned`, `re-anchored … resuming paced playback`) for "why did this
-fire?" without waiting for the next periodic line.
+future … dropping`) for "why did this fire?" without waiting for the next
+periodic line.
 
 ### Steady-state offset
 
@@ -703,11 +686,7 @@ Naming conventions:
 | `DECODER_SYNC_HARD_THRESHOLD_90K`   | 18000 | Hard-transient threshold (= 200 ms × PTS_TICKS_PER_MS); 2× = catch-up spike entry |
 | `DECODER_SYNC_MAX_CORRECTION_MS`    | 200   | Soft-event cap (matches HARD_THRESHOLD) so one event fully closes corridor |
 | `DECODER_SYNC_HARD_AHEAD_MAX_MS`    | 500   | Live hard-ahead sleep cap (ms) |
-| `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard before the normal due-gate wait |
-| `DECODER_DRAIN_STALL_MS`            | 500   | Re-anchor crawl first-fire delay: re-arm one freerun frame after the head has held > CORRIDOR ahead of clock this long |
-| `DECODER_DRAIN_REANCHOR_MS`         | 100   | Re-anchor crawl cadence once confirmed (~10 fps) so post-seek alignment is smooth motion, not a slideshow |
-| `DECODER_DRAIN_REANCHOR_GAP_90K`    | 67500 | Future-head gap (= 750 ms × PTS_TICKS_PER_MS) that skips the STALL_MS first-fire and crawls immediately (unambiguous re-anchor) |
-| `DECODER_REANCHOR_LOG_COOLDOWN_MS`  | 2000  | Min spacing between "re-anchoring" onset logs (collapses a Clear/scrub burst to one line) |
+| `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard: drop heads >3 s ahead; smaller offsets hold (still frame) until due |
 | `DECODER_NO_CLOCK_HOLD_MS`          | 1500  | Walltime the present drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before falling back to no-clock freerun (covers the mux-interleave seek offset) |
 | `DECODER_SYNC_COOLDOWN_MS`          | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
 | `DECODER_SYNC_EMA_SAMPLES`          | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |

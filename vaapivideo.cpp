@@ -224,6 +224,9 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                 device->RefreshVideoFilters();
             }
         }
+        // SetupParse() runs only at startup, so a live setup change would otherwise leave no trace --
+        // log the effective config once here when the operator confirms the menu.
+        isyslog("vaapivideo/config: %s", vaapiConfig.GetSummary().c_str());
     }
 
   private:

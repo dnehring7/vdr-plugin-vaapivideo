@@ -384,7 +384,7 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> syncLogPending;                   ///< Force sync log on next frame regardless of timer.
     cTimeMs nextSyncLog;              ///< Presentation thread only. Deadline for the periodic sync-stats dsyslog.
     int drainMissCount{};             ///< Drain gaps > 2xframeDur since last sync log = upstream starvation.
-                                      ///< Excludes controller-driven pacing (trick, sync sleep, re-anchor crawl).
+                                      ///< Excludes controller-driven pacing (trick, sync sleep, still-frame hold).
     int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log. Presentation thread only.
     int syncSkipSinceLog{};           ///< Frames delayed (video ahead) since last sync log. Presentation thread only.
     int pendingDrops{};               ///< Remaining frames to drop in current soft- or hard-behind burst.

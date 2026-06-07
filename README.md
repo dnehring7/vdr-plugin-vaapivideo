@@ -545,6 +545,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Persistent A/V drift      | Tune `PCM Audio Latency` or `Passthrough Audio Latency`                    |
 | DRM device not found      | Run `ls -l /dev/dri/` and specify `-d /dev/dri/cardN` explicitly           |
 | Black screen after resume | Send SVDRP: `PLUG vaapivideo DETA` then `PLUG vaapivideo ATTA`             |
+| AMD iGPU stutters / drops | GPU pinned to `low` DPM — use `power_dpm_force_performance_level=auto` (default) |
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
 sync diagnostics; the periodic `sync d=… avg=…` line is described in
