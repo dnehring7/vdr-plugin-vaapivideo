@@ -549,6 +549,7 @@ auto cAudioProcessor::DrainPacketQueue() -> void {
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
         packetQueue.pop();
     }
+    approxQueueSize.store(0, std::memory_order_relaxed);
 }
 
 auto cAudioProcessor::RecreateParser() -> void {
@@ -633,6 +634,7 @@ auto cAudioProcessor::Action() -> void {
 
             packet.reset(packetQueue.front());
             packetQueue.pop();
+            approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
             // Latch under the mutex so GetPendingWorkSize() never sees empty-queue + no-in-flight
             // while this iteration is still draining the packet to ALSA.
             packetInFlight.store(true, std::memory_order_release);
@@ -1095,6 +1097,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         }
 
         packetQueue.push(packet.release());
+        approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
     }
 
     packetCondition.Broadcast();

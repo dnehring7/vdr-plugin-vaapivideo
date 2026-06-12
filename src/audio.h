@@ -86,7 +86,13 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto IsPassthrough() const noexcept
         -> bool;                                    ///< True when the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const -> bool; ///< True when the packet queue has reached AUDIO_QUEUE_CAPACITY
-    [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Current number of packets in the decode queue
+    [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Current number of packets in the decode queue (takes mutex)
+    [[nodiscard]] auto GetQueueSizeRelaxed() const noexcept -> size_t {
+        return approxQueueSize.load(std::memory_order_relaxed);
+    } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() takes the
+      ///< audio mutex, which WritePcmToAlsa() holds across its EAGAIN spin when the ALSA ring is full (bursty
+      ///< replay feed) -- a blocking read there parks presentation ~one ring period. Device backpressure path
+      ///< keeps the exact, mutexed GetQueueSize().
     [[nodiscard]] auto GetPendingWorkSize() const
         -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The mediaplayer EOS drain needs this, not
                    ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
@@ -209,6 +215,8 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
                                              ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
     std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
+    std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under the mutex at every push/pop,
+                                             ///< read lock-free by GetQueueSizeRelaxed() (present-thread diagnostic).
 
     // ========================================================================
     // === PCM CLOCK ===

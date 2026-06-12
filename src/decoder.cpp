@@ -134,7 +134,10 @@ constexpr size_t DECODER_RESERVE_HARD_CAP =
     150; ///< ~3 s @ 50 fps. Per-stage cap on the decode-ahead reserve: the decode thread backpressures
          ///< when handoffQueue reaches it, and the present thread drop-oldest trims jitterBuf past it.
          ///< Caps GPU surface retention when a stuck-but-valid audio clock holds the present due-gate
-         ///< closed (SkipStaleJitterFrames only drops BEHIND-clock heads).
+         ///< closed (SkipStaleJitterFrames only drops BEHIND-clock heads). Deep on purpose -- absorbs a
+         ///< multi-second VPP stall instead of the screen (see AVSYNC.md). A trial cut to 64 regressed
+         ///< replay: a shallow reserve keeps the decoder always producing, multiplying vaDriverMutex
+         ///< contention with the display's per-frame PRIME map. Do not shrink it.
 constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
     3000; ///< Drop any head sitting more than this far ahead of audio_clock. Such an offset is a real
           ///< PTS discontinuity (ATTA anchor swap, broadcast PCR break, stale snd_pcm_delay clamp).
@@ -1372,6 +1375,8 @@ auto cVaapiDecoder::PresentAction() -> void {
     uint64_t lastDrainMs{0};
     cTimeMs jitterOverflowLogGate;   ///< Rate-limits the "jitterBuf overflow" syslog spam.
     size_t jitterOverflowSinceLog{}; ///< Frames dropped by the runaway guard since the last overflow log.
+    cTimeMs futureDropLogGate;       ///< Rate-limits the "head too far in future" drop log (it can fire per frame).
+    size_t futureDropSinceLog{};     ///< Future-head frames dropped since the last log line.
 
     while (!stopping.load(std::memory_order_acquire)) {
         // Consume a deferred Clear()/FlushForSeek() (this is the single consumer -- one exchange(0)
@@ -1532,9 +1537,18 @@ auto cVaapiDecoder::PresentAction() -> void {
                             // real PTS discontinuity (post-ATTA anchor mismatch, broadcast PCR break), not
                             // a normal startup offset -- drop it; catch-up handles the residual.
                             if (dueIn > DECODER_DRAIN_FUTURE_MAX_MS * PTS_TICKS_PER_MS) {
-                                dsyslog(
-                                    "vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- dropping",
-                                    static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size());
+                                // Throttled: this drops one frame and re-checks the next, so a real
+                                // discontinuity fires it per frame -- an unthrottled dsyslog here would
+                                // both flood the journal and block this (present) hot thread on it.
+                                ++futureDropSinceLog;
+                                if (futureDropLogGate.Elapsed() >= 500) {
+                                    dsyslog("vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- "
+                                            "dropping (%zu since last)",
+                                            static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size(),
+                                            futureDropSinceLog);
+                                    futureDropSinceLog = 0;
+                                    futureDropLogGate.Set();
+                                }
                                 jitterBuf.pop_front();
                                 continue; // re-check new head
                             }
@@ -2499,11 +2513,14 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
         (rawDeltaCountSinceLog > 0) ? (rawDeltaSumSinceLog90k / rawDeltaCountSinceLog) : rawDelta90k;
     const auto meanTenths = static_cast<long long>(meanRawDelta90k * 10 / PTS_TICKS_PER_MS);
     const auto avgTenths = static_cast<long long>(smoothedDelta90k * 10 / PTS_TICKS_PER_MS);
+    // aq via the lock-free GetQueueSizeRelaxed(): the mutexed GetQueueSize() would park this (present)
+    // thread behind WritePcmToAlsa's EAGAIN spin (audio mutex held while the ALSA ring is full under a
+    // bursty replay feed) -- a hot-path stall that surfaced as periodic soft/hard-behind drops.
     dsyslog("vaapivideo/decoder: sync d=%+lld.%01lldms avg=%+lld.%01lldms lat=%lldms buf=%zu aq=%zu miss=%d "
             "drop=%d skip=%d",
             meanTenths / 10, std::abs(meanTenths % 10), avgTenths / 10, std::abs(avgTenths % 10),
-            static_cast<long long>(latency90k / PTS_TICKS_PER_MS), jitterBuf.size(), ap->GetQueueSize(), drainMissCount,
-            syncDropSinceLog, syncSkipSinceLog);
+            static_cast<long long>(latency90k / PTS_TICKS_PER_MS), jitterBuf.size(), ap->GetQueueSizeRelaxed(),
+            drainMissCount, syncDropSinceLog, syncSkipSinceLog);
     rawDeltaSumSinceLog90k = 0;
     rawDeltaCountSinceLog = 0;
     drainMissCount = 0;

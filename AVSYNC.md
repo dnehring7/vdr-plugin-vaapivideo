@@ -401,6 +401,11 @@ The drain has three guards against startup / re-anchor / pause stalls:
   bounds each stage of the decode-ahead reserve: the decode thread also
   drop-oldest-trims `handoffQueue` if the present thread stalls past it
   (normally it backpressures there long before — see the decouple section).
+  A trial reduction to 64 to reclaim GPU memory **regressed** replay: the
+  shallow reserve keeps the decoder continuously producing instead of
+  idling, multiplying `vaDriverMutex` contention with the display's
+  per-frame PRIME map. The deep reserve is also the lower-contention
+  operating point — keep it.
 
 `Freeze()` (pause) holds the drain directly: while `devicePaused` and not
 in trick play the loop breaks without submitting, so the head's PTS can't
