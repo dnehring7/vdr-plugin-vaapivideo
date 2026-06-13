@@ -33,6 +33,13 @@ struct VaapiContext;
 inline constexpr size_t DECODER_TRICK_QUEUE_DEPTH =
     1;                                           ///< Depth-1: Poll() throttles the producer; overflow drops incoming.
 inline constexpr int DECODER_TRICK_HOLD_MS = 20; ///< Base hold per frame for slow trick (~= one field period @ 50 Hz).
+inline constexpr size_t DECODER_RESERVE_HARD_CAP =
+    64; ///< Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps total): the decode
+        ///< thread backpressures when the published total reaches it (or handoffQueue alone does), and each
+        ///< stage also drop-oldest-trims past it as a runaway guard. Caps GPU surface retention (~64 4K NV12
+        ///< surfaces ~= 0.8 GB GTT) while still dwarfing the <40 ms VPP variance and the 8-slot display
+        ///< prerender. In decoder.h (not the .cpp) so the mediaplayer's backpressure gate can be statically
+        ///< checked against it (see device.cpp).
 
 // ============================================================================
 // === STRUCTURES ===
@@ -323,19 +330,19 @@ class cVaapiDecoder : public cThread {
     std::atomic<size_t> packetsSinceOpen;  ///< avcodec_send_packet calls since last open; starvation counters.
     std::atomic<size_t> keyPacketsSinceOpen; ///< Subset with AV_PKT_FLAG_KEY; distinguishes silent feed vs HW stall.
     std::atomic<int64_t> lastPts{
-        AV_NOPTS_VALUE};                     ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
-    std::atomic<uint64_t> clearEpoch{0};     ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
-    uint64_t presentEpoch{0};                ///< Presentation thread only. Snapshot of clearEpoch at each present-loop
-                                             ///< iteration; gates submit (SubmitIfCurrent), PublishLastPts, and the
-                                             ///< drain-loop stale-frame discard. The decode thread no longer needs an
-                                             ///< iteration epoch: it stamps producedEpoch from clearEpoch while holding
-                                             ///< codecMutex for the producing decode/drain operation.
-    std::atomic<bool> liveMode;              ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
-    std::atomic<bool> devicePaused{false};   ///< Mirrors cVaapiDevice::Freeze()/Play(). When true the drain loop holds
-                                             ///< (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift
-                                             ///< while ALSA is dropped and the audio master clock is genuinely frozen.
-    std::atomic<bool> ready{false};          ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
-    std::atomic<int> trickSpeed;             ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
+        AV_NOPTS_VALUE};                   ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
+    std::atomic<uint64_t> clearEpoch{0};   ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
+    uint64_t presentEpoch{0};              ///< Presentation thread only. Snapshot of clearEpoch at each present-loop
+                                           ///< iteration; gates submit (SubmitIfCurrent), PublishLastPts, and the
+                                           ///< drain-loop stale-frame discard. The decode thread needs no iteration
+                                           ///< epoch of its own: it stamps producedEpoch from clearEpoch while holding
+                                           ///< codecMutex for the producing decode/drain operation.
+    std::atomic<bool> liveMode;            ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
+    std::atomic<bool> devicePaused{false}; ///< Mirrors cVaapiDevice::Freeze()/Play(). When true the drain loop holds
+                                           ///< (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift
+                                           ///< while ALSA is dropped and the audio master clock is genuinely frozen.
+    std::atomic<bool> ready{false};        ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
+    std::atomic<int> trickSpeed;           ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
     std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
                                              ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
     std::atomic<bool> filterCompactRebuildPending{
@@ -442,6 +449,9 @@ class cVaapiDecoder : public cThread {
     int suppressedCatchUpDrops{};       ///< Cumulative dropped-frame count of those cycles.
     uint64_t suppressedCatchUpWallMs{}; ///< Cumulative wall time spent inside those cycles.
     uint64_t nextCatchUpSummaryMs{};    ///< cTimeMs::Now() at which the next periodic-during-run summary should fire.
+    cTimeMs staleJitterLogGate;         ///< Rate-limits the "stale-jitter bulk" drop log (present thread); a rapid-seek
+                                ///< burst fires it per seek and would otherwise flood/block the drain on syslog.
+    int staleJitterDropsSinceLog{}; ///< Stale-jitter frames dropped while the gate suppressed the log.
 
     // ========================================================================
     // === JITTER BUFFER ===

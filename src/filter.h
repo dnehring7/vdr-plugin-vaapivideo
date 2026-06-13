@@ -91,7 +91,7 @@ class cVideoFilterChain {
         unsigned deinterlaceModeMask{};   ///< Bit (1u<<DeintMode) per driver-supported mode; bounds the low-perf cap
 
         // --- Low-performance-hardware caps (resolved from config by caller; no-op defaults when off) ---
-        int deinterlaceMaxRank{0};    ///< DeintMode rank ceiling (0=MCDI ⇒ no limit); clamps deinterlaceMode down
+        int deinterlaceMaxRank{0};    ///< DeintMode rank ceiling (0=MCDI => no limit); clamps deinterlaceMode down
         bool disableDenoise{false};   ///< Skip denoise_vaapi / hqdn3d regardless of capability/codec
         bool disableHqScaling{false}; ///< Drop scale_vaapi :mode=hq (bicubic) even on non-UHD content
         bool disableSharpness{false}; ///< Skip sharpness_vaapi regardless of capability/codec

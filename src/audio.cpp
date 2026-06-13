@@ -94,9 +94,7 @@ constexpr int AUDIO_DECODER_GRACE_PACKETS =
     3; ///< Error logs suppressed after decoder (re)init; absorbs parser priming garbage on the first few frames
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between repeated decode-error log messages (ms)
 
-// Sized to absorb the OSD-load + codec-prime burst at channel switch or VDR start
-// without dropping (~10 s at AC-3 ~32 ms framing).
-constexpr size_t AUDIO_QUEUE_CAPACITY = 300;
+// AUDIO_QUEUE_HIGHWATER / AUDIO_QUEUE_CAPACITY live in audio.h (shared with the device feed).
 
 // ============================================================================
 // === AUDIO PROCESSOR CLASS ===

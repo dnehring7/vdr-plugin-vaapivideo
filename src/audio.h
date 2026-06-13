@@ -28,6 +28,19 @@ struct AVFormatContext;
 struct AVIOContext;
 
 // ============================================================================
+// === CONSTANTS ===
+// ============================================================================
+
+// Compressed audio packet-queue bounds, shared by the sink and the device feed. HIGHWATER is the
+// active backpressure gate the feed honors (dvbplayer PlayAudio/Poll, mediaplayer demux pacing);
+// CAPACITY is the overflow backstop bounding heap if that gate is ever bypassed. HIGHWATER is shallow
+// so a tail-drop can't open a PTS gap; end-to-end audio resilience is HIGHWATER*packet_ms + the ALSA
+// ring (~720 ms total).
+inline constexpr size_t AUDIO_QUEUE_HIGHWATER = 10; ///< ~320 ms at AC-3 32 ms framing.
+inline constexpr size_t AUDIO_QUEUE_CAPACITY = 100; ///< ~3.2 s; absorbs the channel-switch + codec-prime burst.
+static_assert(AUDIO_QUEUE_HIGHWATER < AUDIO_QUEUE_CAPACITY, "the active gate must trip before the backstop");
+
+// ============================================================================
 // === STRUCTURES ===
 // ============================================================================
 
@@ -211,12 +224,12 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PACKET QUEUE ===
     // ========================================================================
+    std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under the mutex at every push/pop,
+                                             ///< read lock-free by GetQueueSizeRelaxed() (present-thread diagnostic).
     cCondVar packetCondition;                ///< Wakes Action() on enqueue
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
                                              ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
     std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
-    std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under the mutex at every push/pop,
-                                             ///< read lock-free by GetQueueSizeRelaxed() (present-thread diagnostic).
 
     // ========================================================================
     // === PCM CLOCK ===

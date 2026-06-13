@@ -57,60 +57,36 @@ class cVaapiDevice;
 /// Demux thread back-off when the device queues are full or input stalls.
 inline constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
 
-/// Audio packet-queue high-watermark for demux pacing. Matches VDR replay's AUDIO_REPLAY_QUEUE_
-/// HIGHWATER (cDvbPlayer in vdr/dvbplayer.c). The PTS-distance lookahead (MEDIAPLAYER_MAX_LOOKAHEAD_90K)
-/// is a coarse brake: it lets the demuxer push up to 1 s of audio time ahead of the master clock, and
-/// on TS containers where the video PTS leads the audio PTS at the same demux cursor by up to ~2 s
-/// (mux interleave offset) that fills the decoder's 150-frame jitterBuf and triggers the overflow
-/// loop you can see in the syslog after a seek burst. Capping the audio packet queue at this
-/// low-water depth paces the demuxer to the audio thread's consumption rate (~1 x playback rate),
-/// shrinking both audio packet depth and the co-buffered video lead. Audio resilience to demux
-/// stalls = HIGHWATER * audio_packet_ms + ALSA buffer (~400 ms): for AC3 32 ms/packet that's
-/// ~720 ms total, comfortably above any normal demux hiccup. The AUDIO_QUEUE_CAPACITY (300) hard
-/// cap inside cAudioProcessor remains as an overflow backstop for SubmitAudioPacket return value.
-inline constexpr size_t MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER = 10;
-
-/// Max AUDIO lookahead, in 90 kHz ticks, between the latest pushed audio PTS and the audio
-/// master clock before the demux throttles. libavformat reads local files much faster than
-/// wall-clock; without a real-time pacing limit the decoder packet queue and the downstream
-/// jitter buffer overrun their caps. The throttle reference is the audio-stream PTS only
-/// (see latestAudioPts90k), so this bound is an audio-tail budget. The actual VIDEO buffer
-/// depth is (audio_tail + mux_offset) where mux_offset is the per-file inter-stream PTS
-/// spread at the same demux cursor -- ~0 for tight MP4/MKV, but up to ~1 s for broadcast
-/// TS (video PTS leads audio PTS). At 50 fps:
-///   - 2 s audio tail + 1 s TS mux offset = 150 frames = exactly the decoder's 150-frame
-///     hard cap -> jitterBuf hits the cap -> drop oldest -> drain stall / re-arm-freerun loop
-///     after seek or pause on TS, the bug this constant exists to prevent.
-///   - 1 s audio tail + 1 s TS mux offset = 100 frames -- under the cap with ~50 frames
-///     headroom for transient excursions, and well below FUTURE_MAX (3 s).
-/// 1 s gives the demuxer enough buffered audio to absorb wall-clock jitter while keeping the
-/// resulting video depth safely below the hard cap on every container we have seen.
+/// Max AUDIO lookahead, in 90 kHz ticks, between the latest pushed audio PTS and the audio master clock
+/// before the demux throttles. libavformat reads local files far faster than wall-clock; without a
+/// real-time pacing limit the decoder packet queue and jitter buffer overrun their caps. The throttle
+/// reference is the audio-stream PTS only (latestAudioPts90k), an audio-tail budget; 1 s buys enough
+/// buffered audio to absorb wall-clock jitter. Resulting VIDEO depth is (audio_tail + mux_offset), where
+/// mux_offset is the per-file inter-stream PTS spread at the same cursor -- ~0 for tight MP4/MKV, up to
+/// ~1 s for broadcast TS (video PTS leads). When that sum exceeds DECODER_RESERVE_HARD_CAP the decode
+/// backpressures at the cap and the excess lead waits COMPRESSED in the packetQueue, so the cap (not this
+/// budget) bounds the decoded 4K-surface reserve there. Still well below FUTURE_MAX (3 s).
 inline constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 90000;
 
-/// Jitter-buffer high-water mark that triggers backpressure on the mediaplayer demux
-/// path -- but ONLY while the audio master clock is NOPTS (the post-flush window where
-/// ALSA refills before the first decoded sample anchors the clock).
-/// The lookahead-vs-clock throttle is blind in that window, so without a buffer-depth
-/// signal the demuxer pushes packets at file-read speed and the jitterBuf overflows past
-/// its 150-frame hard cap. Once the clock anchors, IsMediaPlayerBackpressured() drops this
-/// gate entirely: the demuxer is a single-cursor demux-order pump, so a video-depth gate
-/// there would stall the shared cursor and starve the audio packet queue, underrunning ALSA
-/// and stalling the very clock the video drain depends on (sustained-stutter-after-seek bug).
-/// With a live clock the lookahead throttle is the sole gate and the 150-frame hard cap is the
-/// overflow backstop. 100 frames = ~2 s @ 50 fps -- above the steady-state video depth with the
-/// 1 s audio-tail lookahead (50 frames + per-file mux offset, up to ~100 on TS) but well below
-/// the hard cap, so this only catches the pre-anchor blind window where the lookahead can't gate.
-inline constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = 100;
+/// Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock
+/// is NOPTS (the post-flush window where ALSA refills before the first decoded sample anchors the clock).
+/// For AUDIO streams AUDIO_QUEUE_HIGHWATER already covers this window; it matters for VIDEO-ONLY streams
+/// (no audio clock ever), where it is the sole video-depth gate stopping the file-read-speed demuxer from
+/// flooding. Once the clock anchors, IsMediaPlayerBackpressured() drops it: the demuxer is a single-cursor
+/// demux-order pump, so a video-depth gate there would stall the shared cursor and starve the audio packet
+/// queue (sustained-stutter-after-seek bug). Must stay below DECODER_RESERVE_HARD_CAP so it throttles
+/// before the reserve hits the cap and the runaway guard drops (static_assert in device.cpp).
+inline constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = 48;
 
 /// Default seek deltas applied by the key bindings (milliseconds).
 inline constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 inline constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
 
 /// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof). At EOF the decode queue (~4 s @ 50 fps)
-/// and present reserve (~3 s) still hold unseen frames; immediate teardown cuts playback seconds
-/// short -- worst on video-only clips, where no audio clock throttles the demuxer so both buffers
-/// fill to their caps. The drain flushes that tail at real-time pace first.
-///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown; covers the ~7 s worst case.
+/// and decoded reserve (~1.3 s @ 50 fps) still hold unseen frames; immediate teardown cuts playback
+/// seconds short -- worst on video-only clips, where no audio clock throttles the demuxer so both
+/// buffers fill to their caps. The drain flushes that tail at real-time pace first.
+///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown; covers the ~5 s queue+reserve tail.
 ///   - STALL_MS: bail when depth stops shrinking (wedged pipeline). Must exceed one frame interval.
 inline constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
 inline constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
@@ -304,7 +280,6 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// called before AdvancePlaylist() tears the entry down. See MEDIAPLAYER_EOF_DRAIN_* .
     auto DrainTailAtEof() -> void;
     auto AdvancePlaylist() -> void;
-    auto LogStatus() -> void; ///< Periodic mediaplayer dsyslog (state + position + lookahead).
 
     std::vector<PlaylistEntry> playlist;
     std::atomic<size_t> currentIndex{0};
@@ -335,7 +310,6 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     mutable cMutex sourceMutex; ///< Guards source-pointer swaps across Action() and command methods
     cCondVar pauseCondition;    ///< Wakes Action() out of pause loop
     mutable cMutex pauseMutex;
-    cTimeMs lastStatusLog; ///< Throttles LogStatus() to its periodic cadence.
 };
 
 // ============================================================================

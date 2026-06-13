@@ -107,9 +107,15 @@ extern "C" {
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
-/// ~320 ms at AC-3 32 ms framing. Shallow cap prevents tail-drops that would create PTS
-/// gaps and derail A/V sync long after the drop event.
-static constexpr size_t AUDIO_REPLAY_QUEUE_HIGHWATER = 10;
+// AUDIO_QUEUE_HIGHWATER (audio.h) paces both feed paths: dvbplayer replay (PlayAudio/Poll) and the
+// mediaplayer demux (to ~1x playback, so a TS mux interleave offset can't over-fill the decoder jitterBuf
+// after a seek -- the coarse PTS-distance brake is MEDIAPLAYER_MAX_LOOKAHEAD_90K).
+
+// The mediaplayer's video-depth gate must trip before the decode-ahead reserve hits its hard cap (else the
+// drop-oldest runaway guard fires first and the demuxer never throttles). Enforced here, where both
+// headers' constants are visible.
+static_assert(MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES < DECODER_RESERVE_HARD_CAP,
+              "mediaplayer backpressure must engage below the reserve cap");
 
 /// How often PlayAudio re-checks the present EPG event while a radio splash is on screen. Program
 /// boundaries land on minute scales, so a couple of seconds is responsive without taxing the
@@ -434,10 +440,13 @@ auto cVaapiDevice::CheckEncryptionTimeout() -> void {
 }
 
 auto cVaapiDevice::ShowEncryptedScreen() -> void {
-    // Show the notice for any encrypted channel (Ca != 0) whose primary content is not decoding:
-    // a TV channel hinges on video, a radio channel (no video PID) on audio. An FTA channel (Ca 0),
-    // or one that actually decodes (it is decryptable), is not our case -- the codec state is the
-    // reliable discriminator, computed here under the channel lock.
+    // "encrypted/undecodable" means the CAM cannot descramble this channel at all. ANY decoding
+    // elementary stream -- video OR audio -- proves it IS descrambling (a DVB service scrambles under
+    // one ECM, so clear audio implies the video will follow), so the notice must not fire: a TV channel
+    // whose audio is already up while its video is a beat behind (slow keyframe, or the CAM just primed
+    // after a replay/mediaplayer handover) is decryptable, not encrypted. Only fire when NOTHING
+    // decodes. FTA channels (Ca 0) are excluded below. Codec state is the reliable discriminator, read
+    // here under the channel lock.
     std::string text;
     int number = 0;
     {
@@ -454,8 +463,8 @@ auto cVaapiDevice::ShowEncryptedScreen() -> void {
             dsyslog("vaapivideo/device: encrypted watchdog -- channel %d is FTA (ca=0), skipping", number);
             return;
         }
-        const bool decoding = (vpid != 0) ? (videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE)
-                                          : (audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE);
+        const bool decoding = videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE ||
+                              audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE;
         if (decoding) {
             dsyslog("vaapivideo/device: encrypted watchdog -- channel %d decrypts (vpid=%d), skipping", number, vpid);
             return;
@@ -1346,7 +1355,7 @@ auto cVaapiDevice::Play() -> void {
     }
 
     // Replay backpressure: cap queue to avoid tail-drops that create PTS gaps. Live: always accept.
-    if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_REPLAY_QUEUE_HIGHWATER) [[unlikely]] {
+    if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) [[unlikely]] {
         return 0;
     }
 
@@ -1464,8 +1473,7 @@ auto cVaapiDevice::Play() -> void {
     if (currentSpeed != 0) {
         return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
     }
-    return !decoder->IsQueueFull() &&
-           (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_REPLAY_QUEUE_HIGHWATER);
+    return !decoder->IsQueueFull() && (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
 }
 
 [[nodiscard]] auto cVaapiDevice::Poll(cPoller & /*Poller*/, int TimeoutMs) -> bool {
@@ -1666,7 +1674,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     // Blue/Stop -> SetPlayMode(pmNone) WITHOUT a prior Play(), so without this the drain hold
     // set by Freeze() (decoder->devicePaused, display->devicePaused) stays asserted across the
     // SetPlayMode transition. The next live-TV / replay session then feeds packets into the
-    // decoder, jitterBuf grows to its 150-frame hard cap, and every subsequent frame overflows
+    // decoder, jitterBuf grows to DECODER_RESERVE_HARD_CAP, and every subsequent frame overflows
     // (visible as "jitterBuf overflow -- dropped N" spam at ~50 fps with no picture on screen).
     // Audio's clockPaused is cleared by the Clear() path below via ResetPlaybackClock().
     paused.store(false, std::memory_order_relaxed);
@@ -2044,7 +2052,7 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
     // mediaplayer's packetPending=true so this already-demuxed audio packet is retried after
     // the queue drains a slot; the shared demux cursor halts without dropping audio or
     // falsely advancing latestAudioPts90k via the post-submit update in cVaapiPlayer::Action.
-    if (audioProcessor->GetQueueSize() >= MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER) {
+    if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) {
         return false;
     }
     return audioProcessor->EnqueuePacket(packet);
@@ -2130,7 +2138,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // and saturates the jitterBuf. Capping the audio packet queue at a small low-water depth (~10,
     // mirroring VDR's replay HIGHWATER) paces the demuxer to audio consumption rate and shrinks
     // both audio packet depth and the co-buffered video lead, keeping jitterBuf well below the cap.
-    const bool audioHighwater = audioOpen && audioDepth >= MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER;
+    const bool audioHighwater = audioOpen && audioDepth >= AUDIO_QUEUE_HIGHWATER;
     // jitterBuf depth: guards ONLY the pre-anchor window (post-seek / startup) where the audio
     // clock is still NOPTS, so the demuxer's lookahead throttle can't gate delivery and HW decode
     // would overrun the jitterBuf hard cap (dropping ~30 frames per rapid-seek burst).
@@ -2142,7 +2150,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // jitterBuf stays full -> backpressure stays asserted. That positive-feedback starvation is
     // the "stutters after a long seek and never recovers" bug. With a live clock the lookahead
     // throttle (audio-referenced, self-releasing at the audio 1x consumption rate) is the correct
-    // and sufficient gate; the 150-frame hard cap remains the ultimate overflow backstop.
+    // and sufficient gate; DECODER_RESERVE_HARD_CAP remains the ultimate overflow backstop.
     //
     // Audio-reanchor escape: pause -> Play() drains the audio queue but preserves jitterBuf
     // (decoder hold). On resume jitterFull would block the demuxer just when audio packets MUST
@@ -2153,7 +2161,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Video-only streams (audioOpen=false) cannot anchor an audio clock, so the escape stays
     // disarmed and jitterFull bounds the decoder's pre-anchor depth.
     const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
-    const bool audioCanReanchor = audioOpen && audioDepth < MEDIAPLAYER_AUDIO_QUEUE_HIGHWATER;
+    const bool audioCanReanchor = audioOpen && audioDepth < AUDIO_QUEUE_HIGHWATER;
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
                             decoder->GetDecodedReserveSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;
@@ -2245,8 +2253,8 @@ auto cVaapiDevice::FlushForSeek() -> void {
     isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
     // Startup splash: cover the console immediately with a black frame and a centered title.
-    // Safe here -- display is ready and the decoder is codec-less/idle, and SubmitBlackFrame now
-    // serializes its VAAPI calls under vaDriverMutex (the race that hung the old startup call).
+    // Safe here -- display is ready and the decoder is codec-less/idle, and SubmitBlackFrame
+    // serializes its VAAPI calls under vaDriverMutex.
     dsyslog("vaapivideo/device: showing startup splash");
     const bool splashShown = SubmitBlackFrame(tr("VDR with vaapivideo is getting ready..."));
     dsyslog("vaapivideo/device: startup splash %s", splashShown ? "submitted" : "FAILED");
@@ -2553,7 +2561,7 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     }
 
     // Pass 2: cold cache (DRM driver just loaded) or sink woke from standby after boot probe.
-    // Full DDC probe -- same cost as the pre-fix single pass, only when pass 1 missed. When a
+    // Full DDC probe -- only when pass 1 missed. When a
     // connector name is configured, pre-filter via the cached connector so we don't pay the
     // probe cost on every connector just to find out the name doesn't match.
     dsyslog("vaapivideo/device: no candidate in cached state -- forcing EDID probe");

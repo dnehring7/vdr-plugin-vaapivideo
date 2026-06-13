@@ -98,28 +98,7 @@ constexpr int OSD_REFRESH_INTERVAL_MS =
 constexpr int OSD_DEFAULT_TIMEOUT_S = 4;   ///< Auto-hide delay after a key event; matches VDR replay-control feel.
 constexpr int DEMUX_IDLE_SLEEP_MS = 5;     ///< Back-off when ReadPacket reports EAGAIN or no work is available.
 constexpr int DEMUX_PAUSE_WAKEUP_MS = 100; ///< Periodic re-check while paused; safety net against missed broadcasts.
-constexpr int STATUS_LOG_INTERVAL_MS = 2000; ///< Cadence for the periodic mediaplayer status dsyslog.
-constexpr int64_t TICKS_PER_MS = 90;         ///< VDR's 90 kHz PTS domain: 90 ticks == 1 ms.
-
-/// Stringify cVaapiPlayer::State for the status log. Defined here so the header doesn't need a
-/// helper, and so the switch is exhaustive (compiler warns if a new state is added).
-[[nodiscard]] auto StateName(cVaapiPlayer::State s) noexcept -> const char * {
-    switch (s) {
-        case cVaapiPlayer::State::Opening:
-            return "Opening";
-        case cVaapiPlayer::State::Playing:
-            return "Playing";
-        case cVaapiPlayer::State::Paused:
-            return "Paused";
-        case cVaapiPlayer::State::Seeking:
-            return "Seeking";
-        case cVaapiPlayer::State::Eof:
-            return "Eof";
-        case cVaapiPlayer::State::Stopped:
-            return "Stopped";
-    }
-    return "?";
-}
+constexpr int64_t TICKS_PER_MS = 90;       ///< VDR's 90 kHz PTS domain: 90 ticks == 1 ms.
 
 /// Convert the container's start_time (AV_TIME_BASE units) to 90 kHz. Returns AV_NOPTS_VALUE
 /// when the demuxer didn't populate start_time (typical for some streams + raw containers).
@@ -1044,23 +1023,6 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
     state.store(paused.load(std::memory_order_acquire) ? State::Paused : State::Playing, std::memory_order_release);
 }
 
-auto cVaapiPlayer::LogStatus() -> void {
-    int totalMs = 0;
-    {
-        const cMutexLock lock(&sourceMutex);
-        if (source) {
-            totalMs = source->DurationMs();
-        }
-    }
-    const int posMs = CurrentPositionMs();
-    const int64_t lookahead = Lookahead90k(FindPrimaryVaapiDevice());
-    const int lookaheadMs = (lookahead != AV_NOPTS_VALUE) ? static_cast<int>(lookahead / TICKS_PER_MS) : -1;
-    const size_t idx = currentIndex.load(std::memory_order_relaxed);
-    const size_t totalCount = playlist.size();
-    dsyslog("vaapivideo/mediaplayer: status mode=%s pos=%dms total=%dms entry=%zu/%zu lookahead=%dms",
-            StateName(state.load(std::memory_order_acquire)), posMs, totalMs, idx + 1, totalCount, lookaheadMs);
-}
-
 auto cVaapiPlayer::DrainTailAtEof() -> void {
     auto *vaapiDev = FindPrimaryVaapiDevice();
     if (vaapiDev == nullptr) {
@@ -1138,7 +1100,6 @@ auto cVaapiPlayer::Action() -> void {
         return;
     }
 
-    lastStatusLog.Set(0); // Emit the first status line immediately on the first iteration.
     // packetPending carries one read packet across iterations when the device's submit
     // queue is briefly full (audio cAudioProcessor::EnqueuePacket returns false on overflow).
     // Without this retry the lookahead throttle would advance latestAudioPts90k even though
@@ -1147,12 +1108,6 @@ auto cVaapiPlayer::Action() -> void {
     bool packetPending = false;
 
     while (!stopping.load(std::memory_order_acquire)) {
-        // -- periodic status diagnostic ------------------------------------------
-        if (lastStatusLog.TimedOut()) {
-            LogStatus();
-            lastStatusLog.Set(STATUS_LOG_INTERVAL_MS);
-        }
-
         // -- seek ----------------------------------------------------------------
         // Repeat-rate shaping (so a held key does not pile up many FlushForSeek -> snd_pcm_drop
         // cycles) is handled upstream in VDR's RcRepeatDelay / RcRepeatDelta. Any seeks that

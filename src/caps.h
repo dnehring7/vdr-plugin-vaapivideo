@@ -15,7 +15,7 @@
  *    mutable runtime state and stay inside cVaapiDisplay.
  *  - AudioSinkCaps provides a single source of truth for both passthrough
  *    eligibility and the PCM fallback path (rates, channel count).
- *  - GpuCaps replaces the flat hwXxx/hasXxx fields that were previously on VaapiContext.
+ *  - GpuCaps is the single source of truth for hardware codec/VPP capability flags.
  */
 
 #ifndef VDR_VAAPIVIDEO_CAPS_H

@@ -124,20 +124,13 @@ constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear()
 constexpr int64_t DECODER_SYNC_HARD_THRESHOLD_90K =
     200 * PTS_TICKS_PER_MS; ///< 200 ms in 90k ticks. Beyond this the soft corridor cannot recover in one event.
 constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Periodic sync-stats dsyslog cadence.
-constexpr int DECODER_SYNC_MAX_CORRECTION_MS =
-    200; ///< Per-event cap = HARD_THRESHOLD; one event clears any in-corridor offset.
+constexpr int DECODER_SYNC_MAX_CORRECTION_MS = static_cast<int>(DECODER_SYNC_HARD_THRESHOLD_90K / PTS_TICKS_PER_MS);
+///< Per-event cap = HARD_THRESHOLD (200 ms); one event clears any in-corridor offset.
 constexpr int DECODER_SYNC_WARMUP_SAMPLES =
     50; ///< Mean-seed samples before EMA starts; sqrt(N) cuts 50p deinterlace bias.
 constexpr int DECODER_SYNC_HARD_AHEAD_MAX_MS =
     500; ///< Live hard-ahead sleep cap (ms); prevents indefinite chase + upstream queue overflow.
-constexpr size_t DECODER_RESERVE_HARD_CAP =
-    150; ///< ~3 s @ 50 fps. Per-stage cap on the decode-ahead reserve: the decode thread backpressures
-         ///< when handoffQueue reaches it, and the present thread drop-oldest trims jitterBuf past it.
-         ///< Caps GPU surface retention when a stuck-but-valid audio clock holds the present due-gate
-         ///< closed (SkipStaleJitterFrames only drops BEHIND-clock heads). Deep on purpose -- absorbs a
-         ///< multi-second VPP stall instead of the screen (see AVSYNC.md). A trial cut to 64 regressed
-         ///< replay: a shallow reserve keeps the decoder always producing, multiplying vaDriverMutex
-         ///< contention with the display's per-frame PRIME map. Do not shrink it.
+// DECODER_RESERVE_HARD_CAP lives in decoder.h (statically coupled to the mediaplayer backpressure gate).
 constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
     3000; ///< Drop any head sitting more than this far ahead of audio_clock. Such an offset is a real
           ///< PTS discontinuity (ATTA anchor swap, broadcast PCR break, stale snd_pcm_delay clamp).
@@ -168,8 +161,7 @@ constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_BASE_MS =
          ///< forward; it must be far larger than the forward 20 ms base or content flies backward at 4-10x.
 constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_STEP_MS =
     70; ///< Added per slowdown unit: slowdown 2/4/5 -> 400/540/610 ms hold (~1.1x/0.8x/0.7x reverse), every level
-        ///< clearly under fast reverse's 2-8x without a multi-second still-frame slideshow. Bumped from 180+60
-        ///< (300/420/480) after on-hardware feedback that the reverse scan still ran a little fast.
+        ///< clearly under fast reverse's 2-8x without a multi-second still-frame slideshow.
 constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_MAX_MS =
     700; ///< Cap on the slow-reverse hold: keeps the slowest level off the seconds-long slideshow that a genuinely
          ///< 0.25x reverse (~1.6 s/frame) would reintroduce.
@@ -179,13 +171,9 @@ constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_MAX_MS =
 // ============================================================================
 
 VaapiFrame::VaapiFrame(VaapiFrame &&other) noexcept
-    : avFrame(other.avFrame), ownsFrame(other.ownsFrame), producedEpoch(other.producedEpoch), pts(other.pts),
-      vaSurfaceId(other.vaSurfaceId) {
-    other.avFrame = nullptr;
-    other.vaSurfaceId = VA_INVALID_SURFACE;
-    other.ownsFrame = false;
-    other.producedEpoch = 0;
-}
+    : avFrame(std::exchange(other.avFrame, nullptr)), ownsFrame(std::exchange(other.ownsFrame, false)),
+      producedEpoch(std::exchange(other.producedEpoch, 0)), pts(std::exchange(other.pts, AV_NOPTS_VALUE)),
+      vaSurfaceId(std::exchange(other.vaSurfaceId, VA_INVALID_SURFACE)) {}
 
 VaapiFrame::~VaapiFrame() noexcept {
     if (avFrame && ownsFrame) {
@@ -198,16 +186,11 @@ auto VaapiFrame::operator=(VaapiFrame &&other) noexcept -> VaapiFrame & {
         if (avFrame && ownsFrame) {
             av_frame_free(&avFrame);
         }
-        avFrame = other.avFrame;
-        vaSurfaceId = other.vaSurfaceId;
-        pts = other.pts;
-        ownsFrame = other.ownsFrame;
-        producedEpoch = other.producedEpoch;
-
-        other.avFrame = nullptr;
-        other.vaSurfaceId = VA_INVALID_SURFACE;
-        other.ownsFrame = false;
-        other.producedEpoch = 0;
+        avFrame = std::exchange(other.avFrame, nullptr);
+        ownsFrame = std::exchange(other.ownsFrame, false);
+        producedEpoch = std::exchange(other.producedEpoch, 0);
+        pts = std::exchange(other.pts, AV_NOPTS_VALUE);
+        vaSurfaceId = std::exchange(other.vaSurfaceId, VA_INVALID_SURFACE);
     }
     return *this;
 }
@@ -1171,7 +1154,7 @@ auto cVaapiDecoder::Action() -> void {
         // Handoff backpressure: if the presentation thread has not drained the reserve below the cap
         // (e.g. it is inside a hard-ahead audio-catch-up sleep), stop decoding ahead instead of
         // overflowing the handoff and dropping already-decoded reserve frames. packetQueue then fills
-        // and the existing upstream gate (IsQueueFull / AUDIO_REPLAY_QUEUE_HIGHWATER) throttles the feed.
+        // and the existing upstream gate (IsQueueFull / AUDIO_QUEUE_HIGHWATER) throttles the feed.
         // Held only on handoffMutex (a strict leaf) so this never blocks Clear()/EnqueueData().
         //
         // Trick play caps the in-flight depth at DECODER_TRICK_QUEUE_DEPTH: SubmitTrickFrame's pacing
@@ -1444,8 +1427,7 @@ auto cVaapiDecoder::PresentAction() -> void {
         // heads, so a stuck-but-valid audio clock with PTS marching ahead holds the due-gate closed
         // while the decode thread keeps producing -- jitterBuf would grow past the documented cap
         // (the handoff backpressure only bounds handoffQueue, which the splice above keeps draining).
-        // Drop oldest to bound GPU surface retention. Mirrors the pre-decouple guard that lived in
-        // the old single-thread drain; runs every iteration regardless of due-gate state.
+        // Drop oldest to bound GPU surface retention; runs every iteration regardless of due-gate state.
         if (jitterBuf.size() > DECODER_RESERVE_HARD_CAP) [[unlikely]] {
             const size_t dropCount = jitterBuf.size() - DECODER_RESERVE_HARD_CAP;
             for (size_t i = 0; i < dropCount; ++i) {
@@ -1489,13 +1471,13 @@ auto cVaapiDecoder::PresentAction() -> void {
             // Device paused (cVaapiDevice::Freeze): hold the drain so the head's PTS doesn't drift
             // while ALSA is dropped. Without this hold, GetClock() goes stale ~1 s into the pause,
             // the no-clock-freerun path below fires, frames are submitted at vsync rate, and on
-            // resume the head sits hundreds of ms ahead of the re-anchored audio clock -- the same
-            // video-ahead drain-stall loop the TS lookahead bug used to produce, just triggered by
-            // pause instead of by mux offset. Reset the stall/miss trackers so the pause duration
-            // doesn't surface as a spurious drain stall or miss spike when playback resumes.
+            // resume the head sits hundreds of ms ahead of the re-anchored audio clock -- a
+            // video-ahead drain-stall loop, here from pause rather than a mux offset. Reset the
+            // stall/miss trackers so the pause duration doesn't surface as a spurious drain stall or
+            // miss spike when playback resumes.
             // NOT during slow trick: VDR calls Freeze() before slow FF/REW (so devicePaused is set),
-            // but those frames must still be paced out by SubmitTrickFrame -- holding here is exactly
-            // what froze slow motion, while fast trick (no preceding Freeze) kept working.
+            // but those frames must still be paced out by SubmitTrickFrame, so holding here would
+            // freeze slow motion (fast trick has no preceding Freeze, so it is unaffected).
             if (devicePaused.load(std::memory_order_acquire) && !inTrick) [[unlikely]] {
                 noClockBlockedSinceMs = 0;
                 lastDrainMs = 0;
@@ -1876,13 +1858,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
             ApplySdColorDefaults(decodedFrame.get());
 
-            // (The old "catch-up fast path" that skipped the VPP chain for soon-to-be-dropped frames
-            // lived here. It read the controller's `catchingUp` flag and mutated catchUpDrops/
-            // syncDropSinceLog on the decode thread -- state that now belongs exclusively to the
-            // presentation thread -- so it was removed when the drain/sync controller moved off this
-            // thread. Frames now always flow through the handoff; the present-thread catch-up drops
-            // the ones it would have dropped. The decouple's whole premise is that the reserve
-            // absorbs VPP cost, so the lost seek-backlog speedup is acceptable.)
+            // No decode-thread catch-up fast path: frames always flow through the handoff and the
+            // present-thread controller drops what it must (catchingUp/catchUpDrops are present-thread
+            // state). The reserve absorbs VPP cost, so the lost seek-backlog speedup is acceptable.
 
             // vaDriverMutex serializes VAAPI access against the display thread's DRM PRIME export.
             // Filter graph is built lazily on first frame and after each Clear() or ScaleVideo() change.
@@ -2272,13 +2250,11 @@ auto cVaapiDecoder::PublishLastPts(int64_t pts) noexcept -> void {
 }
 
 [[nodiscard]] auto cVaapiDecoder::SyncLatency90k(const cAudioProcessor *ap) const noexcept -> int64_t {
-    // User knob (PCM or passthrough) + 1-frame pipeline constant.
-    // The 1-frame tail models the dominant scanout delay (commit + page flip) for an empty
-    // prerender cache, which is the throughput-bound regime where the EMA used to settle at
-    // -2*frameDur with the older 2-frame model. With 1*frameDur the throughput-bound baseline
-    // sits at -1*frameDur (~-20 ms @ 50 fps), well inside CORRIDOR (50 ms), so 10-15 ms/s
-    // crystal/pipeline drift takes ~3x longer to breach. Gate-bound (live TV, replay backlog)
-    // is unaffected: the gate releases at dueIn <= halfFrame, so the EMA still settles at
+    // User knob (PCM or passthrough) + 1-frame pipeline constant. The 1-frame tail models the
+    // dominant scanout delay (commit + page flip) for an empty prerender cache (throughput-bound
+    // regime): the baseline settles at -1*frameDur (~-20 ms @ 50 fps), well inside CORRIDOR (50 ms),
+    // so 10-15 ms/s crystal/pipeline drift takes a long time to breach. Gate-bound (live TV, replay
+    // backlog) is unaffected: the gate releases at dueIn <= halfFrame, so the EMA still settles at
     // +halfFrame regardless of latency. Operator knob still shifts the bias on top.
     const int latencyMs = (ap && ap->IsPassthrough()) ? vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)
                                                       : vaapiConfig.pcmLatency.load(std::memory_order_relaxed);
@@ -2393,22 +2369,33 @@ auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserv
     jitterBuf.clear();
     pendingDrops = 0;
     lastDrainMs = 0;
-    // Catch-up tracker is decode-thread-owned; cleared here (the decode-thread side of Clear /
-    // FlushForSeek) so the "sinceCatchUp" diagnostic only counts within a single playback
-    // session and doesn't carry a stale timestamp across a seek.
+    // "sinceCatchUp" diagnostic baseline: only meaningful within one playback session.
     lastCatchUpExitMs = 0;
-    // Catch-up log-throttle state belongs to a single playback run; a flush is a content /
-    // position boundary, so any cycles aggregated from before the flush no longer describe
-    // the current decode pipeline. Without this reset the first post-flush "catch-up entered"
-    // emits a misleading "cycling settled" summary attributing pre-flush events (possibly from
-    // a different file, minutes ago) to the new session. Silent reset -- a leaked summary line
-    // is worse than dropping a few aggregate counts on the floor.
-    lastCatchUpEntryMs = 0;
-    suppressedCatchUpCycles = 0;
-    suppressedCatchUpDrops = 0;
-    suppressedCatchUpWallMs = 0;
-    nextCatchUpSummaryMs = 0;
     catchUpLogThisCycle = false;
+    // Catch-up log-throttle run state. Reset it ONLY on a content boundary (plain Clear / trick-exit,
+    // preserveSeekHint=false): pre-boundary cycles describe a different pipeline, and zeroing the
+    // aggregates keeps the run-boundary "cycling settled" summary from misattributing them to the new
+    // session. Across a same-content SEEK (preserveSeekHint=true) KEEP the run state: a rapid
+    // forward/back-seek burst then registers as ONE cycling run and is throttled. Otherwise every
+    // seek's post-flush warmup catch-up logs a full entry+exit pair on this (present) hot thread --
+    // a journal flood that also blocks the drain on syslog I/O exactly while the user is scrubbing.
+    if (!preserveSeekHint) {
+        lastCatchUpEntryMs = 0;
+        suppressedCatchUpCycles = 0;
+        suppressedCatchUpDrops = 0;
+        suppressedCatchUpWallMs = 0;
+        nextCatchUpSummaryMs = 0;
+        // Sync-stats accumulators: zero them so the new session's first post-warmup log can't report
+        // drops/skips/misses carried over from before this content boundary. They survive a Clear()
+        // because LogSyncStats only resets them after warmup completes, which a content switch
+        // restarts -- hence a stale pre-switch count would otherwise surface as a phantom first-log
+        // drop spike. A seek keeps them: its post-flush catch-up drops belong to this session.
+        drainMissCount = 0;
+        syncDropSinceLog = 0;
+        syncSkipSinceLog = 0;
+        rawDeltaSumSinceLog90k = 0;
+        rawDeltaCountSinceLog = 0;
+    }
 }
 
 [[nodiscard]] auto cVaapiDecoder::BeginCatchUpLogCycle() noexcept -> bool {
@@ -2565,12 +2552,19 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             // Time-since-catch-up-exit surfaces the cascade pattern: when stale-jitter fires
             // within ~2 s of a catch-up exit, the GPU/audio drift is exceeding the catch-up
             // follow-up margin and the system is stuck in a recovery loop. ms=0 means
-            // catch-up has not run yet this session.
-            const uint64_t sinceCatchUpMs = (lastCatchUpExitMs != 0) ? (cTimeMs::Now() - lastCatchUpExitMs) : 0;
-            dsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu "
-                    "sinceCatchUp=%llums",
-                    dropped, static_cast<long long>(firstDelta90k / PTS_TICKS_PER_MS), jitterBuf.size(),
-                    static_cast<unsigned long long>(sinceCatchUpMs));
+            // catch-up has not run yet this session. Throttled: a rapid-seek burst triggers this
+            // per seek, and an unthrottled dsyslog on this (present) hot thread would flood the
+            // journal and block the drain; suppressed drops fold into the next line's tail count.
+            staleJitterDropsSinceLog += dropped;
+            if (staleJitterLogGate.Elapsed() >= 500) {
+                const uint64_t sinceCatchUpMs = (lastCatchUpExitMs != 0) ? (cTimeMs::Now() - lastCatchUpExitMs) : 0;
+                dsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu "
+                        "sinceCatchUp=%llums (%d since last)",
+                        dropped, static_cast<long long>(firstDelta90k / PTS_TICKS_PER_MS), jitterBuf.size(),
+                        static_cast<unsigned long long>(sinceCatchUpMs), staleJitterDropsSinceLog);
+                staleJitterDropsSinceLog = 0;
+                staleJitterLogGate.Set();
+            }
         }
     }
 }

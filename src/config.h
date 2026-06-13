@@ -32,6 +32,8 @@ inline constexpr size_t DISPLAY_PRERENDER_SLOTS =
        ///< without draining the cache and forcing a re-present. SubmitFrame blocks when all slots
        ///< are full so audio clock stays in lipsync (the whole pipeline is delayed in lockstep, not
        ///< just video). FHD HW paths never fill past 1-2 slots; the extra depth is a no-op there.
+       ///< COUPLED to display.cpp's UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2); revisit that margin if you
+       ///< change this (the relationship is not linear -- see the note at that definition).
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===
@@ -161,7 +163,7 @@ struct VaapiConfig {
     DisplayConfig display;                         ///< Display geometry; init-time only, not thread-safe after that
     std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< Re-read on every codec change / filter-graph rebuild
     // Low-performance-hardware knobs: ignored unless lowPerfEnabled; re-read on every filter-graph rebuild.
-    std::atomic<int> lowPerfDeintMax{0};               ///< DeintMode index ceiling (0=MCDI ⇒ no limit); see DeintMode
+    std::atomic<int> lowPerfDeintMax{0};               ///< DeintMode index ceiling (0=MCDI => no limit); see DeintMode
     std::atomic<bool> lowPerfDisableDenoise{false};    ///< Skip denoise_vaapi / MPEG-2 hqdn3d fallback in the chain
     std::atomic<bool> lowPerfDisableHqScaling{false};  ///< Drop scale_vaapi :mode=hq (bicubic) even on non-UHD
     std::atomic<bool> lowPerfDisableSharpening{false}; ///< Skip sharpness_vaapi in the chain

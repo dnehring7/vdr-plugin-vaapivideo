@@ -8,8 +8,8 @@
  * packet. Returns a zero-initialized result on any error rather than reading past
  * the supplied buffer.
  *
- * Codec detection previously lived here but was moved to stream.cpp where it can
- * share the elementary-stream byte inspection logic with the SPS peek.
+ * Codec detection lives in stream.cpp, sharing the elementary-stream byte inspection
+ * logic with the SPS peek.
  */
 
 #include "pes.h"
