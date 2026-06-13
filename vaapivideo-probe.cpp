@@ -17,7 +17,10 @@
  *
  * Each profile is tested against the exact surface format it requires
  * (YUV420 for 8-bit, YUV420_10 for 10-bit). VPP filters, HDR tone mapping,
- * and deinterlacing modes are also reported.
+ * and deinterlacing modes are also reported. Per connector, the sink EDID is
+ * parsed for its advertised HDR10 (PQ) / HLG / BT.2020 / HDR10+ support and
+ * Dolby Vision VSVDB -- the display half of the HDR decision (DV is reported
+ * for information only; VAAPI cannot decode it).
  *
  * Usage:   ./vaapivideo-probe [/dev/dri/cardN]   (default: /dev/dri/card0)
  * Compile: g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva-drm) -o vaapivideo-probe vaapivideo-probe.cpp
@@ -27,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +60,9 @@ constexpr int kProbeSurfaceSize = 64;
 namespace {
 struct DrmDeviceDeleter {
     auto operator()(drmDevice *dev) const noexcept -> void { drmFreeDevice(&dev); }
+};
+struct DrmBlobDeleter {
+    auto operator()(drmModePropertyBlobRes *blob) const noexcept -> void { drmModeFreePropertyBlob(blob); }
 };
 } // namespace
 
@@ -246,17 +253,17 @@ namespace {
 // Mirrors GpuCaps (src/caps.h): one flag per codec/bit-depth the plugin uses.
 // Populated by ProbeDecodeProfiles; consumed by PrintColorConversions.
 struct DecodeSupport {
-    bool mpeg2 = false;      ///< MPEG-2 Simple or Main (8-bit)
-    bool h264 = false;       ///< H.264 CBP / Main / High (8-bit)
-    bool h264High10 = false; ///< H.264 High 10 (10-bit)
-    bool hevc = false;       ///< HEVC Main / SccMain (8-bit 4:2:0)
-    bool hevcMain10 = false; ///< HEVC Main 10 / SccMain 10 (10-bit 4:2:0)
-    bool av1 = false;        ///< AV1 Profile 0 (8-bit)
-    bool av1Main10 = false;  ///< AV1 Profile 0 (10-bit)
-    bool vp9 = false;        ///< VP9 Profile 0 (8-bit)
-    bool vp9Profile2 = false;///< VP9 Profile 2 (10-bit)
-    bool vvc = false;        ///< VVC Main 10 at YUV420 (8-bit)
-    bool vvcMain10 = false;  ///< VVC Main 10 at YUV420_10 (10-bit)
+    bool mpeg2 = false;       ///< MPEG-2 Simple or Main (8-bit)
+    bool h264 = false;        ///< H.264 CBP / Main / High (8-bit)
+    bool h264High10 = false;  ///< H.264 High 10 (10-bit)
+    bool hevc = false;        ///< HEVC Main / SccMain (8-bit 4:2:0)
+    bool hevcMain10 = false;  ///< HEVC Main 10 / SccMain 10 (10-bit 4:2:0)
+    bool av1 = false;         ///< AV1 Profile 0 (8-bit)
+    bool av1Main10 = false;   ///< AV1 Profile 0 (10-bit)
+    bool vp9 = false;         ///< VP9 Profile 0 (8-bit)
+    bool vp9Profile2 = false; ///< VP9 Profile 2 (10-bit)
+    bool vvc = false;         ///< VVC Main 10 at YUV420 (8-bit)
+    bool vvcMain10 = false;   ///< VVC Main 10 at YUV420_10 (10-bit)
 };
 } // namespace
 
@@ -429,29 +436,47 @@ namespace {
 
 [[nodiscard]] auto ConnectorTypeName(uint32_t t) -> const char * {
     switch (t) {
-        case DRM_MODE_CONNECTOR_HDMIA: return "HDMI-A";
-        case DRM_MODE_CONNECTOR_HDMIB: return "HDMI-B";
-        case DRM_MODE_CONNECTOR_DisplayPort: return "DisplayPort";
-        case DRM_MODE_CONNECTOR_eDP: return "eDP";
-        case DRM_MODE_CONNECTOR_DVII: return "DVI-I";
-        case DRM_MODE_CONNECTOR_DVID: return "DVI-D";
-        case DRM_MODE_CONNECTOR_DVIA: return "DVI-A";
-        case DRM_MODE_CONNECTOR_VGA: return "VGA";
-        case DRM_MODE_CONNECTOR_LVDS: return "LVDS";
-        case DRM_MODE_CONNECTOR_Composite: return "Composite";
-        case DRM_MODE_CONNECTOR_SVIDEO: return "S-Video";
-        case DRM_MODE_CONNECTOR_Component: return "Component";
-        case DRM_MODE_CONNECTOR_DSI: return "DSI";
-        default: return "?";
+        case DRM_MODE_CONNECTOR_HDMIA:
+            return "HDMI-A";
+        case DRM_MODE_CONNECTOR_HDMIB:
+            return "HDMI-B";
+        case DRM_MODE_CONNECTOR_DisplayPort:
+            return "DisplayPort";
+        case DRM_MODE_CONNECTOR_eDP:
+            return "eDP";
+        case DRM_MODE_CONNECTOR_DVII:
+            return "DVI-I";
+        case DRM_MODE_CONNECTOR_DVID:
+            return "DVI-D";
+        case DRM_MODE_CONNECTOR_DVIA:
+            return "DVI-A";
+        case DRM_MODE_CONNECTOR_VGA:
+            return "VGA";
+        case DRM_MODE_CONNECTOR_LVDS:
+            return "LVDS";
+        case DRM_MODE_CONNECTOR_Composite:
+            return "Composite";
+        case DRM_MODE_CONNECTOR_SVIDEO:
+            return "S-Video";
+        case DRM_MODE_CONNECTOR_Component:
+            return "Component";
+        case DRM_MODE_CONNECTOR_DSI:
+            return "DSI";
+        default:
+            return "?";
     }
 }
 
 [[nodiscard]] auto PlaneTypeName(uint64_t t) -> const char * {
     switch (t) {
-        case DRM_PLANE_TYPE_PRIMARY: return "PRIMARY";
-        case DRM_PLANE_TYPE_OVERLAY: return "OVERLAY";
-        case DRM_PLANE_TYPE_CURSOR: return "CURSOR";
-        default: return "?";
+        case DRM_PLANE_TYPE_PRIMARY:
+            return "PRIMARY";
+        case DRM_PLANE_TYPE_OVERLAY:
+            return "OVERLAY";
+        case DRM_PLANE_TYPE_CURSOR:
+            return "CURSOR";
+        default:
+            return "?";
     }
 }
 
@@ -528,6 +553,130 @@ struct PropEntry {
     return nullptr;
 }
 
+// What the sink advertises in its EDID CTA-861 blocks -- the display half of the HDR decision (the
+// plugin's auto gate needs PQ + BT.2020 Y'CbCr). Mirrors src/display.cpp plus luminance/HDR10+/DV.
+struct SinkHdrCaps {
+    bool eotfSdr{};        ///< HDR Static Metadata EOTF bit 0 (traditional gamma SDR)
+    bool eotfHdrGamma{};   ///< EOTF bit 1 (traditional gamma HDR)
+    bool hdr10Pq{};        ///< EOTF bit 2 (SMPTE ST 2084 / PQ -> HDR10)
+    bool hlg{};            ///< EOTF bit 3 (ARIB STD-B67 / HLG)
+    bool bt2020Ycc{};      ///< Colorimetry bit 6 (BT.2020 Y'CbCr)
+    bool bt2020Rgb{};      ///< Colorimetry bit 7 (BT.2020 RGB)
+    bool hdr10Plus{};      ///< HDR Dynamic Metadata block advertises SMPTE ST 2094-40
+    bool dolbyVision{};    ///< Vendor-Specific Video Data Block carries the Dolby OUI (00-D0-46)
+    bool hasLuminance{};   ///< The HDR Static Metadata block carried the optional luminance bytes
+    uint8_t maxLumaCode{}; ///< Desired content max luminance (CTA code; nits = 50 * 2^(code/32))
+};
+
+constexpr size_t EDID_BLOCK_SIZE = 128;
+constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;
+constexpr size_t EDID_CHECKSUM_OFFSET = 127;
+
+/// Desired-content-luminance EDID code -> cd/m^2 (CTA-861-G sec.7.5.13).
+[[nodiscard]] auto LuminanceCodeToNits(uint8_t code) -> double { return 50.0 * std::pow(2.0, code / 32.0); }
+
+/// Parse one 128-byte CTA-861 extension block (tag 0x02). OR results into @p caps so multiple
+/// extension blocks accumulate. Mirrors src/display.cpp ParseCtaExtension plus DV/HDR10+/luminance.
+auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -> void {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
+    if (ext.size() < 4 || ext[0] != 0x02) {
+        return;
+    }
+    const size_t dtdOffset = ext[2];
+    const size_t dataBlockEnd = (dtdOffset == 0) ? EDID_CHECKSUM_OFFSET : dtdOffset;
+    if (dataBlockEnd < 4 || dataBlockEnd > ext.size()) {
+        return;
+    }
+    size_t offset = 4;
+    while (offset < dataBlockEnd) {
+        const uint8_t header = ext[offset];
+        const uint8_t blockTag = header >> 5;
+        const uint8_t payloadLen = header & 0x1F;
+        if (offset + 1 + payloadLen > dataBlockEnd) {
+            break;
+        }
+        const std::span<const uint8_t> payload = ext.subspan(offset + 1, payloadLen);
+        if (blockTag == 7 && !payload.empty()) { // Extended Tag block; payload[0] = extended tag
+            const uint8_t extTag = payload[0];
+            if (extTag == 0x06 && payload.size() >= 2) { // HDR Static Metadata (sec.7.5.13)
+                caps.eotfSdr = caps.eotfSdr || (payload[1] & (1U << 0)) != 0;
+                caps.eotfHdrGamma = caps.eotfHdrGamma || (payload[1] & (1U << 1)) != 0;
+                caps.hdr10Pq = caps.hdr10Pq || (payload[1] & (1U << 2)) != 0;
+                caps.hlg = caps.hlg || (payload[1] & (1U << 3)) != 0;
+                if (payload.size() >= 4) { // optional: [2]=descriptor, [3]=max luminance
+                    caps.hasLuminance = true;
+                    caps.maxLumaCode = payload[3];
+                }
+            } else if (extTag == 0x05 && payload.size() >= 2) { // Colorimetry (sec.7.5.6)
+                caps.bt2020Ycc = caps.bt2020Ycc || (payload[1] & (1U << 6)) != 0;
+                caps.bt2020Rgb = caps.bt2020Rgb || (payload[1] & (1U << 7)) != 0;
+            } else if (extTag == 0x07 && payload.size() >= 3) { // HDR Dynamic Metadata (sec.7.5.14)
+                // Walk the (length, type-LSB, type-MSB, ...) sub-blocks; type 0x0004 = SMPTE ST 2094-40 (HDR10+).
+                size_t p = 1;
+                while (p + 1 < payload.size()) {
+                    const uint8_t subLen = payload[p];
+                    if (subLen == 0 || p + 1 + subLen > payload.size()) {
+                        break;
+                    }
+                    const uint16_t type =
+                        static_cast<uint16_t>(payload[p + 1]) | (static_cast<uint16_t>(payload[p + 2]) << 8U);
+                    caps.hdr10Plus = caps.hdr10Plus || type == 0x0004;
+                    p += 1 + subLen;
+                }
+            } else if (extTag == 0x01 && payload.size() >= 4) { // Vendor-Specific Video Data Block
+                // IEEE OUI stored LSB-first; Dolby = 00-D0-46 -> bytes 46 D0 00.
+                caps.dolbyVision = caps.dolbyVision || (payload[1] == 0x46 && payload[2] == 0xD0 && payload[3] == 0x00);
+            }
+        }
+        offset += 1 + payloadLen;
+    }
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
+
+/// Read and parse a connector's EDID blob into @p caps. Returns false if no usable EDID was found.
+[[nodiscard]] auto ParseConnectorEdid(int fd, const std::vector<PropEntry> &props, SinkHdrCaps &caps) -> bool {
+    const PropEntry *edidProp = FindProp(props, "EDID");
+    if (edidProp == nullptr || edidProp->value == 0) {
+        return false;
+    }
+    const std::unique_ptr<drmModePropertyBlobRes, DrmBlobDeleter> blob{
+        drmModeGetPropertyBlob(fd, static_cast<uint32_t>(edidProp->value))};
+    if (!blob || blob->data == nullptr || blob->length < EDID_BLOCK_SIZE) {
+        return false;
+    }
+    const std::span<const uint8_t> edid{static_cast<const uint8_t *>(blob->data), blob->length};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bounded by the size check
+    const size_t extCount = edid[EDID_EXTENSION_COUNT_OFFSET];
+    for (size_t i = 0; i < extCount; ++i) {
+        const size_t extOffset = EDID_BLOCK_SIZE * (i + 1);
+        if (extOffset + EDID_BLOCK_SIZE > edid.size()) {
+            break;
+        }
+        ParseCtaExtensionForSink(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
+    }
+    return true;
+}
+
+auto PrintSinkHdrCaps(int fd, const std::vector<PropEntry> &props) -> void {
+    SinkHdrCaps caps;
+    if (!ParseConnectorEdid(fd, props, caps)) {
+        std::printf("    Sink HDR (EDID):          (no readable EDID)\n");
+        return;
+    }
+    const auto yn = [](bool b) -> const char * { return b ? "yes" : "no"; };
+    std::printf("    Sink HDR (EDID CTA-861):\n");
+    std::printf("      HDR10 / PQ (ST 2084)    %s\n", yn(caps.hdr10Pq));
+    std::printf("      HLG (ARIB STD-B67)      %s\n", yn(caps.hlg));
+    std::printf("      BT.2020 Y'CbCr          %s\n", yn(caps.bt2020Ycc));
+    std::printf("      HDR10+ (ST 2094-40)     %s\n", yn(caps.hdr10Plus));
+    if (caps.hasLuminance) {
+        std::printf("      desired max luminance   ~%.0f cd/m^2 (code %u)\n", LuminanceCodeToNits(caps.maxLumaCode),
+                    caps.maxLumaCode);
+    }
+    // DV is sink capability only.
+    std::printf("      Dolby Vision (sink)     %s\n", yn(caps.dolbyVision));
+}
+
 auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
     std::printf("\n--- DRM Connectors ---\n");
     uint32_t disconnected = 0;
@@ -556,6 +705,7 @@ auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
         if (const auto *p = FindProp(props, "Colorspace"); p != nullptr) {
             std::printf("    Colorspace (current)      %u\n", static_cast<uint32_t>(p->value));
         }
+        PrintSinkHdrCaps(fd, props);
         drmModeFreeConnector(c);
     }
     if (disconnected != 0) {
@@ -741,7 +891,8 @@ auto main(int argc, char *argv[]) -> int {
                 "================================================\n");
 
     // --- Open DRM device ---
-    const int drmFd = open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
+    const int drmFd =
+        open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
     if (drmFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open '%s': %s\n", devicePath, std::strerror(errno));
         (void)std::fprintf(stderr, "       Ensure user is in 'video' or 'render' group.\n");
@@ -760,7 +911,9 @@ auto main(int argc, char *argv[]) -> int {
     std::printf("Render node: %s\n", renderNode.c_str());
 
     // --- Open render node and initialize VAAPI ---
-    const int renderFd = open(renderNode.c_str(), O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
+    const int renderFd =
+        open(renderNode.c_str(),
+             O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
     if (renderFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open render node '%s': %s\n", renderNode.c_str(),
                            std::strerror(errno));

@@ -63,7 +63,10 @@ extern "C" {
 #include <libavcodec/packet.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/dict.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/error.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
@@ -74,6 +77,7 @@ extern "C" {
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/config.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
 #include <vdr/keys.h>
@@ -143,6 +147,52 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
         infoExtra = storage.data();
         infoSize = static_cast<int>(storage.size());
     }
+}
+
+/// Channel-layout label for a track description; empty for uncommon counts.
+[[nodiscard]] auto AudioLayoutLabel(int channels) -> std::string_view {
+    switch (channels) {
+        case 1:
+            return "Mono";
+        case 2:
+            return "Stereo";
+        case 6:
+            return "5.1";
+        case 8:
+            return "7.1";
+        default:
+            return {};
+    }
+}
+
+/// cDisplayTracks label, e.g. "AC-3 5.1 (eng)". Kept short: tTrackId.description is char[32].
+[[nodiscard]] auto AudioTrackDescription(const cVaapiMediaSource::AudioTrackDesc &track) -> std::string {
+    std::string desc = avcodec_get_name(track.info.codecId);
+    if (const std::string_view layout = AudioLayoutLabel(track.srcChannels); !layout.empty()) {
+        desc += std::format(" {}", layout);
+    }
+    if (!track.language.empty()) {
+        desc += std::format(" ({})", track.language);
+    }
+    return desc;
+}
+
+/// Match cDevice::EnsureAudioTrack's pick (Setup.AudioLanguages, else track 0) so opening
+/// cDisplayTracks never silently re-switches the track. -1 when the source has no audio.
+[[nodiscard]] auto ChoosePreferredAudioTrack(const cVaapiMediaSource &source) -> int {
+    const auto &tracks = source.AudioTracks();
+    if (tracks.empty()) {
+        return -1;
+    }
+    int preferred = -1;
+    int languagePreference = -1;
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        int pos = 0;
+        if (I18nIsPreferredLanguage(Setup.AudioLanguages, tracks.at(i).language.c_str(), languagePreference, &pos)) {
+            preferred = static_cast<int>(i);
+        }
+    }
+    return preferred >= 0 ? preferred : 0;
 }
 
 /// libavformat interrupt_callback. Polled by avformat_open_input / av_read_frame on slow
@@ -443,7 +493,8 @@ auto cVaapiMediaSource::Close() noexcept -> void {
     videoStreamIndex = -1;
     audioStreamIndex = -1;
     videoExtradataStorage.clear();
-    audioExtradataStorage.clear();
+    audioTracks.clear();
+    currentAudioTrack = -1;
     videoInfo = VideoStreamInfo{};
     audioInfo = AudioStreamInfo{};
     ptsOrigin90k = AV_NOPTS_VALUE;
@@ -502,7 +553,8 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     videoInfo = VideoStreamInfo{};
     audioInfo = AudioStreamInfo{};
     videoExtradataStorage.clear();
-    audioExtradataStorage.clear();
+    audioTracks.clear();
+    currentAudioTrack = -1;
 
     // Pick ptsOrigin90k = MAX of tracked-stream start_times so both streams begin at
     // rebased PTS 0 together. Files where audio (or any other stream) leads video by
@@ -557,22 +609,119 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
         // path always has the container's extradata, so the decoder can open immediately.
         videoInfo.hasSps = true;
         CopyExtradata(p, videoExtradataStorage, videoInfo.extradata, videoInfo.extradataSize);
+        // VP9/AV1 carry HDR static metadata in the container, not the bitstream -- copy it so the
+        // HDR_OUTPUT_METADATA blob gets real mastering luminance instead of zeros.
+        if (const AVPacketSideData *sd = av_packet_side_data_get(p->coded_side_data, p->nb_coded_side_data,
+                                                                 AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            sd != nullptr && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
+            videoInfo.hasMasteringDisplay = true;
+            std::memcpy(&videoInfo.masteringDisplay, sd->data, sizeof(videoInfo.masteringDisplay));
+        }
+        if (const AVPacketSideData *sd =
+                av_packet_side_data_get(p->coded_side_data, p->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+            sd != nullptr && sd->size >= sizeof(AVContentLightMetadata)) {
+            videoInfo.hasContentLight = true;
+            std::memcpy(&videoInfo.contentLight, sd->data, sizeof(videoInfo.contentLight));
+        }
+        // Dolby Vision: VAAPI has no DV path, so only the HEVC base layer decodes (RPU + enhancement
+        // layer dropped). A BL compatibility id of 1 (HDR10) / 4 (HLG) renders correctly; 0/2 (e.g.
+        // profile 5 IPT-PQ, profile 4) have no standard fallback and show wrong colors. Log it so the
+        // result is never a silent mystery.
+        if (const AVPacketSideData *sd =
+                av_packet_side_data_get(p->coded_side_data, p->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+            sd != nullptr && sd->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+            AVDOVIDecoderConfigurationRecord dovi{};
+            std::memcpy(&dovi, sd->data, sizeof(dovi));
+            const unsigned compat = dovi.dv_bl_signal_compatibility_id;
+            const bool hasHdrBase = compat == 1 || compat == 4;
+            isyslog("vaapivideo/mediaplayer: Dolby Vision profile %u (BL compatibility id %u) -- DV not decodable; "
+                    "base layer %s",
+                    static_cast<unsigned>(dovi.dv_profile), compat,
+                    hasHdrBase ? "renders as standard HDR10/HLG" : "may show wrong colors (no standard fallback)");
+        }
     }
 
-    if (audioStreamIndex >= 0) {
-        const AVStream *stream = formatCtx->streams[audioStreamIndex];
-        audioTimeBase = stream->time_base;
-        const AVCodecParameters *p = stream->codecpar;
-        audioInfo.codecId = p->codec_id;
-        audioInfo.sampleRate = p->sample_rate;
-        // Always open ALSA at 2 channels and let swresample downmix from the container's
-        // native layout (5.1, 7.1, ...) -- matches the live-TV path in cVaapiDevice::PlayAudio
-        // (hardcoded to 2ch there too). Without this, 5.1 AC3 files open ALSA at 6 channels
-        // and the plug device's automatic downmix produces audibly distorted output on a
-        // stereo sink. Multi-channel passthrough would need separate plumbing.
-        audioInfo.channels = 2;
-        CopyExtradata(p, audioExtradataStorage, audioInfo.extradata, audioInfo.extradataSize);
+    // reserve() and never push_back after: each descriptor's info.extradata aliases its own
+    // extradataStorage, so a reallocation would dangle the active mirror.
+    unsigned audioCount = 0;
+    for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ++audioCount;
+        }
     }
+    audioTracks.reserve(audioCount);
+    for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        const AVStream *stream = formatCtx->streams[i];
+        if (stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+            continue;
+        }
+        AudioTrackDesc desc;
+        desc.avStreamIndex = static_cast<int>(i);
+        desc.timeBase = stream->time_base;
+        desc.srcChannels = stream->codecpar->ch_layout.nb_channels;
+        if (const AVDictionaryEntry *lang = av_dict_get(stream->metadata, "language", nullptr, 0);
+            lang != nullptr && lang->value != nullptr) {
+            desc.language = lang->value;
+        }
+        PopulateAudioInfo(stream, desc.info, desc.extradataStorage);
+        audioTracks.push_back(std::move(desc));
+    }
+
+    // Default to libavformat's best-stream pick; the player overrides it with the preferred-language
+    // track before the codec opens.
+    currentAudioTrack = -1;
+    for (size_t i = 0; i < audioTracks.size(); ++i) {
+        if (audioTracks.at(i).avStreamIndex == audioStreamIndex) {
+            currentAudioTrack = static_cast<int>(i);
+            break;
+        }
+    }
+    if (currentAudioTrack < 0 && !audioTracks.empty()) {
+        currentAudioTrack = 0;
+    }
+    ApplyCurrentAudioTrack();
+}
+
+auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInfo &info, std::vector<uint8_t> &storage)
+    -> void {
+    const AVCodecParameters *p = stream->codecpar;
+    info.codecId = p->codec_id;
+    info.sampleRate = p->sample_rate;
+    // Always open ALSA at 2 channels and let swresample downmix from the container's
+    // native layout (5.1, 7.1, ...) -- matches the live-TV path in cVaapiDevice::PlayAudio
+    // (hardcoded to 2ch there too). Without this, 5.1 AC3 files open ALSA at 6 channels
+    // and the plug device's automatic downmix produces audibly distorted output on a
+    // stereo sink. Multi-channel passthrough would need separate plumbing.
+    info.channels = 2;
+    CopyExtradata(p, storage, info.extradata, info.extradataSize);
+}
+
+auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
+    if (currentAudioTrack < 0 || currentAudioTrack >= static_cast<int>(audioTracks.size())) {
+        audioStreamIndex = -1;
+        audioTimeBase = AVRational{.num = 1, .den = 90000};
+        audioInfo = AudioStreamInfo{};
+        return;
+    }
+    const AudioTrackDesc &desc = audioTracks.at(static_cast<size_t>(currentAudioTrack));
+    audioStreamIndex = desc.avStreamIndex;
+    audioTimeBase = desc.timeBase;
+    audioInfo = desc.info; // .extradata still aliases desc.extradataStorage (stable in the table)
+}
+
+[[nodiscard]] auto cVaapiMediaSource::SelectAudioTrack(int trackIdx) -> bool {
+    if (trackIdx < 0 || trackIdx >= static_cast<int>(audioTracks.size())) {
+        return false;
+    }
+    if (trackIdx == currentAudioTrack) {
+        return true;
+    }
+    currentAudioTrack = trackIdx;
+    ApplyCurrentAudioTrack();
+    // Clear any stale discard window so a pre-open repoint (no following seek) keeps the new track's
+    // opening packets.
+    discardAudioBefore90k = AV_NOPTS_VALUE;
+    return true;
 }
 
 [[nodiscard]] auto cVaapiMediaSource::DurationMs() const noexcept -> int {
@@ -745,9 +894,11 @@ cVaapiPlayer::cVaapiPlayer(std::vector<PlaylistEntry> entries)
 }
 
 cVaapiPlayer::~cVaapiPlayer() noexcept {
-    // Order: raise stop, wake pause-waiter, join (bounded 3s via InterruptOnStop on slow
-    // network URLs), drop the source under the mutex. ioInterrupt is raised too so a thread
-    // parked in a network read bails immediately rather than after the I/O timeout.
+    // Must call CloseCurrentEntry here, not a bare source.reset(): ~cPlayer's Detach()->Activate(false)
+    // dispatches to the empty base cPlayer::Activate during base destruction, so this is the only path
+    // that runs our teardown -- without it ClrAvailableTracks/ClearForMediaPlayer never fire and
+    // mediaPlayerAudioActive stays latched, wedging live-TV audio after the player exits.
+    // ioInterrupt breaks a parked network read so Cancel(3) joins fast.
     stopping.store(true, std::memory_order_release);
     ioInterrupt.store(true, std::memory_order_release);
     {
@@ -755,8 +906,7 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         pauseCondition.Broadcast();
     }
     Cancel(3);
-    const cMutexLock lock(&sourceMutex);
-    source.reset();
+    CloseCurrentEntry();
 }
 
 [[nodiscard]] auto cVaapiPlayer::CurrentPositionMs() const noexcept -> int {
@@ -811,6 +961,11 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         esyslog("vaapivideo/mediaplayer: primary device is not vaapivideo -- cannot play");
         return false;
     }
+    // Pick the preferred-language track BEFORE OpenForMediaPlayer so the right codec opens directly
+    // (no startup reopen). nextSource is unpublished, so SelectAudioTrack needs no lock.
+    if (const int preferred = ChoosePreferredAudioTrack(*nextSource); preferred >= 0) {
+        (void)nextSource->SelectAudioTrack(preferred);
+    }
     if (!vaapiDev->OpenForMediaPlayer(nextSource->VideoInfo(), nextSource->AudioInfo())) {
         vaapiDev->ClearForMediaPlayer();
         return false;
@@ -820,14 +975,21 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
     // fallback must not carry over from the previous entry.
     latestAudioPts90k.store(AV_NOPTS_VALUE, std::memory_order_release);
     pendingSeekTargetMs.store(-1, std::memory_order_release);
+    // Drop any audio-switch request left pending from the previous entry before re-registering.
+    audioSwitchPending.store(false, std::memory_order_release);
+    audioSwitchTargetIdx.store(-1, std::memory_order_release);
+    RegisterAudioTracks(vaapiDev);
     return true;
 }
 
 auto cVaapiPlayer::CloseCurrentEntry() noexcept -> void {
     const cMutexLock lock(&sourceMutex);
     if (auto *vaapiDev = FindPrimaryVaapiDevice(); vaapiDev != nullptr) {
+        vaapiDev->ClrAvailableTracks(); // drop this entry's audio tracks (no stale list into live TV)
         vaapiDev->ClearForMediaPlayer();
     }
+    activeMenuIndex.store(-1, std::memory_order_release);
+    audioTrackCount.store(0, std::memory_order_release);
     source.reset();
 }
 
@@ -934,7 +1096,6 @@ auto cVaapiPlayer::Next() -> void {
     }
     const auto [w, h] = source->VideoCodedSize();
     const auto &v = source->VideoInfo();
-    const auto &a = source->AudioInfo();
     const double fps = source->VideoFps();
     const size_t idx = currentIndex.load(std::memory_order_relaxed);
 
@@ -949,10 +1110,20 @@ auto cVaapiPlayer::Next() -> void {
         text += std::format(" @ {:.3f} fps", fps);
     }
     text += "\n";
-    if (a.codecId != AV_CODEC_ID_NONE) {
-        text += std::format("Audio:    {} {} Hz {} ch\n", avcodec_get_name(a.codecId), a.sampleRate, a.channels);
-    } else {
+    const auto &tracks = source->AudioTracks();
+    const int current = source->CurrentAudioTrack();
+    if (tracks.empty()) {
         text += "Audio:    (none)\n";
+    } else {
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            const auto &track = tracks.at(i);
+            const std::string_view layout = AudioLayoutLabel(track.srcChannels);
+            const std::string channels = layout.empty() ? std::format("{} ch", track.srcChannels) : std::string{layout};
+            const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
+            // A leading "* " marks the active track; "  " keeps the others column-aligned.
+            text += std::format("Audio {}: {}{} {} Hz {}{}\n", i + 1, (static_cast<int>(i) == current) ? "* " : "  ",
+                                avcodec_get_name(track.info.codecId), track.info.sampleRate, channels, lang);
+        }
     }
     if (playlist.size() > 1) {
         text += std::format("Playlist: {}/{}\n", idx + 1, playlist.size());
@@ -987,15 +1158,23 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
     if (!source) {
         return;
     }
+    SeekToMs(static_cast<int64_t>(CurrentPositionMs()) + deltaMs);
+}
+
+auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
+    // sourceMutex is held by the caller (PerformSeek / PerformAudioSwitch). cMutex is
+    // non-recursive, so this must NOT re-lock.
+    if (!source) {
+        return;
+    }
     auto *vaapiDev = FindPrimaryVaapiDevice();
     if (vaapiDev == nullptr) {
         return;
     }
 
-    const int currentMs = CurrentPositionMs();
     const int totalMs = source->DurationMs();
+    targetMs = std::max<int64_t>(0, targetMs);
     // 1 s tail margin: landing past the last keyframe would look like a hang.
-    int64_t targetMs = std::max<int64_t>(0, static_cast<int64_t>(currentMs) + deltaMs);
     if (totalMs > 0 && targetMs > totalMs - 1000) {
         targetMs = std::max<int64_t>(0, totalMs - 1000);
     }
@@ -1018,9 +1197,96 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
     // CurrentPositionMs() returns this while GetSTC() is briefly NOPTS post-flush; without
     // it a rapid follow-up Seek() would compute its delta against 0.
     pendingSeekTargetMs.store(static_cast<int>(targetMs), std::memory_order_release);
-    dsyslog("vaapivideo/mediaplayer: seek %+lldms -- %dms -> %lldms (total=%dms)", static_cast<long long>(deltaMs),
-            currentMs, static_cast<long long>(targetMs), totalMs);
+    dsyslog("vaapivideo/mediaplayer: seek -> %lldms (total=%dms)", static_cast<long long>(targetMs), totalMs);
     state.store(paused.load(std::memory_order_acquire) ? State::Paused : State::Playing, std::memory_order_release);
+}
+
+auto cVaapiPlayer::SetAudioTrack(eTrackType Type, const tTrackId * /*TrackId*/) -> void {
+    // Must NOT take sourceMutex (the demux thread may hold it): only atomics + pause wake, like Seek().
+    // All tracks register as ttAudio, so idx = Type - ttAudioFirst and the range check rejects any
+    // non-audio Type -- no explicit IS_AUDIO_TRACK test needed.
+    const int idx = static_cast<int>(Type) - static_cast<int>(ttAudioFirst);
+    if (idx < 0 || idx >= audioTrackCount.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (idx == activeMenuIndex.load(std::memory_order_acquire)) {
+        return; // initial set / re-select of the active track: nothing to do
+    }
+    audioSwitchTargetIdx.store(idx, std::memory_order_release);
+    audioSwitchPending.store(true, std::memory_order_release);
+    ioInterrupt.store(true, std::memory_order_release); // break a parked network read, like Seek()
+    const cMutexLock lock(&pauseMutex);
+    pauseCondition.Broadcast(); // wake the demux thread if paused
+}
+
+auto cVaapiPlayer::RegisterAudioTracks(cVaapiDevice *vaapiDev) -> void {
+    // sourceMutex held (from OpenCurrentEntry). Publishes the source's audio streams so the Audio
+    // button (cDisplayTracks) lists them, then selects the current track.
+    if (vaapiDev == nullptr || !source) {
+        return;
+    }
+    vaapiDev->ClrAvailableTracks(); // also resets the device's currentAudioTrack to ttNone
+    const auto &tracks = source->AudioTracks();
+    constexpr int kMaxAudioSlots = static_cast<int>(ttAudioLast) - static_cast<int>(ttAudioFirst) + 1;
+    const int count = std::min(static_cast<int>(tracks.size()), kMaxAudioSlots);
+    if (static_cast<int>(tracks.size()) > count) {
+        isyslog("vaapivideo/mediaplayer: %zu audio tracks -- only the first %d are selectable", tracks.size(), count);
+    }
+    for (int i = 0; i < count; ++i) {
+        const auto &track = tracks.at(static_cast<size_t>(i));
+        const std::string desc = AudioTrackDescription(track);
+        // Id = avStreamIndex + 1: nonzero (VDR's availability gate) and unique per stream.
+        (void)vaapiDev->SetAvailableTrack(ttAudio, i, static_cast<uint16_t>(track.avStreamIndex + 1),
+                                          track.language.c_str(), desc.c_str());
+    }
+    // Clamp the source's current track into the selectable range (only matters for the >32 edge).
+    int current = source->CurrentAudioTrack();
+    if (current < 0 || current >= count) {
+        current = count > 0 ? 0 : -1;
+    }
+    // Set activeMenuIndex BEFORE SetCurrentAudioTrack so the SetAudioTrack callback it fires no-ops
+    // (no spurious startup re-anchor).
+    activeMenuIndex.store(current, std::memory_order_release);
+    audioTrackCount.store(count, std::memory_order_release);
+    if (current >= 0) {
+        // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- clamped to ttAudio range above
+        (void)vaapiDev->SetCurrentAudioTrack(static_cast<eTrackType>(static_cast<int>(ttAudioFirst) + current));
+    }
+}
+
+auto cVaapiPlayer::PerformAudioSwitch(int trackIdx) -> void {
+    const cMutexLock lock(&sourceMutex);
+    if (!source) {
+        return;
+    }
+    auto *vaapiDev = FindPrimaryVaapiDevice();
+    if (vaapiDev == nullptr) {
+        return;
+    }
+    const int previous = source->CurrentAudioTrack();
+    if (trackIdx == previous) {
+        return; // already active (a duplicate request raced the no-op guard)
+    }
+    // Capture position BEFORE disturbing the clock; the re-anchor seeks back to it.
+    const int64_t currentMs = CurrentPositionMs();
+
+    // (a) repoint the demuxer to the new stream (no device / codec / seek side effects)
+    if (!source->SelectAudioTrack(trackIdx)) {
+        esyslog("vaapivideo/mediaplayer: audio track %d out of range -- keeping current", trackIdx);
+        return;
+    }
+    // (b) reopen ONLY the audio codec for the new stream
+    if (!vaapiDev->ReopenMediaPlayerAudio(source->AudioInfo())) {
+        esyslog("vaapivideo/mediaplayer: audio reopen failed -- reverting to track %d", previous);
+        if (source->SelectAudioTrack(previous)) {
+            (void)vaapiDev->ReopenMediaPlayerAudio(source->AudioInfo()); // best-effort restore of the old codec
+        }
+        return;
+    }
+    // (c) re-anchor: seek to the captured position so the new stream flows from here and A/V resyncs.
+    SeekToMs(currentMs);
+    activeMenuIndex.store(trackIdx, std::memory_order_release);
+    isyslog("vaapivideo/mediaplayer: audio track -> %d", trackIdx);
 }
 
 auto cVaapiPlayer::DrainTailAtEof() -> void {
@@ -1136,6 +1402,19 @@ auto cVaapiPlayer::Action() -> void {
             }
         }
 
+        // -- audio track switch --------------------------------------------------
+        // Before the pause branch so a frozen player still switches (then plays the new track on resume).
+        if (audioSwitchPending.exchange(false, std::memory_order_acq_rel)) {
+            ioInterrupt.store(false, std::memory_order_release); // av_seek_frame shares the callback
+            if (packetPending) { // held packet belongs to the old stream; PerformAudioSwitch flushes
+                av_packet_unref(packet.get());
+                packetPending = false;
+            }
+            if (const int target = audioSwitchTargetIdx.exchange(-1, std::memory_order_relaxed); target >= 0) {
+                PerformAudioSwitch(target);
+            }
+        }
+
         // -- next ----------------------------------------------------------------
         if (nextRequested.exchange(false, std::memory_order_acq_rel)) {
             // Clear before AdvancePlaylist(): it opens the next entry's source (a network connect
@@ -1157,7 +1436,8 @@ auto cVaapiPlayer::Action() -> void {
         if (paused.load(std::memory_order_acquire)) {
             const cMutexLock lock(&pauseMutex);
             if (paused.load(std::memory_order_acquire) && !stopping.load(std::memory_order_acquire) &&
-                !seekPending.load(std::memory_order_acquire) && !nextRequested.load(std::memory_order_acquire)) {
+                !seekPending.load(std::memory_order_acquire) && !nextRequested.load(std::memory_order_acquire) &&
+                !audioSwitchPending.load(std::memory_order_acquire)) {
                 pauseCondition.TimedWait(pauseMutex, DEMUX_PAUSE_WAKEUP_MS);
             }
             continue;

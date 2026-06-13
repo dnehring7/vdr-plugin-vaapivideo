@@ -56,6 +56,12 @@ struct VideoStreamInfo {
     bool hasSps{false};                ///< True iff ProbeVideoSps parsed an authoritative in-band parameter set
     int level{0};                      ///< Codec level (level_idc or general_level_idc)
     int profile{AV_PROFILE_UNKNOWN};   ///< e.g. AV_PROFILE_HEVC_MAIN_10, AV_PROFILE_AV1_MAIN
+    // Container HDR static metadata (codecpar coded_side_data); VP9/AV1 carry it here, not in the
+    // bitstream, so the HDR_OUTPUT_METADATA blob gets real luminance instead of zeros.
+    bool hasMasteringDisplay{false};               ///< masteringDisplay is valid
+    bool hasContentLight{false};                   ///< contentLight is valid
+    AVMasteringDisplayMetadata masteringDisplay{}; ///< Display primaries + luminance
+    AVContentLightMetadata contentLight{};         ///< MaxCLL / MaxFALL
 };
 
 /// Audio elementary stream descriptor. Field order is preserved from the former

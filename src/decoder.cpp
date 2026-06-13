@@ -813,6 +813,25 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
         decoderCtx->framerate = AVRational{.num = info.fpsNum, .den = info.fpsDen};
     }
 
+    // VP9/AV1 signal HDR transfer/primaries only in the container, not the bitstream. Seed the codec
+    // color fields so FFmpeg stamps them onto every frame; UNSPECIFIED on the PES path leaves the
+    // in-bitstream VUI authoritative.
+    decoderCtx->color_primaries = info.primaries;
+    decoderCtx->color_trc = info.transfer;
+    decoderCtx->colorspace = info.colorSpace;
+    decoderCtx->color_range = info.range;
+
+    // Post-decode net for the seed: a decoder may rewrite the frame's color from an UNSPECIFIED VUI
+    // (HEVC/DV base layers), and mastering/content-light have no avctx field at all.
+    hintColorPrimaries = info.primaries;
+    hintColorTransfer = info.transfer;
+    hintColorSpace = info.colorSpace;
+    hintColorRange = info.range;
+    hintHasMasteringDisplay = info.hasMasteringDisplay;
+    hintMasteringDisplay = info.masteringDisplay;
+    hintHasContentLight = info.hasContentLight;
+    hintContentLight = info.contentLight;
+
     // Mediaplayer path: container demuxers (mkv/mp4) store parameter sets in the track header,
     // not in every AU like DVB. FFmpeg requires them here before avcodec_open2.
     if (info.extradata && info.extradataSize > 0) {
@@ -1674,7 +1693,41 @@ static auto ApplySdColorDefaults(AVFrame *frame) noexcept -> void {
     }
 }
 
+auto cVaapiDecoder::ApplyContainerColorHints(AVFrame *frame) const noexcept -> void {
+    // Fill only UNSPECIFIED fields so an explicit in-bitstream VUI always wins over the container.
+    if (frame->color_primaries == AVCOL_PRI_UNSPECIFIED && hintColorPrimaries != AVCOL_PRI_UNSPECIFIED) {
+        frame->color_primaries = hintColorPrimaries;
+    }
+    if (frame->color_trc == AVCOL_TRC_UNSPECIFIED && hintColorTransfer != AVCOL_TRC_UNSPECIFIED) {
+        frame->color_trc = hintColorTransfer;
+    }
+    if (frame->colorspace == AVCOL_SPC_UNSPECIFIED && hintColorSpace != AVCOL_SPC_UNSPECIFIED) {
+        frame->colorspace = hintColorSpace;
+    }
+    if (frame->color_range == AVCOL_RANGE_UNSPECIFIED && hintColorRange != AVCOL_RANGE_UNSPECIFIED) {
+        frame->color_range = hintColorRange;
+    }
+}
+
+auto cVaapiDecoder::ResolveHdrInfo(const AVFrame *frame) const noexcept -> HdrStreamInfo {
+    HdrStreamInfo info = ExtractHdrInfo(frame);
+    // Backfill mastering/content-light from the container only when the frame lacked it (VP9/AV1
+    // carry it in the MKV/MP4 header, not the bitstream); frame SEI wins.
+    if (info.kind != StreamHdrKind::Sdr) {
+        if (!info.hasMasteringDisplay && hintHasMasteringDisplay) {
+            info.hasMasteringDisplay = true;
+            info.mastering = hintMasteringDisplay;
+        }
+        if (!info.hasContentLight && hintHasContentLight) {
+            info.hasContentLight = true;
+            info.contentLight = hintContentLight;
+        }
+    }
+    return info;
+}
+
 auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
+    ApplyContainerColorHints(decodedFrame.get());
     ApplySdColorDefaults(decodedFrame.get());
 
     const int64_t sourcePts = decodedFrame->pts;
@@ -1824,10 +1877,13 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 continue; // re-check the receive queue for the next (hopefully clean) frame
             }
 
+            // Before the log + filter/HDR build below, so all of them see the corrected colorimetry.
+            ApplyContainerColorHints(decodedFrame.get());
+
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
                 const char *swFmtName = av_get_pix_fmt_name(ResolveSwPixFmt(decodedFrame.get()));
-                const HdrStreamInfo hdr = ExtractHdrInfo(decodedFrame.get());
+                const HdrStreamInfo hdr = ResolveHdrInfo(decodedFrame.get());
                 // codecCtx->profile is populated by FFmpeg during SPS/VPS parsing, which
                 // is guaranteed to have happened before the first frame surfaces. At
                 // OpenCodec() time this field is still AV_PROFILE_UNKNOWN and logging it
@@ -1980,7 +2036,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
     // Classify HDR and stage the passthrough decision on the display BEFORE building the chain
     // so the next DRM atomic commit carries the correct HDR metadata (or clears it for SDR).
-    const HdrStreamInfo hdrInfo = ExtractHdrInfo(firstFrame);
+    const HdrStreamInfo hdrInfo = ResolveHdrInfo(firstFrame);
     const bool hdrPassthrough = ShouldUseHdrPassthrough(hdrInfo);
     display->SetHdrOutputState(hdrPassthrough ? hdrInfo : HdrStreamInfo{});
 

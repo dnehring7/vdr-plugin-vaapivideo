@@ -2015,24 +2015,63 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
     }
     videoCodecId.store(video.codecId, std::memory_order_relaxed);
 
+    // Audio failure is non-fatal: some containers omit the audio sample rate until a frame decodes
+    // (raw-ADTS AAC in TS), which must not block an otherwise-fine HDR video. Degrade to video-only.
+    bool audioOpened = false;
     if (audio.codecId != AV_CODEC_ID_NONE) {
-        if (!audioProcessor->OpenCodecWithInfo(audio)) [[unlikely]] {
-            esyslog("vaapivideo/device: OpenForMediaPlayer audio codec %s open failed",
+        if (audioProcessor->OpenCodecWithInfo(audio)) {
+            audioCodecId.store(audio.codecId, std::memory_order_relaxed);
+            audioOpened = true;
+        } else {
+            esyslog("vaapivideo/device: OpenForMediaPlayer audio codec %s open failed -- playing video-only",
                     avcodec_get_name(audio.codecId));
-            return false;
         }
-        audioCodecId.store(audio.codecId, std::memory_order_relaxed);
-        decoder->NotifyAudioChange();
-    } else {
-        // Video-only entry: drop any audio codec / clock state left over from a previous entry
-        // so the decoder enters freerun and does not try to lip-sync to the prior file's audio.
+    }
+    if (!audioOpened) {
+        // No audio: drop codec/clock state so the decoder freeruns and SubmitAudioPacket swallows
+        // any AUs the demuxer still delivers (no demux stall).
+        audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        audioProcessor->Clear();
+    }
+    decoder->NotifyAudioChange();
+
+    // Menu-driven track switches now route through cVaapiPlayer::SetAudioTrack, so the live-TV
+    // HandleAudioTrackChange reset must stand down for this session.
+    mediaPlayerAudioActive.store(true, std::memory_order_release);
+
+    isyslog("vaapivideo/device: mediaplayer open -- video=%s audio=%s", avcodec_get_name(video.codecId),
+            audioOpened ? avcodec_get_name(audio.codecId) : "none");
+    return true;
+}
+
+[[nodiscard]] auto cVaapiDevice::ReopenMediaPlayerAudio(const AudioStreamInfo &audio) -> bool {
+    if (!HardwareReady()) [[unlikely]] {
+        esyslog("vaapivideo/device: ReopenMediaPlayerAudio rejected -- hardware not attached");
+        return false;
+    }
+    if (!audioProcessor || !decoder) [[unlikely]] {
+        esyslog("vaapivideo/device: ReopenMediaPlayerAudio rejected -- subsystems missing");
+        return false;
+    }
+
+    if (audio.codecId == AV_CODEC_ID_NONE) {
+        // Switching to "no audio": drop the codec/clock state so the decoder freeruns.
         audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
         audioProcessor->Clear();
         decoder->NotifyAudioChange();
+        return true;
     }
 
-    isyslog("vaapivideo/device: mediaplayer open -- video=%s audio=%s", avcodec_get_name(video.codecId),
-            audio.codecId == AV_CODEC_ID_NONE ? "none" : avcodec_get_name(audio.codecId));
+    // SetStreamParams drains + reconfigures ALSA (PCM<->IEC61937, rate/channel) + reopens the decoder
+    // under the audio mutex; the present thread reads audio lock-free, so this cannot stall it. The
+    // caller re-anchors the clock via FlushForSeek afterwards.
+    if (!audioProcessor->OpenCodecWithInfo(audio)) [[unlikely]] {
+        esyslog("vaapivideo/device: ReopenMediaPlayerAudio %s open failed", avcodec_get_name(audio.codecId));
+        return false;
+    }
+    audioCodecId.store(audio.codecId, std::memory_order_relaxed);
+    decoder->NotifyAudioChange(); // arm freerun: the new audio clock is NOPTS until it primes
+    isyslog("vaapivideo/device: mediaplayer audio reopen -- %s", avcodec_get_name(audio.codecId));
     return true;
 }
 
@@ -2045,7 +2084,15 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
 }
 
 [[nodiscard]] auto cVaapiDevice::SubmitAudioPacket(const AVPacket *packet) -> bool {
-    if (!HardwareReady() || !audioProcessor || !audioProcessor->IsInitialized()) [[unlikely]] {
+    if (!HardwareReady() || !audioProcessor) [[unlikely]] {
+        return false;
+    }
+    // Video-only degrade (no audio codec): swallow the AU so the shared demux cursor doesn't stall
+    // retrying a packet that can never be queued.
+    if (audioCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
+        return true;
+    }
+    if (!audioProcessor->IsInitialized()) [[unlikely]] {
         return false;
     }
     // Queue HIGHWATER is a pacing signal, not a hard failure. Returning false keeps the
@@ -2062,6 +2109,8 @@ auto cVaapiDevice::ClearForMediaPlayer() -> void {
     // Used at entry open/close (where codec params may change). Drops in-flight packets,
     // tears down the filter chain, and lets the next frame rebuild it with new params.
     // Codec contexts stay open and play-mode is unchanged.
+    // Leaving media-player mode re-arms the live-TV HandleAudioTrackChange path.
+    mediaPlayerAudioActive.store(false, std::memory_order_release);
     if (display) [[likely]] {
         display->BeginStreamSwitch();
     }
@@ -2273,6 +2322,13 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     //   SetAudioTrackDevice   - reliable post-assignment read (no cPlayer attached).
     //   SetDigitalAudioDevice - On=true fires BEFORE assignment; uses dolby slot walk.
     //   Clear() via Empty/Goto - replay-path safety net.
+
+    // In media-player mode cVaapiPlayer::SetAudioTrack owns audio; this PES-oriented reset would only
+    // fight it. Live TV never sets the flag.
+    if (mediaPlayerAudioActive.load(std::memory_order_acquire)) {
+        dsyslog("vaapivideo/device: %s ignored -- media-player audio is player-driven", reason);
+        return;
+    }
 
     eTrackType type = ttNone;
     const tTrackId *track = nullptr;

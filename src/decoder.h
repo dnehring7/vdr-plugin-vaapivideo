@@ -201,6 +201,12 @@ class cVaapiDecoder : public cThread {
                  ///< Caller holds codecMutex and must have populated decodedFrame.
     auto DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< NULL-packet EOS drain, then avcodec_flush_buffers to re-arm. Caller holds codecMutex.
+    auto ApplyContainerColorHints(AVFrame *frame) const noexcept
+        -> void; ///< Fill UNSPECIFIED frame color from container hints so VP9/DV streams classify as HDR.
+                 ///< Caller holds codecMutex.
+    [[nodiscard]] auto ResolveHdrInfo(const AVFrame *frame) const noexcept
+        -> HdrStreamInfo; ///< ExtractHdrInfo + container mastering/content-light when the frame lacked it.
+                          ///< Caller holds codecMutex.
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame, bool compactLog = false)
         -> bool; ///< Fill BuildParams and delegate to filterChain_.Build(). compactLog=true for
                  ///< ScaleVideo-driven rebuilds (one-line dsyslog); false for first build / channel switch.
@@ -299,6 +305,15 @@ class cVaapiDecoder : public cThread {
         codecCtx;                               ///< Active decoder context (HW or SW). Null before OpenCodec().
     AVCodecID currentCodecId{AV_CODEC_ID_NONE}; ///< Codec ID currently open; used for reuse check and parser recreate.
     bool forceCodecReopen{};                    ///< Set by RequestCodecReopen(); cleared by OpenCodecWithInfo().
+    // Container HDR hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED on the PES path.
+    AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};
+    AVColorTransferCharacteristic hintColorTransfer{AVCOL_TRC_UNSPECIFIED};
+    AVColorSpace hintColorSpace{AVCOL_SPC_UNSPECIFIED};
+    AVColorRange hintColorRange{AVCOL_RANGE_UNSPECIFIED};
+    bool hintHasMasteringDisplay{false};
+    AVMasteringDisplayMetadata hintMasteringDisplay{};
+    bool hintHasContentLight{false};
+    AVContentLightMetadata hintContentLight{};
     std::unique_ptr<AVFrame, FreeAVFrame>
         decodedFrame;              ///< Staging for avcodec_receive_frame(); unref'd each iteration.
     cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi -> optional denoise/sharpness).

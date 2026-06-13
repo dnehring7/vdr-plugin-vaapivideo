@@ -22,7 +22,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 | Audio       | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D)           |
 | Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
-| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists — see [Mediaplayer](#mediaplayer) |
+| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, runtime audio-track switching — see [Mediaplayer](#mediaplayer) |
 | A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
 
@@ -286,8 +286,17 @@ formats, and HDR tone mapping. Built on demand — it is not part of `make`:
     ./vaapivideo-probe                     # uses /dev/dri/card0
     ./vaapivideo-probe /dev/dri/card1      # explicit device
 
-Any line showing **no** indicates a missing driver capability. Compare against
-the plugin log (`vdr -l 3`) to identify mismatches.
+For each connected output it also parses the **sink EDID** and reports what the
+display advertises — HDR10 (PQ), HLG, BT.2020 Y'CbCr, HDR10+, desired max
+luminance, and a Dolby Vision VSVDB — under *Sink HDR (EDID CTA-861)*. This is
+the display half of the HDR decision: the plugin's `auto` HDR10 gate needs both
+*HDR10 / PQ* and *BT.2020 Y'CbCr* to read **yes** here, and the probe flags that
+correlation directly. The Dolby Vision line is informational only — it shows
+whether the panel supports DV; the plugin cannot decode it (see
+[Dolby Vision and the VAAPI limit](#dolby-vision-and-the-vaapi-limit)).
+
+Any line showing **no** indicates a missing driver or sink capability. Compare
+against the plugin log (`vdr -l 3`) to identify mismatches.
 
 ### 6. Configure the ALSA audio device
 
@@ -637,6 +646,43 @@ content forced through the SDR pipeline (HdrMode::Off, or `auto` with any gate
 failing) will show clipped highlights and compressed primaries because no
 PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
 
+### HDR signalling sources
+
+HDR10 / HLG is detected from BT.2020 primaries + a PQ/HLG transfer + ≥10-bit
+samples. That metadata reaches the decoded frame from one of two places:
+
+- **In-bitstream** (HEVC/AV1 VUI + SEI) — the common case for HEVC HDR10.
+- **Container tags** (Matroska/MP4/WebM `Colour` element + mastering/CLL side
+  data) — required for **VP9**, whose bitstream signals only a colour-space
+  matrix and no transfer function. The mediaplayer seeds the decoder's colour
+  fields and the `HDR_OUTPUT_METADATA` mastering luminance from these container
+  tags, so a properly tagged VP9 HDR file engages HDR10 with correct mastering
+  metadata. An untagged HDR file (no in-bitstream and no container colour info)
+  cannot be distinguished from SDR and plays as SDR.
+
+### Dolby Vision and the VAAPI limit
+
+**Dolby Vision is not decoded.** This is a hard VAAPI limitation, not an
+omission: no VAAPI driver exposes a DV entry point, and DV's per-scene dynamic
+metadata lives in a proprietary **RPU** (plus, for dual-layer profiles, a second
+HEVC enhancement layer) that the open VPP/KMS path cannot process or tunnel to
+the sink. FFmpeg only ever decodes the **HEVC base layer**. What you get
+therefore depends on that base layer's *cross-compatibility*, which the plugin
+logs on open (`Dolby Vision profile N (BL compatibility id M)`):
+
+| DV profile | BL compatibility | Result |
+|------------|------------------|--------|
+| 8.1        | HDR10 (id 1)     | Plays as **HDR10** via the base layer's standard HDR10 metadata (no dynamic DV) |
+| 8.4        | HLG (id 4)       | Plays as **HLG** |
+| 7          | HDR10 (id 1)     | Base layer plays as **HDR10**; the BD enhancement layer is ignored |
+| 5          | none (id 0)      | **SDR fallback** — the base is IPT-PQ with no standard colour signalling |
+| 4          | none (id 0)      | **SDR fallback** — dual-layer, no HDR10-compatible base |
+
+So DV files that carry an HDR10/HLG-compatible base play correctly as HDR10/HLG;
+profile 4/5 (compatibility id 0) carry their colour only in the RPU and fall back
+to SDR. Full DV would require a DV-capable decode + a DV output path neither of
+which exists for VAAPI/DRM, so it is **out of scope** rather than planned.
+
 ## Mediaplayer
 
 An integrated player for local files, http(s) / ftp URLs, and m3u / m3u8
@@ -675,11 +721,37 @@ passthrough work identically to the live-TV path.
 | `Left` / `Right`           | Seek −/+ 10 s                |
 | `Green` / `Yellow`         | Seek −/+ 60 s                |
 | `Blue`                     | Cycle manual zoom (Off → 1–5)|
+| `Audio`                    | Audio-track menu (multi-track files) |
 | `Next`                     | Skip to next playlist entry  |
 | `Back` / `Stop`            | Return to the file browser   |
 
 Rapid key repeats sum: pressing `Right` three times before the demuxer
 services the first one lands at +30 s, not +10 s.
+
+### Audio tracks
+
+Files carrying more than one audio track — multiple languages, or a stereo plus
+an AC-3 mix — can be switched during playback with the **Audio** key. It opens
+the same on-screen track menu VDR uses in live TV and recording replay, listing
+each track by codec, channel layout and language (e.g. `AC-3 5.1 (eng)`). Pick
+one and the player re-opens the audio decoder and re-anchors A/V at the current
+position (a brief, seek-like resync); switching also works while paused and the
+new track plays on resume.
+
+On open, the initial track follows your VDR audio-language preference
+(*Setup → DVB → Audio languages*), exactly as live and replay do; with no
+preference match it defaults to the file's first audio track. AC-3 / DTS and the
+other compressed formats still passthrough as IEC61937 when selected — the
+wrapping is decided by the codec, not by the menu.
+
+The **Info** key's file page lists every audio track with codec, sample rate,
+channel layout and language, marking the active one with a leading `*`.
+Subtitle-track selection is not yet supported.
+
+If an audio codec cannot be opened — e.g. a container that omits the sample rate
+until a frame is decoded (raw-ADTS AAC in some TS files) — playback degrades to
+**video-only** rather than refusing the file; the log notes `audio codec … open
+failed -- playing video-only`. The video (including HDR) plays normally.
 
 ### File-browser scope
 
@@ -721,14 +793,11 @@ duplicated or dropped as needed — there is no motion interpolation.
 - AV1 live decode path: OBU sequence-header probe + Main / Main 10 backend
   routing, closing the AV1 live branch (the mediaplayer path already opens
   AV1 with codec params from the container).
-- Dolby Vision Profile 5 / 8 passthrough on displays that advertise DV EDID
-  metadata (RPU forwarding, no tone-mapping).
 - Variable refresh rate (HDMI VRR / FreeSync) for judder-free 24p and 25p
   film playback: tie the DRM page-flip cadence to the decoded stream's
   frame rate instead of the panel's fixed refresh.
-- Mediaplayer: subtitle rendering, audio-track switching mid-file,
-  trick-speed (fast/slow forward and reverse) and persistent resume
-  position.
+- Mediaplayer: subtitle rendering, trick-speed (fast/slow forward and
+  reverse) and persistent resume position.
 
 
 ## Credits

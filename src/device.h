@@ -200,6 +200,9 @@ class cVaapiDevice : public cDevice {
                    ///< drain. Mediaplayer EOS-drain phase 2 waits for this to reach 0 before teardown.
     auto FlushForSeek()
         -> void; ///< Light flush: drops queues but keeps filter chain and swresample alive. Used at seek.
+    [[nodiscard]] auto ReopenMediaPlayerAudio(const AudioStreamInfo &audio)
+        -> bool; ///< Reconfigure only the audio path to a new stream mid-playback, leaving video untouched.
+                 ///< Demux thread only; caller re-anchors via FlushForSeek. False on codec/ALSA failure.
     [[nodiscard]] auto IsMediaPlayerBackpressured() const noexcept
         -> bool; ///< True iff either decoder or audio queue is at capacity. Mediaplayer demux thread polls this.
     [[nodiscard]] auto GetAudioClock() const noexcept
@@ -303,6 +306,9 @@ class cVaapiDevice : public cDevice {
                                                            ///< SetPlayMode call; gates the resume-Attach path.
     std::atomic<bool> startupComplete{false};              ///< Gates deferred-attach against --detached
     std::atomic<bool> liveMode;                            ///< True in Transfer Mode (live TV)
+    std::atomic<bool> mediaPlayerAudioActive{false};       ///< Gates HandleAudioTrackChange off while the
+                                                           ///< mediaplayer owns audio (track switches go via
+                                                           ///< cVaapiPlayer::SetAudioTrack, not the live-TV reset)
     int osdHeight{};                                       ///< Cached display height (px)
     int osdWidth{};                                        ///< Cached display width (px)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm

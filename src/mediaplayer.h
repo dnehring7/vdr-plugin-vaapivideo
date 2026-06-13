@@ -152,6 +152,17 @@ class cVaapiMediaSource final : public IMediaSource {
     auto operator=(const cVaapiMediaSource &) -> cVaapiMediaSource & = delete;
     auto operator=(cVaapiMediaSource &&) noexcept -> cVaapiMediaSource & = delete;
 
+    /// One demuxed audio stream. @c info.extradata aliases @c extradataStorage, so the table must
+    /// never reallocate after Open (reserve()d once, never appended to).
+    struct AudioTrackDesc {
+        int avStreamIndex{-1};                       ///< Index into formatCtx->streams
+        AVRational timeBase{.num = 1, .den = 90000}; ///< Stream time base (drives Rebase90k)
+        AudioStreamInfo info;                        ///< Decoder descriptor; .extradata aliases extradataStorage
+        std::vector<uint8_t> extradataStorage;       ///< Owns the extradata bytes for this track
+        std::string language;                        ///< ISO-639 from the "language" metadata tag; "" if absent
+        int srcChannels{0};                          ///< Container channel count (info.channels is forced to 2)
+    };
+
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
@@ -171,6 +182,12 @@ class cVaapiMediaSource final : public IMediaSource {
                  ///< pending seek/next via interruptFlag). Polled by the interrupt_callback.
     [[nodiscard]] auto HasAudio() const noexcept -> bool { return audioStreamIndex >= 0; }
     [[nodiscard]] auto HasVideo() const noexcept -> bool { return videoStreamIndex >= 0; }
+    [[nodiscard]] auto AudioTracks() const noexcept -> const std::vector<AudioTrackDesc> & { return audioTracks; }
+    [[nodiscard]] auto AudioTrackCount() const noexcept -> int { return static_cast<int>(audioTracks.size()); }
+    [[nodiscard]] auto CurrentAudioTrack() const noexcept -> int { return currentAudioTrack; }
+    /// Repoint the active audio stream (demux state only -- never the device/codec/seek). False on a
+    /// bad index. Caller serializes via sourceMutex once the source is published.
+    [[nodiscard]] auto SelectAudioTrack(int trackIdx) -> bool;
     [[nodiscard]] auto VideoFps() const noexcept -> double {
         return videoFps;
     } ///< Container-reported avg_frame_rate; 0.0 if unknown.
@@ -180,6 +197,10 @@ class cVaapiMediaSource final : public IMediaSource {
 
   private:
     auto PopulateStreamInfo() -> void;
+    /// Fill @p info (codec / rate / forced-stereo / extradata) for one audio AVStream into @p storage.
+    static auto PopulateAudioInfo(const AVStream *stream, AudioStreamInfo &info, std::vector<uint8_t> &storage) -> void;
+    /// Mirror audioTracks[currentAudioTrack] into audioStreamIndex / audioTimeBase / audioInfo.
+    auto ApplyCurrentAudioTrack() -> void;
     /// Rescale @p ts from @p tb to 90 kHz and subtract the source's PTS origin.
     /// Lazily seeds @c ptsOrigin90k on first call so files whose container/streams
     /// don't advertise start_time still emit a zero-based timeline.
@@ -200,10 +221,11 @@ class cVaapiMediaSource final : public IMediaSource {
                                                    ///< clock anchors at the requested timeline (and not
                                                    ///< at the earlier video keyframe libavformat lands on).
     VideoStreamInfo videoInfo;
-    AudioStreamInfo audioInfo;
+    AudioStreamInfo audioInfo; ///< Mirror of audioTracks[currentAudioTrack].info (the decoding stream)
     std::vector<uint8_t> videoExtradataStorage;
-    std::vector<uint8_t> audioExtradataStorage;
-    double videoFps{0.0}; ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
+    std::vector<AudioTrackDesc> audioTracks; ///< All audio streams; index == cDisplayTracks menu index
+    int currentAudioTrack{-1};               ///< Index into audioTracks of the decoding stream (-1 = none)
+    double videoFps{0.0};                    ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
     bool eofReached{false};
 };
 
@@ -251,6 +273,9 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     [[nodiscard]] auto GetIndex(int &Current, int &Total, bool SnapToIFrame = false) -> bool override;
     [[nodiscard]] auto FramesPerSecond() -> double override;
     [[nodiscard]] auto InfoText() const -> std::string; ///< Multi-line file metadata for cControl::GetInfo().
+    /// cPlayer hook for the Audio-button track menu (VDR main thread). Maps Type to a descriptor index
+    /// and hands it to the demux thread. @p TrackId unused (the player owns the mapping).
+    auto SetAudioTrack(eTrackType Type, const tTrackId *TrackId) -> void override;
 
   protected:
     // ========================================================================
@@ -274,6 +299,15 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// (startup, post-seek, no device) -- callers must skip the comparison in that case.
     [[nodiscard]] auto Lookahead90k(const cVaapiDevice *vaapiDev) const noexcept -> int64_t;
     auto PerformSeek(int64_t deltaMs) -> void;
+    /// Absolute seek + re-anchor; assumes sourceMutex held. Shared by PerformSeek and the track
+    /// switch's re-anchor (which Seek() would skip as a delta==0 no-op).
+    auto SeekToMs(int64_t targetMs) -> void;
+    /// Publish the source's audio streams to the device for cDisplayTracks and select the
+    /// Setup.AudioLanguages-preferred initial track. sourceMutex held (from OpenCurrentEntry).
+    auto RegisterAudioTracks(cVaapiDevice *vaapiDev) -> void;
+    /// Demux-thread track switch: repoint source, reopen audio codec, re-anchor A/V. Reverts to the
+    /// old track if the new codec fails.
+    auto PerformAudioSwitch(int trackIdx) -> void;
     /// Block until the decode + present pipeline has flushed the buffered end-of-stream tail to the
     /// screen, so a natural EOF does not cut playback short. Returns early if the user issues
     /// stop / pause / seek / next during the wait, or if the pipeline stalls. Demux thread only;
@@ -289,6 +323,12 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     std::atomic<bool> paused{false};
     std::atomic<bool> seekPending{false};
     std::atomic<int64_t> seekDeltaMs{0};
+    std::atomic<bool> audioSwitchPending{false}; ///< Set by SetAudioTrack(); serviced in Action() before the
+                                                 ///< pause branch so a frozen player still switches.
+    std::atomic<int> audioSwitchTargetIdx{-1};   ///< Descriptor index requested by SetAudioTrack(); -1 = none
+    std::atomic<int> activeMenuIndex{-1};        ///< Descriptor index currently decoding; lets SetAudioTrack()
+                                                 ///< no-op an initial set / re-select without touching source.
+    std::atomic<int> audioTrackCount{0};         ///< Registered audio-track count; SetAudioTrack() range check.
     std::atomic<bool> nextRequested{false};
     std::atomic<bool> stopping{false};
     std::atomic<bool> ioInterrupt{false}; ///< Set by Seek()/Next() (and shutdown) to break a blocking
