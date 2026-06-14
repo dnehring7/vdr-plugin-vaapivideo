@@ -49,13 +49,15 @@ struct VideoStreamInfo {
     AVColorRange range{AVCOL_RANGE_UNSPECIFIED};                   ///< VUI color range (Limited / Full)
     AVColorSpace colorSpace{AVCOL_SPC_UNSPECIFIED};                ///< VUI matrix coefficients
     AVColorTransferCharacteristic transfer{AVCOL_TRC_UNSPECIFIED}; ///< VUI transfer function
-    const uint8_t *extradata{nullptr}; ///< Non-owning init data (SPS/PPS/VPS concat); nullptr on PES path
-    int extradataSize{0};              ///< Byte length of @c extradata
-    int fpsDen{1};                     ///< Container-reported frame-rate denominator; 0 means unknown
-    int fpsNum{0};                     ///< Container-reported frame-rate numerator; 0 means unknown
-    bool hasSps{false};                ///< True iff ProbeVideoSps parsed an authoritative in-band parameter set
-    int level{0};                      ///< Codec level (level_idc or general_level_idc)
-    int profile{AV_PROFILE_UNKNOWN};   ///< e.g. AV_PROFILE_HEVC_MAIN_10, AV_PROFILE_AV1_MAIN
+    const uint8_t *extradata{nullptr};  ///< Non-owning init data (SPS/PPS/VPS concat); nullptr on PES path
+    int extradataSize{0};               ///< Byte length of @c extradata
+    int fpsDen{1};                      ///< Container-reported frame-rate denominator; 0 means unknown
+    int fpsNum{0};                      ///< Container-reported frame-rate numerator; 0 means unknown
+    bool hasSps{false};                 ///< True iff ProbeVideoSps parsed an authoritative in-band parameter set
+    bool hasStreamInterlaceInfo{false}; ///< True iff streamInterlaced came from bitstream/container metadata
+    bool streamInterlaced{false};       ///< Positive sequence/container hint; forces deinterlace at graph build
+    int level{0};                       ///< Codec level (level_idc or general_level_idc)
+    int profile{AV_PROFILE_UNKNOWN};    ///< e.g. AV_PROFILE_HEVC_MAIN_10, AV_PROFILE_AV1_MAIN
     // Container HDR static metadata (codecpar coded_side_data); VP9/AV1 carry it here, not in the
     // bitstream, so the HDR_OUTPUT_METADATA blob gets real luminance instead of zeros.
     bool hasMasteringDisplay{false};               ///< masteringDisplay is valid
@@ -165,7 +167,7 @@ static_assert(std::ranges::all_of(kVideoBackendTable,
 /// Minimal in-band parameter-set peek. Per-codec coverage:
 ///   H.264  (NAL type 7):  profile / level / bit-depth
 ///   HEVC   (NAL type 33): profile / level / bit-depth / coded size
-///   MPEG-2 (start 0xB3):  coded size only
+///   MPEG-2 (start 0xB3 + sequence_extension 0xB5): coded size + progressive_sequence
 /// VUI color metadata is not parsed. AV1 is not parsed (DVB does not carry it
 /// in-band; the mediaplayer path gets profile/bit-depth from AVCodecParameters).
 /// Returns hasSps=false on error or unsupported codec; callers should wait for

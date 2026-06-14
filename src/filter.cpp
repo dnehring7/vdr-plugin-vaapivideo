@@ -192,7 +192,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     const int srcWidth = firstFrame->width;
     const int srcHeight = firstFrame->height;
-    const bool isInterlaced = (firstFrame->flags & AV_FRAME_FLAG_INTERLACED) != 0;
+    // streamInterlaced overrides the unreliable per-frame flag (see FrameNeedsDeinterlace).
+    const bool isInterlaced = FrameNeedsDeinterlace(firstFrame, params.streamInterlaced);
     const auto srcPixFmt = static_cast<AVPixelFormat>(firstFrame->format);
 
     // 1088, not 1080: MPEG-2/H.264 pad height to a 16-px macroblock boundary.

@@ -761,6 +761,9 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
 
     if (codecCtx && currentCodecId == info.codecId && !forceCodecReopen &&
         ((codecCtx->hw_device_ctx != nullptr) == useHwDecode) && extradataMatches) {
+        // Context is shared across an MPEG-2 -> MPEG-2 switch, so refresh the hint here; the
+        // preceding Clear() reset the graph, which rebuilds with this value on the next frame.
+        streamInterlaced = info.streamInterlaced;
         return true;
     }
     forceCodecReopen = false;
@@ -775,6 +778,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
         filterChain.Reset();
     }
     currentCodecId = AV_CODEC_ID_NONE;
+    streamInterlaced = false;
     hasLoggedFirstFrame.store(false, std::memory_order_relaxed);
     // Reset so the 3 s and 15 s starvation tiers fire at most once per codec open.
     starvationWarned.store(false, std::memory_order_relaxed);
@@ -868,6 +872,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
 
     codecCtx = std::move(decoderCtx);
     currentCodecId = info.codecId;
+    streamInterlaced = info.streamInterlaced;
     // codecCtx->profile is AV_PROFILE_UNKNOWN until FFmpeg parses the first SPS/VPS.
     // The authoritative value is logged in the first-frame block inside DecodeOnePacket.
     isyslog("vaapivideo/decoder: opened %s (%s%s)", decoder->name, useHwDecode ? "hardware" : "software",
@@ -1891,10 +1896,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 const AVCodec *openedDecoder = codecCtx ? codecCtx->codec : nullptr;
                 const char *profileName =
                     openedDecoder ? av_get_profile_name(openedDecoder, codecCtx->profile) : nullptr;
+                // Match the filter chain's verdict (stream hint folded in) so the log can't read
+                // "progressive" while the chain deinterlaces. See FrameNeedsDeinterlace().
                 isyslog("vaapivideo/decoder: first frame %dx%d %s (sw=%s, profile=%s)%s", decodedFrame->width,
                         decodedFrame->height, fmtName ? fmtName : "unknown", swFmtName ? swFmtName : "unknown",
                         profileName ? profileName : "unknown",
-                        (decodedFrame->flags & AV_FRAME_FLAG_INTERLACED) ? " interlaced" : "");
+                        FrameNeedsDeinterlace(decodedFrame.get(), streamInterlaced) ? " interlaced" : "");
                 isyslog("vaapivideo/decoder: colorimetry -- primaries=%d trc=%d space=%d range=%d kind=%s",
                         static_cast<int>(decodedFrame->color_primaries), static_cast<int>(decodedFrame->color_trc),
                         static_cast<int>(decodedFrame->colorspace), static_cast<int>(decodedFrame->color_range),
@@ -2042,6 +2049,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
     cVideoFilterChain::BuildParams params;
     params.codecId = currentCodecId;
+    params.streamInterlaced = streamInterlaced;
     params.fpsNum = codecCtx->framerate.num;
     params.fpsDen = codecCtx->framerate.den;
     params.hwFramesCtx = codecCtx->hw_frames_ctx;

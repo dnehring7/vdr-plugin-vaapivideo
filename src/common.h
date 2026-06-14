@@ -163,6 +163,20 @@ struct HdrStreamInfo {
     return buf;
 }
 
+/// Deinterlace verdict for a decoded frame; single source of truth.
+///
+/// @p streamInterlaced is a positive sequence/container hint (MPEG-2 progressive_sequence, or the
+/// container field_order) that forces deinterlace when the per-frame flag is unreliable: FFmpeg
+/// clears AV_FRAME_FLAG_INTERLACED on a progressive-coded I-picture even inside an interlaced
+/// MPEG-2 sequence -- exactly the picture the lazy first-frame filter build samples. It only ever
+/// forces deinterlace ON; it is left false for H.264/HEVC, whose per-frame flag is reliable.
+[[nodiscard]] inline auto FrameNeedsDeinterlace(const AVFrame *frame, bool streamInterlaced) noexcept -> bool {
+    if (frame == nullptr) [[unlikely]] {
+        return false;
+    }
+    return streamInterlaced || (frame->flags & AV_FRAME_FLAG_INTERLACED) != 0;
+}
+
 // ============================================================================
 // === RAII CUSTOM DELETERS ===
 // ============================================================================

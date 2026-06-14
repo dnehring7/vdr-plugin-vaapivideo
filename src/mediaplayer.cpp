@@ -601,6 +601,10 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
         videoInfo.transfer = p->color_trc;
         videoInfo.colorSpace = p->color_space;
         videoInfo.range = p->color_range;
+        // field_order is the container's interlace verdict (the mediaplayer analog of MPEG-2
+        // progressive_sequence); UNKNOWN leaves the hint off so the per-frame flag decides.
+        videoInfo.hasStreamInterlaceInfo = p->field_order != AV_FIELD_UNKNOWN;
+        videoInfo.streamInterlaced = p->field_order != AV_FIELD_UNKNOWN && p->field_order != AV_FIELD_PROGRESSIVE;
         // Bit depth drives SelectVideoBackendCap (HW-vs-SW decode decision). Profile alone is
         // ambiguous: HEVC REXT can be 8-16 bit, AV1 Main can be 8 or 10, etc. Inspect the
         // pixel format descriptor for the authoritative answer.

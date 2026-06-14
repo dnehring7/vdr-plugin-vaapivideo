@@ -74,6 +74,7 @@ class cVideoFilterChain {
         int fpsDen{1};                       ///< codecCtx->framerate.den
         AVBufferRef *hwFramesCtx{nullptr};   ///< codecCtx->hw_frames_ctx; nullptr for SW decode
         AVBufferRef *hwDeviceRef{nullptr};   ///< VAAPI device (required, borrowed -- Build() refs internally)
+        bool streamInterlaced{false};        ///< Positive sequence/container hint; forces deinterlace when set
 
         // --- Target surface ---
         uint32_t outputWidth{0};     ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout

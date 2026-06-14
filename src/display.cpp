@@ -1436,12 +1436,10 @@ namespace {
     return x.num == y.num && x.den == y.den;
 }
 
-/// Compare two 2-element AVRational arrays (chromaticity XY). Wraps the constant-index
-/// accesses to a C array (FFmpeg ABI type) in a single scope, so call sites stay NOLINT-free.
+/// Compare two 2-element AVRational arrays (chromaticity XY, an FFmpeg ABI C-array type).
+/// A named helper keeps the paired element compares readable at the call sites.
 [[nodiscard]] auto XyRationalEqual(const AVRational (&a)[2], const AVRational (&b)[2]) noexcept -> bool {
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
     return AvRationalEqual(a[0], b[0]) && AvRationalEqual(a[1], b[1]);
-    // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
 }
 
 [[nodiscard]] auto MasteringEqual(const AVMasteringDisplayMetadata &a, const AVMasteringDisplayMetadata &b) noexcept
@@ -1502,10 +1500,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
             // primary order; FFmpeg's HEVC decoder already translates the SEI's native
             // (g, b, r) layout, so no further reordering is needed here.
             for (int i = 0; i < 3; ++i) {
-                // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index) -- FFmpeg ABI fixed [3][2] array
                 m.display_primaries[i].x = EncodePrimary(info.mastering.display_primaries[i][0]);
                 m.display_primaries[i].y = EncodePrimary(info.mastering.display_primaries[i][1]);
-                // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
             }
             m.white_point.x = EncodePrimary(info.mastering.white_point[0]);
             m.white_point.y = EncodePrimary(info.mastering.white_point[1]);

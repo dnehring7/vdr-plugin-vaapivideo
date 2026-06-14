@@ -305,6 +305,7 @@ class cVaapiDecoder : public cThread {
         codecCtx;                               ///< Active decoder context (HW or SW). Null before OpenCodec().
     AVCodecID currentCodecId{AV_CODEC_ID_NONE}; ///< Codec ID currently open; used for reuse check and parser recreate.
     bool forceCodecReopen{};                    ///< Set by RequestCodecReopen(); cleared by OpenCodecWithInfo().
+    bool streamInterlaced{false};               ///< Positive sequence-level hint; forces deinterlace at graph build.
     // Container HDR hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED on the PES path.
     AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};
     AVColorTransferCharacteristic hintColorTransfer{AVCOL_TRC_UNSPECIFIED};

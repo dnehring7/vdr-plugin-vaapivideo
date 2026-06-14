@@ -856,7 +856,7 @@ auto ProbeDrm(const char *devicePath) -> void {
                 "DRM Capability Trace (%s)\n"
                 "================================================\n",
                 devicePath);
-    const int fd = open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    const int fd = open(devicePath, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         std::printf("  (cannot open %s: %s)\n", devicePath, std::strerror(errno));
         return;
@@ -891,8 +891,7 @@ auto main(int argc, char *argv[]) -> int {
                 "================================================\n");
 
     // --- Open DRM device ---
-    const int drmFd =
-        open(devicePath, O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
+    const int drmFd = open(devicePath, O_RDWR | O_CLOEXEC);
     if (drmFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open '%s': %s\n", devicePath, std::strerror(errno));
         (void)std::fprintf(stderr, "       Ensure user is in 'video' or 'render' group.\n");
@@ -911,9 +910,7 @@ auto main(int argc, char *argv[]) -> int {
     std::printf("Render node: %s\n", renderNode.c_str());
 
     // --- Open render node and initialize VAAPI ---
-    const int renderFd =
-        open(renderNode.c_str(),
-             O_RDWR | O_CLOEXEC); // NOLINT(cppcoreguidelines-pro-type-vararg) -- POSIX open() is variadic
+    const int renderFd = open(renderNode.c_str(), O_RDWR | O_CLOEXEC);
     if (renderFd < 0) [[unlikely]] {
         (void)std::fprintf(stderr, "ERROR: cannot open render node '%s': %s\n", renderNode.c_str(),
                            std::strerror(errno));

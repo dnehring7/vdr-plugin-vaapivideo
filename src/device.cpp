@@ -1424,21 +1424,26 @@ auto cVaapiDevice::Play() -> void {
                     candidateCount);
         }
 
-        videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-        videoCodecCandidateCount.store(0, std::memory_order_relaxed);
-
-        // Wait for an SPS before opening H.264/HEVC: backend selection (8-bit vs High10/
-        // Main10) keys on bit-depth/profile from the SPS. Opening without it would hit the
-        // 8-bit table row and misclassify 10-bit streams. DVB carries SPS at least once per
-        // GOP, so the wait is bounded.
+        // Wait for in-band config before opening: H.264/HEVC need the SPS bit-depth/profile for
+        // backend selection (else the 8-bit row misclassifies 10-bit streams); MPEG-2 needs the
+        // sequence_extension progressive_sequence for the deinterlace verdict (FrameNeedsDeinterlace).
+        // DVB carries both each GOP, so the wait is bounded.
         VideoStreamInfo streamInfo;
         streamInfo.codecId = detectedCodec;
-        if (detectedCodec == AV_CODEC_ID_H264 || detectedCodec == AV_CODEC_ID_HEVC) {
+        if (detectedCodec == AV_CODEC_ID_MPEG2VIDEO || detectedCodec == AV_CODEC_ID_H264 ||
+            detectedCodec == AV_CODEC_ID_HEVC) {
             streamInfo = ::ProbeVideoSps(detectedCodec, {pes.payload, pes.payloadSize});
-            if (!streamInfo.hasSps) [[unlikely]] {
+            if (!streamInfo.hasSps || (detectedCodec == AV_CODEC_ID_MPEG2VIDEO && !streamInfo.hasStreamInterlaceInfo))
+                [[unlikely]] {
                 return Length;
             }
         }
+
+        // Clear the same-codec confirmation only now that config is in hand. A `return Length` above
+        // leaves the candidate confirmed, so the next PES resumes at the probe instead of restarting
+        // the 2-of-2 count -- which could otherwise keep skipping the sparse GOP-header PES.
+        videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        videoCodecCandidateCount.store(0, std::memory_order_relaxed);
 
         if (!decoder->OpenCodecWithInfo(streamInfo)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open video codec %s", avcodec_get_name(detectedCodec));
