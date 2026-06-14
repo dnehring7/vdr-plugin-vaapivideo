@@ -2066,13 +2066,11 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.hasSharpness = vaapiContext->caps.vppSharpness;
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;
     params.deinterlaceModeMask = vaapiContext->caps.deinterlaceModeMask;
-    // Gate the low-perf knobs on the master switch; off leaves the fields at no-op defaults.
-    if (vaapiConfig.lowPerfEnabled.load(std::memory_order_relaxed)) {
-        params.deinterlaceMaxRank = vaapiConfig.lowPerfDeintMax.load(std::memory_order_relaxed);
-        params.disableDenoise = vaapiConfig.lowPerfDisableDenoise.load(std::memory_order_relaxed);
-        params.disableHqScaling = vaapiConfig.lowPerfDisableHqScaling.load(std::memory_order_relaxed);
-        params.disableSharpness = vaapiConfig.lowPerfDisableSharpening.load(std::memory_order_relaxed);
-    }
+    // Post-processing policies; re-read on every filter-graph rebuild so a setup change applies live.
+    params.userDeint = vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed);
+    params.denoise = vaapiConfig.denoiseMode.load(std::memory_order_relaxed);
+    params.scale = vaapiConfig.scaleMode.load(std::memory_order_relaxed);
+    params.sharpen = vaapiConfig.sharpenMode.load(std::memory_order_relaxed);
     params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
     params.compactLog = compactLog;

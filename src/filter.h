@@ -16,6 +16,7 @@
 #define VDR_VAAPIVIDEO_FILTER_H
 
 #include "common.h"
+#include "config.h"
 #include "stream.h"
 
 #include <string>
@@ -88,14 +89,15 @@ class cVideoFilterChain {
         // --- GPU capabilities (queried from GpuCaps by caller) ---
         bool hasDenoise{false};           ///< denoise_vaapi is available on this device
         bool hasSharpness{false};         ///< sharpness_vaapi is available on this device
-        std::string_view deinterlaceMode; ///< "motion_adaptive" / "bob" / ...; empty = skip HW deint
-        unsigned deinterlaceModeMask{};   ///< Bit (1u<<DeintMode) per driver-supported mode; bounds the low-perf cap
+        std::string_view deinterlaceMode; ///< Best advertised mode "motion_adaptive"/"bob"/...; empty = skip HW deint
+        unsigned
+            deinterlaceModeMask{}; ///< Bit (1u<<VppDeintMode) per driver-supported mode; bounds ClampDeinterlaceMode
 
-        // --- Low-performance-hardware caps (resolved from config by caller; no-op defaults when off) ---
-        int deinterlaceMaxRank{0};    ///< DeintMode rank ceiling (0=MCDI => no limit); clamps deinterlaceMode down
-        bool disableDenoise{false};   ///< Skip denoise_vaapi / hqdn3d regardless of capability/codec
-        bool disableHqScaling{false}; ///< Drop scale_vaapi :mode=hq (bicubic) even on non-UHD content
-        bool disableSharpness{false}; ///< Skip sharpness_vaapi regardless of capability/codec
+        // --- Post-processing policies (resolved from config by caller) ---
+        DeinterlaceMode userDeint{DeinterlaceMode::Auto}; ///< Deinterlacer selection (GPU clamp vs. SW block)
+        DenoiseMode denoise{DenoiseMode::Auto};           ///< Denoise strength (denoise_vaapi or hqdn3d)
+        ScaleMode scale{ScaleMode::Auto};                 ///< Scaler (scale_vaapi hq/fast or swscale lanczos)
+        SharpenMode sharpen{SharpenMode::Auto};           ///< Sharpening (sharpness_vaapi or unsharp)
 
         // --- Manual zoom (symmetric crop before scale) ---
         double cropH{0.0}; ///< Per-side horizontal crop fraction (decoder derives it from the zoom-in factor); 0 = none

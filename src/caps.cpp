@@ -416,29 +416,29 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
     auto numDeintCaps = static_cast<unsigned int>(deintCaps.size());
     if (vaQueryVideoProcFilterCaps(vaDisplay, contextId, VAProcFilterDeinterlacing, deintCaps.data(), &numDeintCaps) ==
         VA_STATUS_SUCCESS) {
-        // Mode names come from config.h's DeintModeName() so the probe, the low-perf cap (filter.cpp),
-        // and setup.conf logging all share one source of truth for the quality order.
+        // Mode names come from config.h's VppDeintModeArg() so the probe, ClampDeinterlaceMode
+        // (filter.cpp), and the diagnostic log all share one source of truth for the quality order.
         static constexpr struct {
             VAProcDeinterlacingType type;
-            DeintMode mode;
+            VppDeintMode mode;
         } kDeintModes[] = {
-            {.type = VAProcDeinterlacingMotionCompensated, .mode = DeintMode::MotionCompensated},
-            {.type = VAProcDeinterlacingMotionAdaptive, .mode = DeintMode::MotionAdaptive},
-            {.type = VAProcDeinterlacingWeave, .mode = DeintMode::Weave},
-            {.type = VAProcDeinterlacingBob, .mode = DeintMode::Bob},
+            {.type = VAProcDeinterlacingMotionCompensated, .mode = VppDeintMode::MotionCompensated},
+            {.type = VAProcDeinterlacingMotionAdaptive, .mode = VppDeintMode::MotionAdaptive},
+            {.type = VAProcDeinterlacingWeave, .mode = VppDeintMode::Weave},
+            {.type = VAProcDeinterlacingBob, .mode = VppDeintMode::Bob},
         };
 
         // Driver bug guard: same overflow risk as numFilters / numProfiles.
         const std::span<const VAProcFilterCapDeinterlacing> validDeintCaps{
             deintCaps.data(), std::min(static_cast<size_t>(numDeintCaps), deintCaps.size())};
-        // Mask EVERY advertised mode, not just the best: the low-perf cap needs to know which lower
+        // Mask EVERY advertised mode, not just the best: ClampDeinterlaceMode needs to know which lower
         // modes actually exist (some iHD GPUs advertise only motion_compensated). Descending quality
         // order means the first hit is also the default best mode.
         for (const auto &[type, mode] : kDeintModes) {
             if (std::ranges::any_of(validDeintCaps, [type](const auto &c) -> bool { return c.type == type; })) {
                 caps.deinterlaceModeMask |= 1U << static_cast<unsigned>(mode);
                 if (caps.deinterlaceMode.empty()) {
-                    caps.deinterlaceMode = DeintModeName(mode);
+                    caps.deinterlaceMode = VppDeintModeArg(mode);
                 }
             }
         }
@@ -449,14 +449,14 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
     vaDestroyConfig(vaDisplay, configId);
     // vaRaii destructor runs vaTerminate + close(fd) here.
 
-    // Log the full advertised set so the low-perf cap's choice on limited drivers is explainable.
+    // Log the full advertised set so ClampDeinterlaceMode's choice on limited drivers is explainable.
     std::string deintModes;
-    for (int rank = 0; rank < CONFIG_DEINT_MODE_COUNT; ++rank) {
+    for (int rank = 0; rank < CONFIG_VPP_DEINT_MODE_COUNT; ++rank) {
         if ((caps.deinterlaceModeMask & (1U << static_cast<unsigned>(rank))) != 0) {
             if (!deintModes.empty()) {
                 deintModes += ',';
             }
-            deintModes += DeintModeName(static_cast<DeintMode>(rank));
+            deintModes += VppDeintModeArg(static_cast<VppDeintMode>(rank));
         }
     }
     isyslog("vaapivideo/caps: VPP -- denoise=%s sharpen=%s deinterlace=%s (best=%s) p010=%s",

@@ -1600,7 +1600,7 @@ auto cVaapiDevice::RefreshZoom() -> void {
 }
 
 auto cVaapiDevice::RefreshVideoFilters() -> void {
-    // Reuse the zoom rebuild path so a low-perf knob applies to live playback now, not at the next
+    // Reuse the zoom rebuild path so a post-processing policy change applies to live playback now, not at the next
     // channel/codec change; the decoder re-reads vaapiConfig when it reassembles BuildParams.
     if (HardwareReady() && decoder) { // acquire-gate the decoder read against an in-flight ATTA
         dsyslog("vaapivideo/device: filter policy refresh (rebuild)");

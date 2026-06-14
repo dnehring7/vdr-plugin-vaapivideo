@@ -131,22 +131,19 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
             zoom += std::format("{}{}=+{:.1f}%", i == 0 ? "" : " ", i + 1, static_cast<double>(level) / 10.0);
         }
     }
-    // Low-performance-hardware: render the active knobs only when the master gate is on.
-    std::string lowPerf = "off";
-    if (lowPerfEnabled.load(std::memory_order_relaxed)) {
-        lowPerf = std::format("deint<={} hqscale={} sharpen={} denoise={}",
-                              DeintModeName(static_cast<DeintMode>(lowPerfDeintMax.load(std::memory_order_relaxed))),
-                              lowPerfDisableHqScaling.load(std::memory_order_relaxed) ? "off" : "on",
-                              lowPerfDisableSharpening.load(std::memory_order_relaxed) ? "off" : "on",
-                              lowPerfDisableDenoise.load(std::memory_order_relaxed) ? "off" : "on");
-    }
+    // Post-processing policies.
+    const std::string postProc = std::format("deint={} denoise={} sharpen={} scale={}",
+                                             DeinterlaceModeName(deinterlaceMode.load(std::memory_order_relaxed)),
+                                             DenoiseModeName(denoiseMode.load(std::memory_order_relaxed)),
+                                             SharpenModeName(sharpenMode.load(std::memory_order_relaxed)),
+                                             ScaleModeName(scaleMode.load(std::memory_order_relaxed)));
     return std::format(
         "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}, "
-        "Low-perf HW: {}, Zoom levels (0=off): {}",
+        "Post-proc: {}, Zoom levels (0=off): {}",
         pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
         PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
         HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", lowPerf, zoom);
+        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom);
 }
 
 namespace {
@@ -196,7 +193,7 @@ namespace {
 }
 
 /// Parse VDR's canonical 0/1 boolean encoding into @p target. Relaxed store, matching the other
-/// parsers; shared by the low-performance-hardware disable flags.
+/// parsers.
 [[nodiscard]] auto ParseBoolValue(const char *key, const char *value, std::atomic<bool> &target) -> bool {
     const std::string_view v{value};
     bool parsed{};
@@ -209,6 +206,21 @@ namespace {
         return false;
     }
     target.store(parsed, std::memory_order_relaxed);
+    return true;
+}
+
+/// Parse a contiguous-from-zero enum index (written by cMenuEditStraItem) into @p target after
+/// bounds-checking against @p count. Relaxed store, matching the other parsers.
+template <typename EnumT>
+[[nodiscard]] auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &target, int count) -> bool {
+    int parsed{};
+    const auto *end = value + std::strlen(value);
+    const auto [ptr, ec] = std::from_chars(value, end, parsed);
+    if (ec != std::errc{} || ptr != end || parsed < 0 || parsed >= count) {
+        esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
+        return false;
+    }
+    target.store(static_cast<EnumT>(parsed), std::memory_order_relaxed);
     return true;
 }
 
@@ -259,30 +271,17 @@ namespace {
     if (key == "ClearOnChannelSwitch") {
         return ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);
     }
-    if (key == "LowPerfEnabled") {
-        return ParseBoolValue("LowPerfEnabled", value, lowPerfEnabled);
+    if (key == "DeinterlaceMode") {
+        return ParseEnumValue("DeinterlaceMode", value, deinterlaceMode, CONFIG_DEINTERLACE_MODE_COUNT);
     }
-    if (key == "LowPerfDisableDenoise") {
-        return ParseBoolValue("LowPerfDisableDenoise", value, lowPerfDisableDenoise);
+    if (key == "DenoiseMode") {
+        return ParseEnumValue("DenoiseMode", value, denoiseMode, CONFIG_DENOISE_MODE_COUNT);
     }
-    if (key == "LowPerfDisableHqScaling") {
-        return ParseBoolValue("LowPerfDisableHqScaling", value, lowPerfDisableHqScaling);
+    if (key == "SharpenMode") {
+        return ParseEnumValue("SharpenMode", value, sharpenMode, CONFIG_SHARPEN_MODE_COUNT);
     }
-    if (key == "LowPerfDisableSharpening") {
-        return ParseBoolValue("LowPerfDisableSharpening", value, lowPerfDisableSharpening);
-    }
-    if (key == "LowPerfDeintMax") {
-        // Encoded as the DeintMode index (written by cMenuEditStraItem). Range [0, count-1] is
-        // contiguous so a single bounds check suffices.
-        int parsed{};
-        const auto *end = value + std::strlen(value);
-        const auto [ptr, ec] = std::from_chars(value, end, parsed);
-        if (ec != std::errc{} || ptr != end || parsed < 0 || parsed >= CONFIG_DEINT_MODE_COUNT) {
-            esyslog("vaapivideo/config: invalid LowPerfDeintMax value '%s'", value);
-            return false;
-        }
-        lowPerfDeintMax.store(parsed, std::memory_order_relaxed);
-        return true;
+    if (key == "ScaleMode") {
+        return ParseEnumValue("ScaleMode", value, scaleMode, CONFIG_SCALE_MODE_COUNT);
     }
     // Per-preset zoom level (tenths-of-% zoom-in factor). Keys mirror the SetupStore() loop in
     // vaapivideo.cpp and scale with CONFIG_ZOOM_PRESET_COUNT. The active cycle stop (zoomActive) is

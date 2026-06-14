@@ -135,30 +135,63 @@ namespace {
     return buf;
 }
 
-/// Resolve the deinterlacer under the low-perf cap, choosing ONLY modes the driver advertises in
-/// @p supportedMask -- emitting an unadvertised mode makes VAAPI reject the whole graph (some iHD GPUs
-/// expose just motion_compensated). The DeintMode value is its rank (lower = better); see config.h.
+/// Resolve the GPU deinterlacer for a requested VppDeintMode rank, choosing ONLY modes the driver
+/// advertises in @p supportedMask -- emitting an unadvertised mode makes VAAPI reject the whole graph
+/// (some iHD GPUs expose just motion_compensated). The VppDeintMode value is its rank (lower = better);
+/// rank 0 (MCDI) means "best advertised". See config.h.
 [[nodiscard]] auto ClampDeinterlaceMode(std::string_view gpuMode, int capRank, unsigned supportedMask)
     -> std::string_view {
-    const int cap = std::clamp(capRank, 0, CONFIG_DEINT_MODE_COUNT - 1);
+    const int cap = std::clamp(capRank, 0, CONFIG_VPP_DEINT_MODE_COUNT - 1);
     if (cap == 0 || supportedMask == 0) {
         return gpuMode; // MCDI never limits; an empty mask means we can't safely pick a mode
     }
     const auto isSupported = [supportedMask](int rank) -> bool {
         return (supportedMask & (1U << static_cast<unsigned>(rank))) != 0;
     };
-    for (int rank = cap; rank < CONFIG_DEINT_MODE_COUNT; ++rank) { // best supported mode no better than the cap
+    for (int rank = cap; rank < CONFIG_VPP_DEINT_MODE_COUNT; ++rank) { // best supported mode no better than the cap
         if (isSupported(rank)) {
-            return DeintModeName(static_cast<DeintMode>(rank));
+            return VppDeintModeArg(static_cast<VppDeintMode>(rank));
         }
     }
-    for (int rank = CONFIG_DEINT_MODE_COUNT - 1; rank >= 0; --rank) { // cap unreachable: cheapest mode on offer
+    for (int rank = CONFIG_VPP_DEINT_MODE_COUNT - 1; rank >= 0; --rank) { // cap unreachable: cheapest mode on offer
         if (isSupported(rank)) {
-            return DeintModeName(static_cast<DeintMode>(rank));
+            return VppDeintModeArg(static_cast<VppDeintMode>(rank));
         }
     }
     return gpuMode;
 }
+
+/// Map a user Deinterlace HW selection to its VppDeintMode rank for ClampDeinterlaceMode. Auto resolves
+/// to rank 0 (best advertised); Sw* never reach here.
+[[nodiscard]] auto UserDeintRank(DeinterlaceMode mode) noexcept -> int {
+    switch (mode) {
+        case DeinterlaceMode::HwMotionAdaptive:
+            return static_cast<int>(VppDeintMode::MotionAdaptive);
+        case DeinterlaceMode::HwWeave:
+            return static_cast<int>(VppDeintMode::Weave);
+        case DeinterlaceMode::HwBob:
+            return static_cast<int>(VppDeintMode::Bob);
+        default: // Auto and (defensively) the Sw* values
+            return static_cast<int>(VppDeintMode::MotionCompensated);
+    }
+}
+
+// Software deinterlacers (field-rate / 2x, matching deinterlace_vaapi=rate=field). deint=all, not
+// deint=interlaced: broadcast per-frame flags are unreliable, so we deinterlace every frame once the
+// stream-level hint has flagged the stream interlaced.
+inline constexpr const char *SW_DEINT_BWDIF = "bwdif=mode=send_field:parity=auto:deint=all";
+// w3fdif filter=simple (3-tap) is the lighter alternative to bwdif; complex (9-tap) costs markedly
+// more CPU for little gain on broadcast material.
+inline constexpr const char *SW_DEINT_W3FDIF = "w3fdif=filter=simple:mode=field:parity=auto:deint=all";
+inline constexpr const char *SW_DEINT_YADIF_FALLBACK = "yadif=mode=send_field:parity=auto:deint=all";
+
+// Software denoise (hqdn3d luma_spatial:chroma_spatial:luma_tmp:chroma_tmp) presets.
+inline constexpr const char *SW_DENOISE_MINIMAL = "hqdn3d=1.0:1.0:2.0:2.0";
+inline constexpr const char *SW_DENOISE_ENHANCED = "hqdn3d=2.0:1.5:4.0:3.5";
+
+// Software sharpen (unsharp) presets.
+inline constexpr const char *SW_SHARPEN_MILD = "unsharp=3:3:0.25:3:3:0.0";
+inline constexpr const char *SW_SHARPEN_MEDIUM = "unsharp=5:5:0.5:5:5:0.0";
 
 } // namespace
 
@@ -331,22 +364,19 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const bool ratesDiffer = outputRateNum > 0 && displayFps > 0 && outputRateNum != displayRateInSourceDen;
     const int outputFps = ratesDiffer ? displayFps : naturalOutputFps;
 
-    // Filter chain (comma-joined, built dynamically from flags above):
-    //   SW decode: [bwdif|yadif] -> [hqdn3d for MPEG-2 w/o HW denoise] -> format -> [crop] -> hwupload ->
-    //              [denoise_vaapi] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
-    //   HW decode: [deinterlace_vaapi] -> [denoise_vaapi] -> [crop] -> scale_vaapi -> [sharpness_vaapi] -> [fps]
-    // [crop] only when a manual-zoom preset is active. HW decode passes crop metadata to scale_vaapi
-    // (one GPU pass, zero-copy); SW decode crops in system memory before hwupload.
-    // scale_vaapi is always present: it normalizes pixel format and colorimetry regardless of resize.
-    // Denoise / sharpness run on the GPU (denoise_vaapi / sharpness_vaapi) whenever VPP exposes them,
-    // so they never compete with a CPU-bound SW decoder (libdav1d 1080p50 etc). CPU hqdn3d is only
-    // retained as a fall-back for MPEG-2 SW decode on GPUs that lack denoise_vaapi (e.g. some
-    // Radeon iGPUs): MPEG-2 SW decode is cheap and the block-artefact removal materially improves
-    // perceived quality. For modern codecs (H.264/HEVC/AV1) without HW denoise we skip denoise
-    // entirely -- not worth the CPU cost on an already-saturated decoder thread.
+    // Filter chain (comma-joined, two domains chosen by useSwPost below):
+    //   GPU VPP: [deinterlace_vaapi|bwdif(SW-decode)] -> [denoise_vaapi] -> [crop] -> scale_vaapi
+    //            -> [sharpness_vaapi] -> [fps]
+    //   Hybrid:  hwdownload -> [bwdif|w3fdif] -> [SW-only denoise/scale/sharpen] -> format=nv12,hwupload
+    //            -> [denoise_vaapi] -> [crop] -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
+    // The hybrid keeps exactly ONE hwdownload and ONE hwupload but runs only the software-mandatory
+    // filters (the SW deinterlacer + any explicit sw-* node) in system memory; everything else stays on
+    // the GPU after the upload. It is taken only when the user picks a sw-* deint/scale/sharpen and the
+    // content is SDR, non-UHD, non-trick/still (see useSwPost). [crop] is the manual-zoom node; the
+    // final surface is always VAAPI for KMS scanout.
     std::vector<std::string> filters;
     // Local glue: append the manual-zoom crop node (even-aligned dims/offsets computed above). Capturing
-    // the crop geometry lets the two call sites below read as a plain `appendCropFilter()`.
+    // the crop geometry lets the call sites below read as a plain `appendCropFilter()`.
     const auto appendCropFilter = [&filters, croppedW, croppedH, cropOffX, cropOffY]() -> void {
         filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
     };
@@ -358,76 +388,176 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Both modes also skip denoise/sharpness: quality irrelevant at trick speeds, and still frames
     // are typically JPEG-style I-frames where spatial filters add no value.
     const bool useSimpleDeinterlace = params.trickMode || params.stillPicture;
-    const bool wantDenoise = !useSimpleDeinterlace && denoiseLevel > 0 && !params.disableDenoise;
 
-    if (isSoftwareDecode) {
-        if (isInterlaced && !params.stillPicture) {
-            if (useSimpleDeinterlace) {
-                // yadif send_frame: spatial-only, no temporal priming delay (bwdif needs two fields).
-                filters.emplace_back("yadif=mode=send_frame:parity=auto:deint=all");
+    // Effective GPU VPP levels for the active policy (0 = skip). Only Auto applies HW denoise/sharpen;
+    // Off skips and the Sw* values never reach the GPU domain (they force the SW block). UHD leaves the
+    // base at 0.
+    const int gpuDenoiseLevel = (params.denoise == DenoiseMode::Auto) ? denoiseLevel : 0;
+    const int gpuSharpenLevel = (params.sharpen == SharpenMode::Auto) ? sharpnessLevel : 0;
+
+    // SW post-processing block decision. Any explicit sw-* choice pulls the whole post-process into one
+    // hwdownload..hwupload block. Forced off for HDR (no P010/BT.2020 in the SW chain), UHD (SW filters
+    // stutter at 4K), and trick/still (minimal chain).
+    const bool swDeintRequested =
+        params.userDeint == DeinterlaceMode::SwBwdif || params.userDeint == DeinterlaceMode::SwW3fdif;
+    const bool swDenoiseRequested =
+        params.denoise == DenoiseMode::SwMinimal || params.denoise == DenoiseMode::SwEnhanced;
+    const bool swSharpenRequested = params.sharpen == SharpenMode::SwMild || params.sharpen == SharpenMode::SwMedium;
+    const bool swScaleRequested = params.scale == ScaleMode::SwQuality || params.scale == ScaleMode::SwFast;
+    const bool useSwPost =
+        !useSimpleDeinterlace && !params.hdrPassthrough && !isUhd &&
+        ((swDeintRequested && isInterlaced) || swDenoiseRequested || swSharpenRequested || swScaleRequested);
+
+    if (useSwPost) {
+        // --- Hybrid SW/HW post-processing: ONE hwdownload, ONE hwupload ---
+        // Only the filters that MUST run in software go in the SW segment (the deinterlacer, plus any
+        // explicit sw-* denoise/scale/sharpen); everything else stays on the GPU after the single
+        // upload (denoise_vaapi / scale_vaapi / sharpness_vaapi). The expensive scale in particular is
+        // kept on the GPU unless the user explicitly asked for software scaling -- the previous all-SW
+        // block needlessly ran swscale (and HW-capable denoise/sharpen) on the CPU.
+        //
+        // The SW segment is the pipeline prefix deinterlace->denoise->scale->sharpen up to the LAST
+        // sw-* stage (one upload => no going back to the GPU and returning). Pipeline order forces the
+        // boundary: sw sharpen (post-scale) pulls scale into SW; sw scale pulls denoise's slot into SW.
+        // An "auto" denoise/sharpen that lands inside the SW segment is dropped (auto = HW-only); scale
+        // inside the segment runs as swscale because it is mandatory.
+        const bool swDenoise = params.denoise == DenoiseMode::SwMinimal || params.denoise == DenoiseMode::SwEnhanced;
+        const bool swScale = params.scale == ScaleMode::SwQuality || params.scale == ScaleMode::SwFast;
+        const bool swSharpen = params.sharpen == SharpenMode::SwMild || params.sharpen == SharpenMode::SwMedium;
+        const bool scaleInSw = swScale || swSharpen;     // sharpen must follow scale; keep them together in SW
+        const bool denoiseInSw = swDenoise || scaleInSw; // denoise precedes scale; keep the SW segment contiguous
+
+        // -- single hwdownload (HW decode only; an already-SW-decoded frame is in system memory) --
+        if (!isSoftwareDecode) {
+            filters.emplace_back("hwdownload,format=nv12");
+        }
+        // Deinterlace (software). A HW-leaning selection that lands here (domain forced by a sw scale/
+        // sharpen) falls back to bwdif. bwdif/w3fdif are FFmpeg core filters; guard anyway.
+        if (isInterlaced) {
+            const bool wantW3fdif = params.userDeint == DeinterlaceMode::SwW3fdif;
+            const char *baseName = wantW3fdif ? "w3fdif" : "bwdif";
+            if (avfilter_get_by_name(baseName) == nullptr) [[unlikely]] {
+                dsyslog("vaapivideo/filter: %s unavailable, falling back to yadif", baseName);
+                filters.emplace_back(SW_DEINT_YADIF_FALLBACK);
             } else {
-                // bwdif (w3fdif+yadif hybrid) produces better motion at broadcast bitrates than
-                // VAAPI motion_adaptive on Mesa; HW deint path is taken for iHD/VA-API capable GPUs.
-                filters.emplace_back("bwdif=mode=send_field:parity=auto:deint=all");
+                filters.emplace_back(wantW3fdif ? SW_DEINT_W3FDIF : SW_DEINT_BWDIF);
             }
         }
-        // MPEG-2 SW fall-back: only when the GPU lacks denoise_vaapi. SW decode is cheap and the
-        // block-artefact removal is worth the per-frame CPU cost here (~5 ms @ 1080p25).
-        if (wantDenoise && !params.hasDenoise && params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-            filters.emplace_back("hqdn3d=5");
+        // Denoise (software hqdn3d) -- only the explicit sw-* presets.
+        if (swDenoise) {
+            filters.emplace_back(params.denoise == DenoiseMode::SwEnhanced ? SW_DENOISE_ENHANCED : SW_DENOISE_MINIMAL);
         }
-        filters.push_back(std::format("format={}", pixFmt));
-        // SW decode: crop the system-memory frame before uploading so only the kept region is
-        // uploaded and zoom adds no GPU readback.
-        if (wantCrop) {
-            appendCropFilter();
+        // Scale (software swscale) -- only when it is pulled into the SW segment. Emitted only when it
+        // does real work: a resize, a manual-zoom crop, or BT.601->BT.709 / range normalization.
+        if (scaleInSw) {
+            if (wantCrop) {
+                appendCropFilter();
+            }
+            const bool swNeedsScale = needsResize || wantCrop || firstFrame->colorspace != AVCOL_SPC_BT709 ||
+                                      firstFrame->color_range == AVCOL_RANGE_JPEG;
+            if (swNeedsScale) {
+                // Fast (bilinear) for SwFast / HwFast; HQ (lanczos) otherwise. HwFast can only appear
+                // here when a sw sharpen pulled scale into the SW segment -- honour the "fast" intent.
+                const bool fastScale = params.scale == ScaleMode::SwFast || params.scale == ScaleMode::HwFast;
+                const char *swScaleFlags = fastScale ? "bilinear" : "lanczos+full_chroma_int+accurate_rnd";
+                filters.push_back(
+                    std::format("scale=w={}:h={}:flags={}:in_color_matrix=auto:out_color_matrix=bt709:out_range=tv",
+                                filterWidth, filterHeight, swScaleFlags));
+            }
         }
-        filters.emplace_back("hwupload");
-    } else {
-        if (isInterlaced && !params.stillPicture && !params.deinterlaceMode.empty()) {
-            if (params.trickMode) {
-                // bob rate=frame: spatial-only, single-frame latency; avoids the one-frame
-                // priming buffer that motion_adaptive requires and never drains at trick speeds.
-                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame");
+        // Sharpen (software unsharp) -- only the explicit sw-* presets.
+        if (swSharpen) {
+            filters.emplace_back(params.sharpen == SharpenMode::SwMedium ? SW_SHARPEN_MEDIUM : SW_SHARPEN_MILD);
+        }
+        // -- single hwupload: back onto a VAAPI surface --
+        filters.emplace_back("format=nv12,hwupload");
+
+        // -- HW VPP tail: everything not done in software, on the GPU --
+        if (!denoiseInSw && gpuDenoiseLevel > 0 && params.hasDenoise) {
+            filters.push_back(std::format("denoise_vaapi=denoise={}", gpuDenoiseLevel));
+        }
+        if (!scaleInSw) {
+            // Crop is HW here (scale_vaapi consumes the crop_* metadata in the same pass).
+            if (wantCrop) {
+                appendCropFilter();
+            }
+            const bool needsExplicitScaleSize = needsResize || wantCrop;
+            if (needsExplicitScaleSize) {
+                const char *scaleHq = (isUhd || params.scale == ScaleMode::HwFast) ? "" : ":mode=hq";
+                filters.push_back(
+                    std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleHq, scaleColorArgs));
             } else {
-                // Low-perf cap (no-op at default); only ever emits a driver-supported mode.
-                const std::string_view deintMode =
-                    ClampDeinterlaceMode(params.deinterlaceMode, params.deinterlaceMaxRank, params.deinterlaceModeMask);
+                filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
+            }
+        }
+        if (!swSharpen && gpuSharpenLevel > 0 && params.hasSharpness) {
+            filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
+        }
+    } else {
+        // --- GPU VPP domain (zero-copy where possible) ---
+        if (isInterlaced && !params.stillPicture) {
+            if (isSoftwareDecode) {
+                // SW-decoded frame in system memory: VAAPI can't deinterlace it -- bwdif (or spatial
+                // yadif in trick mode) runs before the hwupload below.
+                filters.emplace_back(useSimpleDeinterlace ? "yadif=mode=send_frame:parity=auto:deint=all"
+                                                          : SW_DEINT_BWDIF);
+            } else if (useSimpleDeinterlace) {
+                // bob rate=frame: spatial-only, single-frame latency; avoids the one-frame priming
+                // buffer that motion_adaptive requires and never drains at trick speeds.
+                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame");
+            } else if (!params.deinterlaceMode.empty()) {
+                // User HW selection clamped to a driver-advertised mode (Auto = best advertised).
+                const std::string_view deintMode = ClampDeinterlaceMode(
+                    params.deinterlaceMode, UserDeintRank(params.userDeint), params.deinterlaceModeMask);
                 filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", deintMode));
             }
         }
-    }
 
-    // HW denoise (post-hwupload for SW / native for HW). Skipped on GPUs that don't expose it;
-    // the MPEG-2 SW fall-back above covers the one case where that materially hurts quality.
-    if (wantDenoise && params.hasDenoise) {
-        filters.push_back(std::format("denoise_vaapi=denoise={}", denoiseLevel));
-    }
+        const bool wantDenoise = !useSimpleDeinterlace && gpuDenoiseLevel > 0;
+        if (isSoftwareDecode) {
+            // SW-decode sysmem tail. MPEG-2 hqdn3d fall-back only when the GPU lacks denoise_vaapi:
+            // SW decode is cheap and block-artefact removal is worth the per-frame CPU cost (~5 ms
+            // @ 1080p25). Crop in system memory before uploading so zoom adds no GPU readback.
+            if (wantDenoise && !params.hasDenoise && params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
+                filters.emplace_back("hqdn3d=5");
+            }
+            filters.push_back(std::format("format={}", pixFmt));
+            if (wantCrop) {
+                appendCropFilter();
+            }
+            filters.emplace_back("hwupload");
+        }
 
-    // HW decode: crop only stores AVFrame::crop_* metadata on a VAAPI surface. The scale_vaapi below
-    // consumes it as the VPP surface_region in the same GPU pass -- as long as that pass actually runs
-    // VPP and isn't elided to a passthrough. The format/range options in scaleColorArgs keep it on the
-    // VPP path (verified even when the conversion is a runtime no-op), and needsExplicitScaleSize keeps
-    // explicit w/h; a bare scale_vaapi (no options, output == surface size) would drop the crop, so we
-    // never emit one while cropping. SW decode already cropped in system memory before hwupload.
-    if (wantCrop && !isSoftwareDecode) {
-        appendCropFilter();
-    }
+        // HW denoise (native for HW decode / post-hwupload for SW). Skipped on GPUs without it.
+        if (wantDenoise && params.hasDenoise) {
+            filters.push_back(std::format("denoise_vaapi=denoise={}", gpuDenoiseLevel));
+        }
 
-    // Hardware crop does not change the input link dimensions, so force an explicit-size scale even
-    // when the kept region already matches the target (keeps VPP doing real work that reads the crop).
-    const bool needsExplicitScaleSize = needsResize || (wantCrop && !isSoftwareDecode);
-    if (needsExplicitScaleSize) {
-        // bicubic (hq) too expensive at 4K; the low-perf knob drops it on non-UHD too.
-        const char *scaleMode = (isUhd || params.disableHqScaling) ? "" : ":mode=hq";
-        filters.push_back(
-            std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleMode, scaleColorArgs));
-    } else {
-        filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
-    }
+        // HW decode: crop only stores AVFrame::crop_* metadata on a VAAPI surface. The scale_vaapi below
+        // consumes it as the VPP surface_region in the same GPU pass -- as long as that pass actually runs
+        // VPP and isn't elided to a passthrough. The format/range options in scaleColorArgs keep it on the
+        // VPP path (verified even when the conversion is a runtime no-op), and needsExplicitScaleSize keeps
+        // explicit w/h; a bare scale_vaapi (no options, output == surface size) would drop the crop, so we
+        // never emit one while cropping. SW decode already cropped in system memory before hwupload.
+        if (wantCrop && !isSoftwareDecode) {
+            appendCropFilter();
+        }
 
-    if (!useSimpleDeinterlace && sharpnessLevel > 0 && params.hasSharpness && !params.disableSharpness) {
-        filters.push_back(std::format("sharpness_vaapi=sharpness={}", sharpnessLevel));
+        // Hardware crop does not change the input link dimensions, so force an explicit-size scale even
+        // when the kept region already matches the target (keeps VPP doing real work that reads the crop).
+        const bool needsExplicitScaleSize = needsResize || (wantCrop && !isSoftwareDecode);
+        if (needsExplicitScaleSize) {
+            // bicubic (hq) too expensive at 4K; ScaleMode::HwFast drops it on non-UHD too.
+            const char *scaleHq = (isUhd || params.scale == ScaleMode::HwFast) ? "" : ":mode=hq";
+            filters.push_back(
+                std::format("scale_vaapi=w={}:h={}{}:{}", filterWidth, filterHeight, scaleHq, scaleColorArgs));
+        } else {
+            filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
+        }
+
+        if (!useSimpleDeinterlace && gpuSharpenLevel > 0 && params.hasSharpness) {
+            filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
+        }
     }
 
     hasFpsFilter_ = !useSimpleDeinterlace && ratesDiffer;
@@ -451,6 +581,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         esyslog("vaapivideo/filter: failed to allocate filter graph");
         return false;
     }
+    // Note: the SW filters (bwdif/w3fdif/hqdn3d/swscale/unsharp) slice-thread across cores already --
+    // avfilter_graph_alloc() defaults nb_threads=0 (auto = all cores) and thread_type=allow-all. We
+    // deliberately do NOT override either: forcing a count only ever caps parallelism below the auto.
 
     // Use numeric pix_fmt: symbolic aliases for HW formats differ across FFmpeg versions.
     // time_base = 1/PTSTICKS matches the 90 kHz domain that stream.cpp rescales every packet into.

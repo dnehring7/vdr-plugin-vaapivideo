@@ -346,11 +346,10 @@ that start VDR before a user session claims the console.
 | `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 | `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–5): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
-| `Low-performance hardware`       | off / on         | Master gate for the filter-cost limits below; the four sub-items appear only when this is **on** (see [Low-performance hardware](#low-performance-hardware)) |
-| `  Max deinterlacer`             | MCDI / MADI / Weave / Bob | Cap HW deinterlacing quality to no better than the selected mode (`MCDI` = no limit)        |
-| `  Disable HQ scaling`           | off / on         | Drop `scale_vaapi:mode=hq` (bicubic) on non-UHD content                                              |
-| `  Disable sharpening`           | off / on         | Skip `sharpness_vaapi`                                                                               |
-| `  Disable denoising`            | off / on         | Skip `denoise_vaapi` (and the MPEG-2 `hqdn3d` software fallback)                                     |
+| `Deinterlace`                    | auto / hardware: motion adaptive / weave / bob / software: bwdif / w3fdif | Deinterlacer policy (see [Post-processing](#post-processing)) |
+| `Denoise`                        | auto (hardware) / off / software: light / strong | `auto` = HW `denoise_vaapi`; `software:` = `hqdn3d` presets (force the SW block) |
+| `Sharpen`                        | auto (hardware) / off / software: mild / medium | `auto` = HW `sharpness_vaapi`; `software:` = `unsharp` presets (force the SW block) |
+| `Scaling`                        | auto (hardware, HQ) / hardware: fast / software: HQ / software: fast | `scale_vaapi:mode=hq` / `scale_vaapi` / `swscale` lanczos / `swscale` bilinear |
 
 The two latency knobs are split because a downstream receiver doing its own
 bitstream decode contributes a different delay than the PCM path. Both default
@@ -427,33 +426,73 @@ Cycling the zoom:
   Or just `Blue @vaapivideo` to open the menu and navigate by hand. The
   `PLUG vaapivideo ZOOM [next|0-5]` SVDRP command remains available for scripting.
 
-### Low-performance hardware
+### Post-processing
 
-On weaker GPUs the VAAPI post-processing chain — motion-compensated deinterlace,
-bicubic (`mode=hq`) scaling, sharpening, denoising — can saturate the hardware and
-cause stutter. `Low-performance hardware` defaults to **off**. The master toggle is
-always shown, but its four sub-items appear only once you enable it, and enabling it
-on its own changes **nothing** until you adjust a knob. Each knob trims one stage of
-the chain:
+Four independent policies control deinterlace, denoise, sharpen, and scaling. They
+all default to **auto**, which keeps the zero-copy VAAPI VPP path (the original
+behaviour). Decoding always stays on the GPU; these options only shape the
+post-processing that follows it.
 
-- **Max deinterlacer** caps HW deinterlacing to no better than the chosen mode
-  (quality order `MCDI` > `MADI` > `Weave` > `Bob`). The cap is a ceiling and only
-  ever selects a mode the driver actually advertises: it picks the best supported
-  mode no better than the cap, and if the driver exposes only modes better than the
-  cap (some iHD GPUs advertise just `motion_compensated`) it keeps the cheapest
-  supported one rather than emit a mode VAAPI would reject. `MCDI` (the default)
-  never limits. The advertised set is logged at startup (`vaapivideo/caps: VPP …
-  deinterlace=…`).
-- **Disable HQ scaling** drops the bicubic `mode=hq` flag from `scale_vaapi` on
-  non-UHD content (UHD already skips it). Scaling still happens, just cheaper.
-- **Disable sharpening** removes the `sharpness_vaapi` stage.
-- **Disable denoising** removes `denoise_vaapi` (and the MPEG-2-only `hqdn3d`
-  software fallback used on GPUs without HW denoise).
+The chain runs in one of two **domains**, chosen automatically:
 
-Unlike audio passthrough, these apply to **live playback immediately**: on leaving
-the setup menu the plugin rebuilds the filter graph (the same path a zoom edit
-uses), so there is no need to switch channels. The knobs only ever affect the
-video filter chain — decoding, audio, HDR, and zoom are untouched.
+- **GPU domain** (all `auto` / `hardware:` choices) — `deinterlace_vaapi` → `denoise_vaapi`
+  → `scale_vaapi` → `sharpness_vaapi`, entirely on the GPU.
+- **SW block** (any `software:` choice) — the decoded surface is pulled to
+  system memory once (`hwdownload`), the whole post-process runs in software
+  (`bwdif`/`w3fdif` → `hqdn3d` → `swscale` lanczos → `unsharp`), then a single
+  `hwupload` puts it back on a VAAPI surface for display. This is the high-quality
+  path for interlaced DVB broadcast on GPUs whose VAAPI deinterlacer is weak (notably
+  AMD/Mesa, where the hardware deinterlacer leaves visible combing). HW decode is
+  retained, so only the post-processing costs CPU. The SW block is automatically
+  bypassed (forced back to the GPU domain) for HDR, UHD, and trick-play/still frames.
+
+Each option's label says where it runs: `auto` and `hardware:` stay on the GPU VPP
+path; `software:` routes the whole post-process through the SW block.
+
+**Deinterlace**
+
+- **auto** — best deinterlace mode the driver advertises (motion-compensated when
+  present). This reproduces the original behaviour exactly.
+- **hardware: motion adaptive / weave / bob** — request a specific VAAPI mode (there is
+  no separate "motion compensated" entry — `auto` already picks it when available). The
+  request is clamped to a mode the driver actually advertises (some iHD GPUs expose just
+  one); the advertised set is logged at startup (`vaapivideo/caps: VPP … deinterlace=…`).
+- **software: bwdif / w3fdif** — software deinterlace (field-rate). `bwdif` is the
+  recommended quality choice for broadcast; `w3fdif` (simple 3-tap) is a **lighter**
+  alternative that costs less CPU. (`yadif` is used internally only as a fallback if
+  `bwdif` is unavailable.) The software filters are slice-threaded across cores so a
+  1080i50 deinterlace doesn't peg a single core.
+
+**Denoise** — `auto (hardware)` is HW `denoise_vaapi` (codec-tuned, heavier for MPEG-2);
+`off` skips it; `software: light` / `strong` are `hqdn3d` presets that route the chain
+through the SW block. `auto` is *HW-only*: it adds no software denoise, so inside the SW
+block it does nothing — pick a `software:` preset if you want denoise there.
+
+**Sharpen** — `auto (hardware)` is HW `sharpness_vaapi` (codec-tuned); `off` skips it;
+`software: mild` / `medium` are `unsharp` presets that route the chain through the SW
+block. Like denoise, `auto` adds no software sharpen inside the SW block.
+
+**Scaling** — `auto (hardware, HQ)` uses `scale_vaapi:mode=hq` (bicubic); `hardware:
+fast` drops `mode=hq` for a cheaper GPU scale; `software: HQ` uses `swscale` lanczos
+and `software: fast` uses `swscale` bilinear (both route through the SW block). In the
+SW block the software scale is emitted only when it does real work (a resize, a manual
+zoom, or a BT.601→BT.709 / range conversion); a 1080i broadcast already at 1920×1080
+BT.709 skips it. `scale_vaapi` always normalises pixel format and colorimetry on the GPU
+path. The `software:` scalers are niche — `auto` (hardware `scale_vaapi`) is both cheaper
+and better; reach for them only when a GPU's `scale_vaapi` itself is suspect.
+
+> **CPU cost:** the SW block runs the deinterlacer at *field rate* (e.g. 1080i50 →
+> 1080p50), so every following software node (`hqdn3d`, `swscale`, `unsharp`) also
+> processes 50 frames/s. On a low-power CPU, `software: strong` denoise plus
+> `software: bwdif` on 1080i50 can saturate cores and drop frames. If playback can't
+> keep up, set denoise to `off`, leave sharpen on `auto`, or — on a GPU with a good
+> hardware deinterlacer (Intel iHD) — use `Deinterlace = auto` and stay on the GPU path.
+
+These apply to **live playback immediately**: on leaving the setup menu the plugin
+rebuilds the filter graph (the same path a zoom edit uses), so there is no need to
+switch channels. Switching `auto`↔`software:` is a filter-graph rebuild only — decode
+stays on the GPU, so there is no channel re-tune or black flash. The options only
+ever affect the video filter chain — decoding, audio, HDR, and zoom are untouched.
 
 ### SVDRP commands
 
@@ -545,16 +584,22 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 
 ## Troubleshooting
 
-| Symptom                   | Diagnosis and fix                                                          |
-|---------------------------|----------------------------------------------------------------------------|
-| Plugin refuses to start   | VPP missing — run `vainfo` and check for `VAEntrypointVideoProc`           |
-| No video output           | Verify group membership (`video`, `render`); run `vainfo`                  |
-| No audio                  | Test ALSA directly: `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`    |
-| Passthrough not working   | Use `hw:CARD,DEV`; verify `/proc/asound/card0/eld#0.N` is non-empty        |
-| Persistent A/V drift      | Tune `PCM Audio Latency` or `Passthrough Audio Latency`                    |
-| DRM device not found      | Run `ls -l /dev/dri/` and specify `-d /dev/dri/cardN` explicitly           |
-| Black screen after resume | Send SVDRP: `PLUG vaapivideo DETA` then `PLUG vaapivideo ATTA`             |
-| AMD iGPU stutters / drops | GPU pinned to `low` DPM — use `power_dpm_force_performance_level=auto` (default) |
+| Area    | Symptom                              | Diagnosis and fix                                          |
+|---------|--------------------------------------|------------------------------------------------------------|
+| Startup | Plugin refuses to start              | VPP missing — `vainfo` must list `VAEntrypointVideoProc`   |
+| Startup | DRM device not found                 | `ls -l /dev/dri/`; pass `-d /dev/dri/cardN` explicitly     |
+| Startup | No video output                      | Check group membership (`video`, `render`); run `vainfo`   |
+| Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
+| Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlace = software: bwdif` (or `w3fdif`) |
+| Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoise = off`       |
+| Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
+| Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
+| Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough Audio Latency` (see [AVSYNC.md](AVSYNC.md)) |
+| Perf    | AMD iGPU stutters / drops            | GPU pinned `low` DPM — `power_dpm_force_performance_level=auto` |
+| Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlace = auto` |
+| Perf    | High CPU on encrypted HD             | Software CSA descrambling (CAM/softcam), not the plugin — a CI+ CAM offloads it |
+
+Picture fixes map to the [Post-processing](#post-processing) options; confirm drops in the `sync … drop=N` log line.
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
 sync diagnostics; the periodic `sync d=… avg=…` line is described in

@@ -143,7 +143,7 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto CycleZoom() -> int; ///< Advance Off->1->..->N->Off; returns the new stop
     auto RefreshZoom() -> void;            ///< Rebuild VPP for edited crop values without changing the active stop
     auto RefreshVideoFilters()
-        -> void;              ///< Rebuild VPP for policy-only setup changes (low-perf knobs); leaves zoom/rect
+        -> void; ///< Rebuild VPP for policy-only setup changes (post-processing policies); leaves zoom/rect
     auto ResetZoom() -> void; ///< Force back to Off; the new stream's graph rebuild picks it up
     [[nodiscard]] auto ZoomStatusLabel() const
         -> std::string; ///< Human-readable active-zoom label for OSD/SVDRP feedback (e.g. "Zoom 2: +12.5%")

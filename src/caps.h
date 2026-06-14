@@ -54,7 +54,7 @@ struct GpuCaps {
     bool vppDenoise{};              ///< VAProcFilterNoiseReduction available
     bool vppSharpness{};            ///< VAProcFilterSharpening available
     std::string deinterlaceMode;    ///< Best VAProcDeinterlacing mode name for deinterlace_vaapi; "" = none
-    unsigned deinterlaceModeMask{}; ///< Bit (1u<<DeintMode) set per supported mode; lets the low-perf cap pick
+    unsigned deinterlaceModeMask{}; ///< Bit (1u<<VppDeintMode) set per supported mode; lets ClampDeinterlaceMode pick
                                     ///< only modes the driver actually advertises (some iHD GPUs expose just one)
 
     // === DIAGNOSTICS ===

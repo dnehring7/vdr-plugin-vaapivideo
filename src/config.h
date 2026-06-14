@@ -109,37 +109,155 @@ enum class HdrMode : uint8_t {
 }
 
 // ============================================================================
-// === LOW-PERFORMANCE-HARDWARE MODE ===
+// === VAAPI VPP DEINTERLACE MODES (internal, NOT a user option) ===
 // ============================================================================
+// This is the hardware (deinterlace_vaapi) mode enum and its ffmpeg argument token. It is distinct
+// from the user-facing DeinterlaceMode policy below: caps.cpp probes which VppDeintMode values the
+// driver advertises, and filter.cpp's ClampDeinterlaceMode maps the user's Hw* choice onto the best
+// advertised one. VppDeintModeArg() returns the bare token fed to "deinterlace_vaapi=mode=..." --
+// human labels live in DeinterlaceModeName(), never here.
 
-/// Deinterlacer quality ceiling for low-performance-hardware mode. Numbered by descending
-/// quality so the numeric value IS the rank (lower = better); the filter chain clamps the
-/// GPU's best mode to no better than this. Numeric values are part of the setup.conf wire
-/// format -- do not renumber. Quality order matches caps.cpp's deinterlace probe.
-enum class DeintMode : uint8_t {
-    MotionCompensated = 0, ///< MCDI -- highest quality (default cap = no effective limit)
+/// VAAPI VPP deinterlace modes, numbered by descending quality so the numeric value IS the rank
+/// (lower = better). Quality order matches the caps probe.
+enum class VppDeintMode : uint8_t {
+    MotionCompensated = 0, ///< MCDI -- highest quality
     MotionAdaptive = 1,    ///< MADI
     Weave = 2,             ///< field weave
     Bob = 3,               ///< line doubling -- lowest cost
 };
 
-inline constexpr int CONFIG_DEINT_MODE_COUNT = 4; ///< Number of DeintMode values; bounds the cap menu/parse
+inline constexpr int CONFIG_VPP_DEINT_MODE_COUNT = 4; ///< Number of VppDeintMode values; bounds the clamp loop
 
-/// ffmpeg deinterlace_vaapi mode string for a DeintMode. Single source of truth shared by
-/// filter.cpp (clamp + filter emit) and config.cpp (logging); mirrors the kDeintModes names
-/// in caps.cpp.
-[[nodiscard]] constexpr auto DeintModeName(DeintMode mode) noexcept -> const char * {
+/// Bare ffmpeg "deinterlace_vaapi=mode=" argument token for a VppDeintMode (MUST stay a bare token --
+/// it is concatenated into the filter string). Single source shared by filter.cpp (clamp + emit) and
+/// caps.cpp (probe + diagnostic log).
+[[nodiscard]] constexpr auto VppDeintModeArg(VppDeintMode mode) noexcept -> const char * {
     switch (mode) {
-        case DeintMode::MotionCompensated:
+        case VppDeintMode::MotionCompensated:
             return "motion_compensated";
-        case DeintMode::MotionAdaptive:
+        case VppDeintMode::MotionAdaptive:
             return "motion_adaptive";
-        case DeintMode::Weave:
+        case VppDeintMode::Weave:
             return "weave";
-        case DeintMode::Bob:
+        case VppDeintMode::Bob:
             return "bob";
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
+// === POST-PROCESSING OPTIONS (deinterlace / denoise / sharpen / scale) ===
+// ============================================================================
+// Four independent user policies. Each "sw-*" / "SwQuality" value routes the whole post-process
+// through one hwdownload->[SW filters]->hwupload block (filter.cpp); "Auto"/"Hw*" stay on the
+// VAAPI VPP path. Numeric values are part of the setup.conf wire format -- do not renumber.
+
+/// Deinterlacer selection. Auto/Hw* run on the GPU (deinterlace_vaapi, clamped to an advertised
+/// VppDeintMode); Sw* force the software block (bwdif / w3fdif). No explicit MCDI entry: Auto already
+/// selects the best advertised HW mode (MCDI when present).
+enum class DeinterlaceMode : uint8_t {
+    Auto = 0,             ///< Best HW mode the driver advertises (MCDI when present)
+    HwMotionAdaptive = 1, ///< Request MADI (clamped to an advertised mode)
+    HwWeave = 2,          ///< Request weave
+    HwBob = 3,            ///< Request bob (cheapest HW)
+    SwBwdif = 4,          ///< Software bwdif -> forces SW block
+    SwW3fdif = 5,         ///< Software w3fdif -> forces SW block
+};
+
+inline constexpr int CONFIG_DEINTERLACE_MODE_COUNT = 6; ///< Number of DeinterlaceMode values
+
+/// Human label for a DeinterlaceMode -- single source for the setup menu AND the log summary.
+[[nodiscard]] constexpr auto DeinterlaceModeName(DeinterlaceMode mode) noexcept -> const char * {
+    switch (mode) {
+        case DeinterlaceMode::Auto:
+            return "auto (best available)";
+        case DeinterlaceMode::HwMotionAdaptive:
+            return "hardware: motion adaptive";
+        case DeinterlaceMode::HwWeave:
+            return "hardware: weave (fast)";
+        case DeinterlaceMode::HwBob:
+            return "hardware: bob (fastest)";
+        case DeinterlaceMode::SwBwdif:
+            return "software: bwdif (best)";
+        case DeinterlaceMode::SwW3fdif:
+            return "software: w3fdif (faster)";
+    }
+    return "?";
+}
+
+/// Denoise. Auto uses HW denoise_vaapi (codec-tuned) on the GPU path and adds nothing when the chain
+/// is already in the SW block. Sw* are software hqdn3d presets that force the SW block. Off emits no
+/// node.
+enum class DenoiseMode : uint8_t {
+    Auto = 0,       ///< HW denoise_vaapi (codec-tuned); no SW fallback
+    Off = 1,        ///< No denoise
+    SwMinimal = 2,  ///< Software hqdn3d (light) -> forces SW block
+    SwEnhanced = 3, ///< Software hqdn3d (strong) -> forces SW block
+};
+
+inline constexpr int CONFIG_DENOISE_MODE_COUNT = 4; ///< Number of DenoiseMode values
+
+[[nodiscard]] constexpr auto DenoiseModeName(DenoiseMode mode) noexcept -> const char * {
+    switch (mode) {
+        case DenoiseMode::Auto:
+            return "auto (hardware)";
+        case DenoiseMode::Off:
+            return "off";
+        case DenoiseMode::SwMinimal:
+            return "software: light";
+        case DenoiseMode::SwEnhanced:
+            return "software: strong";
+    }
+    return "?";
+}
+
+/// Sharpening. Auto uses HW sharpness_vaapi; Sw* force the SW block (unsharp). Off emits no node.
+enum class SharpenMode : uint8_t {
+    Auto = 0,     ///< Codec-tuned HW sharpness
+    Off = 1,      ///< No sharpening
+    SwMild = 2,   ///< Software unsharp (mild) -> forces SW block
+    SwMedium = 3, ///< Software unsharp (medium) -> forces SW block
+};
+
+inline constexpr int CONFIG_SHARPEN_MODE_COUNT = 4; ///< Number of SharpenMode values
+
+[[nodiscard]] constexpr auto SharpenModeName(SharpenMode mode) noexcept -> const char * {
+    switch (mode) {
+        case SharpenMode::Auto:
+            return "auto (hardware)";
+        case SharpenMode::Off:
+            return "off";
+        case SharpenMode::SwMild:
+            return "software: mild";
+        case SharpenMode::SwMedium:
+            return "software: medium";
+    }
+    return "?";
+}
+
+/// Scaler. Auto/HwFast run scale_vaapi (with/without :mode=hq); Sw* force the SW block (swscale,
+/// lanczos for HQ or bilinear for fast).
+enum class ScaleMode : uint8_t {
+    Auto = 0,      ///< scale_vaapi :mode=hq (best HW)
+    HwFast = 1,    ///< scale_vaapi without :mode=hq
+    SwQuality = 2, ///< swscale lanczos -> forces SW block
+    SwFast = 3,    ///< swscale bilinear -> forces SW block
+};
+
+inline constexpr int CONFIG_SCALE_MODE_COUNT = 4; ///< Number of ScaleMode values
+
+[[nodiscard]] constexpr auto ScaleModeName(ScaleMode mode) noexcept -> const char * {
+    switch (mode) {
+        case ScaleMode::Auto:
+            return "auto (hardware, HQ)";
+        case ScaleMode::HwFast:
+            return "hardware: fast";
+        case ScaleMode::SwQuality:
+            return "software: HQ (lanczos)";
+        case ScaleMode::SwFast:
+            return "software: fast (bilinear)";
+    }
+    return "?";
 }
 
 // ============================================================================
@@ -162,12 +280,11 @@ struct VaapiConfig {
     std::atomic<bool> clearOnChannelSwitch{false}; ///< Black frame on channel switch instead of leaving the last frame
     DisplayConfig display;                         ///< Display geometry; init-time only, not thread-safe after that
     std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< Re-read on every codec change / filter-graph rebuild
-    // Low-performance-hardware knobs: ignored unless lowPerfEnabled; re-read on every filter-graph rebuild.
-    std::atomic<int> lowPerfDeintMax{0};               ///< DeintMode index ceiling (0=MCDI => no limit); see DeintMode
-    std::atomic<bool> lowPerfDisableDenoise{false};    ///< Skip denoise_vaapi / MPEG-2 hqdn3d fallback in the chain
-    std::atomic<bool> lowPerfDisableHqScaling{false};  ///< Drop scale_vaapi :mode=hq (bicubic) even on non-UHD
-    std::atomic<bool> lowPerfDisableSharpening{false}; ///< Skip sharpness_vaapi in the chain
-    std::atomic<bool> lowPerfEnabled{false};           ///< Master gate; when off the four knobs above are no-ops
+    // Post-processing policies: re-read on every filter-graph rebuild (alphabetical within group).
+    std::atomic<DeinterlaceMode> deinterlaceMode{DeinterlaceMode::Auto}; ///< Deinterlacer selection
+    std::atomic<DenoiseMode> denoiseMode{DenoiseMode::Auto};             ///< Denoise strength
+    std::atomic<ScaleMode> scaleMode{ScaleMode::Auto};                   ///< Scaler selection
+    std::atomic<SharpenMode> sharpenMode{SharpenMode::Auto};             ///< Sharpening selection
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
