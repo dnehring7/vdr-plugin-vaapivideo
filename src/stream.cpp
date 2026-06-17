@@ -652,11 +652,9 @@ class BitReader {
     return info;
 }
 
-/// Parse the MPEG-2 sequence_header (ISO 13818-2 6.2.2.1) for coded dimensions and the deinterlace
-/// verdict. progressive_sequence (sequence_extension 0xB5/0x1) is only interlaced-CAPABLE -- SD DVB
-/// sets it 0 on progressive content too -- so the per-picture progressive_frame (picture_coding_-
-/// extension 0xB5/0x8) is authoritative: interlaced iff progressive_sequence==0 AND progressive_frame==0.
-/// Profile/level unused: DVB main-profile is always 8-bit 4:2:0.
+/// Parse the MPEG-2 sequence_header (ISO 13818-2 sec.6.2.2.1) for coded dimensions and the
+/// following sequence_extension (0xB5) for progressive_sequence -- the authoritative interlace
+/// verdict (see FrameNeedsDeinterlace). Profile/level unused: DVB main-profile is always 8-bit 4:2:0.
 [[nodiscard]] auto ProbeMpeg2SequenceHeader(std::span<const uint8_t> data) noexcept -> VideoStreamInfo {
     VideoStreamInfo info;
     info.codecId = AV_CODEC_ID_MPEG2VIDEO;
@@ -667,7 +665,6 @@ class BitReader {
     }
     const uint8_t *p = data.data();
 
-    bool sawSequenceExtension = false;
     for (size_t i = 0; i + 7 <= size;) {
         const auto *found = static_cast<const uint8_t *>(std::memchr(p + i, 0x00, size - i));
         if (!found) {
@@ -694,39 +691,20 @@ class BitReader {
             i = headerPos;
             continue;
         }
-        const uint8_t startCode = p[headerPos];
-        if (!sawSequenceExtension) {
-            // First start code after sequence_header distinguishes MPEG-2 (sequence_extension, id 0x1
-            // in byte +1's top nibble; progressive_sequence = bit 3 of byte +2) from MPEG-1 (no
-            // extension -> always progressive). A 0xB5 of another id is malformed: leave the verdict
-            // unset so the caller retries on a clean header.
-            if (startCode == 0xB5 && (p[headerPos + 1] >> 4) == 0x1) {
-                sawSequenceExtension = true;
-                if ((p[headerPos + 2] & 0x08) != 0) { // progressive_sequence=1 -> every frame progressive
-                    info.hasStreamInterlaceInfo = true;
-                    info.streamInterlaced = false;
-                    return info;
-                }
-                i = headerPos; // interlaced-CAPABLE only: progressive_frame below settles the verdict
-                continue;
-            }
-            if (startCode != 0xB5) {
-                info.hasStreamInterlaceInfo = true; // MPEG-1: no sequence_extension -> progressive
-            }
-            return info;
-        }
-        // picture_coding_extension (0xB5, id 0x8): progressive_frame (bit 7 of byte +5) is the verdict.
-        // ==1 is progressive frames inside an interlaced sequence (e.g. 576p25 film) and must not be
-        // deinterlaced. The GOP-start access unit co-locates sequence and picture, so the wait is bounded.
-        if (startCode == 0xB5 && (p[headerPos + 1] >> 4) == 0x8) {
-            if (headerPos + 6 > size) {
-                break; // need byte +5; wait for a PES carrying the full picture header
-            }
+        // The first start code after the sequence_header is decisive. MPEG-2 mandates the
+        // sequence_extension here (id 0x1 in byte +1's top nibble; progressive_sequence is bit 3 of
+        // its byte +2). A non-0xB5 start code means there is no extension -> MPEG-1, which is always
+        // progressive. A 0xB5 with a different extension id is malformed: leave the verdict unset so
+        // the caller retries on a clean header rather than publishing a false progressive verdict.
+        // Deciding here guarantees a verdict for real streams, so the caller never blocks on an
+        // extension-less MPEG-1 stream (also detected as mpeg2video).
+        if (p[headerPos] == 0xB5 && (p[headerPos + 1] >> 4) == 0x1) {
             info.hasStreamInterlaceInfo = true;
-            info.streamInterlaced = (p[headerPos + 5] & 0x80) == 0;
-            return info;
+            info.streamInterlaced = (p[headerPos + 2] & 0x08) == 0;
+        } else if (p[headerPos] != 0xB5) {
+            info.hasStreamInterlaceInfo = true; // MPEG-1: no sequence_extension -> progressive
         }
-        i = headerPos;
+        return info;
     }
     return info;
 }

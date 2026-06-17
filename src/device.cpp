@@ -1424,9 +1424,10 @@ auto cVaapiDevice::Play() -> void {
                     candidateCount);
         }
 
-        // Wait for in-band config before opening: H.264/HEVC need SPS bit-depth/profile for backend
-        // selection (else the 8-bit row misclassifies 10-bit streams); MPEG-2 needs picture_coding_-
-        // extension progressive_frame for the deinterlace verdict. DVB carries both each GOP -> bounded.
+        // Wait for in-band config before opening: H.264/HEVC need the SPS bit-depth/profile for
+        // backend selection (else the 8-bit row misclassifies 10-bit streams); MPEG-2 needs the
+        // sequence_extension progressive_sequence for the deinterlace verdict (FrameNeedsDeinterlace).
+        // DVB carries both each GOP, so the wait is bounded.
         VideoStreamInfo streamInfo;
         streamInfo.codecId = detectedCodec;
         if (detectedCodec == AV_CODEC_ID_MPEG2VIDEO || detectedCodec == AV_CODEC_ID_H264 ||
