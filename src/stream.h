@@ -55,7 +55,7 @@ struct VideoStreamInfo {
     int fpsNum{0};                      ///< Container-reported frame-rate numerator; 0 means unknown
     bool hasSps{false};                 ///< True iff ProbeVideoSps parsed an authoritative in-band parameter set
     bool hasStreamInterlaceInfo{false}; ///< True iff streamInterlaced came from bitstream/container metadata
-    bool streamInterlaced{false};       ///< Positive sequence/container hint; forces deinterlace at graph build
+    bool streamInterlaced{false};       ///< progressive_frame==0 / interlaced field_order; forces deinterlace
     int level{0};                       ///< Codec level (level_idc or general_level_idc)
     int profile{AV_PROFILE_UNKNOWN};    ///< e.g. AV_PROFILE_HEVC_MAIN_10, AV_PROFILE_AV1_MAIN
     // Container HDR static metadata (codecpar coded_side_data); VP9/AV1 carry it here, not in the
