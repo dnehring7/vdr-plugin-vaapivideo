@@ -280,6 +280,7 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
     } else if (currentCodecId == AV_CODEC_ID_NONE) {
         parserCtx.reset();
     }
+    trickAwaitSecondField = false; // parser reset: forget any pending PAFF field-pair (parserMutex held)
 
     // Epoch BEFORE NOPTS: any in-flight decoder publish observes the new epoch on its check or
     // recheck and aborts/undoes. Reversed order would let a stale publish overwrite NOPTS.
@@ -361,11 +362,21 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         currentPts = AV_NOPTS_VALUE;
 
         if (parsedSize > 0) {
-            // FF: drop non-keyframes (inter frames are undisplayable without reference frames).
-            // Reverse must not filter: PAFF second fields carry key_frame=0 but are needed.
-            if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
-                parserCtx->key_frame == 0) {
-                continue;
+            // FF: keep only keyframes (inter frames are undisplayable here). PAFF exception: an I-frame
+            // is two field pictures whose second field carries key_frame==0 -- keep it too, or the
+            // decoder gets unpaired top fields and rejects them (send_packet EINVAL). Reverse skips this
+            // filter entirely (same reason). One-shot: a kept keyframe field arms the next field.
+            if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed)) {
+                const bool isField = parserCtx->picture_structure == AV_PICTURE_STRUCTURE_TOP_FIELD ||
+                                     parserCtx->picture_structure == AV_PICTURE_STRUCTURE_BOTTOM_FIELD;
+                if (parserCtx->key_frame != 0) {
+                    trickAwaitSecondField = isField; // I-frame first field -> keep its pair's second field
+                } else if (trickAwaitSecondField && isField) {
+                    trickAwaitSecondField = false; // second field completes the keyframe pair
+                } else {
+                    trickAwaitSecondField = false;
+                    continue; // inter frame
+                }
             }
 
             AVPacket *pkt = av_packet_alloc();
@@ -1294,9 +1305,17 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         // --- Still-picture codec drain ---
-        // The decode thread may consume the packet before RequestCodecDrain sets the flag;
-        // checking here (after the decode step) catches both orderings.
-        if (codecDrainPending.exchange(false, std::memory_order_acquire)) {
+        // Drain only when the queue is empty. A PAFF field pair is two packets (one decoded per
+        // iteration); draining mid-pair sends EOS holding just the top field, which is discarded ->
+        // frozen 1080i still. RequestCodecDrain() is published after FlushParser() queues any
+        // trailing field, so sample the flag first and only then snapshot the queue state.
+        const bool drainPending = codecDrainPending.load(std::memory_order_acquire);
+        bool packetQueueEmpty = false;
+        if (drainPending) {
+            const cMutexLock lock(&packetMutex);
+            packetQueueEmpty = packetQueue.empty();
+        }
+        if (drainPending && packetQueueEmpty && codecDrainPending.exchange(false, std::memory_order_acquire)) {
             drainedCodecAtEof = true;
             const cMutexLock decodeLock(&codecMutex);
             const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);

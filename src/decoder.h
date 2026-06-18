@@ -322,6 +322,7 @@ class cVaapiDecoder : public cThread {
         filteredFrame; ///< Staging for filterChain.ReceiveFrame(); unref'd each iteration.
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
         parserCtx; ///< Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.
+    bool trickAwaitSecondField{false}; ///< FF keyframe filter: keep the PAFF I-frame's 2nd field (parserMutex).
 
     // ========================================================================
     // === PACKET QUEUE ===

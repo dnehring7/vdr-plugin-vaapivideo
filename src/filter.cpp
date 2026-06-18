@@ -379,12 +379,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
     };
 
-    // Still picture: skip the temporal deinterlacer entirely -- VAAPI VPP buffers one field pair
-    // for motion estimation and never flushes it on EOS, so a lone I-frame would be swallowed.
-    // Minor combing artefacts on a still frame are acceptable.
-    // Trick mode: bob (spatial-only) avoids that one-frame priming delay; steady cadence absorbs it.
-    // Both modes also skip denoise/sharpness: quality irrelevant at trick speeds, and still frames
-    // are typically JPEG-style I-frames where spatial filters add no value.
+    // Trick/still drop denoise/sharpness. Deinterlacing differs (see the GPU VPP block): trick keeps a
+    // spatial deinterlacer (bob/yadif, 1x, no temporal buffer) so interlaced FF/RW/slow doesn't comb;
+    // still drops it -- a lone frame has no field-pair partner and the temporal VPP delay swallows it.
     const bool useSimpleDeinterlace = params.trickMode || params.stillPicture;
 
     // Effective GPU VPP levels for the active policy (0 = skip). Only Auto applies HW denoise/sharpen;
@@ -486,14 +483,16 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         }
     } else {
         // --- GPU VPP domain (zero-copy where possible) ---
+        // Still drops the deinterlacer (lone frame, no field pair -> swallowed). Trick keeps a spatial
+        // one (bob/yadif, 1x): no temporal buffering, and it stops interlaced FF/RW/slow from combing.
         if (isInterlaced && !params.stillPicture) {
             if (isSoftwareDecode) {
-                // SW-decoded frame in system memory: VAAPI can't deinterlace it -- bwdif (or spatial
-                // yadif in trick mode) runs before the hwupload below.
+                // SW-decoded frame in system memory: VAAPI can't deinterlace it. Normal play: bwdif
+                // (temporal, 2x). Trick: yadif spatial 1x, but only on frames marked interlaced.
                 filters.emplace_back(useSimpleDeinterlace ? "yadif=deint=interlaced" : SW_DEINT_BWDIF);
             } else if (useSimpleDeinterlace) {
-                // bob: spatial-only, single-frame latency; avoids the motion_adaptive priming buffer that
-                // never drains at trick speeds. auto=1 leaves a progressive paused frame untouched.
+                // Trick: bob spatial deinterlace at frame rate (1x) -- no temporal buffer, keeps cadence,
+                // and auto=1 leaves progressive frames untouched inside mixed streams.
                 filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame:auto=1");
             } else if (!params.deinterlaceMode.empty()) {
                 // User HW selection clamped to a driver-advertised mode (Auto = best advertised).
@@ -751,11 +750,13 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 cadenceTag = ", decimated";
             }
         }
+        // "deinterlaced" reflects the chain, not the source: only still drops the deinterlacer.
         isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
-                filterWidth, filterHeight, isInterlaced ? ", deinterlaced" : "", cadenceTag, pixFmt,
-                params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
-        dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
+                filterWidth, filterHeight, (isInterlaced && !params.stillPicture) ? ", deinterlaced" : "", cadenceTag,
+                pixFmt, params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
     }
+    // Always surface the actual chain so trick/still/zoom/seek rebuilds are verifiable in the log.
+    dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
 
     return true;
 }
