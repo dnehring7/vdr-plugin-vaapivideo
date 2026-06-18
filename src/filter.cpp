@@ -176,14 +176,12 @@ namespace {
     }
 }
 
-// Software deinterlacers (field-rate / 2x, matching deinterlace_vaapi=rate=field). deint=all, not
-// deint=interlaced: broadcast per-frame flags are unreliable, so we deinterlace every frame once the
-// stream-level hint has flagged the stream interlaced.
-inline constexpr const char *SW_DEINT_BWDIF = "bwdif=mode=send_field:parity=auto:deint=all";
-// w3fdif filter=simple (3-tap) is the lighter alternative to bwdif; complex (9-tap) costs markedly
-// more CPU for little gain on broadcast material.
-inline constexpr const char *SW_DEINT_W3FDIF = "w3fdif=filter=simple:mode=field:parity=auto:deint=all";
-inline constexpr const char *SW_DEINT_YADIF_FALLBACK = "yadif=mode=send_field:parity=auto:deint=all";
+// SW deinterlacers, field-rate (2x, matching deinterlace_vaapi=rate=field). deint=interlaced acts per
+// frame on the picture's flag: MPEG-2 toggles progressive_frame per-GOP, so a fixed verdict would comb
+// progressive frames or needlessly double-rate them. mode/parity stay at their field-rate defaults;
+// w3fdif filter=simple (3-tap) is lighter than the default complex (9-tap) with little loss on broadcast.
+inline constexpr const char *SW_DEINT_BWDIF = "bwdif=deint=interlaced";
+inline constexpr const char *SW_DEINT_W3FDIF = "w3fdif=filter=simple:deint=interlaced";
 
 // Software denoise (hqdn3d luma_spatial:chroma_spatial:luma_tmp:chroma_tmp) presets.
 inline constexpr const char *SW_DENOISE_MINIMAL = "hqdn3d=1.0:1.0:2.0:2.0";
@@ -340,8 +338,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const int fpsNum = params.fpsNum > 0 ? params.fpsNum : 50;
     const int fpsDen = params.fpsDen > 0 ? params.fpsDen : 1;
 
-    // deinterlace_vaapi rate=field emits two frames per field pair (25i -> 50p).
-    // Round when computing naturalOutputFps so NTSC fractional rates (30000/1001,
+    // rate=field doubles interlaced pairs (25i -> 50p); auto=1/deint=interlaced pass progressive frames
+    // 1:1, so this is the output-rate upper bound. Round naturalOutputFps so NTSC rates (30000/1001,
     // 60000/1001) resolve to 30/60 rather than truncating to 29/59.
     const int fieldRateFactor = isInterlaced ? 2 : 1;
     const int64_t outputRateNum = static_cast<int64_t>(fpsNum) * fieldRateFactor;
@@ -431,17 +429,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         if (!isSoftwareDecode) {
             filters.emplace_back("hwdownload,format=nv12");
         }
-        // Deinterlace (software). A HW-leaning selection that lands here (domain forced by a sw scale/
-        // sharpen) falls back to bwdif. bwdif/w3fdif are FFmpeg core filters; guard anyway.
+        // Deinterlace (software). bwdif unless the user explicitly picked w3fdif; a HW-leaning
+        // selection forced into the SW domain by a sw scale/sharpen lands on bwdif.
         if (isInterlaced) {
-            const bool wantW3fdif = params.userDeint == DeinterlaceMode::SwW3fdif;
-            const char *baseName = wantW3fdif ? "w3fdif" : "bwdif";
-            if (avfilter_get_by_name(baseName) == nullptr) [[unlikely]] {
-                dsyslog("vaapivideo/filter: %s unavailable, falling back to yadif", baseName);
-                filters.emplace_back(SW_DEINT_YADIF_FALLBACK);
-            } else {
-                filters.emplace_back(wantW3fdif ? SW_DEINT_W3FDIF : SW_DEINT_BWDIF);
-            }
+            filters.emplace_back(params.userDeint == DeinterlaceMode::SwW3fdif ? SW_DEINT_W3FDIF : SW_DEINT_BWDIF);
         }
         // Denoise (software hqdn3d) -- only the explicit sw-* presets.
         if (swDenoise) {
@@ -499,17 +490,17 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             if (isSoftwareDecode) {
                 // SW-decoded frame in system memory: VAAPI can't deinterlace it -- bwdif (or spatial
                 // yadif in trick mode) runs before the hwupload below.
-                filters.emplace_back(useSimpleDeinterlace ? "yadif=mode=send_frame:parity=auto:deint=all"
-                                                          : SW_DEINT_BWDIF);
+                filters.emplace_back(useSimpleDeinterlace ? "yadif=deint=interlaced" : SW_DEINT_BWDIF);
             } else if (useSimpleDeinterlace) {
-                // bob rate=frame: spatial-only, single-frame latency; avoids the one-frame priming
-                // buffer that motion_adaptive requires and never drains at trick speeds.
-                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame");
+                // bob: spatial-only, single-frame latency; avoids the motion_adaptive priming buffer that
+                // never drains at trick speeds. auto=1 leaves a progressive paused frame untouched.
+                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame:auto=1");
             } else if (!params.deinterlaceMode.empty()) {
                 // User HW selection clamped to a driver-advertised mode (Auto = best advertised).
+                // auto=1 passes progressive frames through, so per-GOP progressive_frame toggles need no rebuild.
                 const std::string_view deintMode = ClampDeinterlaceMode(
                     params.deinterlaceMode, UserDeintRank(params.userDeint), params.deinterlaceModeMask);
-                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field", deintMode));
+                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=field:auto=1", deintMode));
             }
         }
 
