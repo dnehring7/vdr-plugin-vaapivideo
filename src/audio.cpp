@@ -1509,14 +1509,24 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
 
             // Audio Format Codes (AFC): CEA-861-D Table 37 / CTA-861-H Table 38.
             // SAD byte 0 bits [6:3] = AFC. 0x0F = Extended; actual format in byte 2 [7:3] (EAFC).
-            constexpr uint8_t kCeaAc3 = 0x02;        ///< Dolby Digital (AC-3)
-            constexpr uint8_t kCeaDts = 0x07;        ///< DTS Coherent Acoustics
-            constexpr uint8_t kCeaEac3 = 0x0A;       ///< Dolby Digital Plus (E-AC-3)
-            constexpr uint8_t kCeaDtshd = 0x0B;      ///< DTS-HD Master Audio
-            constexpr uint8_t kCeaTruehd = 0x0C;     ///< Dolby TrueHD (Atmos is a metadata layer on top)
-            constexpr uint8_t kCeaExtended = 0x0F;   ///< Extended format escape -- read EAFC from byte 2
-            constexpr uint8_t kCeaExtMpegh3d = 0x0B; ///< EAFC: MPEG-H 3D Audio
-            constexpr uint8_t kCeaExtAc4 = 0x0C;     ///< EAFC: Dolby AC-4
+            constexpr uint8_t kCeaAc3 = 0x02;      ///< Dolby Digital (AC-3)
+            constexpr uint8_t kCeaAac = 0x06;      ///< AAC (CEA AFC 0x06; 0x05 = MPEG-2 multichannel, 0x08 = ATRAC)
+            constexpr uint8_t kCeaDts = 0x07;      ///< DTS Coherent Acoustics
+            constexpr uint8_t kCeaEac3 = 0x0A;     ///< Dolby Digital Plus (E-AC-3)
+            constexpr uint8_t kCeaDtshd = 0x0B;    ///< DTS-HD Master Audio
+            constexpr uint8_t kCeaTruehd = 0x0C;   ///< Dolby TrueHD (Atmos is a metadata layer on top)
+            constexpr uint8_t kCeaExtended = 0x0F; ///< Extended format escape -- read EAFC from byte 2
+            // EAFC AAC-family advertisements (CTA-861 Audio Coding Extension Type). 0x01/0x02 are the
+            // legacy CEA-861-E HE-AAC codes; 0x04-0x0A are the MPEG-4 variants. All map to sinkCaps.aac.
+            constexpr uint8_t kCeaExtHeAac = 0x01;      ///< EAFC: HE-AAC (legacy)
+            constexpr uint8_t kCeaExtHeAacV2 = 0x02;    ///< EAFC: HE-AAC v2 (legacy)
+            constexpr uint8_t kCeaExtMp4HeAac = 0x04;   ///< EAFC: MPEG-4 HE-AAC
+            constexpr uint8_t kCeaExtMp4HeAacV2 = 0x05; ///< EAFC: MPEG-4 HE-AAC v2
+            constexpr uint8_t kCeaExtMp4AacLc = 0x06;   ///< EAFC: MPEG-4 AAC LC
+            constexpr uint8_t kCeaExtMp4HeAacMs = 0x08; ///< EAFC: MPEG-4 HE-AAC + MPEG Surround
+            constexpr uint8_t kCeaExtMp4AacLcMs = 0x0A; ///< EAFC: MPEG-4 AAC LC + MPEG Surround
+            constexpr uint8_t kCeaExtMpegh3d = 0x0B;    ///< EAFC: MPEG-H 3D Audio
+            constexpr uint8_t kCeaExtAc4 = 0x0C;        ///< EAFC: Dolby AC-4
 
             for (unsigned i = 0; i < sadCount; ++i) {
                 const size_t offset = sadOffset + (i * kSadSize);
@@ -1525,6 +1535,11 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                 switch (formatCode) {
                     case kCeaAc3:
                         sinkCaps.ac3 = true;
+                        break;
+                    case kCeaAac:
+                        // Diagnostic only: recorded + logged, but never enables passthrough.
+                        // Current routing keeps AAC/AAC-LATM on the PCM path.
+                        sinkCaps.aac = true;
                         break;
                     case kCeaDts:
                         sinkCaps.dts = true;
@@ -1540,10 +1555,25 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                         break;
                     case kCeaExtended: {
                         const uint8_t extCode = (eldBuffer.at(offset + 2) >> 3) & 0x1F;
-                        if (extCode == kCeaExtMpegh3d) {
-                            sinkCaps.mpegh = true;
-                        } else if (extCode == kCeaExtAc4) {
-                            sinkCaps.ac4 = true;
+                        switch (extCode) {
+                            case kCeaExtHeAac:
+                            case kCeaExtHeAacV2:
+                            case kCeaExtMp4HeAac:
+                            case kCeaExtMp4HeAacV2:
+                            case kCeaExtMp4AacLc:
+                            case kCeaExtMp4HeAacMs:
+                            case kCeaExtMp4AacLcMs:
+                                // Diagnostic only (see base-AFC AAC case); stays on the PCM path.
+                                sinkCaps.aac = true;
+                                break;
+                            case kCeaExtMpegh3d:
+                                sinkCaps.mpegh = true;
+                                break;
+                            case kCeaExtAc4:
+                                sinkCaps.ac4 = true;
+                                break;
+                            default:
+                                break;
                         }
                         break;
                     }
@@ -1584,6 +1614,9 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         }
     }
 
+    // Plugin-actionable passthrough formats only; `hasAny` gates the "PCM-only" verdict.
+    // AAC is deliberately excluded here -- it is diagnostic-only and appended separately
+    // below so it cannot suppress "PCM-only" on a sink the plugin can only feed PCM.
     constexpr std::array<std::pair<bool AudioSinkCaps::*, std::string_view>, 7> kFormats{
         {{&AudioSinkCaps::ac3, "AC-3"},
          {&AudioSinkCaps::eac3, "E-AC-3"},
@@ -1601,7 +1634,13 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             hasAny = true;
         }
     }
-    isyslog("vaapivideo/audio: %s%s", msg.c_str(), hasAny ? "" : " PCM-only");
+    if (!hasAny) {
+        msg += " PCM-only";
+    }
+    if (sinkCaps.aac) {
+        msg += " AAC-family(diag-only)";
+    }
+    isyslog("vaapivideo/audio: %s", msg.c_str());
 }
 
 [[nodiscard]] auto cAudioProcessor::WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,

@@ -177,6 +177,8 @@ auto AudioSinkCaps::Supports(AVCodecID codec) const noexcept -> bool {
             return ac4;
         case AV_CODEC_ID_MPEGH_3D_AUDIO:
             return mpegh;
+        // AV_CODEC_ID_AAC / AV_CODEC_ID_AAC_LATM deliberately fall through: the `aac` cap is
+        // probed for diagnostics only, and current routing keeps both codecs on the PCM path.
         default:
             return false;
     }

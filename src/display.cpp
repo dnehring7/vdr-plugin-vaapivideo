@@ -73,10 +73,33 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+// --- Page flip ---
 constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
+constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
+    200; ///< Stuck-flip watchdog: force-clear isFlipPending if the kernel swallows the page-flip event.
 constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
 constexpr uint32_t PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+
+// --- Underrun / warmup-grace tracking (display consumer thread) ---
+constexpr uint64_t DISPLAY_UNDERRUN_IDLE_MAX_MS =
+    10000; ///< Gap beyond which a re-present streak is treated as paused / stopped, not an underrun: a
+           ///< stream-paused / radio-mode / suspended-stream scenario can leave lastFrameCommitMs hours in
+           ///< the past, and the recovery log on resume would otherwise scream a multi-hour "queue refilled"
+           ///< event. inTrick / inSyncSleep catch the explicit pause paths; this is the catch-all.
+constexpr int DISPLAY_UNDERRUN_LOG_INTERVAL_MS = 2000; ///< Min interval between underrun-onset dsyslog lines.
+constexpr auto DISPLAY_UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
+///< Empty-VSync streak that trips an underrun log (thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs).
+///< SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
+///<   SLOTS -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
+///<   + 1   -> grace VSync for the decoder to catch up (single hiccup, no log)
+///<   + 1   -> one more sample so the trigger fires on sustained gaps, not transients
+///< Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't scale linearly:
+///< at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
+constexpr int DISPLAY_WARMUP_ACTIVE_WINDOW_MS =
+    500; ///< Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log).
+constexpr int DISPLAY_WARMUP_GRACE_MS =
+    3000; ///< Post-idle grace suppressing underrun logs while the pipeline re-anchors after a resume.
 
 // ============================================================================
 // === HELPER FUNCTIONS ===
@@ -679,26 +702,12 @@ auto cVaapiDisplay::Action() -> void {
     // loop is preempted or page_flip events arrive late: a 4 s real-time stall could be
     // mis-reported as 25 vsyncs * 20 ms (=500 ms) or, with a stale-reset bug, as 238 * 20 ms.
     // Wall-clock makes the printed value true by construction.
+    // Tunables for this tracker are file-scope constants above (DISPLAY_UNDERRUN_* / DISPLAY_WARMUP_*).
     //
-    // UNDERRUN_THRESHOLD_VSYNCS = SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
-    //   SLOTS    -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
-    //   + 1      -> grace VSync for the decoder to catch up (single hiccup, no log)
-    //   + 1      -> one more sample so the trigger fires on sustained gaps, not transients
-    // Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't
-    // scale linearly: at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
-    constexpr auto UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
-    constexpr int ACTIVE_WINDOW_MS = 500;
-    constexpr int UNDERRUN_LOG_COOLDOWN_MS = 2000;
-    constexpr int WARMUP_GRACE_MS = 3000;
-    // Beyond this the gap is no longer treated as an underrun: a stream-paused / radio-mode /
-    // suspended-stream scenario can leave lastCommitMs hours in the past, and the recovery log
-    // on resume would otherwise scream a multi-hour "queue refilled" event. inTrick / inSyncSleep
-    // catch the explicit pause paths; this is the catch-all for everything else.
-    constexpr uint64_t IDLE_THRESHOLD_MS = 10000;
     // refreshRate is set once in Initialize() before Action() starts and stays constant for
     // the consumer-thread lifetime, so vsyncMs / thresholdMs are loop invariants -- hoisted.
     const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
-    const uint64_t thresholdMs = UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
+    const uint64_t thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
     uint64_t gapStartMs = 0;      ///< Wall-clock baseline for the current gap; 0 = "anchor on next re-present".
                                   ///< Reset on commit / isClearing / inTrick / inSyncSleep so a deliberate sleep
                                   ///< or trick-pace exit does not surface its duration as a fake underrun.
@@ -720,13 +729,12 @@ auto cVaapiDisplay::Action() -> void {
         // VSync gate: don't queue a new flip until the previous one's event has arrived.
         // 5 ms poll avoids busy-spinning; page_flip_handler latency is the real bottleneck.
         // Recovery: on first plane attach over HDMI, the kernel occasionally swallows the page
-        // flip event (link renegotiation, sink probe failure, etc.). After PAGE_FLIP_STUCK_MS the
+        // flip event (link renegotiation, sink probe failure, etc.). After DISPLAY_PAGE_FLIP_STUCK_MS the
         // event isn't coming -- force-clear so the next commit can proceed.
         if (isFlipPending.load(std::memory_order_relaxed)) {
             (void)DrainDrmEvents(5);
-            constexpr uint64_t PAGE_FLIP_STUCK_MS = 200;
             const uint64_t since = flipPendingSinceMs.load(std::memory_order_acquire);
-            if (since != 0 && cTimeMs::Now() - since > PAGE_FLIP_STUCK_MS &&
+            if (since != 0 && cTimeMs::Now() - since > DISPLAY_PAGE_FLIP_STUCK_MS &&
                 isFlipPending.load(std::memory_order_relaxed)) {
                 esyslog("vaapivideo/display: page-flip event missing after %llums, forcing recovery",
                         static_cast<unsigned long long>(cTimeMs::Now() - since));
@@ -797,14 +805,14 @@ auto cVaapiDisplay::Action() -> void {
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
                             // Arm warmup grace whenever decoder resumes from idle: post-Clear
-                            // (lastCommit==0) OR after a long gap (commit > ACTIVE_WINDOW_MS old).
+                            // (lastCommit==0) OR after a long gap (commit > DISPLAY_WARMUP_ACTIVE_WINDOW_MS old).
                             // The latter covers transitions where BeginStreamSwitch wasn't invoked
                             // (track switch, post-trick re-anchor). Done under importMutex so a
                             // BeginStreamSwitch racing this commit cannot republish a stale value.
                             const uint64_t prevCommitMs = lastFrameCommitMs.load(std::memory_order_relaxed);
                             const uint64_t nowMs = cTimeMs::Now();
-                            if (prevCommitMs == 0 || nowMs - prevCommitMs > ACTIVE_WINDOW_MS) {
-                                warmupGraceUntil.Set(WARMUP_GRACE_MS);
+                            if (prevCommitMs == 0 || nowMs - prevCommitMs > DISPLAY_WARMUP_ACTIVE_WINDOW_MS) {
+                                warmupGraceUntil.Set(DISPLAY_WARMUP_GRACE_MS);
                             }
                             lastFrameCommitMs.store(nowMs, std::memory_order_release);
                             // Recovery log: onset fires at THRESHOLD regardless of how long the
@@ -843,7 +851,7 @@ auto cVaapiDisplay::Action() -> void {
                 // grace. Gap duration is measured from gapStartMs (NOT lastFrameCommitMs):
                 // anchoring on the first re-present in a streak means a deliberate hard-ahead
                 // sleep, trick hold or stream-switch does not surface its own duration as a fake
-                // underrun the moment it ends. Beyond IDLE_THRESHOLD_MS we stop accumulating so
+                // underrun the moment it ends. Beyond DISPLAY_UNDERRUN_IDLE_MAX_MS we stop accumulating so
                 // a paused stream doesn't grow peakGapMs without bound.
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
@@ -852,16 +860,16 @@ auto cVaapiDisplay::Action() -> void {
                         gapStartMs = nowMs; // anchor: first re-present of the current gap
                     }
                     const uint64_t currentGapMs = nowMs - gapStartMs;
-                    if (currentGapMs < IDLE_THRESHOLD_MS) {
+                    if (currentGapMs < DISPLAY_UNDERRUN_IDLE_MAX_MS) {
                         ++emptyVSyncTotal;
                         peakGapMs = std::max(peakGapMs, currentGapMs);
                         if (currentGapMs >= thresholdMs && underrunLogCooldown.TimedOut()) {
                             dsyslog("vaapivideo/display: queue empty %llums; total=%u",
                                     static_cast<unsigned long long>(currentGapMs), emptyVSyncTotal);
-                            underrunLogCooldown.Set(UNDERRUN_LOG_COOLDOWN_MS);
+                            underrunLogCooldown.Set(DISPLAY_UNDERRUN_LOG_INTERVAL_MS);
                         }
                     } else {
-                        // Gap exceeded IDLE_THRESHOLD_MS: treat as paused / stopped, not as an
+                        // Gap exceeded DISPLAY_UNDERRUN_IDLE_MAX_MS: treat as paused / stopped, not as an
                         // underrun. Clear peak so the recovery log stays silent on resume;
                         // gapStartMs stays put so we don't re-anchor and start a fresh accounting
                         // window every iteration during a long pause.

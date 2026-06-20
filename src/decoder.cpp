@@ -101,35 +101,42 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+// --- Packet / present queues ---
 constexpr size_t DECODER_QUEUE_CAPACITY =
     200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to DECODER_TRICK_QUEUE_DEPTH.
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< VSync backpressure budget inside display->SubmitFrame().
-constexpr int DECODER_CATCHUP_LOG_THROTTLE_MS =
+
+// --- Sync controller: catch-up ---
+constexpr int DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS =
     2000; ///< Min interval between catch-up entry/exit log pairs. Suppresses log flood during sustained
           ///< slow-decode cycling (e.g. VVC SW decode on hardware without VVC HW support); the next
           ///< non-throttled entry emits an aggregated summary of the suppressed cycles.
-constexpr int DECODER_CATCHUP_SUMMARY_INTERVAL_MS =
-    10000; ///< Periodic summary cadence while catch-up keeps cycling under throttle.
+constexpr int DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS =
+    10000; ///< Periodic summary cadence while catch-up keeps cycling under the log interval.
+
+// --- Sync controller: corridor / EMA / hard transients ---
 constexpr int DECODER_SYNC_COOLDOWN_MS = 5000; ///< Min interval between soft corrections; equals 5x EMA time constant.
-constexpr int64_t DECODER_SYNC_CORRIDOR_90K =
-    50 * PTS_TICKS_PER_MS; ///< Soft half-width: 50 ms in 90k ticks. Below the ~80 ms lipsync percept threshold.
 constexpr int DECODER_SYNC_HINT_MAX_AGE_MS =
     DECODER_SYNC_COOLDOWN_MS; ///< Max age of a pre-correction stableDelta snapshot before it counts as stale and the
                               ///< hint falls back to the current smoothedDelta. Mirrors the soft-correction cooldown:
                               ///< if no correction has fired in this window, smoothedDelta is in its own steady-state
                               ///< and is a better seed than an older snapshot from a different operating point.
+constexpr int64_t DECODER_SYNC_CORRIDOR_90K =
+    50 * PTS_TICKS_PER_MS; ///< Soft half-width: 50 ms in 90k ticks. Below the ~80 ms lipsync percept threshold.
 constexpr int DECODER_SYNC_EMA_SAMPLES =
     50; ///< EMA alpha = 1/N (~= 1 s @ 50 fps). Residual accumulator avoids truncation stall.
-constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear() / track switch / trick-exit.
-constexpr int64_t DECODER_SYNC_HARD_THRESHOLD_90K =
-    200 * PTS_TICKS_PER_MS; ///< 200 ms in 90k ticks. Beyond this the soft corridor cannot recover in one event.
-constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Periodic sync-stats dsyslog cadence.
-constexpr int DECODER_SYNC_MAX_CORRECTION_MS = static_cast<int>(DECODER_SYNC_HARD_THRESHOLD_90K / PTS_TICKS_PER_MS);
-///< Per-event cap = HARD_THRESHOLD (200 ms); one event clears any in-corridor offset.
 constexpr int DECODER_SYNC_WARMUP_SAMPLES =
     50; ///< Mean-seed samples before EMA starts; sqrt(N) cuts 50p deinterlace bias.
+constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Periodic sync-stats dsyslog cadence.
+constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;     ///< Unpaced frames after Clear() / track switch / trick-exit.
+constexpr int64_t DECODER_SYNC_HARD_THRESHOLD_90K =
+    200 * PTS_TICKS_PER_MS; ///< 200 ms in 90k ticks. Beyond this the soft corridor cannot recover in one event.
+constexpr int DECODER_SYNC_CORRECTION_MAX_MS = static_cast<int>(DECODER_SYNC_HARD_THRESHOLD_90K / PTS_TICKS_PER_MS);
+///< Per-event soft-correction cap = HARD_THRESHOLD (200 ms); one event clears any in-corridor offset.
 constexpr int DECODER_SYNC_HARD_AHEAD_MAX_MS =
     500; ///< Live hard-ahead sleep cap (ms); prevents indefinite chase + upstream queue overflow.
+
+// --- Present-thread drain ---
 // DECODER_RESERVE_HARD_CAP lives in decoder.h (statically coupled to the mediaplayer backpressure gate).
 constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
     3000; ///< Drop any head sitting more than this far ahead of audio_clock. Such an offset is a real
@@ -146,6 +153,8 @@ constexpr uint64_t DECODER_NO_CLOCK_HOLD_MS =
           ///< freerun. Keeps post-seek frames buffered so the head doesn't run ahead of the clock at
           ///< VSync rate. Bounded so a video-only stream (ap non-null, no audio anchor ever) does not
           ///< freeze forever; the nearCap escape additionally bypasses it if jitterBuf hits the cap.
+
+// --- Trick-play pacing ---
 constexpr int VDR_SLOW_REVERSE_SPEED_MULT =
     12; ///< VDR dvbplayer.c SPEED_MULT. Slow FORWARD passes the bare slowdown factor (2/4/8); slow REVERSE
         ///< passes slowdown * this, clamped to MAX_VIDEO_SLOWMOTION (24/48/96 -> 63). Divided back out in
@@ -2485,7 +2494,8 @@ auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserv
     // not the previous logged entry. Keying off the logged entry (the earlier design) forced a
     // log every THROTTLE_MS and made the periodic "sustained" summary unreachable, because
     // suppression reset before the longer summary interval could elapse.
-    const bool runActive = lastCatchUpEntryMs != 0 && (nowMs - lastCatchUpEntryMs) < DECODER_CATCHUP_LOG_THROTTLE_MS;
+    const bool runActive =
+        lastCatchUpEntryMs != 0 && (nowMs - lastCatchUpEntryMs) < DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS;
     lastCatchUpEntryMs = nowMs;
     if (runActive) {
         // Inside a cycling run: suppress this entry (and its exit). The exit path aggregates
@@ -2795,7 +2805,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                 suppressedCatchUpWallMs += cycleWallMs;
                 if (nextCatchUpSummaryMs == 0) {
                     // First suppression of this run -- schedule the periodic summary.
-                    nextCatchUpSummaryMs = exitNowMs + DECODER_CATCHUP_SUMMARY_INTERVAL_MS;
+                    nextCatchUpSummaryMs = exitNowMs + DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS;
                 } else if (exitNowMs >= nextCatchUpSummaryMs) {
                     // Run still going at the summary interval: emit a periodic "sustained" line and
                     // reset the aggregate so the count reflects one interval, not the whole run.
@@ -2803,11 +2813,11 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                             "in last %dms (decoder unable to keep up)",
                             suppressedCatchUpCycles, suppressedCatchUpDrops,
                             static_cast<unsigned long long>(suppressedCatchUpWallMs),
-                            DECODER_CATCHUP_SUMMARY_INTERVAL_MS);
+                            DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS);
                     suppressedCatchUpCycles = 0;
                     suppressedCatchUpDrops = 0;
                     suppressedCatchUpWallMs = 0;
-                    nextCatchUpSummaryMs = exitNowMs + DECODER_CATCHUP_SUMMARY_INTERVAL_MS;
+                    nextCatchUpSummaryMs = exitNowMs + DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS;
                 }
             }
             catchingUp = false;
@@ -2932,7 +2942,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         const int64_t absDelta90k = smoothedDelta90k < 0 ? -smoothedDelta90k : smoothedDelta90k;
         if (absDelta90k > DECODER_SYNC_CORRIDOR_90K) {
             const int correctMs =
-                std::min(static_cast<int>(std::abs(rawDelta) / PTS_TICKS_PER_MS), DECODER_SYNC_MAX_CORRECTION_MS);
+                std::min(static_cast<int>(std::abs(rawDelta) / PTS_TICKS_PER_MS), DECODER_SYNC_CORRECTION_MAX_MS);
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
 
             if (smoothedDelta90k < 0) {

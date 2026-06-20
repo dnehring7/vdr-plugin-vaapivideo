@@ -32,7 +32,7 @@ inline constexpr size_t DISPLAY_PRERENDER_SLOTS =
        ///< without draining the cache and forcing a re-present. SubmitFrame blocks when all slots
        ///< are full so audio clock stays in lipsync (the whole pipeline is delayed in lockstep, not
        ///< just video). FHD HW paths never fill past 1-2 slots; the extra depth is a no-op there.
-       ///< COUPLED to display.cpp's UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2); revisit that margin if you
+       ///< COUPLED to display.cpp's DISPLAY_UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2); revisit that margin if you
        ///< change this (the relationship is not linear -- see the note at that definition).
 
 // ============================================================================

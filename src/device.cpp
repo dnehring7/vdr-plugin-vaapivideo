@@ -767,7 +767,7 @@ auto cVaapiDevice::Freeze() -> void {
     }
     // Suppress the display's underrun ("queue empty Nms") log: with the decoder holding the drain,
     // re-presents of the last frame are intentional, not a stall. Without this gate the per-pause
-    // syslog gains a stream of vsync-rate underrun lines until the display's 10 s IDLE_THRESHOLD
+    // syslog gains a stream of vsync-rate underrun lines until the display's 10 s DISPLAY_UNDERRUN_IDLE_MAX_MS
     // catch-all kicks in (i.e. several entries per pause are typical).
     if (display) [[likely]] {
         display->SetDevicePaused(true);

@@ -148,16 +148,30 @@ edges. `jitterBuf` and the sync controller stay present-thread-private (no lock)
 
 ## Filter pipeline
 
+Two filter domains, selected by `useSwPost` (true when a `sw-*`
+deinterlace/denoise/scale/sharpen preset is active and the stream is not HDR
+passthrough / UHD / simple-deint):
+
 ```
-SW decode: [bwdif|yadif] → [hqdn3d] → format=nv12 → [crop] → hwupload → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
-HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → [crop] → scale_vaapi → [sharpness_vaapi] [→ fps]
+GPU VPP domain (default / "auto" presets):
+  SW decode: [bwdif|yadif] → [hqdn3d] → format=nv12|p010le → [crop] → hwupload → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
+  HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → [crop] → scale_vaapi → [sharpness_vaapi] [→ fps]
+
+Hybrid SW/HW domain (a sw-* preset is active) — HW decode adds one hwdownload; all paths end with one hwupload:
+  [hwdownload (HW decode only)] → [bwdif|w3fdif] → [hqdn3d] → [crop → swscale] → [unsharp] → hwupload → [denoise_vaapi] → [crop → scale_vaapi] → [sharpness_vaapi] [→ fps]
 ```
 
-Bracketed nodes are conditional: `[bwdif|yadif]` on interlaced input
-(`yadif`/`bob` in trick / still mode), `[hqdn3d]`/`[denoise_vaapi]`/`[sharpness_vaapi]`
-on codec + GPU-VPP availability, `[crop]` only while a manual-zoom preset is
-active, and `[fps]` per invariant 3. `scale_vaapi` is always present — it
-normalizes pixel format + colorimetry even when not resizing.
+Bracketed nodes are conditional. In the GPU VPP domain the chain forks again on
+decode path (`isSoftwareDecode`): a SW-decoded frame is uploaded mid-chain
+(`format=nv12|p010le`, `p010le` under HDR, then `hwupload`), while a HW-decoded
+frame deinterlaces and scales natively. `[bwdif|yadif]` runs on interlaced input
+(`yadif`/`bob` in trick / still mode); `[hqdn3d]` is an MPEG-2-only SW-denoise
+fallback used when the GPU lacks `denoise_vaapi`;
+`[denoise_vaapi]`/`[sharpness_vaapi]` depend on codec + GPU-VPP availability;
+`[crop]` is active only while a manual-zoom preset is; and `[fps]` per invariant
+3. In the GPU VPP domain `scale_vaapi` is always present — it normalizes pixel
+format + colorimetry even when not resizing (the hybrid domain may run `swscale`
+instead when a `sw-*` scale/sharpen pulls scaling into the SW segment).
 
 `fps` only duplicates or drops `AVFrame` references; it never reprocesses pixels.
 Placing it at the chain tail keeps scale/denoise/sharpen at one execution per
@@ -225,7 +239,7 @@ bypass the cooldown.
 
 ### Soft corridor — `|smoothed| > CORRIDOR (50 ms)`, cooldown elapsed
 
-`correctMs = min(|rawDelta| / 90, MAX_CORRECTION_MS = 200)`.
+`correctMs = min(|rawDelta| / 90, DECODER_SYNC_CORRECTION_MAX_MS = 200)`.
 
 | Direction | Action |
 | --------- | ------ |
@@ -241,7 +255,7 @@ The behind path resets the EMA so the next warmup (~1 s) re-measures from the
 post-correction reality, removing any open-loop bump. One short burst lands a real
 correction; that is what makes post-correction `d ≈ 0` reproducible.
 
-`MAX_CORRECTION_MS = HARD_THRESHOLD = 200` (it is *derived* from
+`DECODER_SYNC_CORRECTION_MAX_MS = HARD_THRESHOLD = 200` (it is *derived* from
 `HARD_THRESHOLD`), so a single soft event can fully close the corridor with no
 sub-corridor residual left to re-fire on.
 
@@ -290,14 +304,18 @@ no EMA churn, no cooldown arm — until `rawDelta` rises above `−CORRIDOR`. Tw
 lines bracket the pass:
 
 ```
-vaapivideo/decoder: catch-up entered (spike|warmup|sustained) raw=-2738ms
+vaapivideo/decoder: catch-up entered (spike) raw=-2738ms
+vaapivideo/decoder: catch-up entered (sustained) avg=-118ms raw=-2738ms
 vaapivideo/decoder: catch-up complete dropped=143 wall=314ms exit-raw=-38ms follow-up=4 (target=+10ms)
 ```
 
+The `sustained` entry additionally carries the `avg=<smoothedDelta>ms` that
+triggered it; `spike` / `warmup` print `raw=` only.
+
 When catch-up *cycles* (e.g. a VVC SW decode that can't sustain real time), those
-lines are throttled to one per `DECODER_CATCHUP_LOG_THROTTLE_MS = 2 s`; suppressed
+lines are throttled to one per `DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS = 2 s`; suppressed
 cycles fold into a periodic `catch-up cycling sustained: …` line every
-`DECODER_CATCHUP_SUMMARY_INTERVAL_MS = 10 s`, with a final `catch-up cycling
+`DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS = 10 s`, with a final `catch-up cycling
 settled: …` when it stops.
 
 The entry (−100 ms) and exit (−50 ms) thresholds give `CORRIDOR` of hysteresis.
@@ -471,7 +489,7 @@ warmup grace):
 
 1. Anchor `gapStartMs = nowMs` if it's `0`.
 2. `currentGapMs = nowMs − gapStartMs`.
-3. If `currentGapMs < IDLE_THRESHOLD_MS (10 s)`: update `peakGapMs`, and if
+3. If `currentGapMs < DISPLAY_UNDERRUN_IDLE_MAX_MS (10 s)`: update `peakGapMs`, and if
    `currentGapMs ≥ thresholdMs` and the log cooldown elapsed, emit
    `queue empty Nms; total=M`.
 4. Else (gap ≥ 10 s): treat as paused / stopped, clear `peakGapMs`, leave
@@ -483,24 +501,24 @@ plus one so a single hiccup doesn't trip. On the next fresh commit, if
 `peakGapMs ≥ thresholdMs` the recovery line `queue refilled after Nms; total=M`
 reports the peak; then `gapStartMs`/`peakGapMs` reset.
 
-Onset is rate-limited to once per `UNDERRUN_LOG_COOLDOWN_MS = 2 s`. `isClearing`,
+Onset is rate-limited to once per `DISPLAY_UNDERRUN_LOG_INTERVAL_MS = 2 s`. `isClearing`,
 `inTrick`, `inSyncSleep`, and `inPause` (device frozen) each force `gapStartMs = 0`
 so a deliberate hard-ahead sleep (≤ 500 ms), trick hold, or pause does not surface
-its own duration as a fake underrun. A `PAGE_FLIP_STUCK_MS = 200 ms` watchdog
+its own duration as a fake underrun. A `DISPLAY_PAGE_FLIP_STUCK_MS = 200 ms` watchdog
 force-clears `isFlipPending` if the kernel swallows the page-flip event.
 
 ### Warmup grace
 
-`WARMUP_GRACE_MS = 3 s` suppresses the underrun gate for the first 3 s after the
+`DISPLAY_WARMUP_GRACE_MS = 3 s` suppresses the underrun gate for the first 3 s after the
 decoder resumes from idle. Armed on a fresh commit when:
 
 - `lastFrameCommitMs == 0` (post-`Clear()` reset), OR
-- `nowMs − lastFrameCommitMs > ACTIVE_WINDOW_MS (500 ms)` (idle resume where
+- `nowMs − lastFrameCommitMs > DISPLAY_WARMUP_ACTIVE_WINDOW_MS (500 ms)` (idle resume where
   `BeginStreamSwitch` wasn't invoked — track switch, post-trick re-anchor).
 
 Without it, every `Clear()` would log a spurious underrun while the filter graph
-rebuilds and the audio clock anchors. `ACTIVE_WINDOW_MS` exists only to arm this
-grace — it does **not** gate the underrun log (that gate is `IDLE_THRESHOLD_MS`).
+rebuilds and the audio clock anchors. `DISPLAY_WARMUP_ACTIVE_WINDOW_MS` exists only to arm this
+grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_IDLE_MAX_MS`).
 
 ## Sync bypass
 
@@ -559,8 +577,8 @@ sync d=+15.2ms avg=+15.1ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
 | `lat`  | Active `SyncLatency90k` (1-frame tail + active operator knob) |
 | `buf`  | `jitterBuf` depth in frames at log emission |
 | `aq`   | Audio packet queue depth |
-| `miss` | Drain gaps > 2 × output frame period since last log (VSync backpressure, deliberate sync sleeps) |
-| `drop` | Frames dropped (video behind) since last log — soft + hard combined |
+| `miss` | Drain gaps > 2 × output frame period since last log (upstream starvation; deliberate sync sleeps and trick-play holds are explicitly excluded via `sleptInLastSubmit`) |
+| `drop` | Frames dropped (video behind) since last log — soft-behind, hard-behind, catch-up, stale-jitter, and pending-drop bursts combined |
 | `skip` | Render delays (video ahead) since last log — soft sleep + hard-ahead combined |
 
 `d ≈ avg` in steady state means the EMA has converged on current reality. The line
@@ -592,54 +610,111 @@ or throughput-bound:
 - **Throughput-bound** (replay post-`Clear()`, `buf ≈ 0`): `d ≈ −frameDur`
   (~−20 ms @ 50 fps). Each frame is submitted as soon as decoded — no buffered
   lead — and the audio clock has advanced past the latency target by the time
-  `SyncAndSubmit` runs. The 1-frame pipeline-latency tail keeps this well inside
-  `CORRIDOR`, leaving ~30 ms of headroom before a typical 10–15 ms/s
+  `SyncAndSubmitFrame` runs. The 1-frame pipeline-latency tail keeps this well
+  inside `CORRIDOR`, leaving ~30 ms of headroom before a typical 10–15 ms/s
   pipeline/crystal drift could trip soft-behind.
 
-To re-center either regime, tune `PcmLatency` / `PassthroughLatency` (negative
-values pull video earlier vs audio).
+To re-center either regime, tune `PcmLatency` / `PassthroughLatency`. Since
+`rawDelta = videoPTS − GetClock() − pipelineLatency`, a **positive** value
+subtracts more from `rawDelta`, releasing each frame at an earlier audio-clock
+value — i.e. positive latency pulls video earlier vs audio (it delays audio
+relative to video, per `config.h`).
 
 ## Constants
 
-File-scope constants live in [src/decoder.cpp](src/decoder.cpp),
-[src/decoder.h](src/decoder.h), [src/audio.cpp](src/audio.cpp),
-[src/audio.h](src/audio.h), and [src/config.h](src/config.h); each carries a
-`///<` comment with purpose and unit. Constants marked *(local)* live inside the
-function that uses them.
+Every constant below is file-scope — in [src/config.h](src/config.h),
+[src/audio.h](src/audio.h), [src/audio.cpp](src/audio.cpp),
+[src/decoder.h](src/decoder.h), [src/decoder.cpp](src/decoder.cpp), or
+[src/display.cpp](src/display.cpp) — and each carries a `///<` comment with
+purpose and unit. Within each file they are grouped by sub-function under
+`// --- label ---` rulers; the groups below mirror that layout.
 
 Naming conventions:
 
-- `_MS` — milliseconds.
-- `_90K` — 90 kHz PTS ticks (matches code variables like `rawDelta`,
-  `smoothedDelta90k`, `latency90k`).
-- no suffix — dimensionless (sample / frame counts, depths).
+- A module prefix (`PTS_` / `AUDIO_` / `DECODER_` / `DISPLAY_` / `CONFIG_` /
+  `VDR_`) names the owning subsystem.
+- `_MS` — milliseconds; `_90K` — 90 kHz PTS ticks (matches code variables like
+  `rawDelta`, `smoothedDelta90k`, `latency90k`); `_VSYNCS` — display refresh
+  periods; no suffix — dimensionless (sample / frame / slot counts, depths).
+  (`PTS_TICKS_PER_MS` is the lone exception: there `_MS` means *per* millisecond.)
+- `_MAX_MS` / `_MIN_MS` — a cap or clamp bound, with `MAX`/`MIN` trailing before
+  the unit (`DECODER_SYNC_CORRECTION_MAX_MS`, `DECODER_DRAIN_FUTURE_MAX_MS`,
+  `CONFIG_AUDIO_LATENCY_MAX_MS`).
+
+**Clock & audio** (config.h, audio.h, audio.cpp)
+
+| Constant                      | Value | Purpose |
+| ----------------------------- | ----- | ------- |
+| `PTS_TICKS_PER_MS`            | 90    | DVB 90 kHz PTS clock factor: ticks = ms × this (here `_MS` means *per* ms) |
+| `AUDIO_ALSA_BUFFER_MS`        | 400   | ALSA ring size (ms); the lagged audio clock pulls live `buf` to ~MS/frameDur |
+| `AUDIO_CLOCK_STALE_MS`        | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
+| `AUDIO_QUEUE_HIGHWATER`       | 10    | Active audio-feed backpressure gate (~320 ms AC-3); paces both replay and mediaplayer |
+| `AUDIO_QUEUE_CAPACITY`        | 100   | Audio packet-queue overflow backstop (~3.2 s); HIGHWATER is the real gate |
+| `CONFIG_AUDIO_LATENCY_MIN_MS` | −200  | Lower clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
+| `CONFIG_AUDIO_LATENCY_MAX_MS` | 200   | Upper clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
+
+**Video queues & decode-ahead reserve** (decoder.h, decoder.cpp)
+
+| Constant                    | Value | Purpose |
+| --------------------------- | ----- | ------- |
+| `DECODER_QUEUE_CAPACITY`    | 200   | Video packet queue depth (~4 s @ 50 fps) |
+| `DECODER_SUBMIT_TIMEOUT_MS` | 100   | Present-side VSync backpressure budget inside `display->SubmitFrame()` |
+| `DECODER_RESERVE_HARD_CAP`  | 64    | Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps **total**); decode-side backpressure / present-side drop-oldest guard; also bounds 4K-surface GTT |
+
+**Sync controller — corridor / EMA / cooldown** (decoder.cpp)
+
+| Constant                       | Value | Purpose |
+| ------------------------------ | ----- | ------- |
+| `DECODER_SYNC_COOLDOWN_MS`     | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
+| `DECODER_SYNC_HINT_MAX_AGE_MS` | 5000  | Max age (= `…COOLDOWN_MS`) of a pre-correction `stableDelta` snapshot before the seek hint falls back to the current `smoothedDelta` |
+| `DECODER_SYNC_CORRIDOR_90K`    | 4500  | Soft corridor half-width (= 50 ms × `PTS_TICKS_PER_MS`); below lipsync percept threshold |
+| `DECODER_SYNC_EMA_SAMPLES`     | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
+| `DECODER_SYNC_WARMUP_SAMPLES`  | 50    | Samples averaged before the EMA seed (~1 s @ 50 fps) |
+| `DECODER_SYNC_LOG_INTERVAL_MS` | 2000  | Periodic sync diagnostic interval (ms) |
+| `DECODER_SYNC_FREERUN_FRAMES`  | 1     | Unpaced frames after sync-disrupting events |
+
+**Sync controller — hard transients** (decoder.cpp)
+
+| Constant                          | Value | Purpose |
+| --------------------------------- | ----- | ------- |
+| `DECODER_SYNC_HARD_THRESHOLD_90K` | 18000 | Hard-transient threshold (= 200 ms × `PTS_TICKS_PER_MS`); 2× = catch-up spike entry |
+| `DECODER_SYNC_CORRECTION_MAX_MS`  | 200   | Soft-event cap, derived = `HARD_THRESHOLD ÷ PTS_TICKS_PER_MS`, so one event fully closes the corridor |
+| `DECODER_SYNC_HARD_AHEAD_MAX_MS`  | 500   | Live hard-ahead sleep cap (ms) |
+
+**Sync controller — catch-up logging** (decoder.cpp)
+
+| Constant                                   | Value | Purpose |
+| ------------------------------------------ | ----- | ------- |
+| `DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS`     | 2000  | Min interval between catch-up entry/exit log pairs; suppresses flood during sustained slow-decode cycling |
+| `DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS` | 10000 | Cadence of the aggregated "cycling sustained" summary while catch-up keeps cycling under the log interval |
+
+**Present-thread drain** (decoder.cpp)
+
+| Constant                      | Value | Purpose |
+| ----------------------------- | ----- | ------- |
+| `DECODER_DRAIN_FUTURE_MAX_MS` | 3000  | Future-head discontinuity guard: drop heads > 3 s ahead; smaller offsets hold (still frame) until due |
+| `DECODER_NO_CLOCK_HOLD_MS`    | 1500  | Walltime the drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before no-clock freerun (covers the mux-interleave seek offset) |
+
+**Trick-play pacing** (decoder.h, decoder.cpp)
 
 | Constant                            | Value | Purpose |
 | ----------------------------------- | ----- | ------- |
-| `PTS_TICKS_PER_MS`                  | 90    | DVB 90 kHz PTS clock factor: ticks = ms × this |
-| `AUDIO_ALSA_BUFFER_MS`              | 400   | ALSA ring size (ms); the lagged audio clock pulls live `buf` to ~MS/frameDur |
-| `AUDIO_CLOCK_STALE_MS`              | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
-| `AUDIO_QUEUE_HIGHWATER`             | 10    | Active audio-feed backpressure gate (~320 ms AC-3); paces both replay and mediaplayer (audio.h) |
-| `AUDIO_QUEUE_CAPACITY`              | 100   | Audio packet-queue overflow backstop (~3.2 s); HIGHWATER is the real gate (audio.h) |
-| `DECODER_QUEUE_CAPACITY`            | 200   | Video packet queue depth (~4 s @ 50 fps) |
-| `DECODER_RESERVE_HARD_CAP`          | 64    | Per-stage cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps each); decode-side backpressure / present-side drop-oldest guard; also bounds 4K-surface GTT (decoder.h) |
 | `DECODER_TRICK_QUEUE_DEPTH`         | 1     | Handoff reserve depth during trick play (Poll() throttles the producer; overflow drops incoming) |
-| `DECODER_TRICK_HOLD_MS`             | 20    | Base per-frame hold for slow trick (~one field period @ 50 Hz); fast trick scales by the speed multiplier |
-| `DECODER_SYNC_CORRIDOR_90K`         | 4500  | Soft corridor half-width (= 50 ms × PTS_TICKS_PER_MS); below lipsync percept threshold |
-| `DECODER_SYNC_HARD_THRESHOLD_90K`   | 18000 | Hard-transient threshold (= 200 ms × PTS_TICKS_PER_MS); 2× = catch-up spike entry |
-| `DECODER_SYNC_MAX_CORRECTION_MS`    | 200   | Soft-event cap, derived = HARD_THRESHOLD ÷ PTS_TICKS_PER_MS, so one event fully closes the corridor |
-| `DECODER_SYNC_HARD_AHEAD_MAX_MS`    | 500   | Live hard-ahead sleep cap (ms) |
-| `DECODER_DRAIN_FUTURE_MAX_MS`       | 3000  | Future-head discontinuity guard: drop heads > 3 s ahead; smaller offsets hold (still frame) until due |
-| `DECODER_NO_CLOCK_HOLD_MS`          | 1500  | Walltime the drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before no-clock freerun (covers the mux-interleave seek offset) |
-| `DECODER_SYNC_COOLDOWN_MS`          | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
-| `DECODER_SYNC_EMA_SAMPLES`          | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
-| `DECODER_SYNC_WARMUP_SAMPLES`       | 50    | Samples averaged before the EMA seed (~1 s @ 50 fps) |
-| `DECODER_SYNC_FREERUN_FRAMES`       | 1     | Unpaced frames after sync-disrupting events |
-| `DECODER_SYNC_LOG_INTERVAL_MS`      | 2000  | Periodic sync diagnostic interval (ms) |
-| `DISPLAY_PRERENDER_SLOTS`             | 8     | Present→display prerender depth (= 160 ms @ 50 fps); absorbs a UHD VPP / bandwidth spike + SW-decoder variance |
-| `ACTIVE_WINDOW_MS` *(local)*          | 500   | Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log) |
-| `IDLE_THRESHOLD_MS` *(local)*         | 10000 | Wall-clock streak beyond which a re-present gap is treated as paused / stopped (peak cleared) |
-| `UNDERRUN_LOG_COOLDOWN_MS` *(local)*  | 2000  | Min interval between underrun-onset dsyslog lines |
-| `WARMUP_GRACE_MS` *(local)*           | 3000  | Post-idle grace suppressing underrun logs while the pipeline anchors |
-| `UNDERRUN_THRESHOLD_VSYNCS` *(local)* | 10    | `(PRERENDER_SLOTS + 2)`; `thresholdMs = THRESHOLD_VSYNCS × vsyncMs` is the gap that trips a log |
-| `PAGE_FLIP_STUCK_MS` *(local)*        | 200   | Stuck-flip watchdog: force-clear `isFlipPending` if the kernel swallows the page-flip event |
+| `DECODER_TRICK_HOLD_MS`             | 20    | Base per-frame hold (~one field period @ 50 Hz). Slow **forward** scales it by the slowdown factor (capped at `DECODER_TRICK_SLOW_HOLD_MAX_MS`); fast trick keeps the base hold and scales the frame-skip multiplier; slow **reverse** uses the BASE/STEP/MAX holds below |
+| `DECODER_TRICK_SLOW_HOLD_MAX_MS`    | 200   | Cap on the slow-forward per-frame hold (≥ 5 fps) |
+| `VDR_SLOW_REVERSE_SPEED_MULT`       | 12    | VDR `dvbplayer.c` SPEED_MULT; divided back out in `SetTrickSpeed` to recover the slow-reverse slowdown level |
+| `DECODER_SLOW_REVERSE_HOLD_BASE_MS` | 260   | Slow-reverse per-frame hold floor (reverse steps a fixed ~0.4 s of content per frame) |
+| `DECODER_SLOW_REVERSE_HOLD_STEP_MS` | 70    | Added to the slow-reverse hold per slowdown unit |
+| `DECODER_SLOW_REVERSE_HOLD_MAX_MS`  | 700   | Cap on the slow-reverse hold |
+
+**Display prerender & underrun tracking** (config.h, display.cpp)
+
+| Constant                             | Value | Purpose |
+| ------------------------------------ | ----- | ------- |
+| `DISPLAY_PRERENDER_SLOTS`            | 8     | Present→display prerender depth (= 160 ms @ 50 fps); absorbs a UHD VPP / bandwidth spike + SW-decoder variance |
+| `DISPLAY_WARMUP_ACTIVE_WINDOW_MS`    | 500   | Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log) |
+| `DISPLAY_WARMUP_GRACE_MS`            | 3000  | Post-idle grace suppressing underrun logs while the pipeline anchors |
+| `DISPLAY_UNDERRUN_IDLE_MAX_MS`       | 10000 | Wall-clock streak beyond which a re-present gap is treated as paused / stopped (peak cleared) |
+| `DISPLAY_UNDERRUN_LOG_INTERVAL_MS`   | 2000  | Min interval between underrun-onset dsyslog lines |
+| `DISPLAY_UNDERRUN_THRESHOLD_VSYNCS`  | 10    | `(DISPLAY_PRERENDER_SLOTS + 2)`; `thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS × vsyncMs` is the gap that trips a log |
+| `DISPLAY_PAGE_FLIP_STUCK_MS`         | 200   | Stuck-flip watchdog: force-clear `isFlipPending` if the kernel swallows the page-flip event |

@@ -455,15 +455,15 @@ class cVaapiDecoder : public cThread {
     // --- Catch-up log throttling ---
     // Sustained catch-up cycling (e.g. VVC SW decode, or a marginal HW decoder dropping ~5%) emits one
     // entry+exit pair per cycle, flooding syslog. Cycling is detected by inter-entry gap: two entries
-    // within DECODER_CATCHUP_LOG_THROTTLE_MS of each other are a "run". The first entry of a run logs
+    // within DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS of each other are a "run". The first entry of a run logs
     // normally; subsequent entries in the run are suppressed and aggregated into a periodic
-    // (DECODER_CATCHUP_SUMMARY_INTERVAL_MS) "sustained" summary while the run continues, plus a final
+    // (DECODER_SYNC_CATCHUP_SUMMARY_INTERVAL_MS) "sustained" summary while the run continues, plus a final
     // "settled" summary when the gap exceeds the window (run ended). Controller behavior is unchanged.
-    uint64_t lastCatchUpEntryMs{};      ///< cTimeMs::Now() of the most recent catch-up entry (logged OR suppressed).
-                                        ///< Inter-entry gap vs DECODER_CATCHUP_LOG_THROTTLE_MS detects an active run.
-    bool catchUpLogThisCycle{false};    ///< Set at entry, consulted at exit so suppressed entries don't log their exit.
-    int suppressedCatchUpCycles{};      ///< Cycles aggregated since the run started (or last periodic summary).
-    int suppressedCatchUpDrops{};       ///< Cumulative dropped-frame count of those cycles.
+    uint64_t lastCatchUpEntryMs{};   ///< cTimeMs::Now() of the most recent catch-up entry (logged OR suppressed).
+                                     ///< Inter-entry gap vs DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS detects an active run.
+    bool catchUpLogThisCycle{false}; ///< Set at entry, consulted at exit so suppressed entries don't log their exit.
+    int suppressedCatchUpCycles{};   ///< Cycles aggregated since the run started (or last periodic summary).
+    int suppressedCatchUpDrops{};    ///< Cumulative dropped-frame count of those cycles.
     uint64_t suppressedCatchUpWallMs{}; ///< Cumulative wall time spent inside those cycles.
     uint64_t nextCatchUpSummaryMs{};    ///< cTimeMs::Now() at which the next periodic-during-run summary should fire.
     cTimeMs staleJitterLogGate;         ///< Rate-limits the "stale-jitter bulk" drop log (present thread); a rapid-seek

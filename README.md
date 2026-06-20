@@ -835,12 +835,16 @@ duplicated or dropped as needed — there is no motion interpolation.
 ## Roadmap
 
 - Dynamic resolution switching on SD / HD / UHD channel changes.
-- AV1 live decode path: OBU sequence-header probe + Main / Main 10 backend
-  routing, closing the AV1 live branch (the mediaplayer path already opens
-  AV1 with codec params from the container).
-- Variable refresh rate (HDMI VRR / FreeSync) for judder-free 24p and 25p
-  film playback: tie the DRM page-flip cadence to the decoded stream's
-  frame rate instead of the panel's fixed refresh.
+- Multichannel audio output: the PES path opens the sink as stereo (channel
+  count hard-coded at codec open) and downmixes any 5.1 / 7.1 source to 2 ch.
+  Plumb the decoded frame's channel count through and emit multichannel LPCM —
+  or a re-encoded bitstream on AC-3 / E-AC-3 sinks — honoring the sink ELD
+  (`pcmMaxChannels` and the passthrough SADs).
+- AAC passthrough: ELD AAC-family probing is in place (diagnostic only,
+  `sinkCaps.aac`); remaining work is AAC framing normalization for standard
+  DVB LOAS/LATM and container/raw AAC before `WrapIec61937()`, passthrough
+  policy entries for the supported AAC codec IDs, and `AudioSinkCaps::Supports()`
+  wiring — strictly gated on a sink that advertises AAC-family support.
 - Mediaplayer: subtitle rendering, trick-speed (fast/slow forward and
   reverse) and persistent resume position.
 

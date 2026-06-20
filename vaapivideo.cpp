@@ -106,8 +106,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         Clear();
         // Non-selectable section header (VDR core idiom, cf. menu.c). Groups the page into
         // Audio / Video / Zoom / General; entries are sorted within each group.
-        const auto addHeader = [this](const char *title) -> void {
-            Add(new cOsdItem(*cString::sprintf("--- %s ---", title), osUnknown, false));
+        const auto addHeader = [this](const char *label) -> void {
+            Add(new cOsdItem(*cString::sprintf("--- %s ---", label), osUnknown, false));
         };
 
         // --- Audio ---

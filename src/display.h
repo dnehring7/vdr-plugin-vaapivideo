@@ -174,7 +174,7 @@ class cVaapiDisplay : public cThread {
     auto SetSyncSleeping(bool enable) noexcept -> void { syncSleeping.store(enable, std::memory_order_relaxed); }
     /// Device is paused (cVaapiDevice::Freeze() / Play()): the decoder is intentionally holding
     /// the drain so no fresh frames arrive. While set, the underrun detector ignores re-presents
-    /// so a pause does not spam "queue empty Nms; total=N" at vsync rate for the IDLE_THRESHOLD
+    /// so a pause does not spam "queue empty Nms; total=N" at vsync rate for the DISPLAY_UNDERRUN_IDLE_MAX_MS
     /// window (the existing 10 s catch-all already handles longer pauses, but a normal pause is
     /// short enough that the per-vsync log fires several times before the catch-all kicks in).
     auto SetDevicePaused(bool enable) noexcept -> void { devicePaused.store(enable, std::memory_order_relaxed); }

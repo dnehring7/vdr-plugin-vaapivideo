@@ -30,17 +30,24 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <va/va.h>
@@ -50,6 +57,7 @@
 #include <libdrm/drm.h>
 #include <libdrm/drm_fourcc.h>
 #include <libdrm/drm_mode.h>
+#include <libdrm/i915_drm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -497,15 +505,232 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     std::printf("  %-44s %s\n", name, ok ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
 }
 
+// Friendly vendor name for the common GPU PCI vendor IDs.
+[[nodiscard]] auto PciVendorName(uint16_t vendorId) -> const char * {
+    switch (vendorId) {
+        case 0x8086:
+            return "Intel";
+        case 0x1002:
+            return "AMD/ATI";
+        case 0x10de:
+            return "NVIDIA";
+        case 0x1af4:
+            return "Virtio";
+        default:
+            return "unknown vendor";
+    }
+}
+
+// First parsable unsigned value among candidate sysfs paths. Kernels moved the i915
+// frequency knobs from card<N>/gt_*_freq_mhz to card<N>/gt/gt0/rps_*_freq_mhz, so both
+// layouts are tried in order. from_chars keeps the parse locale-independent.
+[[nodiscard]] auto ReadSysfsUint(std::span<const std::string> paths) -> std::optional<uint64_t> {
+    for (const auto &path : paths) {
+        std::ifstream file(path);
+        std::string line;
+        if (!std::getline(file, line)) {
+            continue;
+        }
+        const char *const base = line.c_str();
+        uint64_t value = 0;
+        if (const auto parsed = std::from_chars(base, base + line.size(), value);
+            parsed.ec == std::errc{} && parsed.ptr != base) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
+// Resolve the sysfs class directory (/sys/class/drm/cardN) from a DRM device's libdrm
+// primary-node path -- robust across primary/render nodes and symlinks, unlike deriving
+// it from the opened fd's minor number. Empty if no primary node is advertised.
+[[nodiscard]] auto DrmSysfsCardDir(const ::drmDevice &dev) -> std::string {
+    if ((dev.available_nodes & (1 << DRM_NODE_PRIMARY)) == 0 || dev.nodes[DRM_NODE_PRIMARY] == nullptr) {
+        return {};
+    }
+    const std::string nodePath{dev.nodes[DRM_NODE_PRIMARY]};
+    const size_t slashPos = nodePath.find_last_of('/');
+    return "/sys/class/drm/" + nodePath.substr(slashPos == std::string::npos ? 0 : slashPos + 1);
+}
+
+// One i915 GETPARAM integer (e.g. EU / subslice topology). nullopt on a non-i915
+// driver or an unsupported parameter.
+[[nodiscard]] auto I915GetParam(int fd, int param) -> std::optional<int> {
+    int value = 0;
+    drm_i915_getparam_t gp{};
+    gp.param = param;
+    gp.value = &value;
+    if (drmIoctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) != 0) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+// Parse a leading base-16 id from a null-terminated line span [first, last). On success
+// returns the value and the past-the-digits pointer; nullopt if no hex digits lead.
+[[nodiscard]] auto ParseHexPrefix(const char *first, const char *last)
+    -> std::optional<std::pair<unsigned, const char *>> {
+    unsigned value = 0;
+    const auto [ptr, ec] = std::from_chars(first, last, value, 16);
+    // pci.ids vendor/device ids are exactly four hex digits; rejecting other lengths stops a
+    // class line like "C 00" from being read as vendor 0x000c.
+    if (ec != std::errc{} || ptr - first != 4) {
+        return std::nullopt;
+    }
+    return std::make_pair(value, ptr);
+}
+
+// Marketing name for a PCI vendor:device pair from the system pci.ids database (the
+// source lspci uses), e.g. 1002:1681 -> "Rembrandt [Radeon 680M]". Empty if the file
+// or the entry is absent. Layout: vendor lines start in column 0, device lines are
+// indented one tab, both "<hex-id>  <name>"; entries are sorted by id.
+[[nodiscard]] auto LookupPciDeviceName(uint16_t vendorId, uint16_t deviceId) -> std::string {
+    static constexpr std::array<const char *, 3> kPciIdsPaths{"/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
+                                                              "/usr/share/pci.ids"};
+
+    for (const char *path : kPciIdsPaths) {
+        std::ifstream file(path);
+        if (!file) {
+            continue;
+        }
+        bool inVendor = false;
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty() || line.starts_with('#')) {
+                continue;
+            }
+            const char *const base = line.c_str();
+            const char *const end = base + line.size();
+            if (!line.starts_with('\t')) { // vendor (or class) line
+                if (inVendor) {
+                    break; // sorted file: left our vendor's block without a match -- try the next database
+                }
+                const auto parsed = ParseHexPrefix(base, end);
+                inVendor = parsed && parsed->first == vendorId;
+            } else if (inVendor && !line.starts_with("\t\t")) { // device line (single tab)
+                const auto parsed = ParseHexPrefix(base + 1, end);
+                if (parsed && parsed->first == deviceId) {
+                    const auto namePos = line.find_first_not_of(" \t", static_cast<size_t>(parsed->second - base));
+                    return namePos == std::string::npos ? std::string{} : line.substr(namePos);
+                }
+            }
+        }
+        // No match in this database; it may be stale or partial, so fall through to the next path.
+    }
+    return {};
+}
+
+// amdgpu engine-clock (sclk) range from the DPM state table device/pp_dpm_sclk, whose
+// lines read "<idx>: <freq>Mhz [*]". Returns (min, max) in MHz, nullopt if unreadable.
+[[nodiscard]] auto ReadAmdgpuSclkRange(const std::string &cardDir) -> std::optional<std::pair<uint64_t, uint64_t>> {
+    std::ifstream file(cardDir + "/device/pp_dpm_sclk");
+    if (!file) {
+        return std::nullopt;
+    }
+    uint64_t lo = std::numeric_limits<uint64_t>::max();
+    uint64_t hi = 0;
+    std::string line;
+    while (std::getline(file, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const auto firstDigit = line.find_first_of("0123456789", colon + 1);
+        if (firstDigit == std::string::npos) {
+            continue;
+        }
+        const char *const base = line.c_str();
+        uint64_t mhz = 0; // from_chars stops at the 'M' of "Mhz", so the unit's case is irrelevant
+        const auto parsed = std::from_chars(base + firstDigit, base + line.size(), mhz);
+        if (parsed.ec == std::errc{} && mhz > 0) {
+            lo = std::min(lo, mhz);
+            hi = std::max(hi, mhz);
+        }
+    }
+    if (hi == 0) {
+        return std::nullopt;
+    }
+    return std::make_pair(lo, hi);
+}
+
+// PCI identity, execution-unit topology, and GPU clock range. PCI fields come from
+// libdrm and work on any PCI GPU; EU/subslice counts and the clock range are read via
+// Intel i915 GETPARAM + sysfs (the plugin's target) and silently skipped elsewhere.
+auto PrintGpuHardware(int fd, const char *driverName) -> void {
+    std::printf("\n--- GPU Hardware ---\n");
+
+    ::drmDevicePtr rawDev = nullptr;
+    std::string cardDir;
+    // DRM_DEVICE_GET_PCI_REVISION is required to populate revision_id (left 0xff otherwise).
+    if (drmGetDevice2(fd, DRM_DEVICE_GET_PCI_REVISION, &rawDev) == 0 && rawDev != nullptr) {
+        std::unique_ptr<::drmDevice, DrmDeviceDeleter> dev{rawDev};
+        cardDir = DrmSysfsCardDir(*dev);
+        if (dev->bustype == DRM_BUS_PCI) {
+            // libdrm exposes PCI identity/bus through C unions keyed by bustype (checked above).
+            const auto *pci = dev->deviceinfo.pci; // NOLINT(cppcoreguidelines-pro-type-union-access)
+            const auto *bus = dev->businfo.pci;    // NOLINT(cppcoreguidelines-pro-type-union-access)
+            if (pci != nullptr) {
+                std::printf("  PCI ID:      %04x:%04x (rev 0x%02x)  %s\n", static_cast<unsigned>(pci->vendor_id),
+                            static_cast<unsigned>(pci->device_id), static_cast<unsigned>(pci->revision_id),
+                            PciVendorName(pci->vendor_id));
+                if (const std::string name = LookupPciDeviceName(pci->vendor_id, pci->device_id); !name.empty()) {
+                    std::printf("  Device:      %s\n", name.c_str());
+                }
+                if (pci->subvendor_id != 0 || pci->subdevice_id != 0) {
+                    std::printf("  Subsystem:   %04x:%04x\n", static_cast<unsigned>(pci->subvendor_id),
+                                static_cast<unsigned>(pci->subdevice_id));
+                }
+            }
+            if (bus != nullptr) {
+                std::printf("  PCI bus:     %04x:%02x:%02x.%x\n", static_cast<unsigned>(bus->domain),
+                            static_cast<unsigned>(bus->bus), static_cast<unsigned>(bus->dev),
+                            static_cast<unsigned>(bus->func));
+            }
+        } else {
+            std::printf("  Bus:         non-PCI DRM bus (%d)\n", dev->bustype);
+        }
+    } else {
+        std::printf("  PCI ID:      (drmGetDevice2 failed)\n");
+    }
+
+    if (driverName != nullptr && std::strcmp(driverName, "i915") == 0) {
+        if (const auto euTotal = I915GetParam(fd, I915_PARAM_EU_TOTAL); euTotal && *euTotal > 0) {
+            if (const auto subslices = I915GetParam(fd, I915_PARAM_SUBSLICE_TOTAL); subslices && *subslices > 0) {
+                std::printf("  Render:      %d EUs across %d subslices\n", *euTotal, *subslices);
+            } else {
+                std::printf("  Render:      %d EUs\n", *euTotal);
+            }
+        }
+    }
+
+    // GPU engine-clock range. i915 exposes RPn(min)/RP0(max) under the card's sysfs node
+    // (the path moved across kernels); amdgpu lists DPM states in device/pp_dpm_sclk.
+    if (!cardDir.empty()) {
+        const std::array<std::string, 2> minPaths{cardDir + "/gt_RPn_freq_mhz", cardDir + "/gt/gt0/rps_RPn_freq_mhz"};
+        const std::array<std::string, 2> maxPaths{cardDir + "/gt_RP0_freq_mhz", cardDir + "/gt/gt0/rps_RP0_freq_mhz"};
+        if (const auto freqMin = ReadSysfsUint(minPaths), freqMax = ReadSysfsUint(maxPaths); freqMin && freqMax) {
+            std::printf("  GPU clock:   %llu - %llu MHz\n", static_cast<unsigned long long>(*freqMin),
+                        static_cast<unsigned long long>(*freqMax));
+        } else if (const auto amdClock = ReadAmdgpuSclkRange(cardDir); amdClock) {
+            std::printf("  GPU clock:   %llu - %llu MHz\n", static_cast<unsigned long long>(amdClock->first),
+                        static_cast<unsigned long long>(amdClock->second));
+        }
+    }
+}
+
 auto ProbeDrmDeviceCaps(int fd) -> void {
     std::printf("\n--- DRM Driver ---\n");
+    std::string driverName;
     if (drmVersionPtr v = drmGetVersion(fd); v != nullptr) {
+        driverName.assign(v->name ? v->name : "", v->name ? static_cast<size_t>(v->name_len) : 0);
         std::printf("  Driver:      %.*s %d.%d.%d (%.*s)\n", v->name_len, v->name ? v->name : "?", v->version_major,
                     v->version_minor, v->version_patchlevel, v->desc_len, v->desc ? v->desc : "");
         drmFreeVersion(v);
     } else {
         std::printf("  Driver: (drmGetVersion failed)\n");
     }
+
+    PrintGpuHardware(fd, driverName.c_str());
 
     std::printf("\n--- DRM Device Caps ---\n");
     PrintDrmCap(fd, "DUMB_BUFFER          (OSD framebuffer)", DRM_CAP_DUMB_BUFFER);
@@ -889,6 +1114,10 @@ auto main(int argc, char *argv[]) -> int {
 
     std::printf("VAAPI Capability Prober (vdr-plugin-vaapivideo)\n"
                 "================================================\n");
+
+    if (struct utsname uts{}; uname(&uts) == 0) {
+        std::printf("Kernel:      %s %s (%s)\n", uts.sysname, uts.release, uts.machine);
+    }
 
     // --- Open DRM device ---
     const int drmFd = open(devicePath, O_RDWR | O_CLOEXEC);

@@ -120,10 +120,14 @@ struct AudioSinkCaps {
     bool truehd{}; ///< Dolby TrueHD
     bool ac4{};    ///< AC-4
     bool mpegh{};  ///< MPEG-H 3D Audio
+    bool aac{};    ///< Sink advertises AAC-family support (base CEA AFC 0x06 or AAC-family EAFC).
+                   ///< DIAGNOSTIC ONLY: current routing keeps AV_CODEC_ID_AAC and AV_CODEC_ID_AAC_LATM
+                   ///< (standard DVB LOAS/LATM) on the PCM path. Deliberately NOT consulted by Supports().
 
     /// True iff the sink advertises IEC61937 passthrough for @p codec.
-    /// Returns false for codecs not listed above (PCM, AAC, MP2, etc.) -- those
-    /// are handled by the PCM decode path, never via passthrough.
+    /// Returns false for codecs not listed above (PCM, MP2, etc.) -- those are
+    /// handled by the PCM decode path, never via passthrough. AAC is probed into
+    /// `aac` for logging but intentionally absent here, so AAC/AAC-LATM stay on PCM.
     [[nodiscard]] auto Supports(AVCodecID codec) const noexcept -> bool;
 };
 
