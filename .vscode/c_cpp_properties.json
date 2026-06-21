@@ -7,7 +7,7 @@
                 "/usr/include/ffmpeg"
             ],
             "defines": [],
-            "compilerPath": "/usr/lib64/ccache/gcc",
+            "compilerPath": "/usr/lib64/ccache/g++",
             "cStandard": "c17",
             "cppStandard": "gnu++20",
             "intelliSenseMode": "linux-gcc-x64"

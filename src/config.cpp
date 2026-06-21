@@ -137,13 +137,13 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
                                              DenoiseModeName(denoiseMode.load(std::memory_order_relaxed)),
                                              SharpenModeName(sharpenMode.load(std::memory_order_relaxed)),
                                              ScaleModeName(scaleMode.load(std::memory_order_relaxed)));
-    return std::format(
-        "PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, HDR: {}, Clear on channel switch: {}, "
-        "Post-proc: {}, Zoom levels (0=off): {}",
-        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
-        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
-        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom);
+    return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, PCM channels: {}, HDR: {}, "
+                       "Clear on channel switch: {}, Post-proc: {}, Zoom levels (0=off): {}",
+                       pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
+                       PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
+                       PcmChannelModeName(pcmChannelMode.load(std::memory_order_relaxed)),
+                       HdrModeName(hdrMode.load(std::memory_order_relaxed)),
+                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom);
 }
 
 namespace {
@@ -267,6 +267,9 @@ template <typename EnumT>
         }
         hdrMode.store(static_cast<HdrMode>(parsed), std::memory_order_relaxed);
         return true;
+    }
+    if (key == "PcmChannelMode") {
+        return ParseEnumValue("PcmChannelMode", value, pcmChannelMode, CONFIG_PCM_CHANNEL_MODE_COUNT);
     }
     if (key == "ClearOnChannelSwitch") {
         return ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);

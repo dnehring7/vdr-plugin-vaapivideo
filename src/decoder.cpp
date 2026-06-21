@@ -681,10 +681,12 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     return OpenCodecWithInfo(info);
 }
 
+namespace {
+
 /// True iff @p codec exposes a VAAPI hw_device_ctx-style HW config entry. Used to filter
 /// sibling decoders for the same codec ID when avcodec_find_decoder()'s default pick is
 /// software-only (libdav1d / libvpx in typical FFmpeg builds).
-[[nodiscard]] static auto HasVaapiHwConfig(const AVCodec *codec) noexcept -> bool {
+[[nodiscard]] auto HasVaapiHwConfig(const AVCodec *codec) noexcept -> bool {
     if (codec == nullptr) {
         return false;
     }
@@ -704,7 +706,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
 /// matches HasVaapiHwConfig(). Returns nullptr if FFmpeg has no VAAPI-capable decoder for
 /// this codec ID at all (caller must keep its avcodec_find_decoder() result as the SW
 /// fallback and clear useHwDecode).
-[[nodiscard]] static auto FindVaapiDecoder(AVCodecID codecId) noexcept -> const AVCodec * {
+[[nodiscard]] auto FindVaapiDecoder(AVCodecID codecId) noexcept -> const AVCodec * {
     void *iter = nullptr;
     while (const AVCodec *codec = av_codec_iterate(&iter)) {
         if (av_codec_is_decoder(codec) != 0 && codec->id == codecId && HasVaapiHwConfig(codec)) {
@@ -716,8 +718,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
 
 // AVCodecContext::get_format callback: pin decode output to VAAPI surfaces. Without this FFmpeg may
 // silently fall back to SW frames. Free function (not a lambda) so it reads as the C callback it is.
-[[nodiscard]] static auto SelectVaapiPixelFormat(AVCodecContext * /*ctx*/, const AVPixelFormat *formats)
-    -> AVPixelFormat {
+[[nodiscard]] auto SelectVaapiPixelFormat(AVCodecContext * /*ctx*/, const AVPixelFormat *formats) -> AVPixelFormat {
     for (const AVPixelFormat *fmt = formats; *fmt != AV_PIX_FMT_NONE; ++fmt) {
         if (*fmt == AV_PIX_FMT_VAAPI) {
             return AV_PIX_FMT_VAAPI;
@@ -725,6 +726,8 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
     }
     return AV_PIX_FMT_NONE;
 }
+
+} // namespace
 
 [[nodiscard]] auto cVaapiDecoder::OpenCodecWithInfo(const VideoStreamInfo &info) -> bool {
     // codecMutex + parserMutex: reopens both contexts atomically; lock order is fixed
@@ -743,7 +746,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
         return false;
     }
 
-    // Table-driven (kVideoBackendTable in stream.h): returns the GpuCaps member pointer for this
+    // Table-driven (VIDEO_BACKEND_TABLE in stream.h): returns the GpuCaps member pointer for this
     // codec/profile/depth, or nullptr for SW-only. Adding a codec = one row in stream.h + one probe in caps.cpp.
     bool useHwDecode = false;
     if (auto capFlag = SelectVideoBackendCap(info); capFlag != nullptr) {
@@ -767,7 +770,7 @@ auto cVaapiDecoder::RequestFilterRebuild() -> void { videoRectDirty.store(true, 
 
     // Reuse only when codec ID, HW/SW choice, AND extradata all match.
     // Codec ID alone is insufficient: a same-codec stream change can switch bit-depth
-    // (8-bit Main->10-bit Main10 flips the kVideoBackendTable row) or replace extradata (seek).
+    // (8-bit Main->10-bit Main10 flips the VIDEO_BACKEND_TABLE row) or replace extradata (seek).
     bool extradataMatches = true;
     if (codecCtx) {
         if (codecCtx->extradata_size != info.extradataSize) {
@@ -1711,20 +1714,21 @@ auto cVaapiDecoder::PresentAction() -> void {
     return vaapiFrame;
 }
 
-// SD DVB streams routinely omit color_description: default BT.470BG (PAL) primaries AND limited (MPEG)
-// range so scale_vaapi's BT.709/tv conversion neither desaturates the colour nor washes out the levels.
-// SD video -- MPEG-2 and SD H.264 alike -- is BT.601 limited-range by convention.
-static auto ApplySdColorDefaults(AVFrame *frame) noexcept -> void {
-    if (frame->height > 576) {
-        return;
-    }
+namespace {
+// DVB streams routinely omit color_description. Tag the matrix the resolution implies so scale_vaapi's
+// BT.709/tv conversion neither desaturates the colour nor washes out the levels: SD (<=576 lines) is
+// BT.601 (BT.470BG PAL, by DVB convention), HD/UHD is BT.709 -- limited (MPEG) range either way. Only
+// UNSPECIFIED fields are filled, so an explicit bitstream/container value always wins; without this an
+// untagged buffersrc leaves scale_vaapi's input->BT.709 conversion driver-dependent.
+auto ApplyColorDefaults(AVFrame *frame) noexcept -> void {
     if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
-        frame->colorspace = AVCOL_SPC_BT470BG;
+        frame->colorspace = frame->height > 576 ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
     }
     if (frame->color_range == AVCOL_RANGE_UNSPECIFIED) {
         frame->color_range = AVCOL_RANGE_MPEG;
     }
 }
+} // namespace
 
 auto cVaapiDecoder::ApplyContainerColorHints(AVFrame *frame) const noexcept -> void {
     // Fill only UNSPECIFIED fields so an explicit in-bitstream VUI always wins over the container.
@@ -1761,7 +1765,7 @@ auto cVaapiDecoder::ResolveHdrInfo(const AVFrame *frame) const noexcept -> HdrSt
 
 auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
     ApplyContainerColorHints(decodedFrame.get());
-    ApplySdColorDefaults(decodedFrame.get());
+    ApplyColorDefaults(decodedFrame.get());
 
     const int64_t sourcePts = decodedFrame->pts;
     const size_t prevOutCount = outFrames.size();
@@ -1912,6 +1916,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
             // Before the log + filter/HDR build below, so all of them see the corrected colorimetry.
             ApplyContainerColorHints(decodedFrame.get());
+            ApplyColorDefaults(decodedFrame.get());
 
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
@@ -1946,8 +1951,6 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                             hdr.contentLight.MaxFALL);
                 }
             }
-
-            ApplySdColorDefaults(decodedFrame.get());
 
             // No decode-thread catch-up fast path: frames always flow through the handoff and the
             // present-thread controller drops what it must (catchingUp/catchUpDrops are present-thread

@@ -105,7 +105,9 @@ constexpr int DISPLAY_WARMUP_GRACE_MS =
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
-[[nodiscard]] static auto GetPlaneTypeName(uint32_t type) -> const char * {
+namespace {
+
+[[nodiscard]] auto GetPlaneTypeName(uint32_t type) -> const char * {
     switch (type) {
         case DRM_PLANE_TYPE_OVERLAY:
             return "OVL";
@@ -119,79 +121,9 @@ constexpr int DISPLAY_WARMUP_GRACE_MS =
 }
 
 // Read a DRM device cap, returning 0 if unsupported. Used only by the one-time init diagnostic.
-[[nodiscard]] static auto GetDrmCap(int drmFd, uint64_t cap) noexcept -> uint64_t {
+[[nodiscard]] auto GetDrmCap(int drmFd, uint64_t cap) noexcept -> uint64_t {
     uint64_t value = 0;
     return drmGetCap(drmFd, cap, &value) == 0 ? value : uint64_t{0};
-}
-
-namespace {
-
-// CTA-861-G sec.7.5.13 HDR Static Metadata Data Block (extended tag 0x06):
-//   byte 1 = supported EOTFs bitmap: bit 0=SDR, bit 1=HDR gamma, bit 2=PQ, bit 3=HLG.
-// CTA-861-G sec.7.5.6 Colorimetry Data Block (extended tag 0x05):
-//   byte 1 = colorimetry flags: bit 6=BT.2020 YCC.
-constexpr uint8_t EDID_EOTF_PQ = 1U << 2;
-constexpr uint8_t EDID_EOTF_HLG = 1U << 3;
-constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6;
-constexpr size_t EDID_BLOCK_SIZE = 128;             ///< Every EDID block is exactly 128 bytes
-constexpr size_t EDID_CHECKSUM_OFFSET = 127;        ///< Byte 127 is the block checksum (not a data block)
-constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126; ///< Byte 126 of base block: number of extension blocks
-
-/// Parse one 128-byte CTA-861 extension block (tag byte 0x02) for HDR EOTF and BT.2020 YCC.
-/// Per CTA-861-G sec.7.3, a DTD offset of 0 means "no DTDs"; data blocks span [4, checksum).
-/// Malformed blocks are silently ignored. Results are OR'd into @p caps so multiple extension
-/// blocks accumulate rather than overwrite.
-auto ParseCtaExtension(std::span<const uint8_t> ext, DisplayCaps &caps) -> void {
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
-    if (ext.size() < 4 || ext[0] != 0x02) {
-        return;
-    }
-    const size_t dtdOffset = ext[2];
-    const size_t dataBlockEnd = (dtdOffset == 0) ? EDID_CHECKSUM_OFFSET : dtdOffset;
-    if (dataBlockEnd < 4 || dataBlockEnd > ext.size()) {
-        return;
-    }
-    size_t offset = 4;
-    while (offset < dataBlockEnd) {
-        const uint8_t header = ext[offset];
-        const uint8_t blockTag = header >> 5;
-        const uint8_t payloadLen = header & 0x1F;
-        if (offset + 1 + payloadLen > dataBlockEnd) {
-            break;
-        }
-        const std::span<const uint8_t> payload = ext.subspan(offset + 1, payloadLen);
-        // CTA-861-G sec.7.5: blockTag==7 = "Extended Tag" block; payload[0] is the extended tag.
-        if (blockTag == 7 && !payload.empty()) {
-            const uint8_t extTag = payload[0];
-            if (extTag == 0x06 && payload.size() >= 3) {
-                // HDR Static Metadata Data Block (sec.7.5.13): payload[1] = EOTF bitmap.
-                caps.sinkHdr10Pq = caps.sinkHdr10Pq || (payload[1] & EDID_EOTF_PQ) != 0;
-                caps.sinkHlg = caps.sinkHlg || (payload[1] & EDID_EOTF_HLG) != 0;
-            } else if (extTag == 0x05 && payload.size() >= 2) {
-                // Colorimetry Data Block (sec.7.5.6): payload[1] = colorimetry bitmap.
-                caps.sinkBt2020Ycc = caps.sinkBt2020Ycc || (payload[1] & EDID_COLORIMETRY_BT2020_YCC) != 0;
-            }
-        }
-        offset += 1 + payloadLen;
-    }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-}
-
-/// Walk every CTA-861 extension block in a raw EDID blob and OR the sink HDR bits into @p caps.
-auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) -> void {
-    if (edid.size() < EDID_BLOCK_SIZE) {
-        return;
-    }
-    // Bounded by edid.size() >= EDID_BLOCK_SIZE (128) check above; the offset is < 128.
-    const size_t extCount =
-        edid[EDID_EXTENSION_COUNT_OFFSET]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    for (size_t i = 0; i < extCount; ++i) {
-        const size_t extOffset = EDID_BLOCK_SIZE * (i + 1);
-        if (extOffset + EDID_BLOCK_SIZE > edid.size()) {
-            break;
-        }
-        ParseCtaExtension(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
-    }
 }
 
 } // namespace
@@ -1331,6 +1263,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
     // Populates hdrProps (prop IDs used in every commit) and displayCaps (capability bits
     // consumed by CanDriveHdrPlane / SupportsHdrPassthrough) from the same connector/EDID walk.
+    // The DRM I/O (property IDs, plane formats, raw EDID blob) lives here because hdrProps must
+    // stay with cVaapiDisplay; the pure EDID byte parse is delegated to ParseEdidHdrCaps (caps.cpp).
     // Clear first: a re-probe after hotplug must not inherit bits from the previous sink.
     hdrProps = HdrConnectorProps{};
     displayCaps = DisplayCaps{};
@@ -1522,9 +1456,9 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     }
     if (info.hasContentLight) {
         // AVContentLightMetadata fields are unsigned int; the HDMI infoframe slots are u16.
-        constexpr unsigned int LIGHT_MAX = 0xFFFFU;
-        m.max_cll = static_cast<uint16_t>(std::min(info.contentLight.MaxCLL, LIGHT_MAX));
-        m.max_fall = static_cast<uint16_t>(std::min(info.contentLight.MaxFALL, LIGHT_MAX));
+        constexpr unsigned int kLightMax = 0xFFFFU;
+        m.max_cll = static_cast<uint16_t>(std::min(info.contentLight.MaxCLL, kLightMax));
+        m.max_fall = static_cast<uint16_t>(std::min(info.contentLight.MaxFALL, kLightMax));
     }
     // NOLINTEND(cppcoreguidelines-pro-type-union-access)
     return meta;

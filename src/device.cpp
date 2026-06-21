@@ -120,18 +120,18 @@ static_assert(MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES < DECODER_RESERVE_HARD_C
 /// How often PlayAudio re-checks the present EPG event while a radio splash is on screen. Program
 /// boundaries land on minute scales, so a couple of seconds is responsive without taxing the
 /// Schedules read-lock on the audio thread.
-static constexpr int RADIO_SPLASH_POLL_MS = 2000;
+constexpr int RADIO_SPLASH_POLL_MS = 2000;
 
 /// radioSplashEventId cache sentinels. DVB event ids are 16-bit, so top-of-range uint32 values can
 /// never collide with a real id. EMPTY_TEXT = "a blank frame is queued" (distinct from EPG event 0,
 /// so a blank->caption transition still repaints). DIRTY = "force a repaint next poll" -- published
 /// before a forced submit so that, if the submit fails, the poll retries instead of matching the key.
-static constexpr uint32_t RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
-static constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
+constexpr uint32_t RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
+constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
 
 /// Grace period after a channel switch before a video stream that never decodes is declared
 /// encrypted/undecodable and the on-screen notice is shown. Matches the radio black-frame delay.
-static constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
+constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
@@ -146,9 +146,11 @@ constexpr int VT_SWITCH_TIMEOUT_MS = 1500; ///< Cap on VT_WAITACTIVE polling. VT
                                            ///< that refuse to release would otherwise block startup forever
                                            ///< and look like a 60 s "plugin hang" until the watchdog fires.
 
-static std::atomic<bool> capWarned{false}, noVtHinted{false};
+namespace {
 
-[[nodiscard]] static auto OwnVt() -> int {
+std::atomic<bool> capWarned{false}, noVtHinted{false};
+
+[[nodiscard]] auto OwnVt() -> int {
     // TTY major=4, minor=N for /dev/ttyN (N=1..63); minor 0 is the current-VT alias.
     struct stat st{};
     if (fstat(STDIN_FILENO, &st) != 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != 4) {
@@ -158,7 +160,7 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     return (vt >= 1 && vt <= 63) ? vt : 0;
 }
 
-[[nodiscard]] static auto SwitchToVt(int vt) -> bool {
+[[nodiscard]] auto SwitchToVt(int vt) -> bool {
     if (ioctl(STDIN_FILENO, VT_ACTIVATE, vt) != 0) {
         const int err = errno;
         if (bool expected = false; capWarned.compare_exchange_strong(expected, true)) {
@@ -186,7 +188,7 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     return false;
 }
 
-[[nodiscard]] static auto ActivateOwnVt() -> bool {
+[[nodiscard]] auto ActivateOwnVt() -> bool {
     const int vt = OwnVt();
     if (vt == 0) {
         if (bool expected = false; noVtHinted.compare_exchange_strong(expected, true)) {
@@ -202,7 +204,7 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     return true;
 }
 
-[[nodiscard]] static auto LeaveOwnVt() -> bool {
+[[nodiscard]] auto LeaveOwnVt() -> bool {
     const int ownVt = OwnVt();
     if (ownVt == 0) {
         return true;
@@ -221,6 +223,8 @@ static std::atomic<bool> capWarned{false}, noVtHinted{false};
     isyslog("vaapivideo/device: yielded VT%d -> VT%d for text console (DETA)", ownVt, targetVt);
     return true;
 }
+
+} // namespace
 
 // ============================================================================
 // === DRM DEVICES CLASS ===
@@ -1555,9 +1559,10 @@ auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
     return clamped;
 }
 
+namespace {
 // Next cycle stop after `current`, skipping disabled (level 0) presets. Off (stop 0) is always a
 // valid stop, so the loop always terminates; returns `current` only when every level is disabled.
-static auto NextZoomStop(int current) -> int {
+auto NextZoomStop(int current) -> int {
     for (int step = 1; step <= CONFIG_ZOOM_PRESET_COUNT + 1; ++step) {
         const int cand = (current + step) % (CONFIG_ZOOM_PRESET_COUNT + 1);
         if (cand == 0 || vaapiConfig.zoomLevel[cand - 1].load(std::memory_order_relaxed) > 0) {
@@ -1566,6 +1571,7 @@ static auto NextZoomStop(int current) -> int {
     }
     return current; // unreachable: Off is always a stop
 }
+} // namespace
 
 [[nodiscard]] auto cVaapiDevice::CycleZoom() -> int {
     // Advance to the next stop, skipping disabled (level 0) presets so a single configured level

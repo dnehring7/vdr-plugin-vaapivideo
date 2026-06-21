@@ -68,9 +68,22 @@ Three invariants:
    Volume 0 writes digital silence (zeroed PCM / zeroed IEC61937 burst) rather
    than stopping ALSA, so the master clock keeps advancing while muted.
 
-2. **Audio is never resampled.** No `swr_set_compensation`, no software PLL.
-   Only video adapts. This keeps the system stateless across channel switches and
-   avoids the feedback-loop instabilities of software audio resampling.
+   A mid-stream PCM channel-layout change re-anchors the clock the same way. When
+   the decoded frame's layout implies a different output channel count than the open
+   device (a broadcast switching stereo↔5.1, or the operator flipping **PCM
+   Channels**), `DecodeToPcm()` flags it and the audio thread calls
+   `ReconfigurePcmOutput()`, which reopens ALSA at the new count and
+   `ResetPlaybackClock()`s. `GetClock()` goes NOPTS briefly (the triggering frame is
+   dropped, and the next packet is held until ALSA reopens and swr rebuilds) and
+   re-anchors on the next write; the decoder's no-clock hold (1.5 s) covers the gap.
+   The reopen is one-shot per layout change — passthrough is never affected (it is a
+   fixed 2-channel IEC61937 carrier).
+
+2. **Audio is never *adaptively* resampled.** No `swr_set_compensation`, no software PLL.
+   The PCM path may do fixed format/channel/rate conversion to the negotiated ALSA format
+   (e.g. 44.1 kHz radio to a 48 kHz device), but the rate ratio is constant — only video
+   adapts over time. This keeps the system stateless across channel switches and avoids the
+   feedback-loop instabilities of a software audio PLL.
 
 3. **Video is producer-paced to the display rate.** When post-deinterlace output
    rate differs from the display rate (rational test
@@ -546,6 +559,7 @@ The sync gate is bypassed (frame submitted unpaced) in:
 | Trick exit → normal (`Play`)     | reset             | unchanged | reserve purged (epoch bump); freerun armed |
 | Pause / resume (`Freeze`/`Play`) | unchanged         | unchanged | held (drain stops); clock pinned, no drops |
 | Audio codec / track change       | unchanged         | unchanged | preserved; freerun armed |
+| PCM channel-layout change        | unchanged         | unchanged | preserved; ALSA reopens, clock re-anchors (brief NOPTS) |
 | Mediaplayer seek                 | reset             | unchanged | flushed; freerun armed; filter graph **preserved** |
 | Mediaplayer playlist advance     | reset (on reopen) | unchanged | flushed; freerun armed; filter graph rebuilt |
 

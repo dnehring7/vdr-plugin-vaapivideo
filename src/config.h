@@ -83,6 +83,35 @@ enum class PassthroughMode : uint8_t {
 }
 
 // ============================================================================
+// === PCM CHANNEL MODE ===
+// ============================================================================
+
+/// User policy for decoded-PCM channel output (the non-passthrough path). Numeric values are part
+/// of the setup.conf wire format -- do not renumber. Never fabricates surround from stereo (output is
+/// capped by the decoded stream's channel count); mono is carried as stereo for HDMI/ALSA compatibility.
+enum class PcmChannelMode : uint8_t {
+    Auto = 0,         ///< Sink-driven: native multichannel up to the ELD's PCM channel cap, else stereo
+    Stereo = 1,       ///< Always downmix decoded PCM to 2.0
+    Multichannel = 2, ///< Force native multichannel; when no ELD is readable, trust the stream's layout
+};
+
+inline constexpr int CONFIG_PCM_CHANNEL_MODE_COUNT = 3; ///< Number of PcmChannelMode values
+
+/// Lowercase wire-format label for a PcmChannelMode. Single source of truth shared by config.cpp
+/// (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels); same pattern as PassthroughModeName.
+[[nodiscard]] constexpr auto PcmChannelModeName(PcmChannelMode mode) noexcept -> const char * {
+    switch (mode) {
+        case PcmChannelMode::Auto:
+            return "auto";
+        case PcmChannelMode::Stereo:
+            return "stereo";
+        case PcmChannelMode::Multichannel:
+            return "multichannel";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
 // === HDR PASSTHROUGH MODE ===
 // ============================================================================
 
@@ -287,6 +316,8 @@ struct VaapiConfig {
     std::atomic<SharpenMode> sharpenMode{SharpenMode::Auto};             ///< Sharpening selection
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
+    std::atomic<PcmChannelMode> pcmChannelMode{
+        PcmChannelMode::Auto};      ///< Decoded-PCM channel policy; re-read per decoded frame (decode-driven)
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
     std::atomic<int> zoomActive{
         0}; ///< Runtime cycle stop (0=Off, 1..ZOOM_PRESET_COUNT=level); transient, never persisted

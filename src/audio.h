@@ -157,6 +157,18 @@ class cAudioProcessor : public cThread {
                                        ///< Caller must hold mutex (single-writer invariant).
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
+    [[nodiscard]] auto ChooseOutputChannels(int inChannels) const noexcept
+        -> unsigned; ///< PCM output channel count for an input of @p inChannels, per PcmChannelMode + sink caps
+                     ///< snapshot. Never upmixes; snaps to a standard HDMI layout (2 / 5.1 / 7.1). Lock-free
+                     ///< (reads only the sinkElded / sinkMaxPcmChannels atomics), so the decode thread may call it.
+    auto ReconfigurePcmOutput()
+        -> void; ///< Action()-thread: reopens the ALSA PCM device at the channel count DecodeToPcm() chose once the
+                 ///< stream's true layout became known, and frees the swr context bound to the old geometry. Takes
+                 ///< the mutex; no-op in passthrough mode.
+    auto QueryDeviceChannelOrder(snd_pcm_t *handle, unsigned channels)
+        -> void; ///< Reads the device order (snd_pcm_get_chmap) and publishes the swr->device permutation into
+                 ///< channelReorder. plug/`default` reject snd_pcm_set_chmap, so we adapt our output to the device
+                 ///< instead of forcing it -- otherwise HDA's default order swaps FC/LFE (dialogue into the LFE).
     [[nodiscard]] auto ConfigureAlsaParams(snd_pcm_t *handle, snd_pcm_format_t format, unsigned channels, unsigned rate,
                                            bool allowResample)
         -> bool; ///< Applies hardware and software ALSA parameters to an open PCM handle;
@@ -199,6 +211,18 @@ class cAudioProcessor : public cThread {
     unsigned alsaIec958CtlIndex{UINT_MAX};          ///< "IEC958 Playback Default" control index; UINT_MAX = unresolved
     std::atomic<bool> alsaPassthroughActive{false}; ///< True in IEC61937 passthrough mode
     std::atomic<unsigned> alsaSampleRate{0};        ///< Negotiated sample rate (Hz)
+    std::atomic<uint64_t> channelReorder{0}; ///< Packed swr->device channel permutation (QueryDeviceChannelOrder):
+                                             ///< nibble 0 = channel count (0 = identity/no reorder), nibbles 1..N =
+                                             ///< the swr-order source index for each device slot. Lock-free: written
+                                             ///< on the ALSA-open path, read per frame in DecodeToPcm().
+    std::atomic<int> inputChannels{2};       ///< Last known decoder input channel count: the producer's hint,
+                                             ///< then the authoritative frame->ch_layout once decoding starts
+    std::atomic<bool> outputChannelsChangePending{false}; ///< DecodeToPcm() saw the stream's true layout imply a
+                                                          ///< different PCM output count; Action() reopens ALSA
+    std::atomic<unsigned> pcmChannelCeiling{8};           ///< Learned PCM channel ceiling: dropped to the count the
+                                                          ///< device actually accepts if a wider reopen fails, so
+                                                          ///< ChooseOutputChannels() converges and never reopen-loops.
+                                                          ///< Reset on device change (CloseDevice()).
 
     // ========================================================================
     // === IEC61937 SPDIF MUXER ===
@@ -217,9 +241,12 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> parserNeedsReset{false}; ///< Action() flags INVALIDDATA cascade; Decode() recreates parserCtx
                                                ///< (cannot be done in Action() -- would deadlock CloseDecoder()).
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx; ///< AU-framing parser
-    int swrChannels{};                                                         ///< swrCtx channel count
-    SwrContext *swrCtx{nullptr};                                               ///< Conversion context to S16LE
-    AVSampleFormat swrFormat{AV_SAMPLE_FMT_NONE};                              ///< swrCtx sample format
+    int swrChannels{};                                                         ///< swrCtx input channel count
+    int swrInRate{};                                                           ///< swrCtx input sample rate (Hz)
+    int swrOutChannels{};                                                      ///< swrCtx output channel count
+    int swrOutRate{};                             ///< swrCtx output sample rate (= device rate)
+    SwrContext *swrCtx{nullptr};                  ///< Conversion context to S16LE
+    AVSampleFormat swrFormat{AV_SAMPLE_FMT_NONE}; ///< swrCtx sample format
 
     // ========================================================================
     // === PACKET QUEUE ===
@@ -254,9 +281,12 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === SINK CAPABILITIES ===
     // ========================================================================
-    AudioSinkCaps sinkCaps;     ///< Compressed-audio formats the HDMI sink advertises (from ELD)
+    AudioSinkCaps sinkCaps;     ///< Compressed-audio formats + PCM caps the HDMI sink advertises (from ELD)
     bool sinkCapsCached{false}; ///< True when sinkCaps was probed for sinkCapsDevice
     std::string sinkCapsDevice; ///< Device name for which sinkCaps was last probed; invalidated on device change
+    std::atomic<bool> sinkElded{false}; ///< Lock-free mirror of sinkCaps.elded for ChooseOutputChannels()
+    std::atomic<unsigned> sinkMaxPcmChannels{
+        2}; ///< Lock-free mirror of sinkCaps.pcmMaxChannels for ChooseOutputChannels()
 
     // ========================================================================
     // === STREAM ===

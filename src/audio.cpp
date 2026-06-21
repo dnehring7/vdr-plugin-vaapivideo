@@ -13,6 +13,7 @@
  */
 
 #include "audio.h"
+#include "caps.h"
 #include "common.h"
 #include "config.h"
 #include "stream.h"
@@ -29,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <memory>
@@ -347,6 +349,40 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     return SetStreamParams(info);
 }
 
+[[nodiscard]] auto cAudioProcessor::EnqueuePacket(const AVPacket *rawPacket) -> bool {
+    if (!rawPacket || !rawPacket->data || rawPacket->size <= 0 || !initialized.load(std::memory_order_relaxed))
+        [[unlikely]] {
+        return false;
+    }
+
+    auto packet = std::unique_ptr<AVPacket, FreeAVPacket>{av_packet_clone(rawPacket)};
+    if (!packet) [[unlikely]] {
+        esyslog("vaapivideo/audio: failed to clone packet");
+        return false;
+    }
+
+    {
+        const cMutexLock lock(mutex.get());
+
+        if (packetQueue.size() >= AUDIO_QUEUE_CAPACITY) [[unlikely]] {
+            // Throttle to one log per 500 ms to avoid flooding syslog under sustained overload.
+            if (lastQueueWarn.Elapsed() > 500) {
+                esyslog("vaapivideo/audio: queue full (%zu packets), dropping (%s @ %dHz %dch passthrough=%s)",
+                        packetQueue.size(), avcodec_get_name(streamParams.codecId), streamParams.sampleRate,
+                        streamParams.channels, alsaPassthroughActive.load(std::memory_order_relaxed) ? "yes" : "no");
+                lastQueueWarn.Set();
+            }
+            return false;
+        }
+
+        packetQueue.push(packet.release());
+        approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
+    }
+
+    packetCondition.Broadcast();
+    return true;
+}
+
 [[nodiscard]] auto cAudioProcessor::SetStreamParams(const AudioStreamParams &params) -> bool {
     if (params.sampleRate <= 0 || params.channels <= 0) [[unlikely]] {
         esyslog("vaapivideo/audio: invalid stream parameters");
@@ -399,6 +435,9 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
     AdoptStreamParams(params);
 
+    // Producer's hint only; DecodeToPcm() replaces it with the decoded frame's true layout.
+    inputChannels.store(params.channels, std::memory_order_relaxed);
+
     const auto targetRate = ComputeAlsaRate(params.codecId, static_cast<unsigned>(params.sampleRate), wantPassthrough);
 
     // ALSA reopen is needed when: handle missing, passthrough mode changed, or the
@@ -407,17 +446,24 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // the common first-Decode-after-Initialize path (decoder/parserCtx still null).
     const unsigned currentAlsaRate = alsaSampleRate.load(std::memory_order_relaxed);
     const unsigned currentAlsaChannels = alsaChannels.load(std::memory_order_relaxed);
+    // Compare the *chosen* PCM output count (after downmix/cap), not the raw input count -- a 5.1
+    // stream downmixed to 2.0 must NOT be seen as a channel change against a 2ch ALSA handle.
+    const unsigned targetChannels = ChooseOutputChannels(params.channels);
     const bool needsReconfig =
         !initialized.load(std::memory_order_relaxed) || alsaHandle == nullptr ||
         currentlyPassthrough != wantPassthrough ||
         (wantPassthrough ? targetRate != currentAlsaRate
-                         : (targetRate != currentAlsaRate || params.channels != static_cast<int>(currentAlsaChannels)));
+                         : (targetRate != currentAlsaRate || targetChannels != currentAlsaChannels));
 
     // Bump clearGeneration BEFORE tearing down decoder/parser. The Action thread may
     // hold an already-dequeued packet from the old codec era; the bump marks it stale
     // so DecodeToPcm()/passthrough drops it instead of feeding the fresh decoder.
     // Clear() also bumps; this covers callers that bypass Clear().
     if (needsReconfig || decoderConfigChanged) {
+        // Cancel any decode-thread channel reopen the old codec era flagged: this producer reconfig
+        // already reopens ALSA for the new stream, so an Action()-thread ReconfigurePcmOutput() would
+        // be redundant (and would run against stale inputChannels).
+        outputChannelsChangePending.store(false, std::memory_order_release);
         clearGeneration.fetch_add(1, std::memory_order_release);
     }
 
@@ -538,6 +584,11 @@ auto cAudioProcessor::CloseDevice() -> void {
     alsaFrameBytes.store(0, std::memory_order_release);
     alsaChannels.store(0, std::memory_order_relaxed);
     alsaSampleRate.store(0, std::memory_order_relaxed);
+    outputChannelsChangePending.store(false, std::memory_order_relaxed);
+    pcmChannelCeiling.store(8, std::memory_order_relaxed); // fresh device: let it advertise its full width again
+    swrInRate = 0;
+    swrOutChannels = 0;
+    swrOutRate = 0;
     initialized.store(false, std::memory_order_release);
 }
 
@@ -703,6 +754,12 @@ auto cAudioProcessor::Action() -> void {
             }
         } else {
             (void)DecodeToPcm(std::span(packet->data, static_cast<size_t>(packet->size)), pts, generationAtDequeue);
+            // DecodeToPcm() runs under decoderRefCount and cannot reopen ALSA itself; it flags the
+            // need here once the stream's true channel layout is known. Safe at this point: the
+            // refcount is released and this is the only consumer thread.
+            if (outputChannelsChangePending.exchange(false, std::memory_order_acquire)) {
+                ReconfigurePcmOutput();
+            }
         }
         packetInFlight.store(false, std::memory_order_release);
     }
@@ -731,7 +788,7 @@ auto cAudioProcessor::Action() -> void {
 
 [[nodiscard]] auto cAudioProcessor::CodecWrappable(AVCodecID codecId) -> bool {
     // Delegates to IsPassthroughCapable() in stream.h, which owns the wrappable codec
-    // list (kAudioPassthroughTable). AudioSinkCaps::Supports() must mirror this set so
+    // list (AUDIO_PASSTHROUGH_TABLE). AudioSinkCaps::Supports() must mirror this set so
     // Auto mode can enable passthrough when the ELD confirms support.
     return IsPassthroughCapable(codecId);
 }
@@ -756,6 +813,9 @@ auto cAudioProcessor::CloseDecoder() -> void {
         swr_free(&swrCtx);
     }
     swrChannels = 0;
+    swrInRate = 0;
+    swrOutChannels = 0;
+    swrOutRate = 0;
     swrFormat = AV_SAMPLE_FMT_NONE;
 }
 
@@ -779,6 +839,177 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     const bool quadRate =
         (codecId == AV_CODEC_ID_EAC3 || codecId == AV_CODEC_ID_AC4 || codecId == AV_CODEC_ID_MPEGH_3D_AUDIO);
     return quadRate ? streamRate * 4 : streamRate;
+}
+
+[[nodiscard]] auto cAudioProcessor::ChooseOutputChannels(int inChannels) const noexcept -> unsigned {
+    const auto in = static_cast<unsigned>(inChannels > 0 ? inChannels : 2);
+    const unsigned ceiling = pcmChannelCeiling.load(std::memory_order_relaxed);
+
+    // Snap to a standard HDMI layout, capped by `in` (downmix only, never invent surround) and by
+    // `ceiling` (the width the device has proven it opens, so the decode-driven reopen converges).
+    const auto snap = [in, ceiling](unsigned cap) -> unsigned {
+        const unsigned want = std::min({cap, in, ceiling});
+        if (want >= 8) {
+            return 8; // 7.1
+        }
+        if (want >= 6) {
+            return 6; // 5.1
+        }
+        return 2; // stereo (covers mono/2.0 and any odd 3/4/5 -> safe downmix)
+    };
+
+    switch (vaapiConfig.pcmChannelMode.load(std::memory_order_relaxed)) {
+        case PcmChannelMode::Stereo:
+            return 2;
+        case PcmChannelMode::Multichannel:
+            // Explicit operator override: honor the ELD cap when present, otherwise trust the
+            // stream's own layout (the user asked for multichannel on a sink that gave no ELD).
+            return snap(sinkElded.load(std::memory_order_relaxed) ? sinkMaxPcmChannels.load(std::memory_order_relaxed)
+                                                                  : 8U);
+        case PcmChannelMode::Auto:
+            break;
+    }
+    // Auto: conservative -- never exceed stereo unless the ELD positively advertises more PCM channels.
+    return snap(sinkElded.load(std::memory_order_relaxed) ? sinkMaxPcmChannels.load(std::memory_order_relaxed) : 2U);
+}
+
+namespace {
+
+/// Map an ALSA chmap position to the FFmpeg channel id. Covers the channels that appear in the standard
+/// 2.0 / 5.1 / 7.1 layouts; non-standard or unknown positions yield AV_CHAN_NONE so the caller can
+/// decline to reorder rather than guess.
+[[nodiscard]] auto AlsaToAvChannel(unsigned pos) noexcept -> AVChannel {
+    switch (pos) {
+        case SND_CHMAP_FL:
+            return AV_CHAN_FRONT_LEFT;
+        case SND_CHMAP_FR:
+            return AV_CHAN_FRONT_RIGHT;
+        case SND_CHMAP_FC:
+            return AV_CHAN_FRONT_CENTER;
+        case SND_CHMAP_LFE:
+            return AV_CHAN_LOW_FREQUENCY;
+        case SND_CHMAP_RL:
+            return AV_CHAN_BACK_LEFT;
+        case SND_CHMAP_RR:
+            return AV_CHAN_BACK_RIGHT;
+        case SND_CHMAP_SL:
+            return AV_CHAN_SIDE_LEFT;
+        case SND_CHMAP_SR:
+            return AV_CHAN_SIDE_RIGHT;
+        case SND_CHMAP_RC:
+            return AV_CHAN_BACK_CENTER;
+        case SND_CHMAP_FLC:
+            return AV_CHAN_FRONT_LEFT_OF_CENTER;
+        case SND_CHMAP_FRC:
+            return AV_CHAN_FRONT_RIGHT_OF_CENTER;
+        default:
+            return AV_CHAN_NONE;
+    }
+}
+
+} // namespace
+
+auto cAudioProcessor::QueryDeviceChannelOrder(snd_pcm_t *handle, unsigned channels) -> void {
+    channelReorder.store(0, std::memory_order_release); // identity until a real device order is proven
+    if (handle == nullptr || channels < 2 || channels > 8) {
+        return;
+    }
+
+    // snd_pcm_get_chmap reports the device's interleaving order. Direct hw/plughw devices expose it (and
+    // accept the query even though they reject snd_pcm_set_chmap with ENXIO); software mixers such as
+    // `default` may return NULL. NULL => order unknown: leave swr's FFmpeg-default order in place.
+    snd_pcm_chmap_t *rawMap = snd_pcm_get_chmap(handle);
+    if (rawMap == nullptr) {
+        dsyslog("vaapivideo/audio: snd_pcm_get_chmap unavailable; using swr default channel order");
+        return;
+    }
+    // Copy the positions out and free ALSA's malloc right away so the rest of the routine carries no
+    // cleanup obligation across its early returns. Bound the copy by the map's own width (pos[] holds
+    // exactly mapChannels entries) so a mismatched count never reads past the flexible array.
+    const unsigned mapChannels = rawMap->channels;
+    std::array<unsigned, 8> pos{};
+    for (unsigned i = 0; i < mapChannels && i < pos.size(); ++i) {
+        pos.at(i) = rawMap->pos[i];
+    }
+    std::free(rawMap); // NOLINT(cppcoreguidelines-no-malloc): ALSA-malloc'd, free() is its documented release
+    if (mapChannels != channels) {
+        return;
+    }
+
+    // For each device slot, find which swr-output (FFmpeg-default order) channel feeds it, and pack that
+    // source index into a nibble. DecodeToPcm() then permutes the interleaved samples into device order --
+    // the snd_pcm_set_chmap-free equivalent that also works on plug/`default`.
+    AVChannelLayout swrOrder{};
+    av_channel_layout_default(&swrOrder, static_cast<int>(channels));
+    uint64_t packed = channels & 0xFU;
+    bool identity = true;
+    for (unsigned slot = 0; slot < channels; ++slot) {
+        const AVChannel ch = AlsaToAvChannel(pos.at(slot));
+        const int src = (ch != AV_CHAN_NONE) ? av_channel_layout_index_from_channel(&swrOrder, ch) : -1;
+        if (src < 0) {
+            av_channel_layout_uninit(&swrOrder);
+            return; // a slot we can't place: don't risk a wrong permutation, keep swr default order
+        }
+        packed |= static_cast<uint64_t>(src & 0xF) << (4U * (slot + 1U));
+        identity = identity && (src == static_cast<int>(slot));
+    }
+    av_channel_layout_uninit(&swrOrder);
+
+    if (identity) {
+        return; // device already matches swr order (typical for raw hw:) -> no permutation needed
+    }
+    channelReorder.store(packed, std::memory_order_release);
+    isyslog("vaapivideo/audio: %uch device channel order differs from swr; remapping output to match", channels);
+}
+
+auto cAudioProcessor::ReconfigurePcmOutput() -> void {
+    const cMutexLock lock(mutex.get());
+
+    // Passthrough carries a fixed 2ch IEC61937 burst; only the decoded-PCM path has a channel layout.
+    if (alsaPassthroughActive.load(std::memory_order_relaxed) || alsaHandle == nullptr) {
+        return;
+    }
+
+    const unsigned want = ChooseOutputChannels(inputChannels.load(std::memory_order_relaxed));
+    if (want == alsaChannels.load(std::memory_order_relaxed)) {
+        return; // already matches (mode flipped back, or a racing producer reopen got there first)
+    }
+
+    isyslog("vaapivideo/audio: switching PCM output to %uch (decoded input %dch)", want,
+            inputChannels.load(std::memory_order_relaxed));
+
+    // No clearGeneration bump: this runs on the Action thread after the triggering packet was already
+    // dropped, so there is no stale codec era to invalidate (that guards Clear() / codec swaps).
+    (void)snd_pcm_drop(alsaHandle);
+    snd_pcm_close(alsaHandle);
+    alsaHandle = nullptr;
+    if (swrCtx) {
+        swr_free(&swrCtx); // make the reopen boundary explicit; the next frame rebuilds for `want`
+    }
+    swrChannels = 0;
+    swrInRate = 0;
+    swrOutChannels = 0;
+    swrOutRate = 0;
+    swrFormat = AV_SAMPLE_FMT_NONE;
+    ResetPlaybackClock();
+
+    if (!OpenAlsaDevice()) {
+        // The device rejected `want` channels. Pin the ceiling to stereo (always openable on a plug
+        // device) so ChooseOutputChannels() stops asking for more, and reopen there. Without this the
+        // next decoded frame would request `want` again and spin the reopen path every packet.
+        esyslog("vaapivideo/audio: PCM reconfiguration to %uch failed; falling back to stereo", want);
+        pcmChannelCeiling.store(2, std::memory_order_release);
+        if (!OpenAlsaDevice()) {
+            esyslog("vaapivideo/audio: stereo PCM fallback also failed");
+        }
+        return;
+    }
+
+    // Exact set_channels means a successful open delivers exactly `want`; if a device ever returns
+    // less, cap to it so the trigger converges instead of re-firing.
+    if (const unsigned got = alsaChannels.load(std::memory_order_relaxed); got < want) {
+        pcmChannelCeiling.store(got, std::memory_order_release);
+    }
 }
 
 [[nodiscard]] auto cAudioProcessor::ConfigureAlsaParams(snd_pcm_t *handle, snd_pcm_format_t format, unsigned channels,
@@ -909,6 +1140,14 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
     alsaFrameBytes.store(static_cast<size_t>(frameBytes), std::memory_order_release);
 
+    // Multichannel PCM only: learn the device's channel order so DecodeToPcm() can permute swr's output to
+    // match. The unconditional reset covers the 2ch/passthrough open (a fixed stereo carrier never reorders);
+    // allowResample marks the decoded-PCM path.
+    channelReorder.store(0, std::memory_order_release);
+    if (allowResample && configuredChannels > 2) {
+        QueryDeviceChannelOrder(handle, configuredChannels);
+    }
+
     return true;
 }
 
@@ -986,12 +1225,28 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             continue;
         }
 
-        const unsigned configuredChannels = alsaChannels.load(std::memory_order_relaxed);
-        const unsigned outCh = configuredChannels > 0 ? configuredChannels : 2;
         const auto frameFmt = static_cast<AVSampleFormat>(frame->format);
         const int frameCh = frame->ch_layout.nb_channels;
 
-        if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels)) {
+        // The decoded frame's layout is authoritative (the producer only guessed, e.g. stereo before
+        // the first AAC 5.1 frame). A reopen here would deadlock CloseDecoder() under decoderRefCount,
+        // so flag it for Action() and drop this frame.
+        inputChannels.store(frameCh, std::memory_order_relaxed);
+        const unsigned outCh = ChooseOutputChannels(frameCh);
+        if (outCh != alsaChannels.load(std::memory_order_relaxed)) {
+            outputChannelsChangePending.store(true, std::memory_order_release);
+            av_frame_unref(frame.get());
+            decoderRefCount.fetch_sub(1, std::memory_order_release);
+            return true;
+        }
+
+        // Output at the device rate, not the frame rate: a no-op for 48 kHz DVB, but it keeps a
+        // non-48 kHz stream (e.g. 44.1 kHz radio) at the correct pitch instead of playing it fast.
+        const unsigned deviceRate = alsaSampleRate.load(std::memory_order_relaxed);
+        const int outRate = deviceRate > 0 ? static_cast<int>(deviceRate) : frame->sample_rate;
+
+        if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels || static_cast<int>(outCh) != swrOutChannels ||
+                       frame->sample_rate != swrInRate || outRate != swrOutRate)) {
             swr_free(&swrCtx);
         }
 
@@ -999,16 +1254,19 @@ auto cAudioProcessor::FlushDecoderState() -> void {
             AVChannelLayout outLayout{};
             av_channel_layout_default(&outLayout, static_cast<int>(outCh));
 
-            const int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, frame->sample_rate,
-                                                &frame->ch_layout, frameFmt, frame->sample_rate, 0, nullptr);
+            const int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, outRate, &frame->ch_layout,
+                                                frameFmt, frame->sample_rate, 0, nullptr);
 
             if (ret < 0 || !swrCtx || swr_init(swrCtx) < 0) {
-                esyslog("vaapivideo/audio: swr_alloc_set_opts2 failed for %s %dch -> S16 %uch",
-                        av_get_sample_fmt_name(frameFmt), frameCh, outCh);
+                esyslog("vaapivideo/audio: swr_alloc_set_opts2 failed for %s %dch %dHz -> S16 %uch %dHz",
+                        av_get_sample_fmt_name(frameFmt), frameCh, frame->sample_rate, outCh, outRate);
                 if (swrCtx) {
                     swr_free(&swrCtx);
                 }
                 swrChannels = 0;
+                swrInRate = 0;
+                swrOutChannels = 0;
+                swrOutRate = 0;
                 swrFormat = AV_SAMPLE_FMT_NONE;
                 decoderRefCount.fetch_sub(1, std::memory_order_release);
                 return false;
@@ -1016,12 +1274,16 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
             swrFormat = frameFmt;
             swrChannels = frameCh;
-            dsyslog("vaapivideo/audio: initialized swresample for %s %dch -> S16 %uch",
-                    av_get_sample_fmt_name(frameFmt), frameCh, outCh);
+            swrInRate = frame->sample_rate;
+            swrOutChannels = static_cast<int>(outCh);
+            swrOutRate = outRate;
+            dsyslog("vaapivideo/audio: initialized swresample for %s %dch %dHz -> S16 %uch %dHz",
+                    av_get_sample_fmt_name(frameFmt), frameCh, frame->sample_rate, outCh, outRate);
         }
 
         const uint8_t *pcmData = nullptr;
         size_t pcmSize = 0;
+        unsigned writtenFrames = 0;
         std::vector<uint8_t> convertedBuffer;
 
         {
@@ -1042,10 +1304,36 @@ auto cAudioProcessor::FlushDecoderState() -> void {
 
             pcmSize = static_cast<size_t>(converted) * outCh * 2;
             pcmData = convertedBuffer.data();
+            writtenFrames = static_cast<unsigned>(converted);
         }
 
-        const auto sampleCount = static_cast<unsigned>(frame->nb_samples);
+        if (writtenFrames == 0) {
+            // swr legitimately returns 0 while priming a resampler (non-48 kHz input); not a failure.
+            // WriteToAlsa() rejects an empty span, so skip the write and wait for the next frame.
+            av_frame_unref(frame.get());
+            continue;
+        }
 
+        // Permute swr's FFmpeg-order interleaved output into the device's channel slots (QueryDeviceChannelOrder).
+        // No-op when the packed count is 0 (device matches swr / order unreadable). The count guard also drops a
+        // torn read against an in-flight reopen -- such frames are dropped by the generation check just below anyway.
+        if (const uint64_t packed = channelReorder.load(std::memory_order_acquire);
+            (packed & 0xFU) == outCh && outCh > 2) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): convertedBuffer holds S16_LE by contract.
+            auto *samples = reinterpret_cast<int16_t *>(convertedBuffer.data());
+            std::array<int16_t, 8> slotSamples{};
+            for (unsigned f = 0; f < writtenFrames; ++f) {
+                int16_t *base = samples + (static_cast<size_t>(f) * outCh);
+                for (unsigned slot = 0; slot < outCh; ++slot) {
+                    slotSamples.at(slot) = base[(packed >> (4U * (slot + 1U))) & 0xFU];
+                }
+                for (unsigned slot = 0; slot < outCh; ++slot) {
+                    base[slot] = slotSamples.at(slot);
+                }
+            }
+        }
+
+        // Clock advances by the real output count (== nb_samples unless swr resamples / rebuffers).
         // Re-check generation: the receive_frame loop can run for many ms (large packets,
         // swr conversion), giving SetStreamParams()/Clear() a window to race.
         // Drop the frame so stale PCM never reaches ALSA or corrupts pcmNextPts.
@@ -1055,7 +1343,8 @@ auto cAudioProcessor::FlushDecoderState() -> void {
         }
 
         const int64_t startPts90k = pcmNextPts.load(std::memory_order_relaxed);
-        const bool writeOk = WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, sampleCount, expectedGeneration);
+        const bool writeOk =
+            WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, writtenFrames, expectedGeneration);
         av_frame_unref(frame.get());
 
         if (!writeOk) {
@@ -1068,46 +1357,14 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     return true;
 }
 
-[[nodiscard]] auto cAudioProcessor::EnqueuePacket(const AVPacket *rawPacket) -> bool {
-    if (!rawPacket || !rawPacket->data || rawPacket->size <= 0 || !initialized.load(std::memory_order_relaxed))
-        [[unlikely]] {
-        return false;
-    }
-
-    auto packet = std::unique_ptr<AVPacket, FreeAVPacket>{av_packet_clone(rawPacket)};
-    if (!packet) [[unlikely]] {
-        esyslog("vaapivideo/audio: failed to clone packet");
-        return false;
-    }
-
-    {
-        const cMutexLock lock(mutex.get());
-
-        if (packetQueue.size() >= AUDIO_QUEUE_CAPACITY) [[unlikely]] {
-            // Throttle to one log per 500 ms to avoid flooding syslog under sustained overload.
-            if (lastQueueWarn.Elapsed() > 500) {
-                esyslog("vaapivideo/audio: queue full (%zu packets), dropping (%s @ %dHz %dch passthrough=%s)",
-                        packetQueue.size(), avcodec_get_name(streamParams.codecId), streamParams.sampleRate,
-                        streamParams.channels, alsaPassthroughActive.load(std::memory_order_relaxed) ? "yes" : "no");
-                lastQueueWarn.Set();
-            }
-            return false;
-        }
-
-        packetQueue.push(packet.release());
-        approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
-    }
-
-    packetCondition.Broadcast();
-    return true;
-}
-
-/// AVIO write callback for the spdif muxer: appends IEC61937 burst bytes to spdifOutputBuf.
-static auto SpdifWriteCallback(void *opaque, const uint8_t *buf, int bufSize) -> int {
+namespace {
+// AVIO write callback for the spdif muxer: appends IEC61937 burst bytes to spdifOutputBuf.
+auto SpdifWriteCallback(void *opaque, const uint8_t *buf, int bufSize) -> int {
     auto &output = *static_cast<std::vector<uint8_t> *>(opaque);
     output.insert(output.end(), buf, buf + bufSize);
     return bufSize;
 }
+} // namespace
 
 auto cAudioProcessor::OpenSpdifMuxer(AVCodecID codecId, int sampleRate) -> bool {
     CloseSpdifMuxer();
@@ -1261,10 +1518,12 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     const bool wantPassthrough = CanPassthrough(streamParams.codecId);
     const unsigned streamRate = streamParams.sampleRate > 0 ? static_cast<unsigned>(streamParams.sampleRate) : 48000;
     const unsigned alsaRate = ComputeAlsaRate(streamParams.codecId, streamRate, wantPassthrough);
-    const unsigned channels =
-        (!wantPassthrough && streamParams.channels > 0) ? static_cast<unsigned>(streamParams.channels) : 2;
+    // PCM output channel count is sink- and policy-driven (ChooseOutputChannels), seeded by the last
+    // known input count (the producer's hint, later the decoded frame's true layout). Passthrough is a
+    // fixed 2ch IEC61937 carrier.
+    const unsigned channels = wantPassthrough ? 2 : ChooseOutputChannels(inputChannels.load(std::memory_order_relaxed));
 
-    constexpr snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE; // fixed; WriteToAlsa() reinterprets as int16_t
+    constexpr snd_pcm_format_t kFormat = SND_PCM_FORMAT_S16_LE; // fixed; WriteToAlsa() reinterprets as int16_t
 
     snd_pcm_t *handle = nullptr;
     if (const int err = snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
@@ -1278,7 +1537,7 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     // ConfigureAlsaParams() leaves the failed handle in an undefined state.
     if (wantPassthrough) {
         SetIec958NonAudio(true);
-        if (ConfigureAlsaParams(handle, format, 2, alsaRate, false)) {
+        if (ConfigureAlsaParams(handle, kFormat, 2, alsaRate, false)) {
             if (OpenSpdifMuxer(streamParams.codecId, streamParams.sampleRate)) {
                 alsaHandle = handle;
                 alsaPassthroughActive.store(true, std::memory_order_release);
@@ -1301,8 +1560,8 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
             return false;
         }
 
-        const unsigned pcmChannels = streamParams.channels > 0 ? static_cast<unsigned>(streamParams.channels) : 2;
-        if (ConfigureAlsaParams(handle, format, pcmChannels, streamRate, true)) {
+        const unsigned pcmChannels = ChooseOutputChannels(inputChannels.load(std::memory_order_relaxed));
+        if (ConfigureAlsaParams(handle, kFormat, pcmChannels, streamRate, true)) {
             alsaHandle = handle;
             alsaPassthroughActive.store(false, std::memory_order_release);
             isyslog("vaapivideo/audio: PCM fallback @ %uHz", alsaSampleRate.load(std::memory_order_relaxed));
@@ -1310,7 +1569,7 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
         }
     } else {
         SetIec958NonAudio(false);
-        if (ConfigureAlsaParams(handle, format, channels, alsaRate, true)) {
+        if (ConfigureAlsaParams(handle, kFormat, channels, alsaRate, true)) {
             alsaHandle = handle;
             alsaPassthroughActive.store(false, std::memory_order_release);
             isyslog("vaapivideo/audio: opened PCM @ %uHz on '%s'", alsaSampleRate.load(std::memory_order_relaxed),
@@ -1354,9 +1613,9 @@ auto cAudioProcessor::OpenDecoder() -> void {
     ctx->err_recognition = AV_EF_CAREFUL;
     ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
-    if (streamParams.channels > 0) {
-        av_channel_layout_default(&ctx->ch_layout, streamParams.channels);
-    }
+    // Deliberately do NOT pre-seed ctx->ch_layout: the decoder reports the stream's true layout
+    // (e.g. AAC 5.1) from the bitstream/extradata, and DecodeToPcm() chooses the PCM output count
+    // from that frame. Forcing a stereo default here would mask multichannel content.
 
     // FFmpeg requires AV_INPUT_BUFFER_PADDING_SIZE zero bytes after extradata
     // (e.g. AAC AudioSpecificConfig) to allow SIMD overread without a fault.
@@ -1385,7 +1644,11 @@ auto cAudioProcessor::OpenDecoder() -> void {
     }
 
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
-    isyslog("vaapivideo/audio: opened %s @ %dHz %dch (%s)", codec->name, ctx->sample_rate, ctx->ch_layout.nb_channels,
+    // nb_channels is 0 until the first frame for codecs whose layout rides in the frame header
+    // (DVB MP2/AAC) rather than extradata; show "?" instead of a misleading "0ch".
+    const int openChannels = ctx->ch_layout.nb_channels;
+    const std::string channelLabel = openChannels > 0 ? std::format("{}ch", openChannels) : "?ch";
+    isyslog("vaapivideo/audio: opened %s @ %dHz %s (%s)", codec->name, ctx->sample_rate, channelLabel.c_str(),
             alsaPassthroughActive.load(std::memory_order_relaxed) ? "passthrough" : "PCM");
 }
 
@@ -1395,6 +1658,11 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     }
 
     sinkCaps = AudioSinkCaps{};
+    // Publish the conservative default mirror up front. The ELD read below has several early returns
+    // (PCM open / info failure); without this, a probe that fails after a device swap would leave the
+    // decode thread's ChooseOutputChannels() trusting the *previous* sink's ELD (stale multichannel).
+    sinkElded.store(false, std::memory_order_release);
+    sinkMaxPcmChannels.store(sinkCaps.pcmMaxChannels, std::memory_order_release);
     sinkCapsDevice = alsaDeviceName;
     sinkCapsCached = true;
     alsaCardId = -1;
@@ -1418,6 +1686,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         }
 
         dsyslog("vaapivideo/audio: cannot probe capabilities, PCM-only mode: %s", snd_strerror(ret));
+        sinkCapsCached = false; // transient (e.g. device busy mid channel-switch): re-probe next time
         return;
     }
 
@@ -1427,6 +1696,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     if (const int err = snd_pcm_info(handle, info); err < 0) {
         dsyslog("vaapivideo/audio: snd_pcm_info failed: %s", snd_strerror(err));
         snd_pcm_close(handle);
+        sinkCapsCached = false; // not a permanent verdict; allow a later retry to read the ELD
         return;
     }
 
@@ -1485,110 +1755,42 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
                 eldBuffer.at(i) = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
             }
 
-            // ELD layout (kernel sound/hda/hda_eld.c):
-            //   Byte 4 [4:0] = MNL (Monitor Name Length)
-            //   Byte 5 [7:4] = SAD count
-            //   Bytes 20 .. 20+MNL-1 = monitor name string
-            //   Bytes 20+MNL .. = Short Audio Descriptors (3 bytes each)
-            const unsigned mnl = eldBuffer.at(4) & 0x1FU;
-            const unsigned sadCount = (eldBuffer.at(5) >> 4) & 0x0FU;
-            const unsigned sadOffset = kEldFixedHeader + mnl;
-            constexpr unsigned kSadSize = 3; ///< CEA-861 SAD is always 3 bytes
-
-            if (sadCount == 0) {
-                dsyslog("vaapivideo/audio: ELD found but no SADs (PCM-only sink)");
+            // All CEA-861 SAD / speaker-allocation / LPCM-cap decoding lives in caps.cpp
+            // (pure, testable). Keep only the ALSA control plumbing here. Build the span from
+            // data()+size() instead of passing eldBuffer directly: equivalent in C++20, but the explicit
+            // form sidesteps an IntelliSense parser limitation on span's contiguous_range constructor.
+            const std::span<const uint8_t> eldSpan{eldBuffer.data(), eldBuffer.size()};
+            if (auto parsed = ParseEldSinkCaps(eldSpan); parsed) {
+                sinkCaps = *parsed;
                 foundValidEld = true;
-                break;
+            } else {
+                dsyslog("vaapivideo/audio: ELD at index %u unparsable (truncated); trying next index", index);
             }
-
-            if (sadOffset + (sadCount * kSadSize) > eldSize) {
-                dsyslog("vaapivideo/audio: truncated ELD (%u SADs @ offset %u need %u bytes, have %u)", sadCount,
-                        sadOffset, sadOffset + (sadCount * kSadSize), eldSize);
-                continue;
-            }
-
-            // Audio Format Codes (AFC): CEA-861-D Table 37 / CTA-861-H Table 38.
-            // SAD byte 0 bits [6:3] = AFC. 0x0F = Extended; actual format in byte 2 [7:3] (EAFC).
-            constexpr uint8_t kCeaAc3 = 0x02;      ///< Dolby Digital (AC-3)
-            constexpr uint8_t kCeaAac = 0x06;      ///< AAC (CEA AFC 0x06; 0x05 = MPEG-2 multichannel, 0x08 = ATRAC)
-            constexpr uint8_t kCeaDts = 0x07;      ///< DTS Coherent Acoustics
-            constexpr uint8_t kCeaEac3 = 0x0A;     ///< Dolby Digital Plus (E-AC-3)
-            constexpr uint8_t kCeaDtshd = 0x0B;    ///< DTS-HD Master Audio
-            constexpr uint8_t kCeaTruehd = 0x0C;   ///< Dolby TrueHD (Atmos is a metadata layer on top)
-            constexpr uint8_t kCeaExtended = 0x0F; ///< Extended format escape -- read EAFC from byte 2
-            // EAFC AAC-family advertisements (CTA-861 Audio Coding Extension Type). 0x01/0x02 are the
-            // legacy CEA-861-E HE-AAC codes; 0x04-0x0A are the MPEG-4 variants. All map to sinkCaps.aac.
-            constexpr uint8_t kCeaExtHeAac = 0x01;      ///< EAFC: HE-AAC (legacy)
-            constexpr uint8_t kCeaExtHeAacV2 = 0x02;    ///< EAFC: HE-AAC v2 (legacy)
-            constexpr uint8_t kCeaExtMp4HeAac = 0x04;   ///< EAFC: MPEG-4 HE-AAC
-            constexpr uint8_t kCeaExtMp4HeAacV2 = 0x05; ///< EAFC: MPEG-4 HE-AAC v2
-            constexpr uint8_t kCeaExtMp4AacLc = 0x06;   ///< EAFC: MPEG-4 AAC LC
-            constexpr uint8_t kCeaExtMp4HeAacMs = 0x08; ///< EAFC: MPEG-4 HE-AAC + MPEG Surround
-            constexpr uint8_t kCeaExtMp4AacLcMs = 0x0A; ///< EAFC: MPEG-4 AAC LC + MPEG Surround
-            constexpr uint8_t kCeaExtMpegh3d = 0x0B;    ///< EAFC: MPEG-H 3D Audio
-            constexpr uint8_t kCeaExtAc4 = 0x0C;        ///< EAFC: Dolby AC-4
-
-            for (unsigned i = 0; i < sadCount; ++i) {
-                const size_t offset = sadOffset + (i * kSadSize);
-                const uint8_t formatCode = (eldBuffer.at(offset) >> 3) & 0x0F;
-
-                switch (formatCode) {
-                    case kCeaAc3:
-                        sinkCaps.ac3 = true;
-                        break;
-                    case kCeaAac:
-                        // Diagnostic only: recorded + logged, but never enables passthrough.
-                        // Current routing keeps AAC/AAC-LATM on the PCM path.
-                        sinkCaps.aac = true;
-                        break;
-                    case kCeaDts:
-                        sinkCaps.dts = true;
-                        break;
-                    case kCeaEac3:
-                        sinkCaps.eac3 = true;
-                        break;
-                    case kCeaDtshd:
-                        sinkCaps.dtshd = true;
-                        break;
-                    case kCeaTruehd:
-                        sinkCaps.truehd = true;
-                        break;
-                    case kCeaExtended: {
-                        const uint8_t extCode = (eldBuffer.at(offset + 2) >> 3) & 0x1F;
-                        switch (extCode) {
-                            case kCeaExtHeAac:
-                            case kCeaExtHeAacV2:
-                            case kCeaExtMp4HeAac:
-                            case kCeaExtMp4HeAacV2:
-                            case kCeaExtMp4AacLc:
-                            case kCeaExtMp4HeAacMs:
-                            case kCeaExtMp4AacLcMs:
-                                // Diagnostic only (see base-AFC AAC case); stays on the PCM path.
-                                sinkCaps.aac = true;
-                                break;
-                            case kCeaExtMpegh3d:
-                                sinkCaps.mpegh = true;
-                                break;
-                            case kCeaExtAc4:
-                                sinkCaps.ac4 = true;
-                                break;
-                            default:
-                                break;
-                        }
-                        break;
-                    }
-                    default:
-                        break;
-                }
-            }
-
-            foundValidEld = true;
         }
 
         sinkCaps.elded = foundValidEld;
-        if (!foundValidEld) {
+        if (foundValidEld) {
+            // Render the parsed PCM caps once so an operator can see what the sink advertises.
+            std::string rates;
+            for (const int hz : sinkCaps.pcmRates) {
+                rates += std::format("{}{}", rates.empty() ? "" : ",", hz);
+            }
+            dsyslog("vaapivideo/audio: sink PCM caps: maxCh=%u rates=[%s] speakers=[%s] (0x%02x)",
+                    sinkCaps.pcmMaxChannels, rates.empty() ? "48000(default)" : rates.c_str(),
+                    DescribeSpeakerAlloc(sinkCaps.speakerAlloc).c_str(), sinkCaps.speakerAlloc);
+        } else {
+            // Don't cache the miss: an all-zero/absent ELD often means the receiver is off or asleep, and
+            // becomes valid after a wake/hotplug. Re-probe on the next call so multichannel can light up
+            // without a VDR restart. A sink that genuinely has a valid ELD takes the branch above and caches.
             dsyslog("vaapivideo/audio: no valid ELD found across all indices");
+            sinkCapsCached = false;
         }
+
+        // Publish the lock-free snapshot the decode thread reads when choosing the PCM output
+        // layout (ChooseOutputChannels): sinkCaps itself carries a std::vector and must not be
+        // touched off-mutex.
+        sinkElded.store(sinkCaps.elded, std::memory_order_release);
+        sinkMaxPcmChannels.store(sinkCaps.pcmMaxChannels, std::memory_order_release);
 
         snd_ctl_elem_id_t *iecId = nullptr;
         snd_ctl_elem_id_alloca(&iecId);

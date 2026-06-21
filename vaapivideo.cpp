@@ -87,6 +87,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
           editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
                                          0, kPassthroughModeCount - 1)),
+          editPcmChannelMode(std::clamp(static_cast<int>(vaapiConfig.pcmChannelMode.load(std::memory_order_relaxed)), 0,
+                                        kPcmChannelModeCount - 1)),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
           editScaleMode(
               std::clamp(static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed)), 0, kScaleCount - 1)),
@@ -114,6 +116,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         addHeader(tr("Audio"));
         Add(new cMenuEditStraItem(tr("Audio Passthrough"), &editPassthroughMode, kPassthroughModeCount,
                                   kPassthroughModeLabels.data()));
+        // Decoded-PCM channel policy (ignored while passthrough is active). Auto follows the sink's
+        // ELD PCM channel cap; takes effect on the next decoded frame (decode-driven, no codec reopen).
+        Add(new cMenuEditStraItem(tr("PCM Channels"), &editPcmChannelMode, kPcmChannelModeCount,
+                                  kPcmChannelModeLabels.data()));
         // Separate A/V offsets for PCM and IEC61937 passthrough paths; bounds from config.h
         // keep the menu and setup.conf parser in sync.
         Add(new cMenuEditIntItem(tr("PCM Audio Latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
@@ -164,6 +170,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
+        vaapiConfig.pcmChannelMode.store(static_cast<PcmChannelMode>(editPcmChannelMode), std::memory_order_relaxed);
         vaapiConfig.hdrMode.store(static_cast<HdrMode>(editHdrMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
         vaapiConfig.deinterlaceMode.store(static_cast<DeinterlaceMode>(editDeinterlaceMode), std::memory_order_relaxed);
@@ -173,6 +180,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
         SetupStore("PassthroughMode", editPassthroughMode);
+        SetupStore("PcmChannelMode", editPcmChannelMode);
         SetupStore("HdrMode", editHdrMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
         // Post-processing policies; applied by the filter rebuild below, or any later rebuild.
@@ -229,6 +237,14 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
 
+    // Same pattern as kPassthroughModeLabels; rooted in PcmChannelModeName().
+    static constexpr std::array kPcmChannelModeLabels{
+        PcmChannelModeName(PcmChannelMode::Auto),
+        PcmChannelModeName(PcmChannelMode::Stereo),
+        PcmChannelModeName(PcmChannelMode::Multichannel),
+    };
+    static constexpr int kPcmChannelModeCount = static_cast<int>(kPcmChannelModeLabels.size());
+
     // Same pattern as kPassthroughModeLabels; rooted in HdrModeName().
     static constexpr std::array kHdrModeLabels{
         HdrModeName(HdrMode::Auto),
@@ -274,6 +290,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editHdrMode;              ///< Scratch copy of hdrMode as int (index into kHdrModeLabels).
     int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
     int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
+    int editPcmChannelMode;       ///< Scratch copy of pcmChannelMode as int (index into kPcmChannelModeLabels).
     int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
     int editScaleMode;            ///< Scratch copy of scaleMode (index into kScaleLabels).
     int editSharpenMode;          ///< Scratch copy of sharpenMode (index into kSharpenLabels).
@@ -815,8 +832,8 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
 }
 
 auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
-    // Built once; *zoomHelp stays valid for the array's lifetime because the cString is static.
-    static const cString zoomHelp = cString::sprintf(
+    // Built once; *kZoomHelp stays valid for the array's lifetime because the cString is static.
+    static const cString kZoomHelp = cString::sprintf(
         "ZOOM [next|0-%d]\n    Cycle manual zoom or pick a stop (0=off, 1-%d=preset). Resets on content change.",
         CONFIG_ZOOM_PRESET_COUNT, CONFIG_ZOOM_PRESET_COUNT);
     static const char *const kHelpPages[] = {
@@ -825,7 +842,7 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         "STAT\n    Show detailed device status and statistics.",
         "CONF\n    Display current configuration settings.",
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
-        *zoomHelp,
+        *kZoomHelp,
         nullptr};
     // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
     // both pointee levels are read-only at the call site, so stripping the inner const is safe.

@@ -1,49 +1,24 @@
 # Coding Rules
 
-README.md = architecture / build. `src/common.h` = RAII deleters + `AvErr()`.
-
-Build: `make` | Lint: `make lint` (bear + clang-tidy) | Format: `make indent`.
+README.md = architecture/build; `src/common.h` = RAII deleters + `AvErr()`.
+Build `make DEV_WARNINGS=1` (strict `-Werror`; plain `make` is the lenient packaging build) · lint `make lint` (bear+clang-tidy) · format `make indent`.
 
 ## Hard rules
-
-- Trailing return type on every function (incl. `-> void`, deleted ops).
-- `[[nodiscard]]` on every value-returning function.
+- Trailing return type everywhere (incl. `-> void`, deleted ops); `[[nodiscard]]` on every value-returning fn.
 - `noexcept` on dtors, moves, trivial const getters.
-- Include guards `#ifndef/#define/#endif` -- no `#pragma once`.
-- `std::format` (never `snprintf` into `std::string`). `std::span` (never `ptr+size`). `std::`-qualified C funcs.
-- RAII for all resources; no naked `new`/`delete`, no manual `av_*_free`.
-- Check every C-API return value. No exceptions (VDR is exception-free).
-- VDR threading primitives only: `cThread`, `cMutex`, `cMutexLock`, `cCondVar`, `cCondWait::SleepMs()`, `cTimeMs` -- no `std::thread`/`std::mutex`.
-- `NOLINT` only at C-API boundaries; always name the check.
+- Include guards `#ifndef/#define/#endif`, never `#pragma once`.
+- `std::format` not `snprintf`+`std::string`; `std::span` not `ptr+size`; `std::`-qualify C funcs.
+- RAII-own every resource (no naked `new`/`delete`); direct `av_*_free`/C frees only in deleters, dtors, or cleanup/transfer paths. Check every C-API return.
+- No exceptions (VDR is exception-free). `NOLINT` only at C-API boundaries; name the check, give a reason.
+- Threads: VDR primitives only (`cThread`, `cMutex`, `cMutexLock`, `cCondVar`, `cCondWait::SleepMs`, `cTimeMs`), never `std::thread`/`std::mutex`. `Running()` is not thread-safe -- gate on `stopping`/`hasExited` atomics (acquire/release).
 
 ## Conventions
-
-- Constants: `inline constexpr` UPPERCASE in headers, plain `constexpr` in `.cpp`.
-- File scope: `static` for free fns, anon namespace for types.
-- Logging: `"vaapivideo/<basename>: <msg>"`; never in hot paths.
-- Errors: FFmpeg -> `AvErr(ret).data()`; DRM/VAAPI -> `%m` or `strerror(errno)`.
-- Members: inline Doxygen `///<` after member, brace-init, alphabetical within groups.
-- Section rulers: `// === LABEL ===`.
-- Hints: `[[unlikely]]` on error paths, `[[likely]]` on hot paths, early returns.
-
-## Lambdas vs named helpers
-
-Lambdas for local mechanics; named helpers for domain behavior.
-
-- Lambda = short local glue: predicates, algorithm / `std::function` callbacks, IIFE const-init.
-  e.g. `const auto kind = [&]{ ...; return k; }();`
-- Named fn (static free / member) when the body names a real operation, mutates members, takes a
-  lock, calls a C API, encodes thread-ownership, runs >~15 lines, or is reused.
-  e.g. `ResolvePendingTrickExit()`, `SubmitTrickFrame()`.
-- Don't wrap a one-shot expression in a lambda. Snapshot an atomic into a `const` for a
-  scope-stable value (a re-reading lambda reloads each call).
-
-## Thread-safety
-
-VDR's `Running()` is **not** thread-safe. Use `std::atomic<bool> stopping` / `hasExited` with `acquire`/`release`. Mirror existing `Shutdown()` patterns.
+- Constants: file/namespace scope is `UPPERCASE` (headers `inline constexpr`; `.cpp` `constexpr` in the anonymous namespace); function-local `constexpr` is `kCamelCase`.
+- File-local helpers (free fns, types): anonymous namespace, co-located with use (multiple per file ok); no new file-scope `static`. Exported symbols stay global (`c`-prefix; no project namespace).
+- Logging `"vaapivideo/<basename>: <msg>"`, never hot paths. Errors: FFmpeg `AvErr(ret).data()`, DRM/VAAPI `%m`/`strerror(errno)`.
+- Members: trailing `///<`, brace-init; alphabetical within groups, but lifetime/lock order wins where it matters (e.g. a thread member declared last). Section rulers `// === LABEL ===`.
+- `[[likely]]`/`[[unlikely]]` on hot/error paths; prefer early returns.
+- Lambdas for tiny local glue; a named fn (anon-ns free or member) when reused, mutating, locking, calling a C API, or >~15 lines. Snapshot an atomic into a `const` before a lambda (avoid re-reads).
 
 ## Lifecycle (match existing patterns)
-
-- `Clear()` -- reset buffers, keep resources.
-- `Shutdown()` -- release everything, log stats, idempotent via `stopping.exchange(true)`.
-- `~Destructor() noexcept` -- calls `Shutdown()` if not yet done.
+- `Clear()` resets buffers, keeps resources. `Shutdown()` releases everything + logs stats, idempotent via `stopping.exchange(true)`. `~Dtor() noexcept` calls `Shutdown()` if not already done.

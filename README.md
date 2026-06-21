@@ -19,7 +19,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 |-------------|----------------------------------------------------------------------------------------------------|
 | Decode      | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10), AV1 Main / Main 10 — hardware (VAAPI) with per-profile software fallback |
 | Filters     | Deinterlace, denoise, DAR-preserving scale, sharpen — SW path (bwdif, hqdn3d) or HW (VAAPI VPP)    |
-| Audio       | PCM decode (AAC, MP2); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D)           |
+| Audio       | PCM decode/downmix with sink-driven multichannel output (AAC, MP2, or any codec when passthrough is off); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
 | Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, runtime audio-track switching — see [Mediaplayer](#mediaplayer) |
@@ -82,12 +82,12 @@ spends the reserve instead of stalling the screen. See
 | `src/decoder.cpp`     | Decoupled VAAPI decode + presentation threads, A/V sync controller                     |
 | `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
 | `src/display.cpp`     | DRM atomic modesetting, PRIME import, page-flip thread                                |
-| `src/audio.cpp`       | ALSA output, IEC61937 passthrough, HDMI ELD/EDID probe                                |
+| `src/audio.cpp`       | ALSA output (multichannel PCM / downmix, chmap), IEC61937 passthrough, HDMI ELD read   |
 | `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
 | `src/mediaplayer.cpp` | libavformat demux, file browser, cControl with OSD replay bar                         |
 | `src/stream.cpp`      | Shared codec/profile data model, H.264/HEVC SPS probe                                 |
 | `src/pes.cpp`         | PES header parsing                                                                    |
-| `src/caps.cpp`        | One-shot GPU/display/sink capability probes (GpuCaps, DisplayCaps, AudioSinkCaps)     |
+| `src/caps.cpp`        | Capability derivation for GPU/display/sink (GpuCaps, DisplayCaps, AudioSinkCaps): VAAPI profile/VPP probe + pure EDID/ELD parsers; live-handle I/O stays with the resource owner |
 | `src/config.cpp`      | Resolution parsing, `setup.conf` storage                                              |
 | `src/common.h`        | RAII deleters, `AvErr()` helper, version/API guards                                   |
 
@@ -300,12 +300,18 @@ against the plugin log (`vdr -l 3`) to identify mismatches.
 
 ### 6. Configure the ALSA audio device
 
-The default ALSA device is `default` (stereo PCM). For IEC61937 passthrough use
-a direct hardware device — supported passthrough formats are detected from the
-sink's EDID at startup:
+Prefer a device bound **directly to the HDMI/DisplayPort output** — either
+`hw:CARD,DEV` (bit-exact) or `plughw:CARD,DEV` (the same device with rate/format
+conversion added, handy for the PCM path); both expose the real sink and forward
+its channel map, so IEC61937 passthrough and native multichannel PCM both work
+(formats and channel count are detected from the sink's ELD at startup). Avoid the
+bare `default`: it routes through dmix/PulseAudio, which downmixes multichannel to
+stereo and rejects the channel-map query the plugin uses to order surround
+channels, so 5.1 collapses to stereo or lands on the wrong speakers. Find the
+HDMI/DisplayPort device with:
 
     aplay -l | grep -E "HDMI|DisplayPort"
-    vdr -P 'vaapivideo -a hw:0,3'
+    vdr -P 'vaapivideo -a plughw:0,3'
 
 
 ## Configuration
@@ -316,7 +322,7 @@ sink's EDID at startup:
 
 | Option                           | Default         | Description                                           |
 |----------------------------------|-----------------|-------------------------------------------------------|
-| `-a DEV`, `--audio=DEV`          | `default`       | ALSA audio device (use `hw:CARD,DEV` for passthrough) |
+| `-a DEV`, `--audio=DEV`          | `default`       | ALSA audio device — prefer `hw:`/`plughw:CARD,DEV` for passthrough and multichannel PCM |
 | `-c NAME`, `--connector=NAME`    | first connected | DRM connector name (e.g. `HDMI-A-1`, `DP-2`)          |
 | `-D`, `--detached`               | off             | Start without opening the DRM/VAAPI/ALSA hardware     |
 | `-d DEV`, `--drm=DEV`            | auto-detect     | DRM device path (`/dev/dri/cardN`)                    |
@@ -343,6 +349,7 @@ that start VDR before a user session claims the console.
 | `PCM Audio Latency (ms)`         | −200 … 200       | A/V offset applied when audio is decoded to PCM by the plugin                                        |
 | `Passthrough Audio Latency (ms)` | −200 … 200       | A/V offset applied when audio is forwarded as IEC61937 to an AVR                                     |
 | `Audio Passthrough`              | auto / on / off  | IEC61937 passthrough policy (see below)                                                              |
+| `PCM Channels`                   | auto / stereo / multichannel | Decoded-PCM channel layout when not passing through (see below)                          |
 | `HDR Passthrough`                | auto / on / off  | HDR10 / HLG BT.2020 + P010 output policy (see [HDR passthrough](#hdr-passthrough))                   |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of leaving the previous channel's last frame on screen |
 | `Zoom level N (0.1% larger, 0=off)` | 0 … 499       | Level N (1–5): zoom-in factor in tenths-of-% (`344` = +34.4%, picture enlarged 1.34×); 0 disables the level (skipped while cycling) |
@@ -364,7 +371,8 @@ regardless of this setting.
 
 `Audio Passthrough` defaults to **auto**: the plugin reads the HDMI sink's ELD
 at startup and forwards a compressed codec as IEC61937 only when the sink
-advertises support for it — everything else is decoded to stereo PCM. Use
+advertises support for it — everything else is decoded to PCM (see
+[PCM Channels](#pcm-channels) for the channel layout). Use
 **on** to unconditionally force passthrough for every wrappable codec (AC-3,
 E-AC-3, TrueHD, DTS, AC-4, MPEG-H 3D Audio) and **ignore the ELD entirely**.
 This is the knob for topologies where the probed capabilities are wrong — the
@@ -386,6 +394,36 @@ device really does decode the codec — otherwise switch back to **auto** or
 Changes to this setting only take effect when the audio device is reopened —
 i.e. on the next channel switch or codec change. Switch channels once after
 leaving the setup menu to activate the new mode.
+
+### PCM Channels
+
+When audio is **decoded to PCM** (no passthrough, or a codec without IEC61937
+framing such as AAC or MP2), `PCM Channels` decides the ALSA output layout. The
+plugin parses the sink's PCM capabilities from the same ELD used for passthrough
+(linear-PCM max channel count and speaker allocation; supported sample rates are
+parsed for diagnostics only) and picks the output layout from the **decoded
+stream's actual channel count** — so a
+5.1 AAC broadcast or file plays as 5.1 when the sink accepts it, and is downmixed
+by libswresample otherwise. The output never fabricates surround from stereo
+(mono is carried as stereo for HDMI/ALSA compatibility), and is snapped to a
+standard HDMI layout (stereo / 5.1 / 7.1). For
+multichannel output the plugin reads the device's channel order
+(`snd_pcm_get_chmap()`) and reorders libswresample's output to match, so centre
+and LFE land on the right speakers — this needs a direct `hw:`/`plughw:` device,
+since the system `default` route blocks the query and would mis-route those channels.
+
+- **auto** (default): native multichannel up to the sink's advertised PCM channel
+  count; falls back to **stereo** when the ELD is unreadable (conservative — never
+  sends more channels than the sink can prove it accepts).
+- **stereo**: always downmix decoded audio to 2.0. Use for a stereo TV/receiver, or
+  if a multichannel mix sounds wrong.
+- **multichannel**: force native multichannel even when no ELD is readable (trusts
+  the receiver to downmix what it can't render). Use when the sink's caps are masked
+  (e.g. an AVR behind a TV) but you know it handles multichannel PCM.
+
+The decision is made from the decoded stream, so it adapts mid-stream: if a
+broadcast switches stereo↔5.1, the device reopens at the new count on the next
+frame. IEC61937 passthrough is unaffected — it is always a 2-channel carrier.
 
 ### Manual zoom
 
@@ -594,6 +632,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoise = off`       |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
+| Audio   | Multichannel plays as stereo / wrong speakers | Use a direct `hw:`/`plughw:CARD,DEV`, not `default` (it downmixes and blocks the channel-map query); log shows `remapping output to match` when ordering is active |
 | Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough Audio Latency` (see [AVSYNC.md](AVSYNC.md)) |
 | Perf    | AMD iGPU stutters / drops            | GPU pinned `low` DPM — `power_dpm_force_performance_level=auto` |
 | Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlace = auto` |

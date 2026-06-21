@@ -43,7 +43,7 @@ extern "C" {
 auto SelectVideoBackendCap(const VideoStreamInfo &info) noexcept -> bool GpuCaps::* {
     // Linear scan: first row whose codec matches AND bitDepth matches AND profile
     // matches (or is FF_PROFILE_UNKNOWN wildcard) wins. Order rows most-specific-first.
-    for (const auto &row : kVideoBackendTable) {
+    for (const auto &row : VIDEO_BACKEND_TABLE) {
         if (row.codecId != info.codecId) {
             continue;
         }
@@ -59,7 +59,7 @@ auto SelectVideoBackendCap(const VideoStreamInfo &info) noexcept -> bool GpuCaps
 }
 
 auto IsPassthroughCapable(AVCodecID codec) noexcept -> bool {
-    return std::ranges::find(kAudioPassthroughTable, codec) != kAudioPassthroughTable.end();
+    return std::ranges::find(AUDIO_PASSTHROUGH_TABLE, codec) != AUDIO_PASSTHROUGH_TABLE.end();
 }
 
 // ============================================================================

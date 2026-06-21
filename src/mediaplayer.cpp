@@ -208,15 +208,15 @@ extern "C" auto InterruptOnStop(void *opaque) -> int {
 // audio-only formats are intentionally absent because cVaapiMediaSource::Open requires a
 // video stream and would fail at open. Extend with care -- adding here implies the entire
 // decode path supports the format.
-constexpr std::array<std::string_view, 7> kMediaExtensions{{".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v", ".webm"}};
+constexpr std::array<std::string_view, 7> MEDIA_EXTENSIONS{{".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v", ".webm"}};
 
-constexpr std::array<std::string_view, 2> kPlaylistExtensions{{".m3u", ".m3u8"}};
+constexpr std::array<std::string_view, 2> PLAYLIST_EXTENSIONS{{".m3u", ".m3u8"}};
 
 // URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
 // HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
 // file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
 // instead of being mangled into "<playlist-dir>/file:///media/movie.mkv".
-constexpr std::array<std::string_view, 4> kUrlSchemes{{"file://", "http://", "https://", "ftp://"}};
+constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "https://", "ftp://"}};
 
 [[nodiscard]] auto AsciiToLower(char c) noexcept -> char {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -236,7 +236,7 @@ constexpr std::array<std::string_view, 4> kUrlSchemes{{"file://", "http://", "ht
 }
 
 [[nodiscard]] auto HasUrlScheme(std::string_view path) noexcept -> bool {
-    return std::ranges::any_of(kUrlSchemes, [path](std::string_view scheme) noexcept -> bool {
+    return std::ranges::any_of(URL_SCHEMES, [path](std::string_view scheme) noexcept -> bool {
         return path.size() >= scheme.size() && IEquals(path.substr(0, scheme.size()), scheme);
     });
 }
@@ -278,8 +278,8 @@ constexpr std::array<std::string_view, 4> kUrlSchemes{{"file://", "http://", "ht
 /// rounds to "0 MB": sub-half-MiB sizes are floored up to "1 MB" so the column
 /// always reflects that there is content.
 [[nodiscard]] auto FormatSizeMb(std::uintmax_t bytes) -> cString {
-    constexpr std::uintmax_t BYTES_PER_MIB = 1024U * 1024U;
-    std::uintmax_t mib = (bytes + (BYTES_PER_MIB / 2)) / BYTES_PER_MIB;
+    constexpr std::uintmax_t kBytesPerMiB = 1024U * 1024U;
+    std::uintmax_t mib = (bytes + (kBytesPerMiB / 2)) / kBytesPerMiB;
     if (mib == 0 && bytes > 0) {
         mib = 1;
     }
@@ -303,7 +303,7 @@ constexpr std::array<std::string_view, 4> kUrlSchemes{{"file://", "http://", "ht
 ///   3. Profile heuristic -- last resort. Only honors profiles that are unambiguously
 ///      10-bit by spec: H.264 HIGH_10 and HEVC MAIN_10. REXT / HIGH_422 / HIGH_444 are
 ///      intentionally NOT special-cased: they straddle 8 / 10 / 12-bit and a bad guess
-///      sends the wrong row of kVideoBackendTable to the decoder. Defaulting to k8 there
+///      sends the wrong row of VIDEO_BACKEND_TABLE to the decoder. Defaulting to k8 there
 ///      sacrifices a HW open attempt to FFmpeg's get_format SW fallback, which is safe.
 ///
 /// >10-bit streams are reported as k10. The backend table has no row for 12-bit, so
@@ -417,7 +417,7 @@ auto IsMediaUri(std::string_view path) noexcept -> bool {
     if (HasUrlScheme(path)) {
         return true;
     }
-    return std::ranges::any_of(kMediaExtensions,
+    return std::ranges::any_of(MEDIA_EXTENSIONS,
                                [path](std::string_view ext) noexcept -> bool { return HasExtension(path, ext); });
 }
 
@@ -426,7 +426,7 @@ auto IsPlaylistUri(std::string_view path) noexcept -> bool {
     if (HasUrlScheme(path)) {
         return false;
     }
-    return std::ranges::any_of(kPlaylistExtensions,
+    return std::ranges::any_of(PLAYLIST_EXTENSIONS,
                                [path](std::string_view ext) noexcept -> bool { return HasExtension(path, ext); });
 }
 
@@ -451,10 +451,12 @@ auto StartPlayback(std::vector<PlaylistEntry> entries) -> bool {
 
 // One-shot "return to browser" target. Set on Stop/EOF, consumed by MainMenuAction(); both run on
 // the VDR main thread (never concurrent), so no lock is needed.
-[[nodiscard]] static auto PendingBrowserReturn() -> std::optional<std::string> & {
+namespace {
+[[nodiscard]] auto PendingBrowserReturn() -> std::optional<std::string> & {
     static std::optional<std::string> pending;
     return pending;
 }
+} // namespace
 
 auto RequestReturnToBrowser(std::string jumpToPath) -> void {
     PendingBrowserReturn() = std::move(jumpToPath);
@@ -691,12 +693,9 @@ auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInf
     const AVCodecParameters *p = stream->codecpar;
     info.codecId = p->codec_id;
     info.sampleRate = p->sample_rate;
-    // Always open ALSA at 2 channels and let swresample downmix from the container's
-    // native layout (5.1, 7.1, ...) -- matches the live-TV path in cVaapiDevice::PlayAudio
-    // (hardcoded to 2ch there too). Without this, 5.1 AC3 files open ALSA at 6 channels
-    // and the plug device's automatic downmix produces audibly distorted output on a
-    // stereo sink. Multi-channel passthrough would need separate plumbing.
-    info.channels = 2;
+    // True channel count; the sink picks the PCM layout (ChooseOutputChannels). 0/unknown -> stereo
+    // (SetStreamParams rejects <= 0).
+    info.channels = p->ch_layout.nb_channels > 0 ? p->ch_layout.nb_channels : 2;
     CopyExtradata(p, storage, info.extradata, info.extradataSize);
 }
 

@@ -4,10 +4,20 @@
  * @file caps.h
  * @brief Consolidated hardware capability snapshots (GPU, display, audio sink)
  *
- * Populated once at hardware attach by the Probe...() functions in caps.cpp,
- * then read-only for the session lifetime. On hotplug the structs are replaced
- * wholesale -- no partial updates. Each struct is a plain value type; callers
- * own their copy.
+ * Populated once at hardware attach, then read-only for the session lifetime. On
+ * hotplug the structs are replaced wholesale -- no partial updates. Each struct is
+ * a plain value type; callers own their copy.
+ *
+ * Capability *derivation* lives here (this is the single home for "what can the
+ * hardware/sink do"); capability *consumption* lives in the feature modules
+ * (decoder, filter, display, audio). The pure byte-blob parsers are here and
+ * unit-testable; the live-handle I/O that feeds them stays with the resource owner:
+ *  - GpuCaps     -- ProbeGpuCaps() (opens its own throwaway VADisplay; fully here).
+ *  - DisplayCaps -- ParseEdidHdrCaps() (pure EDID) here; the DRM connector/plane walk
+ *                   that supplies the EDID blob + plane formats is in cVaapiDisplay
+ *                   (it is interleaved with DRM property-ID capture, which must stay).
+ *  - AudioSinkCaps -- ParseEldSinkCaps() (pure ELD) here; the ALSA control read that
+ *                   supplies the ELD bytes is in cAudioProcessor.
  *
  * Design invariants:
  *  - DisplayCaps carries capability bits only. DRM property IDs needed for
@@ -24,6 +34,8 @@
 #include "common.h"
 
 #include <optional>
+#include <span>
+#include <string>
 
 // ============================================================================
 // === GPU CAPABILITIES ===
@@ -109,8 +121,11 @@ struct AudioSinkCaps {
     bool elded{false}; ///< True when ProbeAudioSinkCaps successfully parsed an ELD
 
     // === PCM BASELINE ===
-    std::vector<int> pcmRates; ///< Supported PCM sample rates (Hz), ascending; empty => treat as {48000}
-    uint8_t pcmMaxChannels{2}; ///< Max linear-PCM channel count; range 2..8
+    std::vector<int> pcmRates; ///< Supported LPCM sample rates (Hz), ascending; empty => treat as {48000}
+    uint8_t pcmMaxChannels{2}; ///< Max linear-PCM channel count from the LPCM SAD; range 2..8
+    uint8_t speakerAlloc{0};   ///< CEA-861 Speaker Allocation mask (ELD byte 7, bits 6:0): bit0 FL/FR, bit1 LFE,
+                               ///< bit2 FC, bit3 RL/RR, bit4 RC, bit5 FLC/FRC, bit6 RLC/RRC. 0 when absent.
+                               ///< Stored for diagnostics; the PCM channel cap is driven by pcmMaxChannels.
 
     // === IEC61937 PASSTHROUGH FORMATS ===
     bool ac3{};    ///< Dolby Digital (AC-3)
@@ -143,5 +158,26 @@ struct AudioSinkCaps {
 /// must abort hardware attach. A returned struct with all hw* flags false is
 /// valid: VPP is operational but no codec was confirmed usable for HW decode.
 [[nodiscard]] auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps>;
+
+/// OR the sink HDR capability bits from a raw EDID blob into @p caps (sinkHdr10Pq, sinkHlg,
+/// sinkBt2020Ycc). Pure: no DRM/system dependency, so it is unit-testable and shared by the display
+/// probe. Walks every CTA-861 extension block for the HDR Static Metadata (EOTF) and Colorimetry
+/// data blocks. The remaining DisplayCaps fields (DRM plane formats, connector properties) come from
+/// the live DRM walk in cVaapiDisplay, so this is a contributor, not the sole producer -- it only
+/// touches the EDID-derived bits and leaves the rest of @p caps untouched.
+auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) noexcept -> void;
+
+/// Parse a raw HDMI ELD (the byte blob from the ALSA "ELD" control) into AudioSinkCaps.
+/// Pure: no ALSA/system dependency, so it is unit-testable and shared by the audio sink probe.
+/// Decodes the CEA-861 Short Audio Descriptors (passthrough format flags + the LPCM SAD's max
+/// channels / sample rates) and the ELD byte-7 speaker-allocation mask. Returns std::nullopt when
+/// @p eld is too short to hold the fixed header or its SAD block is truncated; the returned struct
+/// has @c elded == true (a PCM-only sink with zero SADs is still a valid ELD).
+[[nodiscard]] auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<AudioSinkCaps>;
+
+/// Render a CEA-861 speaker-allocation mask (AudioSinkCaps::speakerAlloc) as a human-readable list of the
+/// speaker groups it advertises, e.g. "FL/FR LFE FC RL/RR RC RLC/RRC"; "none" when the mask is zero. Pure;
+/// used only for the sink-capabilities diagnostic log.
+[[nodiscard]] auto DescribeSpeakerAlloc(uint8_t alloc) -> std::string;
 
 #endif // VDR_VAAPIVIDEO_CAPS_H
