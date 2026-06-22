@@ -42,13 +42,8 @@ struct VaapiContext {
 // === DRM DEVICES CLASS ===
 // ============================================================================
 
-/**
- * @class DrmDevices
- * @brief Enumerates all DRM devices visible to the system via libdrm.
- *
- * Used to pick a primary node when no explicit device path is configured.
- * Iteration follows the standard range-for protocol via begin()/end().
- */
+/// Enumerates all DRM devices visible to the system via libdrm, to pick a primary node when no explicit
+/// device path is configured. Iteration follows the standard range-for protocol via begin()/end().
 class DrmDevices {
   public:
     DrmDevices() = default;
@@ -82,15 +77,10 @@ class DrmDevices {
 // === VAAPI DEVICE CLASS ===
 // ============================================================================
 
-/**
- * @class cVaapiDevice
- * @brief Primary VDR output device: demuxes PES, decodes via VAAPI, and renders over DRM/KMS.
- *
- * Lifecycle: Initialize() latches device arguments and either attaches hardware immediately
- * or leaves the device detached (--detached). Once attached, VDR routes
- * SetPlayMode/PlayVideo/PlayAudio here; Stop() tears the subsystems down.
- * All playback state transitions (pause, trick speed, track switch) are handled inline.
- */
+/// Primary VDR output device: demuxes PES, decodes via VAAPI, and renders over DRM/KMS.
+/// Lifecycle: Initialize() latches device arguments and either attaches hardware immediately or stays
+/// detached (--detached); once attached, VDR routes SetPlayMode/PlayVideo/PlayAudio here and Stop() tears
+/// the subsystems down. All playback transitions (pause, trick speed, track switch) are handled inline.
 class cVaapiDevice : public cDevice {
   public:
     cVaapiDevice();

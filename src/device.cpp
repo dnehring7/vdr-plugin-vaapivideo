@@ -107,13 +107,20 @@ extern "C" {
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
-// AUDIO_QUEUE_HIGHWATER (audio.h) paces both feed paths: dvbplayer replay (PlayAudio/Poll) and the
-// mediaplayer demux (to ~1x playback, so a TS mux interleave offset can't over-fill the decoder jitterBuf
-// after a seek -- the coarse PTS-distance brake is MEDIAPLAYER_MAX_LOOKAHEAD_90K).
+// AUDIO_QUEUE_HIGHWATER paces dvbplayer/PES replay (PlayAudio/Poll); AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER
+// paces the single-cursor mediaplayer demux. MEDIAPLAYER_MAX_LOOKAHEAD_90K is the coarser PTS-distance
+// brake (so a TS mux interleave offset can't over-fill the decoder jitterBuf after a seek).
 
-// The mediaplayer's video-depth gate must trip before the decode-ahead reserve hits its hard cap (else the
-// drop-oldest runaway guard fires first and the demuxer never throttles). Enforced here, where both
-// headers' constants are visible.
+// Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock is
+// NOPTS (the post-flush window before the first decoded sample anchors the clock). For AUDIO streams
+// AUDIO_QUEUE_HIGHWATER already covers this; it matters for VIDEO-ONLY streams (no audio clock ever), where
+// it is the sole video-depth gate stopping the file-read-speed demuxer from flooding. Once the clock
+// anchors, IsMediaPlayerBackpressured() drops it (a video gate on the single demux cursor would starve the
+// audio queue -- sustained-stutter-after-seek bug). Derived from the reserve cap (3/4) and kept here, the
+// only user, so it stays coupled to the buffer it protects and below the cap by construction. The
+// static_assert must trip before the decode-ahead reserve hits its hard cap (else the drop-oldest runaway
+// guard fires first and the demuxer never throttles).
+constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = (DECODER_RESERVE_HARD_CAP * 3) / 4;
 static_assert(MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES < DECODER_RESERVE_HARD_CAP,
               "mediaplayer backpressure must engage below the reserve cap");
 
@@ -2110,7 +2117,20 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
     // mediaplayer's packetPending=true so this already-demuxed audio packet is retried after
     // the queue drains a slot; the shared demux cursor halts without dropping audio or
     // falsely advancing latestAudioPts90k via the post-submit update in cVaapiPlayer::Action.
-    if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) {
+    //
+    // Use the DEEPER mediaplayer high-water, not the shallow PES one. This gate is the TRUE bound
+    // on the single-cursor demux read-ahead: when it trips, the cursor stalls on the held audio
+    // packet and stops reading VIDEO too (demux-order pump). At the PES value (~320 ms) the video
+    // decoded reserve is therefore capped at ~320 ms -- fine for progressive (25 fps, ~16 frames is
+    // plenty of slack) but starves interlaced content (deinterlaced to 50 fps: ~320 ms is ~16 frames,
+    // and a post-seek catch-up drains it to zero, then the decoder runs input-starved and can never
+    // rebuild the cushion -> sustained "decoder unable to keep up"). The PES path is immune: it feeds
+    // video via a separate PlayVideo() call, so video fills the reserve to the cap independent of this
+    // audio gate. Matching the audio read-ahead to AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER (~1 s) lets the
+    // shared cursor pull video ~1 s ahead too, so the reserve fills toward DECODER_RESERVE_HARD_CAP
+    // exactly like the live/dvbplayer paths. (This is mediaplayer-only: PlayAudio() keeps the shallow
+    // real-time gate.)
+    if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER) {
         return false;
     }
     return audioProcessor->EnqueuePacket(packet);
@@ -2198,7 +2218,9 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // and saturates the jitterBuf. Capping the audio packet queue at a small low-water depth (~10,
     // mirroring VDR's replay HIGHWATER) paces the demuxer to audio consumption rate and shrinks
     // both audio packet depth and the co-buffered video lead, keeping jitterBuf well below the cap.
-    const bool audioHighwater = audioOpen && audioDepth >= AUDIO_QUEUE_HIGHWATER;
+    // Mediaplayer-only deeper highwater (single-cursor demux: audio depth bounds the video reserve).
+    // See AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER -- the shallow shared gate starves heavy interlaced 4K.
+    const bool audioHighwater = audioOpen && audioDepth >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER;
     // jitterBuf depth: guards ONLY the pre-anchor window (post-seek / startup) where the audio
     // clock is still NOPTS, so the demuxer's lookahead throttle can't gate delivery and HW decode
     // would overrun the jitterBuf hard cap (dropping ~30 frames per rapid-seek burst).
@@ -2216,12 +2238,12 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // (decoder hold). On resume jitterFull would block the demuxer just when audio packets MUST
     // flow to re-anchor the clock -- deadlock, since the gate stays asserted until the clock
     // anchors and the clock can't anchor without audio. Yielding jitterFull while audio has room
-    // below HIGHWATER lets audio packets through; ALSA writes; clock anchors; the gate becomes
-    // moot. The audioHighwater gate above caps the co-pumped burst at ~10 audio packets (~250 ms).
+    // below AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER lets audio packets through; ALSA writes; clock anchors;
+    // the gate becomes moot. The audioHighwater gate above caps the co-pumped burst at ~32 AC-3 packets.
     // Video-only streams (audioOpen=false) cannot anchor an audio clock, so the escape stays
     // disarmed and jitterFull bounds the decoder's pre-anchor depth.
     const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
-    const bool audioCanReanchor = audioOpen && audioDepth < AUDIO_QUEUE_HIGHWATER;
+    const bool audioCanReanchor = audioOpen && audioDepth < AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER;
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
                             decoder->GetDecodedReserveSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;

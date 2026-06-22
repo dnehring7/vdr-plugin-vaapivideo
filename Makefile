@@ -116,13 +116,14 @@ SOURCES = $(PLUGIN).cpp \
           src/caps.cpp \
           src/config.cpp \
           src/decoder.cpp \
-	  	  src/device.cpp \
+          src/device.cpp \
           src/display.cpp \
           src/filter.cpp \
           src/mediaplayer.cpp \
           src/osd.cpp \
           src/pes.cpp \
-          src/stream.cpp
+          src/stream.cpp \
+          src/subtitle.cpp
 
 # Build Artifacts
 OBJECTS = $(SOURCES:.cpp=.o)

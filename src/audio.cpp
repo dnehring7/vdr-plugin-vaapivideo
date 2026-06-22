@@ -5,7 +5,8 @@
  * @brief ALSA audio sink: IEC61937 compressed passthrough with decoded-PCM fallback.
  *
  * Threading model:
- *   - Producer (VDR PES thread): Decode() -> parser -> EnqueuePacket() under `mutex`.
+ *   - PES producer: Decode() parses under `mutex`, then EnqueuePacket() takes queueMutex only.
+ *     Mediaplayer producers call EnqueuePacket() directly and never wait behind the ALSA write.
  *   - Consumer Action(): PCM path is lock-free via `decoderRefCount`+`clearGeneration`;
  *     passthrough holds `mutex` across WrapIec61937 + WritePcmToAlsa to gate against
  *     CloseSpdifMuxer (no refcount equivalent for the spdif muxer).
@@ -102,7 +103,8 @@ constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between 
 // === AUDIO PROCESSOR CLASS ===
 // ============================================================================
 
-cAudioProcessor::cAudioProcessor() : cThread("vaapivideo/audio"), mutex(std::make_unique<cMutex>()) {}
+cAudioProcessor::cAudioProcessor()
+    : cThread("vaapivideo/audio"), mutex(std::make_unique<cMutex>()), queueMutex(std::make_unique<cMutex>()) {}
 
 cAudioProcessor::~cAudioProcessor() noexcept {
     dsyslog("vaapivideo/audio: destroying (stopping=%d)", stopping.load(std::memory_order_relaxed));
@@ -299,14 +301,14 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::GetQueueSize() const -> size_t {
-    const cMutexLock lock(mutex.get());
+    const cMutexLock lock(queueMutex.get());
     return packetQueue.size();
 }
 
 [[nodiscard]] auto cAudioProcessor::GetPendingWorkSize() const -> size_t {
     size_t depth = 0;
     {
-        const cMutexLock lock(mutex.get());
+        const cMutexLock lock(queueMutex.get());
         depth = packetQueue.size();
     }
     // Queue reads 0 while Action() still holds a popped packet mid-handoff to ALSA.
@@ -329,7 +331,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 }
 
 [[nodiscard]] auto cAudioProcessor::IsQueueFull() const -> bool {
-    const cMutexLock lock(mutex.get());
+    const cMutexLock lock(queueMutex.get());
     return packetQueue.size() >= AUDIO_QUEUE_CAPACITY;
 }
 
@@ -362,14 +364,19 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     }
 
     {
-        const cMutexLock lock(mutex.get());
+        // queueMutex, NOT mutex: the audio thread holds `mutex` across its blocking ALSA write
+        // (WritePcmToAlsa -> snd_pcm_writei). Taking `mutex` here would block this producer -- on the
+        // mediaplayer's single demux cursor that stalls VIDEO reads too, pacing the whole demux to ~1x
+        // (shallow reserve, interlaced jitter). The queue has its own lock so enqueue never waits on ALSA.
+        const cMutexLock lock(queueMutex.get());
 
         if (packetQueue.size() >= AUDIO_QUEUE_CAPACITY) [[unlikely]] {
             // Throttle to one log per 500 ms to avoid flooding syslog under sustained overload.
             if (lastQueueWarn.Elapsed() > 500) {
-                esyslog("vaapivideo/audio: queue full (%zu packets), dropping (%s @ %dHz %dch passthrough=%s)",
-                        packetQueue.size(), avcodec_get_name(streamParams.codecId), streamParams.sampleRate,
-                        streamParams.channels, alsaPassthroughActive.load(std::memory_order_relaxed) ? "yes" : "no");
+                // Keep this lock-free: streamParams is guarded by `mutex`, which this producer path
+                // deliberately never takes (see the queueMutex rationale above). The codec/rate/channel
+                // detail is already in the open-time log; the overflow line only needs the depth.
+                esyslog("vaapivideo/audio: queue full (%zu packets), dropping", packetQueue.size());
                 lastQueueWarn.Set();
             }
             return false;
@@ -593,7 +600,9 @@ auto cAudioProcessor::CloseDevice() -> void {
 }
 
 auto cAudioProcessor::DrainPacketQueue() -> void {
-    // Caller must hold mutex. FreeAVPacket deleter runs on each packet as the unique_ptr leaves scope.
+    // Takes queueMutex (the packet-queue lock). Callers already hold `mutex`; lock order is
+    // mutex -> queueMutex. FreeAVPacket deleter runs on each packet as the unique_ptr leaves scope.
+    const cMutexLock lock(queueMutex.get());
     while (!packetQueue.empty()) {
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
         packetQueue.pop();
@@ -672,9 +681,11 @@ auto cAudioProcessor::Action() -> void {
         uint32_t generationAtDequeue = 0;
 
         {
-            const cMutexLock lock(mutex.get());
+            // queueMutex (not `mutex`): the queue is its own domain now, so popping never blocks the
+            // producer behind the ALSA write. The processing below re-takes `mutex` in a separate scope.
+            const cMutexLock lock(queueMutex.get());
             while (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
-                packetCondition.TimedWait(*mutex, 100);
+                packetCondition.TimedWait(*queueMutex, 100);
             }
 
             if (stopping.load(std::memory_order_acquire)) {
@@ -684,13 +695,13 @@ auto cAudioProcessor::Action() -> void {
             packet.reset(packetQueue.front());
             packetQueue.pop();
             approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
-            // Latch under the mutex so GetPendingWorkSize() never sees empty-queue + no-in-flight
+            // Latch under queueMutex so GetPendingWorkSize() never sees empty-queue + no-in-flight
             // while this iteration is still draining the packet to ALSA.
             packetInFlight.store(true, std::memory_order_release);
             passthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
-            // Snapshot clearGeneration under the mutex so it pairs atomically with the pop.
-            // DecodeToPcm()/passthrough re-check it later to drop packets whose bytes
-            // belong to a codec era swapped out between dequeue and decode.
+            // Snapshot clearGeneration with the pop. clearGeneration is bumped under `mutex` (a different
+            // lock now), so this is an optimization only -- DecodeToPcm()/passthrough re-check it under
+            // `mutex` later to drop packets whose bytes belong to a codec era swapped out mid-flight.
             generationAtDequeue = clearGeneration.load(std::memory_order_relaxed);
         }
 
@@ -721,6 +732,14 @@ auto cAudioProcessor::Action() -> void {
             // If you add new pcmNextPts readers outside the mutex (currently only
             // generation-gated readers exist), re-verify the ordering here.
             const cMutexLock lock(mutex.get());
+            // Re-check generation now that we hold `mutex`: a Clear()/SetStreamParams() that bumped the
+            // era while we waited for the lock must not let this stale packet anchor pcmNextPts (the
+            // passthrough/decode paths below would drop it, but only after the store). Covers the first
+            // state mutation, mirroring the gates at the passthrough block and inside DecodeToPcm().
+            if (clearGeneration.load(std::memory_order_acquire) != generationAtDequeue) {
+                packetInFlight.store(false, std::memory_order_release);
+                continue;
+            }
             const int64_t prevNextPts = pcmNextPts.load(std::memory_order_relaxed);
             if (prevNextPts != AV_NOPTS_VALUE) {
                 const int64_t diff = (pts > prevNextPts) ? (pts - prevNextPts) : (prevNextPts - pts);

@@ -49,6 +49,7 @@
 #pragma GCC diagnostic pop
 
 class cVaapiDevice;
+class cSubtitleConverter;
 
 // ============================================================================
 // === CONSTANTS ===
@@ -57,37 +58,25 @@ class cVaapiDevice;
 /// Demux thread back-off when the device queues are full or input stalls.
 inline constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
 
-/// Max AUDIO lookahead, in 90 kHz ticks, between the latest pushed audio PTS and the audio master clock
-/// before the demux throttles. libavformat reads local files far faster than wall-clock; without a
-/// real-time pacing limit the decoder packet queue and jitter buffer overrun their caps. The throttle
-/// reference is the audio-stream PTS only (latestAudioPts90k), an audio-tail budget; 1 s buys enough
-/// buffered audio to absorb wall-clock jitter. Resulting VIDEO depth is (audio_tail + mux_offset), where
-/// mux_offset is the per-file inter-stream PTS spread at the same cursor -- ~0 for tight MP4/MKV, up to
-/// ~1 s for broadcast TS (video PTS leads). When that sum exceeds DECODER_RESERVE_HARD_CAP the decode
-/// backpressures at the cap and the excess lead waits COMPRESSED in the packetQueue, so the cap (not this
-/// budget) bounds the decoded 4K-surface reserve there. Still well below FUTURE_MAX (3 s).
-inline constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 90000;
-
-/// Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock
-/// is NOPTS (the post-flush window where ALSA refills before the first decoded sample anchors the clock).
-/// For AUDIO streams AUDIO_QUEUE_HIGHWATER already covers this window; it matters for VIDEO-ONLY streams
-/// (no audio clock ever), where it is the sole video-depth gate stopping the file-read-speed demuxer from
-/// flooding. Once the clock anchors, IsMediaPlayerBackpressured() drops it: the demuxer is a single-cursor
-/// demux-order pump, so a video-depth gate there would stall the shared cursor and starve the audio packet
-/// queue (sustained-stutter-after-seek bug). Must stay below DECODER_RESERVE_HARD_CAP so it throttles
-/// before the reserve hits the cap and the runaway guard drops (static_assert in device.cpp).
-inline constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = 48;
+/// Real-time pacing brake: max AUDIO lookahead (90 kHz ticks) of the latest pushed audio PTS over the
+/// audio master clock before the demux throttles. libavformat reads files far faster than wall-clock, so
+/// without it the decoder queue + jitterBuf overrun their caps. Keyed off the audio tail only
+/// (latestAudioPts90k); the resulting video depth (audio_tail + per-file mux offset) is bounded instead by
+/// DECODER_RESERVE_HARD_CAP, where the excess lead waits COMPRESSED in the packetQueue. 1.5 s (not 1 s) so
+/// the budget still reaches the ~1.3 s reserve cap when interlaced content deinterlaces to 50 fps.
+inline constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 135000;
+// MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES (the pre-anchor video-depth gate) lives in device.cpp, its only
+// user, derived from DECODER_RESERVE_HARD_CAP so it stays coupled to the buffer it protects.
 
 /// Default seek deltas applied by the key bindings (milliseconds).
 inline constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 inline constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
 
-/// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof). At EOF the decode queue (~4 s @ 50 fps)
-/// and decoded reserve (~1.3 s @ 50 fps) still hold unseen frames; immediate teardown cuts playback
-/// seconds short -- worst on video-only clips, where no audio clock throttles the demuxer so both
-/// buffers fill to their caps. The drain flushes that tail at real-time pace first.
-///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown; covers the ~5 s queue+reserve tail.
-///   - STALL_MS: bail when depth stops shrinking (wedged pipeline). Must exceed one frame interval.
+/// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof): at EOF the decode queue (~4 s) and decoded
+/// reserve (~1.3 s) still hold unseen frames, so immediate teardown cuts playback seconds short (worst on
+/// video-only clips, where no audio clock throttles the demuxer). Flush that tail at real-time pace first.
+///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown (covers the ~5 s queue+reserve tail).
+///   - STALL_MS: bail when depth stops shrinking; must exceed one frame interval.
 inline constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
 inline constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
 
@@ -163,6 +152,17 @@ class cVaapiMediaSource final : public IMediaSource {
         int srcChannels{0};                          ///< Container channel count (info.channels is forced to 2)
     };
 
+    /// One demuxed text-subtitle stream (SubRip / mov_text / plain text). @c codecpar aliases the
+    /// AVStream owned by formatCtx, so it is valid only while the source is open; the subtitle
+    /// converter copies what it needs when opening its decoder.
+    struct SubtitleTrackDesc {
+        int avStreamIndex{-1};                       ///< Index into formatCtx->streams
+        AVRational timeBase{.num = 1, .den = 90000}; ///< Stream time base (drives Rebase90k)
+        AVCodecID codecId{AV_CODEC_ID_NONE};         ///< Text subtitle codec (subrip / mov_text / text)
+        const AVCodecParameters *codecpar{nullptr};  ///< Borrowed; used to open the converter's decoder
+        std::string language;                        ///< ISO-639 from the "language" metadata tag; "" if absent
+    };
+
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
@@ -188,6 +188,14 @@ class cVaapiMediaSource final : public IMediaSource {
     /// Repoint the active audio stream (demux state only -- never the device/codec/seek). False on a
     /// bad index. Caller serializes via sourceMutex once the source is published.
     [[nodiscard]] auto SelectAudioTrack(int trackIdx) -> bool;
+    [[nodiscard]] auto SubtitleTracks() const noexcept -> const std::vector<SubtitleTrackDesc> & {
+        return subtitleTracks;
+    }
+    [[nodiscard]] auto SubtitleTrackCount() const noexcept -> int { return static_cast<int>(subtitleTracks.size()); }
+    [[nodiscard]] auto CurrentSubtitleTrack() const noexcept -> int { return currentSubtitleTrack; }
+    /// Repoint (or disable, idx < 0) the active subtitle stream -- demux routing only; the converter
+    /// owns decode/render. False on an out-of-range index. Caller serializes via sourceMutex.
+    [[nodiscard]] auto SelectSubtitleTrack(int trackIdx) -> bool;
     [[nodiscard]] auto VideoFps() const noexcept -> double {
         return videoFps;
     } ///< Container-reported avg_frame_rate; 0.0 if unknown.
@@ -201,10 +209,15 @@ class cVaapiMediaSource final : public IMediaSource {
     static auto PopulateAudioInfo(const AVStream *stream, AudioStreamInfo &info, std::vector<uint8_t> &storage) -> void;
     /// Mirror audioTracks[currentAudioTrack] into audioStreamIndex / audioTimeBase / audioInfo.
     auto ApplyCurrentAudioTrack() -> void;
+    /// Mirror subtitleTracks[currentSubtitleTrack] into subtitleStreamIndex / subtitleTimeBase
+    /// (or clear them when no subtitle track is selected).
+    auto ApplyCurrentSubtitleTrack() -> void;
     /// Rescale @p ts from @p tb to 90 kHz and subtract the source's PTS origin.
-    /// Lazily seeds @c ptsOrigin90k on first call so files whose container/streams
-    /// don't advertise start_time still emit a zero-based timeline.
-    [[nodiscard]] auto Rebase90k(int64_t ts, AVRational tb) noexcept -> int64_t;
+    /// Lazily seeds @c ptsOrigin90k on first call (when @p seedOrigin) so files whose
+    /// container/streams don't advertise start_time still emit a zero-based timeline.
+    /// Subtitle packets pass @p seedOrigin = false: they must never define the playback
+    /// timeline, so before audio/video has seeded the origin they rebase to NOPTS and drop.
+    [[nodiscard]] auto Rebase90k(int64_t ts, AVRational tb, bool seedOrigin = true) noexcept -> int64_t;
 
     std::unique_ptr<AVFormatContext, FreeAVFormatContext> formatCtx;
     std::atomic<bool> *stopFlag{nullptr};      ///< Non-owning; shutdown signal polled by the interrupt_callback.
@@ -223,9 +236,13 @@ class cVaapiMediaSource final : public IMediaSource {
     VideoStreamInfo videoInfo;
     AudioStreamInfo audioInfo; ///< Mirror of audioTracks[currentAudioTrack].info (the decoding stream)
     std::vector<uint8_t> videoExtradataStorage;
-    std::vector<AudioTrackDesc> audioTracks; ///< All audio streams; index == cDisplayTracks menu index
-    int currentAudioTrack{-1};               ///< Index into audioTracks of the decoding stream (-1 = none)
-    double videoFps{0.0};                    ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
+    std::vector<AudioTrackDesc> audioTracks;       ///< All audio streams; index == cDisplayTracks menu index
+    int currentAudioTrack{-1};                     ///< Index into audioTracks of the decoding stream (-1 = none)
+    std::vector<SubtitleTrackDesc> subtitleTracks; ///< All text-subtitle streams; index == chooser menu index
+    int currentSubtitleTrack{-1};                  ///< Index into subtitleTracks of the routed stream (-1 = off)
+    int subtitleStreamIndex{-1};                   ///< Mirror of subtitleTracks[currentSubtitleTrack].avStreamIndex
+    AVRational subtitleTimeBase{.num = 1, .den = 90000}; ///< Mirror of the routed subtitle stream's time base
+    double videoFps{0.0}; ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
     bool eofReached{false};
 };
 
@@ -276,6 +293,9 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// cPlayer hook for the Audio-button track menu (VDR main thread). Maps Type to a descriptor index
     /// and hands it to the demux thread. @p TrackId unused (the player owns the mapping).
     auto SetAudioTrack(eTrackType Type, const tTrackId *TrackId) -> void override;
+    /// cPlayer hook for the Subtitles-button chooser (VDR main thread). Maps Type to a subtitle
+    /// descriptor index (ttNone = off) and hands it to the demux thread. @p TrackId unused.
+    auto SetSubtitleTrack(eTrackType Type, const tTrackId *TrackId) -> void override;
 
   protected:
     // ========================================================================
@@ -304,10 +324,16 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     auto SeekToMs(int64_t targetMs) -> void;
     /// Publish the source's audio streams to the device for cDisplayTracks and select the
     /// Setup.AudioLanguages-preferred initial track. sourceMutex held (from OpenCurrentEntry).
-    auto RegisterAudioTracks(cVaapiDevice *vaapiDev) -> void;
+    auto RegisterAudioTracks() -> void;
     /// Demux-thread track switch: repoint source, reopen audio codec, re-anchor A/V. Reverts to the
     /// old track if the new codec fails.
     auto PerformAudioSwitch(int trackIdx) -> void;
+    /// Publish the source's text-subtitle streams to the device for the Subtitles-button chooser.
+    /// Subtitles default off. sourceMutex held (from OpenCurrentEntry).
+    auto RegisterSubtitleTracks() -> void;
+    /// Demux-thread subtitle switch: repoint source routing and (re)open or close the converter's
+    /// decoder. @p trackIdx < 0 turns subtitles off. No A/V re-anchor (subtitles ride the same clock).
+    auto PerformSubtitleSwitch(int trackIdx) -> void;
     /// Block until the decode + present pipeline has flushed the buffered end-of-stream tail to the
     /// screen, so a natural EOF does not cut playback short. Returns early if the user issues
     /// stop / pause / seek / next during the wait, or if the pipeline stalls. Demux thread only;
@@ -319,16 +345,22 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     std::atomic<size_t> currentIndex{0};
 
     std::unique_ptr<cVaapiMediaSource> source;
+    std::unique_ptr<cSubtitleConverter>
+        subtitles; ///< Text-subtitle decode + overlay; created lazily in OpenCurrentEntry
     std::atomic<State> state{State::Opening};
     std::atomic<bool> paused{false};
     std::atomic<bool> seekPending{false};
     std::atomic<int64_t> seekDeltaMs{0};
-    std::atomic<bool> audioSwitchPending{false}; ///< Set by SetAudioTrack(); serviced in Action() before the
-                                                 ///< pause branch so a frozen player still switches.
-    std::atomic<int> audioSwitchTargetIdx{-1};   ///< Descriptor index requested by SetAudioTrack(); -1 = none
-    std::atomic<int> activeMenuIndex{-1};        ///< Descriptor index currently decoding; lets SetAudioTrack()
-                                                 ///< no-op an initial set / re-select without touching source.
-    std::atomic<int> audioTrackCount{0};         ///< Registered audio-track count; SetAudioTrack() range check.
+    /// Per-track-type switch coordination. A Set*Track() call (VDR thread) stages a request here;
+    /// the demux Action() services it before the pause branch so a frozen player still switches.
+    struct TrackSwitchState {
+        std::atomic<bool> pending{false}; ///< Set by Set*Track(); serviced (and cleared) in Action().
+        std::atomic<int> targetIdx{-1};   ///< Descriptor index requested; -1 = none/off.
+        std::atomic<int> menuIndex{-1};   ///< Index last selected; lets Set*Track() no-op redundant re-selections.
+        std::atomic<int> trackCount{0};   ///< Registered track count; range check in Set*Track().
+    };
+    TrackSwitchState audioSwitch;    ///< Audio-track switch request (menuIndex = index currently decoding).
+    TrackSwitchState subtitleSwitch; ///< Subtitle-track switch request (menuIndex = last requested, -1 = off).
     std::atomic<bool> nextRequested{false};
     std::atomic<bool> stopping{false};
     std::atomic<bool> ioInterrupt{false}; ///< Set by Seek()/Next() (and shutdown) to break a blocking

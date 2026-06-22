@@ -40,6 +40,18 @@ inline constexpr size_t AUDIO_QUEUE_HIGHWATER = 10; ///< ~320 ms at AC-3 32 ms f
 inline constexpr size_t AUDIO_QUEUE_CAPACITY = 100; ///< ~3.2 s; absorbs the channel-switch + codec-prime burst.
 static_assert(AUDIO_QUEUE_HIGHWATER < AUDIO_QUEUE_CAPACITY, "the active gate must trip before the backstop");
 
+/// Mediaplayer-only audio packet highwater (~1 s at AC-3 32 ms framing). The mediaplayer demux is a
+/// SINGLE cursor: when the audio queue trips its highwater the demux stops reading BOTH streams, so
+/// the audio depth bounds how deep the VIDEO decoded reserve can fill. The shared 10-packet gate
+/// (~320 ms) starves heavy interlaced 4K (deinterlace doubles to 50 fps; ~16 frames can't absorb the
+/// decode bursts -> choppy), while progressive 4K survives. dvbplayer/live feed video and audio
+/// through SEPARATE PES calls, so video fills its decoder queue deeply regardless -- hence smooth.
+/// A deeper allowance lets the reserve reach DECODER_RESERVE_HARD_CAP (~1.3 s @ 50 fps), matching
+/// the PES path. Only IsMediaPlayerBackpressured() honors it; the PES feed keeps the shallow gate.
+inline constexpr size_t AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER = 32;
+static_assert(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER < AUDIO_QUEUE_CAPACITY,
+              "the active gate must trip before the backstop");
+
 // ============================================================================
 // === STRUCTURES ===
 // ============================================================================
@@ -53,18 +65,10 @@ using AudioStreamParams = AudioStreamInfo;
 // === AUDIO PROCESSOR CLASS ===
 // ============================================================================
 
-/**
- * @class cAudioProcessor
- * @brief Threaded ALSA audio renderer with IEC61937 passthrough and FFmpeg PCM decode fallback.
- *
- * A background thread (Action()) dequeues compressed audio packets, decodes them to
- * S16LE PCM via FFmpeg, and writes the result to an ALSA PCM device. When the HDMI
- * sink advertises support for the codec's IEC61937 framing (via ELD or PassthroughMode::On),
- * the compressed bitstream is passed through directly without decoding.
- *
- * Thread safety: all public methods are safe to call from any thread.
- * See audio.cpp file header for the full threading model and synchronization design.
- */
+/// Threaded ALSA audio renderer with IEC61937 passthrough and FFmpeg PCM decode fallback. Action()
+/// dequeues compressed packets and either passes the bitstream through (when the HDMI sink advertises
+/// IEC61937 support via ELD or PassthroughMode::On) or decodes to S16LE PCM and writes it to ALSA.
+/// Thread safety: all public methods are safe from any thread; see audio.cpp for the threading model.
 class cAudioProcessor : public cThread {
   public:
     cAudioProcessor();
@@ -99,13 +103,11 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto IsPassthrough() const noexcept
         -> bool;                                    ///< True when the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const -> bool; ///< True when the packet queue has reached AUDIO_QUEUE_CAPACITY
-    [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Current number of packets in the decode queue (takes mutex)
+    [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Exact packet-queue depth (takes queueMutex)
     [[nodiscard]] auto GetQueueSizeRelaxed() const noexcept -> size_t {
         return approxQueueSize.load(std::memory_order_relaxed);
-    } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() takes the
-      ///< audio mutex, which WritePcmToAlsa() holds across its EAGAIN spin when the ALSA ring is full (bursty
-      ///< replay feed) -- a blocking read there parks presentation ~one ring period. Device backpressure path
-      ///< keeps the exact, mutexed GetQueueSize().
+    } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() is exact but
+      ///< takes queueMutex; this mirror avoids even that short queue lock in hot display / status paths.
     [[nodiscard]] auto GetPendingWorkSize() const
         -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The mediaplayer EOS drain needs this, not
                    ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
@@ -150,7 +152,7 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Reconfigures ALSA and the FFmpeg decoder when codec, rate, or passthrough mode changes.
                  ///< Returns false if the pipeline could not be established.
     auto CloseDecoder() -> void; ///< Spins until in-flight DecodeToPcm() callers finish, then frees decoder + parser
-    auto DrainPacketQueue() -> void;   ///< Pops and frees every queued packet. Caller must hold mutex.
+    auto DrainPacketQueue() -> void;   ///< Pops and frees every queued packet. Takes queueMutex internally.
     auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
     auto RecreateParser() -> void;     ///< Close + re-init parser for the current codec; caller holds mutex.
     auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
@@ -251,7 +253,7 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PACKET QUEUE ===
     // ========================================================================
-    std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under the mutex at every push/pop,
+    std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under queueMutex at every push/pop,
                                              ///< read lock-free by GetQueueSizeRelaxed() (present-thread diagnostic).
     cCondVar packetCondition;                ///< Wakes Action() on enqueue
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
@@ -306,7 +308,11 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     std::atomic<bool> hasExited{false};    ///< Set by Action() just before it returns; Shutdown() polls this
     std::atomic<bool> initialized{false};  ///< True after Initialize() succeeds and before Shutdown()/CloseDevice()
-    mutable std::unique_ptr<cMutex> mutex; ///< Serializes ALSA handle, packet queue, decoder state, and seqlock writes
+    mutable std::unique_ptr<cMutex> mutex; ///< Serializes ALSA handle, decoder state, and seqlock writes
+    mutable std::unique_ptr<cMutex> queueMutex; ///< Guards packetQueue + packetCondition ONLY, separate from `mutex` so
+                                                ///< the producer (EnqueuePacket, on the mediaplayer demux cursor) never
+                                                ///< blocks behind the audio thread's mutex-held blocking ALSA write.
+                                                ///< Lock order: mutex -> queueMutex (never the reverse).
     std::atomic<bool> stopping{
         false};                   ///< Signals Action() to exit; also set on fatal ALSA error to mark processor unusable
     std::atomic<int> volume{255}; ///< Volume applied in WriteToAlsa(); 255 = unity, 0 = mute (zero-filled output on

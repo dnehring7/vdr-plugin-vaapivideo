@@ -22,7 +22,7 @@ software decoding transparently. The VAAPI Video Processing Pipeline (VPP)
 | Audio       | PCM decode/downmix with sink-driven multichannel output (AAC, MP2, or any codec when passthrough is off); IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
 | Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough      |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
-| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, runtime audio-track switching — see [Mediaplayer](#mediaplayer) |
+| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, runtime audio-track switching, text subtitles (SubRip/ASS/mov_text) — see [Mediaplayer](#mediaplayer) |
 | A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
 
@@ -85,6 +85,7 @@ spends the reserve instead of stalling the screen. See
 | `src/audio.cpp`       | ALSA output (multichannel PCM / downmix, chmap), IEC61937 passthrough, HDMI ELD read   |
 | `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
 | `src/mediaplayer.cpp` | libavformat demux, file browser, cControl with OSD replay bar                         |
+| `src/subtitle.cpp`    | Mediaplayer text-subtitle decode (SubRip/ASS/mov_text) + OSD rendering                |
 | `src/stream.cpp`      | Shared codec/profile data model, H.264/HEVC SPS probe                                 |
 | `src/pes.cpp`         | PES header parsing                                                                    |
 | `src/caps.cpp`        | Capability derivation for GPU/display/sink (GpuCaps, DisplayCaps, AudioSinkCaps): VAAPI profile/VPP probe + pure EDID/ELD parsers; live-handle I/O stays with the resource owner |
@@ -830,12 +831,34 @@ wrapping is decided by the codec, not by the menu.
 
 The **Info** key's file page lists every audio track with codec, sample rate,
 channel layout and language, marking the active one with a leading `*`.
-Subtitle-track selection is not yet supported.
 
 If an audio codec cannot be opened — e.g. a container that omits the sample rate
 until a frame is decoded (raw-ADTS AAC in some TS files) — playback degrades to
 **video-only** rather than refusing the file; the log notes `audio codec … open
 failed -- playing video-only`. The video (including HDR) plays normally.
+
+### Subtitles
+
+Embedded **text** subtitle streams — SubRip (`.srt`), ASS/SSA and mov_text — are
+supported. Press the **Subtitles** key to open VDR's standard track chooser
+(the same one live TV uses), pick a track by language (e.g. `SRT (ger)`) or
+choose **No subtitles** to turn them off. Subtitles default to off; the chooser
+is driven entirely by VDR core, so track registration, the "No subtitles" entry
+and preferred-language handling behave exactly as elsewhere in VDR.
+
+Cues are decoded with FFmpeg, timed against the audio master clock, and drawn on
+VDR's OSD at the subtitle level (`OSD_LEVEL_SUBTITLES`) — the same path VDR's
+own DVB-subtitle converter uses — bottom-centered, white text (or the cue's
+`<font color>` per line) on a 50%-transparent black box. The box and text
+opacity follow *Setup → DVB → Subtitle background/foreground transparency*, and
+the vertical position follows *Subtitle offset*. Long lines wrap to the screen
+width via VDR's text wrapper.
+
+Bitmap subtitle formats (DVB subtitles, PGS) are **not** rendered on the
+mediaplayer path — VDR core has no text decoder and this plugin decodes text
+only. (DVB subtitles in live TV and recordings are handled by VDR core through
+this plugin's OSD as usual.) On a seek, on-screen cues clear immediately and
+reappear at the new position.
 
 ### File-browser scope
 

@@ -180,8 +180,8 @@ static_assert(std::ranges::all_of(VIDEO_BACKEND_TABLE,
 
 /// Which tracked elementary stream a packet returned from IMediaSource::ReadPacket belongs to.
 /// Returned out-of-band so the consumer can dispatch the packet to the correct decoder/audio
-/// sink without inspecting AVPacket::stream_index (which is implementation-internal).
-enum class MediaPacketStream : uint8_t { Video, Audio };
+/// sink/subtitle converter without inspecting AVPacket::stream_index (implementation-internal).
+enum class MediaPacketStream : uint8_t { Video, Audio, Subtitle };
 
 /// Abstract input source for the decoder pipeline. The PES path in device.cpp continues
 /// to push raw bytes directly into cVaapiDecoder::EnqueueData / cAudioProcessor::Decode;
@@ -206,8 +206,8 @@ class IMediaSource {
 
     /// Pull one tracked packet in demux order. Returns 0 on success, AVERROR(EAGAIN) when
     /// no packet is available yet (network sources), or AVERROR_EOF at end of input.
-    /// On success, @p stream is set to indicate whether @p out is a video or audio packet.
-    /// Untracked streams (subtitles, data) are silently skipped.
+    /// On success, @p stream is set to whether @p out is a video, audio, or subtitle packet.
+    /// Untracked streams (data, and subtitles when no subtitle track is selected) are skipped.
     [[nodiscard]] virtual auto ReadPacket(AVPacket *out, MediaPacketStream &stream) -> int = 0;
 
     /// Video stream descriptor. Stable after Open(); undefined before.

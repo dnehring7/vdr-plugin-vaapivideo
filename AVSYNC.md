@@ -34,8 +34,9 @@ source:
   container timestamp to 90 kHz, then subtract `ptsOrigin90k`. `ptsOrigin90k` is
   `max(start_time)` across the tracked streams (`PopulateStreamInfo`), so the
   *trailing* stream defines t=0 and any leading pre-sync packets (rebased PTS < 0)
-  are dropped in `ReadPacket` — both streams begin at rebased PTS 0 together. A
-  seek additionally arms `discardAudioBefore90k` so audio anchors at the requested
+  are dropped in `ReadPacket` — both streams begin at rebased PTS 0 together.
+  Subtitle packets never seed `ptsOrigin90k`, so a stray early cue can't shift the
+  A/V timeline. A seek additionally arms `discardAudioBefore90k` so audio anchors at the requested
   position, not at the earlier keyframe libavformat lands on. See
   `cVaapiMediaSource` in [src/mediaplayer.cpp](src/mediaplayer.cpp).
 
@@ -662,10 +663,18 @@ Naming conventions:
 | `PTS_TICKS_PER_MS`            | 90    | DVB 90 kHz PTS clock factor: ticks = ms × this (here `_MS` means *per* ms) |
 | `AUDIO_ALSA_BUFFER_MS`        | 400   | ALSA ring size (ms); the lagged audio clock pulls live `buf` to ~MS/frameDur |
 | `AUDIO_CLOCK_STALE_MS`        | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
-| `AUDIO_QUEUE_HIGHWATER`       | 10    | Active audio-feed backpressure gate (~320 ms AC-3); paces both replay and mediaplayer |
-| `AUDIO_QUEUE_CAPACITY`        | 100   | Audio packet-queue overflow backstop (~3.2 s); HIGHWATER is the real gate |
+| `AUDIO_QUEUE_HIGHWATER`            | 10    | Audio-feed backpressure gate for dvbplayer/PES replay (~320 ms AC-3) |
+| `AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER`| 32    | Audio-feed gate for the single-cursor mediaplayer demux (~1 s AC-3); deeper than `HIGHWATER` because one cursor feeds both audio and video |
+| `AUDIO_QUEUE_CAPACITY`             | 100   | Audio packet-queue overflow backstop (~3.2 s); the HIGHWATER gates are the real limit |
 | `CONFIG_AUDIO_LATENCY_MIN_MS` | −200  | Lower clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
 | `CONFIG_AUDIO_LATENCY_MAX_MS` | 200   | Upper clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
+
+**Mediaplayer feed pacing** (mediaplayer.h, device.cpp)
+
+| Constant                                    | Value  | Purpose |
+| ------------------------------------------- | ------ | ------- |
+| `MEDIAPLAYER_MAX_LOOKAHEAD_90K`             | 135000 | Real-time demux brake: max audio lookahead (1.5 s @ 90 kHz) of the latest pushed audio PTS over the audio clock before the demux throttles; keeps libavformat's fast file reads from overrunning the reserve |
+| `MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES` | 48     | Pre-anchor video-depth gate (¾ of `DECODER_RESERVE_HARD_CAP`); the sole demux brake for VIDEO-ONLY streams while no audio clock exists yet |
 
 **Video queues & decode-ahead reserve** (decoder.h, decoder.cpp)
 

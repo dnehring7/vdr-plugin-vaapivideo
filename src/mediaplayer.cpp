@@ -29,8 +29,10 @@
 #include "mediaplayer.h"
 #include "audio.h"
 #include "common.h"
+#include "config.h"
 #include "device.h"
 #include "stream.h"
+#include "subtitle.h"
 
 #include <algorithm>
 #include <array>
@@ -97,12 +99,10 @@ namespace {
 // === LOCAL CONSTANTS ===
 // ============================================================================
 
-constexpr int OSD_REFRESH_INTERVAL_MS =
-    500;                                   ///< Replay-bar update cadence; ~2 Hz is enough to feel live without flicker.
-constexpr int OSD_DEFAULT_TIMEOUT_S = 4;   ///< Auto-hide delay after a key event; matches VDR replay-control feel.
-constexpr int DEMUX_IDLE_SLEEP_MS = 5;     ///< Back-off when ReadPacket reports EAGAIN or no work is available.
-constexpr int DEMUX_PAUSE_WAKEUP_MS = 100; ///< Periodic re-check while paused; safety net against missed broadcasts.
-constexpr int64_t TICKS_PER_MS = 90;       ///< VDR's 90 kHz PTS domain: 90 ticks == 1 ms.
+constexpr int DEMUX_IDLE_SLEEP_MS = 5;       ///< Back-off when ReadPacket reports EAGAIN or no work is available.
+constexpr int DEMUX_PAUSE_WAKEUP_MS = 100;   ///< Periodic re-check while paused; safety net against a missed broadcast.
+constexpr int OSD_DEFAULT_TIMEOUT_S = 4;     ///< Auto-hide delay after a key event; matches VDR replay-control feel.
+constexpr int OSD_REFRESH_INTERVAL_MS = 500; ///< Replay-bar update cadence; ~2 Hz feels live without flicker.
 
 /// Convert the container's start_time (AV_TIME_BASE units) to 90 kHz. Returns AV_NOPTS_VALUE
 /// when the demuxer didn't populate start_time (typical for some streams + raw containers).
@@ -175,6 +175,27 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
         desc += std::format(" ({})", track.language);
     }
     return desc;
+}
+
+/// Short codec label for the UI; "SRT" reads better than FFmpeg's "subrip". Other codecs use their name.
+[[nodiscard]] auto SubtitleCodecName(AVCodecID codecId) noexcept -> const char * {
+    return codecId == AV_CODEC_ID_SUBRIP ? "SRT" : avcodec_get_name(codecId);
+}
+
+/// cDisplaySubtitleTracks label, e.g. "SRT (ger)". Kept short: tTrackId.description is char[32].
+[[nodiscard]] auto SubtitleTrackDescription(const cVaapiMediaSource::SubtitleTrackDesc &track) -> std::string {
+    std::string desc = SubtitleCodecName(track.codecId);
+    if (!track.language.empty()) {
+        desc += std::format(" ({})", track.language);
+    }
+    return desc;
+}
+
+/// Text-based subtitle codecs the converter can decode to plain text in v1. Bitmap subtitles
+/// (dvb_subtitle, hdmv_pgs, xsub) are intentionally excluded -- they need a separate raster path.
+[[nodiscard]] auto IsTextSubtitle(AVCodecID codec) noexcept -> bool {
+    return codec == AV_CODEC_ID_SUBRIP || codec == AV_CODEC_ID_TEXT || codec == AV_CODEC_ID_MOV_TEXT ||
+           codec == AV_CODEC_ID_ASS || codec == AV_CODEC_ID_SSA;
 }
 
 /// Match cDevice::EnsureAudioTrack's pick (Setup.AudioLanguages, else track 0) so opening
@@ -490,6 +511,8 @@ cVaapiMediaSource::~cVaapiMediaSource() noexcept { Close(); }
     return stop || command;
 }
 
+// Reset to the pre-Open state; idempotent (dtor and Open() both call it). Every field Open()/
+// PopulateStreamInfo() set must be cleared here, or it leaks into the next entry.
 auto cVaapiMediaSource::Close() noexcept -> void {
     formatCtx.reset();
     videoStreamIndex = -1;
@@ -497,6 +520,10 @@ auto cVaapiMediaSource::Close() noexcept -> void {
     videoExtradataStorage.clear();
     audioTracks.clear();
     currentAudioTrack = -1;
+    subtitleTracks.clear();
+    currentSubtitleTrack = -1;
+    subtitleStreamIndex = -1;
+    subtitleTimeBase = AVRational{.num = 1, .den = 90000};
     videoInfo = VideoStreamInfo{};
     audioInfo = AudioStreamInfo{};
     ptsOrigin90k = AV_NOPTS_VALUE;
@@ -557,6 +584,10 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     videoExtradataStorage.clear();
     audioTracks.clear();
     currentAudioTrack = -1;
+    subtitleTracks.clear();
+    currentSubtitleTrack = -1;
+    subtitleStreamIndex = -1;
+    subtitleTimeBase = AVRational{.num = 1, .den = 90000};
 
     // Pick ptsOrigin90k = MAX of tracked-stream start_times so both streams begin at
     // rebased PTS 0 together. Files where audio (or any other stream) leads video by
@@ -686,6 +717,38 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
         currentAudioTrack = 0;
     }
     ApplyCurrentAudioTrack();
+
+    // Enumerate text-subtitle streams (reserve once: SubtitleTrackDesc holds a borrowed codecpar,
+    // but the vector itself must not move while the chooser indexes into it). Bitmap subtitle
+    // streams are skipped here -- only text codecs are selectable in v1.
+    unsigned subtitleCount = 0;
+    for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        const AVCodecParameters *p = formatCtx->streams[i]->codecpar;
+        if (p->codec_type == AVMEDIA_TYPE_SUBTITLE && IsTextSubtitle(p->codec_id)) {
+            ++subtitleCount;
+        }
+    }
+    subtitleTracks.reserve(subtitleCount);
+    for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
+        const AVStream *stream = formatCtx->streams[i];
+        const AVCodecParameters *p = stream->codecpar;
+        if (p->codec_type != AVMEDIA_TYPE_SUBTITLE || !IsTextSubtitle(p->codec_id)) {
+            continue;
+        }
+        SubtitleTrackDesc desc;
+        desc.avStreamIndex = static_cast<int>(i);
+        desc.timeBase = stream->time_base;
+        desc.codecId = p->codec_id;
+        desc.codecpar = p;
+        if (const AVDictionaryEntry *lang = av_dict_get(stream->metadata, "language", nullptr, 0);
+            lang != nullptr && lang->value != nullptr) {
+            desc.language = lang->value;
+        }
+        subtitleTracks.push_back(std::move(desc));
+    }
+    // Subtitles default to off: the user enables them with the Subtitles key (like dvbplayer).
+    currentSubtitleTrack = -1;
+    ApplyCurrentSubtitleTrack();
 }
 
 auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInfo &info, std::vector<uint8_t> &storage)
@@ -724,6 +787,27 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
     // Clear any stale discard window so a pre-open repoint (no following seek) keeps the new track's
     // opening packets.
     discardAudioBefore90k = AV_NOPTS_VALUE;
+    return true;
+}
+
+auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
+    if (currentSubtitleTrack < 0 || currentSubtitleTrack >= static_cast<int>(subtitleTracks.size())) {
+        subtitleStreamIndex = -1;
+        subtitleTimeBase = AVRational{.num = 1, .den = 90000};
+        return;
+    }
+    const SubtitleTrackDesc &desc = subtitleTracks.at(static_cast<size_t>(currentSubtitleTrack));
+    subtitleStreamIndex = desc.avStreamIndex;
+    subtitleTimeBase = desc.timeBase;
+}
+
+[[nodiscard]] auto cVaapiMediaSource::SelectSubtitleTrack(int trackIdx) -> bool {
+    // trackIdx < 0 disables routing (subtitles off). A valid index >= track count is rejected.
+    if (trackIdx >= static_cast<int>(subtitleTracks.size())) {
+        return false;
+    }
+    currentSubtitleTrack = trackIdx < 0 ? -1 : trackIdx;
+    ApplyCurrentSubtitleTrack();
     return true;
 }
 
@@ -802,8 +886,23 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
         } else if (pkt->stream_index == audioStreamIndex) {
             tb = audioTimeBase;
             stream = MediaPacketStream::Audio;
+        } else if (currentSubtitleTrack >= 0 && pkt->stream_index == subtitleStreamIndex) {
+            tb = subtitleTimeBase; // MUST set before Rebase90k -- else tb stays {0,0} and pts -> NOPTS
+            // Text-subtitle cue. Rebase pts AND duration to 90 kHz (cues carry a display duration),
+            // then hand straight to the consumer: subtitles bypass the pre-sync / audio-discard gates
+            // below -- the converter keys display off cue start/end vs the clock, so a stale cue simply
+            // never matches the clock. duration uses the same 90 kHz target as Rebase90k's pts path.
+            pkt->pts = Rebase90k(pkt->pts, tb, false); // never let a subtitle seed the timeline origin
+            pkt->dts = Rebase90k(pkt->dts, tb, false);
+            if (pkt->duration > 0) {
+                constexpr AVRational k90kHz{.num = 1, .den = 90000};
+                pkt->duration = av_rescale_q(pkt->duration, tb, k90kHz);
+            }
+            stream = MediaPacketStream::Subtitle;
+            av_packet_move_ref(out, pkt.get());
+            return 0;
         } else {
-            continue; // untracked (subtitle/data)
+            continue; // untracked (unselected subtitle / data)
         }
 
         // Rebase to a zero-based 90 kHz timeline. Files with non-zero container start_time
@@ -840,7 +939,7 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
     }
 }
 
-[[nodiscard]] auto cVaapiMediaSource::Rebase90k(int64_t ts, AVRational tb) noexcept -> int64_t {
+[[nodiscard]] auto cVaapiMediaSource::Rebase90k(int64_t ts, AVRational tb, bool seedOrigin) noexcept -> int64_t {
     // tb.num/den <= 0 guards damaged container metadata: av_rescale_q divides by tb.den
     // and would produce garbage / UB on a zero denominator. Returning NOPTS makes the
     // downstream pre-sync and discard checks skip the packet safely.
@@ -850,6 +949,11 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
     constexpr AVRational k90kHz{.num = 1, .den = 90000};
     const int64_t ts90k = av_rescale_q(ts, tb, k90kHz);
     if (ptsOrigin90k == AV_NOPTS_VALUE) {
+        // Only audio/video may seed the origin; a subtitle arriving first rebases to NOPTS (and is
+        // dropped by the converter) rather than anchoring the A/V timeline on subtitle timing.
+        if (!seedOrigin) {
+            return AV_NOPTS_VALUE;
+        }
         ptsOrigin90k = ts90k;
     }
     return ts90k - ptsOrigin90k;
@@ -859,7 +963,7 @@ auto cVaapiMediaSource::Flush() -> void {
     if (formatCtx) {
         avformat_flush(formatCtx.get());
     }
-    eofReached = false;
+    eofReached = false; // a prior EOF must not latch: the post-seek/flush read has to resume
 }
 
 [[nodiscard]] auto cVaapiMediaSource::Seek(int64_t targetPts90k) -> bool {
@@ -909,6 +1013,11 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         pauseCondition.Broadcast();
     }
     Cancel(3);
+    // Stop the subtitle thread + free its overlay while the device/display are still attached
+    // (AwaitSubtitleHidden needs the live display). Then run the per-entry teardown.
+    if (subtitles) {
+        subtitles->Shutdown();
+    }
     CloseCurrentEntry();
 }
 
@@ -918,7 +1027,7 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         return 0;
     }
     if (const int64_t stc = vaapiDev->GetSTC(); stc >= 0) {
-        return static_cast<int>(stc / TICKS_PER_MS);
+        return static_cast<int>(stc / PTS_TICKS_PER_MS);
     }
     // STC briefly NOPTS post-Clear (~50ms). Fall back to the last seek target so a rapid
     // follow-up Seek() computes its delta against the right base, not 0.
@@ -979,20 +1088,35 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
     latestAudioPts90k.store(AV_NOPTS_VALUE, std::memory_order_release);
     pendingSeekTargetMs.store(-1, std::memory_order_release);
     // Drop any audio-switch request left pending from the previous entry before re-registering.
-    audioSwitchPending.store(false, std::memory_order_release);
-    audioSwitchTargetIdx.store(-1, std::memory_order_release);
-    RegisterAudioTracks(vaapiDev);
+    audioSwitch.pending.store(false, std::memory_order_release);
+    audioSwitch.targetIdx.store(-1, std::memory_order_release);
+    RegisterAudioTracks();
+    // Subtitle converter: one per player, created lazily on the first entry. Start each entry off
+    // (closed) and drop any stale switch request.
+    if (!subtitles) {
+        subtitles = std::make_unique<cSubtitleConverter>(vaapiDev);
+    } else {
+        subtitles->Close();
+    }
+    subtitleSwitch.pending.store(false, std::memory_order_release);
+    subtitleSwitch.targetIdx.store(-1, std::memory_order_release);
+    RegisterSubtitleTracks();
     return true;
 }
 
 auto cVaapiPlayer::CloseCurrentEntry() noexcept -> void {
     const cMutexLock lock(&sourceMutex);
+    if (subtitles) {
+        subtitles->Close(); // drop decoder + cues + hide overlay before the source goes away
+    }
     if (auto *vaapiDev = FindPrimaryVaapiDevice(); vaapiDev != nullptr) {
-        vaapiDev->ClrAvailableTracks(); // drop this entry's audio tracks (no stale list into live TV)
+        vaapiDev->ClrAvailableTracks(); // drop this entry's audio + subtitle tracks (no stale list into live TV)
         vaapiDev->ClearForMediaPlayer();
     }
-    activeMenuIndex.store(-1, std::memory_order_release);
-    audioTrackCount.store(0, std::memory_order_release);
+    audioSwitch.menuIndex.store(-1, std::memory_order_release);
+    audioSwitch.trackCount.store(0, std::memory_order_release);
+    subtitleSwitch.trackCount.store(0, std::memory_order_release);
+    subtitleSwitch.menuIndex.store(-1, std::memory_order_release);
     source.reset();
 }
 
@@ -1016,6 +1140,9 @@ auto cVaapiPlayer::Activate(bool On) -> void {
             pauseCondition.Broadcast();
         }
         Cancel(3);
+        if (subtitles) {
+            subtitles->Shutdown(); // stop subtitle thread + free overlay while display is still attached
+        }
         CloseCurrentEntry();
         state.store(State::Stopped, std::memory_order_release);
     }
@@ -1128,6 +1255,18 @@ auto cVaapiPlayer::Next() -> void {
                                 avcodec_get_name(track.info.codecId), track.info.sampleRate, channels, lang);
         }
     }
+    const auto &subtitleTracks = source->SubtitleTracks();
+    const int currentSub = source->CurrentSubtitleTrack();
+    if (!subtitleTracks.empty()) {
+        for (size_t i = 0; i < subtitleTracks.size(); ++i) {
+            const auto &track = subtitleTracks.at(i);
+            const char *codecName = SubtitleCodecName(track.codecId);
+            const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
+            // A leading "* " marks the active subtitle track; "off" reads as none selected.
+            text += std::format("Subs {}:  {}{}{}\n", i + 1, (static_cast<int>(i) == currentSub) ? "* " : "  ",
+                                codecName, lang);
+        }
+    }
     if (playlist.size() > 1) {
         text += std::format("Playlist: {}/{}\n", idx + 1, playlist.size());
     }
@@ -1181,7 +1320,7 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     if (totalMs > 0 && targetMs > totalMs - 1000) {
         targetMs = std::max<int64_t>(0, totalMs - 1000);
     }
-    const int64_t targetPts90k = targetMs * TICKS_PER_MS;
+    const int64_t targetPts90k = targetMs * PTS_TICKS_PER_MS;
 
     state.store(State::Seeking, std::memory_order_release);
 
@@ -1194,6 +1333,11 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     }
 
     vaapiDev->FlushForSeek();
+    // Drop pending cues + hide any on-screen subtitle so a stale cue doesn't linger across the seek;
+    // new cues arrive as the post-seek packets are read.
+    if (subtitles) {
+        subtitles->Reset();
+    }
     // Reset the throttle high-water mark so a post-seek PTS smaller than pre-seek doesn't
     // stall the demuxer until audio "catches up" to a stale value.
     latestAudioPts90k.store(AV_NOPTS_VALUE, std::memory_order_release);
@@ -1209,26 +1353,53 @@ auto cVaapiPlayer::SetAudioTrack(eTrackType Type, const tTrackId * /*TrackId*/) 
     // All tracks register as ttAudio, so idx = Type - ttAudioFirst and the range check rejects any
     // non-audio Type -- no explicit IS_AUDIO_TRACK test needed.
     const int idx = static_cast<int>(Type) - static_cast<int>(ttAudioFirst);
-    if (idx < 0 || idx >= audioTrackCount.load(std::memory_order_acquire)) {
+    if (idx < 0 || idx >= audioSwitch.trackCount.load(std::memory_order_acquire)) {
         return;
     }
-    if (idx == activeMenuIndex.load(std::memory_order_acquire)) {
+    if (idx == audioSwitch.menuIndex.load(std::memory_order_acquire)) {
         return; // initial set / re-select of the active track: nothing to do
     }
-    audioSwitchTargetIdx.store(idx, std::memory_order_release);
-    audioSwitchPending.store(true, std::memory_order_release);
+    audioSwitch.targetIdx.store(idx, std::memory_order_release);
+    audioSwitch.pending.store(true, std::memory_order_release);
     ioInterrupt.store(true, std::memory_order_release); // break a parked network read, like Seek()
     const cMutexLock lock(&pauseMutex);
     pauseCondition.Broadcast(); // wake the demux thread if paused
 }
 
-auto cVaapiPlayer::RegisterAudioTracks(cVaapiDevice *vaapiDev) -> void {
-    // sourceMutex held (from OpenCurrentEntry). Publishes the source's audio streams so the Audio
-    // button (cDisplayTracks) lists them, then selects the current track.
-    if (vaapiDev == nullptr || !source) {
+auto cVaapiPlayer::SetSubtitleTrack(eTrackType Type, const tTrackId * /*TrackId*/) -> void {
+    // Atomics + pause wake only (no sourceMutex), like SetAudioTrack/Seek. ttNone disables subtitles;
+    // a valid subtitle Type maps to a descriptor index range-checked against subtitleSwitch.trackCount.
+    int idx = -1;
+    if (Type != ttNone) {
+        // No explicit IS_SUBTITLE_TRACK test: a non-subtitle Type yields an idx outside
+        // [0, subtitleSwitch.trackCount) and is rejected by the range check (cf. SetAudioTrack).
+        idx = static_cast<int>(Type) - static_cast<int>(ttSubtitleFirst);
+        if (idx < 0 || idx >= subtitleSwitch.trackCount.load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+    // No-op the redundant re-selection VDR fires (EnsureSubtitleTrack / chooser re-apply): without this
+    // each repeat re-arms ioInterrupt, aborting the demux's av_read_frame again and again, which starves
+    // audio/video and stalls the clock until a seek. Mirrors SetAudioTrack()'s audioSwitch.menuIndex guard.
+    // exchange so concurrent callers collapse to a single switch request for a given index.
+    if (subtitleSwitch.menuIndex.exchange(idx, std::memory_order_acq_rel) == idx) {
         return;
     }
-    vaapiDev->ClrAvailableTracks(); // also resets the device's currentAudioTrack to ttNone
+    subtitleSwitch.targetIdx.store(idx, std::memory_order_release);
+    subtitleSwitch.pending.store(true, std::memory_order_release);
+    ioInterrupt.store(true, std::memory_order_release);
+    const cMutexLock lock(&pauseMutex);
+    pauseCondition.Broadcast();
+}
+
+auto cVaapiPlayer::RegisterAudioTracks() -> void {
+    // sourceMutex held (from OpenCurrentEntry). Publishes the source's audio streams so the Audio
+    // button (cDisplayTracks) lists them, then selects the current track. Uses cPlayer's device
+    // wrappers (they forward to the attached device) instead of reaching for the cVaapiDevice.
+    if (!source) {
+        return;
+    }
+    DeviceClrAvailableTracks(); // also resets the device's currentAudioTrack to ttNone
     const auto &tracks = source->AudioTracks();
     constexpr int kMaxAudioSlots = static_cast<int>(ttAudioLast) - static_cast<int>(ttAudioFirst) + 1;
     const int count = std::min(static_cast<int>(tracks.size()), kMaxAudioSlots);
@@ -1239,22 +1410,51 @@ auto cVaapiPlayer::RegisterAudioTracks(cVaapiDevice *vaapiDev) -> void {
         const auto &track = tracks.at(static_cast<size_t>(i));
         const std::string desc = AudioTrackDescription(track);
         // Id = avStreamIndex + 1: nonzero (VDR's availability gate) and unique per stream.
-        (void)vaapiDev->SetAvailableTrack(ttAudio, i, static_cast<uint16_t>(track.avStreamIndex + 1),
-                                          track.language.c_str(), desc.c_str());
+        (void)DeviceSetAvailableTrack(ttAudio, i, static_cast<uint16_t>(track.avStreamIndex + 1),
+                                      track.language.c_str(), desc.c_str());
     }
     // Clamp the source's current track into the selectable range (only matters for the >32 edge).
     int current = source->CurrentAudioTrack();
     if (current < 0 || current >= count) {
         current = count > 0 ? 0 : -1;
     }
-    // Set activeMenuIndex BEFORE SetCurrentAudioTrack so the SetAudioTrack callback it fires no-ops
+    // Set audioSwitch.menuIndex BEFORE SetCurrentAudioTrack so the SetAudioTrack callback it fires no-ops
     // (no spurious startup re-anchor).
-    activeMenuIndex.store(current, std::memory_order_release);
-    audioTrackCount.store(count, std::memory_order_release);
+    audioSwitch.menuIndex.store(current, std::memory_order_release);
+    audioSwitch.trackCount.store(count, std::memory_order_release);
     if (current >= 0) {
         // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- clamped to ttAudio range above
-        (void)vaapiDev->SetCurrentAudioTrack(static_cast<eTrackType>(static_cast<int>(ttAudioFirst) + current));
+        (void)DeviceSetCurrentAudioTrack(static_cast<eTrackType>(static_cast<int>(ttAudioFirst) + current));
     }
+}
+
+auto cVaapiPlayer::RegisterSubtitleTracks() -> void {
+    // sourceMutex held (from OpenCurrentEntry). Publishes the source's text-subtitle streams so the
+    // Subtitles button (cDisplaySubtitleTracks) lists them. Subtitles start off (ttNone) -- like
+    // dvbplayer, the user enables them with the Subtitles key. Uses cPlayer's device wrappers.
+    if (!source) {
+        return;
+    }
+    const auto &tracks = source->SubtitleTracks();
+    constexpr int kMaxSubtitleSlots = static_cast<int>(ttSubtitleLast) - static_cast<int>(ttSubtitleFirst) + 1;
+    const int count = std::min(static_cast<int>(tracks.size()), kMaxSubtitleSlots);
+    if (static_cast<int>(tracks.size()) > count) {
+        isyslog("vaapivideo/mediaplayer: %zu subtitle tracks -- only the first %d are selectable", tracks.size(),
+                count);
+    }
+    for (int i = 0; i < count; ++i) {
+        const auto &track = tracks.at(static_cast<size_t>(i));
+        const std::string desc = SubtitleTrackDescription(track);
+        // Id = avStreamIndex + 1: nonzero (VDR's availability gate) and unique per stream.
+        (void)DeviceSetAvailableTrack(ttSubtitle, i, static_cast<uint16_t>(track.avStreamIndex + 1),
+                                      track.language.c_str(), desc.c_str());
+    }
+    subtitleSwitch.menuIndex.store(-1, std::memory_order_release);
+    subtitleSwitch.trackCount.store(count, std::memory_order_release);
+    // Force VDR's current subtitle track to ttNone so preferred-language / DisplaySubtitles handling
+    // can't silently preselect one. Subtitles start off (like dvbplayer); the source already defaults
+    // currentSubtitleTrack to -1 and the converter stays closed until the user selects a track.
+    (void)DeviceSetCurrentSubtitleTrack(ttNone);
 }
 
 auto cVaapiPlayer::PerformAudioSwitch(int trackIdx) -> void {
@@ -1288,8 +1488,48 @@ auto cVaapiPlayer::PerformAudioSwitch(int trackIdx) -> void {
     }
     // (c) re-anchor: seek to the captured position so the new stream flows from here and A/V resyncs.
     SeekToMs(currentMs);
-    activeMenuIndex.store(trackIdx, std::memory_order_release);
+    audioSwitch.menuIndex.store(trackIdx, std::memory_order_release);
     isyslog("vaapivideo/mediaplayer: audio track -> %d", trackIdx);
+}
+
+auto cVaapiPlayer::PerformSubtitleSwitch(int trackIdx) -> void {
+    const cMutexLock lock(&sourceMutex);
+    if (!source) {
+        return;
+    }
+    // The Subtitles chooser fires SetSubtitleTrack twice per pick (cycle + OK); skip the redundant
+    // re-open (which would needlessly reopen the decoder and drop cues), like PerformAudioSwitch.
+    const int previous = source->CurrentSubtitleTrack();
+    if (trackIdx == previous) {
+        return;
+    }
+    // Repoint demux routing (trackIdx < 0 = off). No A/V re-anchor: subtitles ride the same clock,
+    // and cue display keys off the clock, so no seek/flush is needed.
+    if (!source->SelectSubtitleTrack(trackIdx)) {
+        esyslog("vaapivideo/mediaplayer: subtitle track %d out of range -- keeping current", trackIdx);
+        subtitleSwitch.menuIndex.store(previous, std::memory_order_release); // keep the chooser state honest
+        return;
+    }
+    if (!subtitles) {
+        return;
+    }
+    if (trackIdx >= 0) {
+        const auto &tracks = source->SubtitleTracks();
+        const auto &track = tracks.at(static_cast<size_t>(trackIdx));
+        const AVCodecParameters *codecpar = track.codecpar; // borrowed; converter deep-copies what it needs
+        if (!subtitles->Open(codecpar)) {
+            esyslog("vaapivideo/mediaplayer: subtitle decoder open failed -- turning subtitles off");
+            (void)source->SelectSubtitleTrack(-1);
+            subtitles->Close();
+            subtitleSwitch.menuIndex.store(-1, std::memory_order_release); // let the user retry a different track
+            (void)DeviceSetCurrentSubtitleTrack(ttNone);                   // push VDR's UI state back to off
+            return;
+        }
+        isyslog("vaapivideo/mediaplayer: subtitle track -> %d", trackIdx);
+    } else {
+        subtitles->Close();
+        isyslog("vaapivideo/mediaplayer: subtitles off");
+    }
 }
 
 auto cVaapiPlayer::DrainTailAtEof() -> void {
@@ -1303,7 +1543,9 @@ auto cVaapiPlayer::DrainTailAtEof() -> void {
     // resumes when EOF is re-detected on Play.
     const auto aborted = [this]() noexcept -> bool {
         return stopping.load(std::memory_order_acquire) || paused.load(std::memory_order_acquire) ||
-               seekPending.load(std::memory_order_acquire) || nextRequested.load(std::memory_order_acquire);
+               seekPending.load(std::memory_order_acquire) || nextRequested.load(std::memory_order_acquire) ||
+               audioSwitch.pending.load(std::memory_order_acquire) ||
+               subtitleSwitch.pending.load(std::memory_order_acquire);
     };
     // Wait for depthFn to reach 0, bailing on user command, hard timeout, or stall. A real-time
     // presenter advances every frame, so no decrease within STALL_MS means a wedged pipeline.
@@ -1407,15 +1649,25 @@ auto cVaapiPlayer::Action() -> void {
 
         // -- audio track switch --------------------------------------------------
         // Before the pause branch so a frozen player still switches (then plays the new track on resume).
-        if (audioSwitchPending.exchange(false, std::memory_order_acq_rel)) {
+        if (audioSwitch.pending.exchange(false, std::memory_order_acq_rel)) {
             ioInterrupt.store(false, std::memory_order_release); // av_seek_frame shares the callback
             if (packetPending) { // held packet belongs to the old stream; PerformAudioSwitch flushes
                 av_packet_unref(packet.get());
                 packetPending = false;
             }
-            if (const int target = audioSwitchTargetIdx.exchange(-1, std::memory_order_relaxed); target >= 0) {
+            if (const int target = audioSwitch.targetIdx.exchange(-1, std::memory_order_relaxed); target >= 0) {
                 PerformAudioSwitch(target);
             }
+        }
+
+        // -- subtitle track switch ----------------------------------------------
+        // Before the pause branch (like the audio switch) so a frozen player still toggles subtitles.
+        // The pending flag gates the target read: -1 is a valid target here (subtitles off).
+        if (subtitleSwitch.pending.exchange(false, std::memory_order_acq_rel)) {
+            // SetSubtitleTrack() set ioInterrupt to break a parked read; clear it like the audio/seek
+            // paths or the next av_read_frame aborts. The held packet stays valid (no flush/seek here).
+            ioInterrupt.store(false, std::memory_order_release);
+            PerformSubtitleSwitch(subtitleSwitch.targetIdx.load(std::memory_order_acquire));
         }
 
         // -- next ----------------------------------------------------------------
@@ -1440,7 +1692,8 @@ auto cVaapiPlayer::Action() -> void {
             const cMutexLock lock(&pauseMutex);
             if (paused.load(std::memory_order_acquire) && !stopping.load(std::memory_order_acquire) &&
                 !seekPending.load(std::memory_order_acquire) && !nextRequested.load(std::memory_order_acquire) &&
-                !audioSwitchPending.load(std::memory_order_acquire)) {
+                !audioSwitch.pending.load(std::memory_order_acquire) &&
+                !subtitleSwitch.pending.load(std::memory_order_acquire)) {
                 pauseCondition.TimedWait(pauseMutex, DEMUX_PAUSE_WAKEUP_MS);
             }
             continue;
@@ -1501,7 +1754,16 @@ auto cVaapiPlayer::Action() -> void {
             // AVERROR(EAGAIN) falls through to the idle sleep below.
         }
 
-        if (packetPending) {
+        if (packetPending && packetStream == MediaPacketStream::Subtitle) {
+            // Subtitles never touch the device queues or the lookahead/backpressure throttle: hand the
+            // cue to the converter and consume the packet unconditionally (tiny, sparse).
+            if (subtitles) {
+                subtitles->Convert(packet.get());
+            }
+            av_packet_unref(packet.get());
+            packetPending = false;
+            didWork = true;
+        } else if (packetPending) {
             const bool submitted = (packetStream == MediaPacketStream::Video)
                                        ? vaapiDev->SubmitVideoPacket(packet.get())
                                        : vaapiDev->SubmitAudioPacket(packet.get());
@@ -1544,7 +1806,8 @@ auto cVaapiPlayer::Action() -> void {
             // The drain bailed on a user command: let the loop top service it instead of advancing
             // (pause holds; a seek resets eofReached; the tail re-drains once EOF is hit again).
             if (paused.load(std::memory_order_acquire) || seekPending.load(std::memory_order_acquire) ||
-                nextRequested.load(std::memory_order_acquire)) {
+                nextRequested.load(std::memory_order_acquire) || audioSwitch.pending.load(std::memory_order_acquire) ||
+                subtitleSwitch.pending.load(std::memory_order_acquire)) {
                 continue;
             }
             AdvancePlaylist();

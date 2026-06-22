@@ -421,7 +421,17 @@ auto cVaapiDecoder::EnqueuePacket(const AVPacket *packet) -> void {
         return;
     }
 
-    const cMutexLock decodeLock(&codecMutex);
+    // parserMutex (NOT codecMutex) for the codecCtx-existence guard, mirroring EnqueueData. The decode
+    // thread holds codecMutex for the ENTIRE decode + 4K filter pass of each packet (DecodeOnePacket,
+    // ~20 ms for interlaced 4K50). Taking codecMutex here would serialize this mediaplayer feed behind
+    // the decoder -- the single demux cursor then submits at most one video packet per decoded frame
+    // (~1x), so packetQueue/jitterBuf never build a read-ahead cushion and the decoder runs perpetually
+    // input-starved (sustained "decoder unable to keep up", choppy interlaced playback). parserMutex is
+    // never held by the decode thread, so this runs concurrently with decoding -- exactly like the PES
+    // EnqueueData path (which is why live/dvbplayer fill the reserve deep). Writers of codecCtx existence
+    // (OpenCodecWithInfo / Clear / SetTrickSpeed) take BOTH mutexes, so parserMutex safely guards the
+    // existence check; lock order parserMutex -> packetMutex (via PushPacketToQueue) is preserved.
+    const cMutexLock parseLock(&parserMutex);
     if (!codecCtx) {
         return;
     }
