@@ -2,11 +2,13 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file subtitle.cpp
- * @brief cSubtitleConverter: decode text-subtitle cues and pace them onto the OSD.
+ * @brief cSubtitleConverter: decode subtitle cues and pace them onto the OSD.
  *
  * See subtitle.h for the threading model. Rendering uses the VDR core OSD exactly like the core
- * DVB subtitle path: a cOsd at OSD_LEVEL_SUBTITLES with cOsd::DrawText. The FFmpeg subtitle decoder
- * turns SubRip/ASS/mov_text into plain text (VDR core has no text-subtitle decoder).
+ * DVB subtitle path: a cOsd at OSD_LEVEL_SUBTITLES, with cOsd::DrawText for text cues and
+ * cOsd::DrawScaledBitmap for DVB bitmap cues. The FFmpeg subtitle decoder turns SubRip/ASS/mov_text
+ * into plain text (VDR core has no text-subtitle decoder) and dvb_subtitle into palette bitmaps,
+ * which are rebuilt as VDR cBitmaps and scaled onto the OSD.
  */
 
 #include "subtitle.h"
@@ -19,9 +21,12 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -62,6 +67,14 @@ constexpr int64_t DEFAULT_CUE_DURATION_90K = 270000; ///< 3 s fallback when a cu
 constexpr size_t SUBTITLE_QUEUE_CAPACITY = 256;      ///< Bound future cues from a malformed / front-loaded stream.
 constexpr int SUBTITLE_SHUTDOWN_TIMEOUT_S = 2;       ///< Action() join timeout in Shutdown().
 constexpr int SUBTITLE_TICK_MS = 50;                 ///< Pacing cadence: how often Action() re-checks the cue vs clock.
+constexpr int DVB_SUBTITLE_CANVAS_W = 720;           ///< SD PAL canvas fallback when a DVB stream omits a display
+constexpr int DVB_SUBTITLE_CANVAS_H = 576;           ///< definition segment (so the decoder reports no size).
+constexpr int DVB_SUBTITLE_MAX_COLORS = 256;         ///< 8 bpp palette ceiling for a DVB region bitmap.
+
+/// Scale @p sourceAlpha by VDR's subtitle transparency (0..10), the mapping cDvbSubtitleConverter uses.
+[[nodiscard]] auto SubtitleAlpha(uint8_t sourceAlpha, int transparency) noexcept -> uint8_t {
+    return static_cast<uint8_t>(static_cast<int>(sourceAlpha) * (10 - std::clamp(transparency, 0, 10)) / 10);
+}
 
 // ============================================================================
 // === TEXT PARSING ===
@@ -252,6 +265,53 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
 }
 // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
+// ============================================================================
+// === BITMAP (DVB) DECODE ===
+// ============================================================================
+
+/// Build a VDR indexed bitmap from one decoded DVB region. FFmpeg's palette (data[1]) is already
+/// VDR's 0xAARRGGBB tColor layout; pixels (data[0]) are one index per byte, rows padded to linesize[0].
+/// Alpha is rescaled by subtitle transparency, mirroring cDvbSubtitleConverter (index 0 = background).
+[[nodiscard]] auto MakeRegionBitmap(const AVSubtitleRect *rect) -> std::shared_ptr<const cBitmap> {
+    // nb_colors <= 0 would cast to a huge span size; linesize < width would run the row subspan
+    // off the pixel buffer (and guarantees stride > 0 for the overflow check below).
+    if (rect == nullptr || rect->w <= 0 || rect->h <= 0 || rect->linesize[0] < rect->w || rect->nb_colors <= 0 ||
+        rect->data[0] == nullptr || rect->data[1] == nullptr) {
+        return nullptr;
+    }
+    auto bitmap = std::make_shared<cBitmap>(rect->w, rect->h, 8); // 8 bpp: up to 256 palette colors
+
+    const auto scaleAlpha = [](uint32_t argb, int transparency) -> tColor {
+        const uint32_t alpha = SubtitleAlpha(static_cast<uint8_t>((argb >> 24) & 0xFFU), transparency);
+        return static_cast<tColor>((alpha << 24) | (argb & 0x00FFFFFFU));
+    };
+    const auto colors = static_cast<size_t>(std::min(rect->nb_colors, DVB_SUBTITLE_MAX_COLORS));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- C-API: data[1] is a packed uint32 ARGB palette
+    const std::span<const uint32_t> palette{reinterpret_cast<const uint32_t *>(rect->data[1]), colors};
+    int index = 0;
+    for (const uint32_t entry : palette) {
+        const int transparency = index == 0 ? Setup.SubtitleBgTransparency : Setup.SubtitleFgTransparency;
+        bitmap->SetColor(index, scaleAlpha(entry, transparency));
+        ++index;
+    }
+
+    const auto stride = static_cast<size_t>(rect->linesize[0]);
+    const auto height = static_cast<size_t>(rect->h);
+    if (height > std::numeric_limits<size_t>::max() / stride) {
+        return nullptr; // guard the span size against a malformed stride*height overflow
+    }
+    const std::span<const uint8_t> pixels{rect->data[0], stride * height};
+    for (int y = 0; y < rect->h; ++y) {
+        int x = 0;
+        for (const uint8_t paletteIndex :
+             pixels.subspan(static_cast<size_t>(y) * stride, static_cast<size_t>(rect->w))) {
+            bitmap->SetIndex(x, y, paletteIndex);
+            ++x;
+        }
+    }
+    return bitmap;
+}
+
 } // namespace
 
 // ============================================================================
@@ -333,16 +393,10 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
         return; // cannot place an untimestamped cue on the timeline -> drop it rather than guess
     }
 
-    // avcodec_decode_subtitle2 takes a non-const AVPacket; clone (ref-counted, cheap, rare) so the
-    // caller's packet is untouched.
-    const std::unique_ptr<AVPacket, FreeAVPacket> clone{av_packet_clone(packet)};
-    if (!clone) {
-        return;
-    }
-
     AVSubtitle sub{};
     int gotSub = 0;
-    const int ret = avcodec_decode_subtitle2(codecCtx_.get(), &sub, &gotSub, clone.get());
+    // avcodec_decode_subtitle2 takes a const AVPacket* (FFmpeg 7+), so the caller's packet is safe.
+    const int ret = avcodec_decode_subtitle2(codecCtx_.get(), &sub, &gotSub, packet);
     if (ret < 0) {
         esyslog("vaapivideo/subtitle: decode: %s", AvErr(ret).data());
         return;
@@ -353,13 +407,27 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     }
 
     const int64_t start90k = packetPts90k + (static_cast<int64_t>(sub.start_display_time) * PTS_TICKS_PER_MS);
-    int64_t end90k = 0;
-    if (packet->duration > 0) {
-        end90k = packetPts90k + packet->duration;
-    } else if (sub.end_display_time != 0 && sub.end_display_time != UINT32_MAX) {
-        end90k = packetPts90k + (static_cast<int64_t>(sub.end_display_time) * PTS_TICKS_PER_MS);
+    // DVB trusts the decoder's page timeout (sub.end_display_time, like VDR core) over a possibly-wrong
+    // container duration; text trusts packet duration first (muxers set it to the cue length). Each
+    // falls back to the other, then to the default.
+    const bool preferDecoderTiming = codecCtx_->codec_id == AV_CODEC_ID_DVB_SUBTITLE;
+    const bool haveDuration = packet->duration > 0;
+    const bool haveDecoder = sub.end_display_time != 0 && sub.end_display_time != UINT32_MAX;
+    const int64_t durationEnd = packetPts90k + packet->duration;
+    const int64_t decoderEnd = packetPts90k + (static_cast<int64_t>(sub.end_display_time) * PTS_TICKS_PER_MS);
+    int64_t end90k = packetPts90k + DEFAULT_CUE_DURATION_90K; // when neither source carries timing
+    if (preferDecoderTiming) {
+        if (haveDecoder) {
+            end90k = decoderEnd;
+        } else if (haveDuration) {
+            end90k = durationEnd;
+        }
     } else {
-        end90k = packetPts90k + DEFAULT_CUE_DURATION_90K;
+        if (haveDuration) {
+            end90k = durationEnd;
+        } else if (haveDecoder) {
+            end90k = decoderEnd;
+        }
     }
     // Guard malformed timing (end <= start): without a positive window the cue's [start,end) test in
     // Action() never matches the clock, so it would silently never appear.
@@ -379,18 +447,43 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
             AppendAssLines(rect->ass, cue.lines);
         } else if (rect->type == SUBTITLE_TEXT && rect->text != nullptr) {
             AppendLinesFromMarkup(rect->text, cue.lines);
+        } else if (rect->type == SUBTITLE_BITMAP) {
+            if (auto bitmap = MakeRegionBitmap(rect)) {
+                cue.regions.push_back({.x = rect->x, .y = rect->y, .bitmap = std::move(bitmap)});
+            }
         }
+    }
+    // Canvas = the DVB display-definition segment, which the decoder reports on the codec context
+    // after decode; fall back to SD PAL when the stream omits a DDS.
+    if (!cue.regions.empty()) {
+        cue.canvasW = codecCtx_->width > 0 ? codecCtx_->width : DVB_SUBTITLE_CANVAS_W;
+        cue.canvasH = codecCtx_->height > 0 ? codecCtx_->height : DVB_SUBTITLE_CANVAS_H;
     }
     avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
 
-    if (cue.lines.empty()) {
-        return; // markup that stripped to nothing -> don't queue a blank cue that draws an empty band
-    }
     // Demux delivers packets in ascending start order, so a plain push_back keeps cues_ sorted -- which
     // Action()'s front-pruning and first-match scan rely on.
     const cMutexLock lock(&cueMutex_);
+    const bool priorIsBitmap = !cues_.empty() && !cues_.back().regions.empty();
+    if (cue.lines.empty() && cue.regions.empty()) {
+        // Empty decode = DVB clear (end-of-display-set): end the on-screen page now, don't queue a blank.
+        if (priorIsBitmap && cues_.back().end90k > start90k) {
+            cues_.back().end90k = start90k;
+        }
+        return;
+    }
+    // A new DVB page supersedes the prior one before its timeout, so they never overlap. Cap BEFORE the
+    // capacity check: even if the queue is full and we drop the new page, the old one must stop on time.
+    if (!cue.regions.empty() && priorIsBitmap && cues_.back().end90k > start90k) {
+        cues_.back().end90k = start90k;
+    }
     if (cues_.size() >= SUBTITLE_QUEUE_CAPACITY) {
         return; // a front-loaded / malformed stream could queue cues faster than the clock prunes them
+    }
+    // Monotonic serial so Action() dedups redraws even when two pages share a PTS.
+    cue.serial = nextCueSerial_++;
+    if (nextCueSerial_ == 0) {
+        nextCueSerial_ = 1; // wrap past the reserved 0 (won't happen in practice with a 64-bit counter)
     }
     cues_.push_back(std::move(cue));
 }
@@ -434,6 +527,7 @@ auto cSubtitleConverter::Action() -> void {
         }
         if (clock90k >= 0) {
             Cue activeCue;
+            uint64_t activeSerial = 0;
             bool haveActive = false;
             {
                 const cMutexLock lock(&cueMutex_);
@@ -446,19 +540,27 @@ auto cSubtitleConverter::Action() -> void {
                         break; // future cue: nothing later can match
                     }
                     if (clock90k < cue.end90k) {
-                        activeCue = cue; // latest cue whose window contains the clock
+                        // Latest cue whose window holds the clock. Copy its content only if not already
+                        // shown, so the steady-state tick doesn't re-copy strings / bitmap vectors.
+                        activeSerial = cue.serial;
+                        if (cue.serial != shownCueSerial_) {
+                            activeCue = cue;
+                        }
                         haveActive = true;
                     }
                 }
             }
 
             if (haveActive) {
-                // Only latch shownStart90k_ on a successful draw: a transient OSD failure then retries
-                // on the next tick instead of silently swallowing the whole cue.
-                if (activeCue.start90k != shownStart90k_ && ShowCue(activeCue)) {
-                    shownStart90k_ = activeCue.start90k;
+                // Latch the serial only on a successful draw, so a transient OSD failure retries next
+                // tick. Renderer picked by content -- a track is purely text or purely DVB bitmap.
+                if (activeSerial != shownCueSerial_) {
+                    const bool shown = activeCue.regions.empty() ? ShowCue(activeCue) : ShowBitmapCue(activeCue);
+                    if (shown) {
+                        shownCueSerial_ = activeSerial;
+                    }
                 }
-            } else if (shownStart90k_ != AV_NOPTS_VALUE) {
+            } else if (shownCueSerial_ != 0) {
                 HideCue();
             }
         }
@@ -504,10 +606,7 @@ auto cSubtitleConverter::ShowCue(const Cue &cue) -> bool {
 
     // Honor VDR's subtitle transparency settings (0..10, same scale + mapping as cDvbSubtitleConverter:
     // 0 = opaque, 10 = fully transparent). Foreground defaults to white but follows the line's color.
-    const auto alpha = [](int transparency) -> uint8_t {
-        return static_cast<uint8_t>(ALPHA_OPAQUE * (10 - std::clamp(transparency, 0, 10)) / 10);
-    };
-    const uint8_t fgAlpha = alpha(Setup.SubtitleFgTransparency);
+    const uint8_t fgAlpha = SubtitleAlpha(ALPHA_OPAQUE, Setup.SubtitleFgTransparency);
 
     // Wrap each cue line to the usable width with VDR's cTextWrapper (reuses the core text layout),
     // carrying the line's color onto each wrapped row -- long lines wrap instead of being clipped.
@@ -554,7 +653,8 @@ auto cSubtitleConverter::ShowCue(const Cue &cue) -> bool {
     // just clear and redraw, avoiding a dumb-buffer + KMS-framebuffer alloc/free per cue. Geometry
     // is fixed at NewOsd/SetAreas, so a different size/position needs a fresh OSD. Gaps (no active
     // cue) still destroy the OSD via HideCue(), freeing the single OSD plane for menus / the replay bar.
-    const bool reuse = osd_ != nullptr && osdAreaWidth_ == osdWidth && osdAreaHeight_ == bandHeight && osdTop_ == top;
+    const bool reuse =
+        osd_ != nullptr && osdLeft_ == 0 && osdAreaWidth_ == osdWidth && osdAreaHeight_ == bandHeight && osdTop_ == top;
     if (reuse) {
         osd_->DrawRectangle(0, 0, osdWidth - 1, bandHeight - 1, clrTransparent); // clear prior text
     } else {
@@ -569,14 +669,14 @@ auto cSubtitleConverter::ShowCue(const Cue &cue) -> bool {
             HideCue();
             return false;
         }
+        osdLeft_ = 0;
         osdTop_ = top;
         osdAreaWidth_ = osdWidth;
         osdAreaHeight_ = bandHeight;
     }
 
     // Backing box: black at 50% opacity, thinned further by SubtitleBgTransparency (0 -> 50%, 10 -> 0%).
-    const auto boxAlpha =
-        static_cast<uint8_t>((ALPHA_OPAQUE / 2) * (10 - std::clamp(Setup.SubtitleBgTransparency, 0, 10)) / 10);
+    const auto boxAlpha = SubtitleAlpha(ALPHA_OPAQUE / 2, Setup.SubtitleBgTransparency);
     const tColor bg = ArgbToColor(boxAlpha, 0x00, 0x00, 0x00);
     for (int i = 0; i < lineCount; ++i) {
         const DrawLine &line = drawLines.at(static_cast<size_t>(i));
@@ -591,11 +691,104 @@ auto cSubtitleConverter::ShowCue(const Cue &cue) -> bool {
     return true;
 }
 
+// Render a DVB bitmap cue, mirroring cDvbSubtitleConverter::SetOsdData + cDvbSubtitleBitmaps::Draw.
+// Regions are blitted individually (not composited) so each keeps its own CLUT -- one 8-bit composite
+// could overflow 256 colors across differing palettes. Reuses the live OSD on same-geometry pages
+// (a replace with no clear gap) to skip a per-page dumb-buffer + KMS-framebuffer alloc/free.
+auto cSubtitleConverter::ShowBitmapCue(const Cue &cue) -> bool {
+    if (device_ == nullptr || cue.regions.empty()) {
+        return false;
+    }
+    int osdWidth = 0;
+    int osdHeight = 0;
+    double aspect = 1.0;
+    device_->GetOsdSize(osdWidth, osdHeight, aspect);
+    if (osdWidth <= 0 || osdHeight <= 0) {
+        return false;
+    }
+    const int canvasW = cue.canvasW > 0 ? cue.canvasW : DVB_SUBTITLE_CANVAS_W;
+    const int canvasH = cue.canvasH > 0 ? cue.canvasH : DVB_SUBTITLE_CANVAS_H;
+
+    // Region bounding box (pre-scale) so the OSD covers only the painted area. Clip each region to the
+    // canvas first: a malformed off-canvas region would otherwise oversize the bbox and OSD. The visible
+    // part still draws -- DrawScaledBitmap clips the rest.
+    int x1 = canvasW;
+    int y1 = canvasH;
+    int x2 = 0;
+    int y2 = 0;
+    for (const BitmapRegion &region : cue.regions) {
+        if (!region.bitmap) {
+            continue;
+        }
+        const int regionX1 = std::clamp(region.x, 0, canvasW);
+        const int regionY1 = std::clamp(region.y, 0, canvasH);
+        const int regionX2 = static_cast<int>(std::clamp<int64_t>(
+            static_cast<int64_t>(region.x) + region.bitmap->Width(), 0, static_cast<int64_t>(canvasW)));
+        const int regionY2 = static_cast<int>(std::clamp<int64_t>(
+            static_cast<int64_t>(region.y) + region.bitmap->Height(), 0, static_cast<int64_t>(canvasH)));
+        if (regionX2 <= regionX1 || regionY2 <= regionY1) {
+            continue; // entirely off-canvas
+        }
+        x1 = std::min(x1, regionX1);
+        y1 = std::min(y1, regionY1);
+        x2 = std::max(x2, regionX2);
+        y2 = std::max(y2, regionY2);
+    }
+    if (x2 <= x1 || y2 <= y1) {
+        return false;
+    }
+    const int bboxW = x2 - x1;
+    const int bboxH = y2 - y1;
+
+    // Aspect-preserving fit, like cDvbSubtitleConverter::SetOsdData; honor the offset, stay on-screen.
+    const double factor = std::min(static_cast<double>(osdWidth) / canvasW, static_cast<double>(osdHeight) / canvasH);
+    const double deltaX = (osdWidth - (canvasW * factor)) / 2.0;
+    const double deltaY = (osdHeight - (canvasH * factor)) / 2.0;
+    const int areaW = std::max(1, static_cast<int>(std::lround(bboxW * factor)));
+    const int areaH = std::max(1, static_cast<int>(std::lround(bboxH * factor)));
+    const int left =
+        std::clamp(static_cast<int>(std::lround(deltaX + (factor * x1))), 0, std::max(0, osdWidth - areaW));
+    const int top = std::clamp(static_cast<int>(std::lround(deltaY + (factor * y1))) + Setup.SubtitleOffset, 0,
+                               std::max(0, osdHeight - areaH));
+
+    // Reuse the live OSD when the next page has the same geometry; else allocate fresh.
+    const bool reuse =
+        osd_ != nullptr && osdLeft_ == left && osdTop_ == top && osdAreaWidth_ == areaW && osdAreaHeight_ == areaH;
+    if (reuse) {
+        osd_->DrawRectangle(0, 0, areaW - 1, areaH - 1, clrTransparent); // clear the prior page
+    } else {
+        HideCue();
+        osd_ = cOsdProvider::NewOsd(left, top, OSD_LEVEL_SUBTITLES);
+        if (osd_ == nullptr) {
+            return false;
+        }
+        const tArea area = {.x1 = 0, .y1 = 0, .x2 = areaW - 1, .y2 = areaH - 1, .bpp = 32};
+        if (osd_->SetAreas(&area, 1) != oeOk) {
+            HideCue();
+            return false;
+        }
+        osdLeft_ = left;
+        osdTop_ = top;
+        osdAreaWidth_ = areaW;
+        osdAreaHeight_ = areaH;
+    }
+
+    // Draw each region at its scaled position within the OSD (origin at the bbox top-left).
+    for (const BitmapRegion &region : cue.regions) {
+        const int rx = static_cast<int>(std::lround(factor * (region.x - x1)));
+        const int ry = static_cast<int>(std::lround(factor * (region.y - y1)));
+        osd_->DrawScaledBitmap(rx, ry, *region.bitmap, factor, factor, Setup.AntiAlias);
+    }
+    osd_->Flush();
+    return true;
+}
+
 auto cSubtitleConverter::HideCue() -> void {
     delete osd_; // cVaapiOsd dtor hides the plane and frees its buffer safely
     osd_ = nullptr;
+    osdLeft_ = 0;
     osdTop_ = 0;
     osdAreaWidth_ = 0;
     osdAreaHeight_ = 0;
-    shownStart90k_ = AV_NOPTS_VALUE;
+    shownCueSerial_ = 0;
 }

@@ -152,13 +152,13 @@ class cVaapiMediaSource final : public IMediaSource {
         int srcChannels{0};                          ///< Container channel count (info.channels is forced to 2)
     };
 
-    /// One demuxed text-subtitle stream (SubRip / mov_text / plain text). @c codecpar aliases the
-    /// AVStream owned by formatCtx, so it is valid only while the source is open; the subtitle
-    /// converter copies what it needs when opening its decoder.
+    /// One demuxed supported subtitle stream (text or DVB bitmap). @c codecpar aliases the AVStream
+    /// owned by formatCtx, so it is valid only while the source is open; the subtitle converter copies
+    /// what it needs when opening its decoder.
     struct SubtitleTrackDesc {
         int avStreamIndex{-1};                       ///< Index into formatCtx->streams
         AVRational timeBase{.num = 1, .den = 90000}; ///< Stream time base (drives Rebase90k)
-        AVCodecID codecId{AV_CODEC_ID_NONE};         ///< Text subtitle codec (subrip / mov_text / text)
+        AVCodecID codecId{AV_CODEC_ID_NONE};         ///< Subtitle codec (text or dvb_subtitle)
         const AVCodecParameters *codecpar{nullptr};  ///< Borrowed; used to open the converter's decoder
         std::string language;                        ///< ISO-639 from the "language" metadata tag; "" if absent
     };
@@ -238,7 +238,7 @@ class cVaapiMediaSource final : public IMediaSource {
     std::vector<uint8_t> videoExtradataStorage;
     std::vector<AudioTrackDesc> audioTracks;       ///< All audio streams; index == cDisplayTracks menu index
     int currentAudioTrack{-1};                     ///< Index into audioTracks of the decoding stream (-1 = none)
-    std::vector<SubtitleTrackDesc> subtitleTracks; ///< All text-subtitle streams; index == chooser menu index
+    std::vector<SubtitleTrackDesc> subtitleTracks; ///< All selectable subtitle streams; index == chooser menu index
     int currentSubtitleTrack{-1};                  ///< Index into subtitleTracks of the routed stream (-1 = off)
     int subtitleStreamIndex{-1};                   ///< Mirror of subtitleTracks[currentSubtitleTrack].avStreamIndex
     AVRational subtitleTimeBase{.num = 1, .den = 90000}; ///< Mirror of the routed subtitle stream's time base
@@ -328,7 +328,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// Demux-thread track switch: repoint source, reopen audio codec, re-anchor A/V. Reverts to the
     /// old track if the new codec fails.
     auto PerformAudioSwitch(int trackIdx) -> void;
-    /// Publish the source's text-subtitle streams to the device for the Subtitles-button chooser.
+    /// Publish the source's supported subtitle streams to the device for the Subtitles-button chooser.
     /// Subtitles default off. sourceMutex held (from OpenCurrentEntry).
     auto RegisterSubtitleTracks() -> void;
     /// Demux-thread subtitle switch: repoint source routing and (re)open or close the converter's
@@ -345,8 +345,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     std::atomic<size_t> currentIndex{0};
 
     std::unique_ptr<cVaapiMediaSource> source;
-    std::unique_ptr<cSubtitleConverter>
-        subtitles; ///< Text-subtitle decode + overlay; created lazily in OpenCurrentEntry
+    std::unique_ptr<cSubtitleConverter> subtitles; ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
     std::atomic<State> state{State::Opening};
     std::atomic<bool> paused{false};
     std::atomic<bool> seekPending{false};

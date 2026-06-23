@@ -59,6 +59,7 @@
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
+#include <libavcodec/codec.h>
 #include <libavcodec/codec_id.h>
 #include <libavcodec/codec_par.h>
 #include <libavcodec/defs.h>
@@ -177,9 +178,16 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
     return desc;
 }
 
-/// Short codec label for the UI; "SRT" reads better than FFmpeg's "subrip". Other codecs use their name.
+/// Short codec label for the UI; "SRT"/"DVB" read better than FFmpeg's "subrip"/"dvb_subtitle".
+/// Other codecs use their name.
 [[nodiscard]] auto SubtitleCodecName(AVCodecID codecId) noexcept -> const char * {
-    return codecId == AV_CODEC_ID_SUBRIP ? "SRT" : avcodec_get_name(codecId);
+    if (codecId == AV_CODEC_ID_SUBRIP) {
+        return "SRT";
+    }
+    if (codecId == AV_CODEC_ID_DVB_SUBTITLE) {
+        return "DVB";
+    }
+    return avcodec_get_name(codecId);
 }
 
 /// cDisplaySubtitleTracks label, e.g. "SRT (ger)". Kept short: tTrackId.description is char[32].
@@ -191,11 +199,22 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
     return desc;
 }
 
-/// Text-based subtitle codecs the converter can decode to plain text in v1. Bitmap subtitles
-/// (dvb_subtitle, hdmv_pgs, xsub) are intentionally excluded -- they need a separate raster path.
-[[nodiscard]] auto IsTextSubtitle(AVCodecID codec) noexcept -> bool {
-    return codec == AV_CODEC_ID_SUBRIP || codec == AV_CODEC_ID_TEXT || codec == AV_CODEC_ID_MOV_TEXT ||
-           codec == AV_CODEC_ID_ASS || codec == AV_CODEC_ID_SSA;
+/// Subtitle codecs the converter can render: text codecs plus DVB bitmap. Other bitmap codecs
+/// (hdmv_pgs, xsub) are excluded -- the render path is generic, so they are easy but untested follow-ups.
+[[nodiscard]] auto IsSupportedSubtitle(AVCodecID codec) noexcept -> bool {
+    const bool knownCodec = codec == AV_CODEC_ID_SUBRIP || codec == AV_CODEC_ID_TEXT || codec == AV_CODEC_ID_MOV_TEXT ||
+                            codec == AV_CODEC_ID_ASS || codec == AV_CODEC_ID_SSA || codec == AV_CODEC_ID_DVB_SUBTITLE;
+    // Don't advertise a track Open() would reject: this FFmpeg build may lack the decoder.
+    return knownCodec && avcodec_find_decoder(codec) != nullptr;
+}
+
+/// Renderable-subtitle-stream predicate; one definition so the count and populate passes can't drift.
+[[nodiscard]] auto IsSupportedSubtitleStream(const AVStream *stream) noexcept -> bool {
+    if (stream == nullptr || stream->codecpar == nullptr) {
+        return false;
+    }
+    const AVCodecParameters *p = stream->codecpar;
+    return p->codec_type == AVMEDIA_TYPE_SUBTITLE && IsSupportedSubtitle(p->codec_id);
 }
 
 /// Match cDevice::EnsureAudioTrack's pick (Setup.AudioLanguages, else track 0) so opening
@@ -718,23 +737,22 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     }
     ApplyCurrentAudioTrack();
 
-    // Enumerate text-subtitle streams (reserve once: SubtitleTrackDesc holds a borrowed codecpar,
-    // but the vector itself must not move while the chooser indexes into it). Bitmap subtitle
-    // streams are skipped here -- only text codecs are selectable in v1.
+    // Enumerate supported subtitle streams (reserve once: SubtitleTrackDesc holds a borrowed
+    // codecpar, but the vector itself must not move while the chooser indexes into it). Unsupported
+    // bitmap codecs (hdmv_pgs, xsub) are skipped here.
     unsigned subtitleCount = 0;
     for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
-        const AVCodecParameters *p = formatCtx->streams[i]->codecpar;
-        if (p->codec_type == AVMEDIA_TYPE_SUBTITLE && IsTextSubtitle(p->codec_id)) {
+        if (IsSupportedSubtitleStream(formatCtx->streams[i])) {
             ++subtitleCount;
         }
     }
     subtitleTracks.reserve(subtitleCount);
     for (unsigned i = 0; i < formatCtx->nb_streams; ++i) {
         const AVStream *stream = formatCtx->streams[i];
-        const AVCodecParameters *p = stream->codecpar;
-        if (p->codec_type != AVMEDIA_TYPE_SUBTITLE || !IsTextSubtitle(p->codec_id)) {
+        if (!IsSupportedSubtitleStream(stream)) {
             continue;
         }
+        const AVCodecParameters *p = stream->codecpar;
         SubtitleTrackDesc desc;
         desc.avStreamIndex = static_cast<int>(i);
         desc.timeBase = stream->time_base;
@@ -888,7 +906,7 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
             stream = MediaPacketStream::Audio;
         } else if (currentSubtitleTrack >= 0 && pkt->stream_index == subtitleStreamIndex) {
             tb = subtitleTimeBase; // MUST set before Rebase90k -- else tb stays {0,0} and pts -> NOPTS
-            // Text-subtitle cue. Rebase pts AND duration to 90 kHz (cues carry a display duration),
+            // Subtitle cue. Rebase pts AND duration to 90 kHz (cues carry a display duration),
             // then hand straight to the consumer: subtitles bypass the pre-sync / audio-discard gates
             // below -- the converter keys display off cue start/end vs the clock, so a stale cue simply
             // never matches the clock. duration uses the same 90 kHz target as Rebase90k's pts path.
@@ -1429,7 +1447,7 @@ auto cVaapiPlayer::RegisterAudioTracks() -> void {
 }
 
 auto cVaapiPlayer::RegisterSubtitleTracks() -> void {
-    // sourceMutex held (from OpenCurrentEntry). Publishes the source's text-subtitle streams so the
+    // sourceMutex held (from OpenCurrentEntry). Publishes the source's supported subtitle streams so the
     // Subtitles button (cDisplaySubtitleTracks) lists them. Subtitles start off (ttNone) -- like
     // dvbplayer, the user enables them with the Subtitles key. Uses cPlayer's device wrappers.
     if (!source) {
