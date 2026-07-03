@@ -313,7 +313,10 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto ApplyDisplayMode(const drmModeModeInfo &mode) -> bool;
     /// Submit an atomic commit. flags==0 selects the async page-flip path; pass
     /// DRM_MODE_ATOMIC_ALLOW_MODESET for a synchronous transition. EBUSY is silently swallowed.
-    [[nodiscard]] auto AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool;
+    /// @p osdHdrCommit marks a commit touching the OSD plane under HDR: a NONBLOCK EINVAL retries
+    /// under ALLOW_MODESET (CDCLK bump) and latches; if the modeset also fails (or the commit was
+    /// already ALLOW_MODESET, e.g. an HDR transition) it suppresses OSD enables while HDR is active.
+    [[nodiscard]] auto AtomicCommit(AtomicRequest &req, uint32_t flags, bool osdHdrCommit = false) -> bool;
     /// Find the planeIndex-th plane supporting @p format on the active CRTC; cache its property IDs.
     /// Prefers HDR-capable planes (P010 + COLOR_ENCODING BT.2020) for the NV12 video slot.
     [[nodiscard]] auto BindDrmPlane(int planeIndex, uint32_t format) -> bool;
@@ -424,6 +427,12 @@ class cVaapiDisplay : public cThread {
     mutable cMutex hdrStateMutex;       ///< Guards stagedHdrState (written by decoder, read by display thread)
     uint32_t pendingDestroyHdrBlobId{}; ///< Previous blob ID to destroy on the next successful flip
     HdrStreamInfo stagedHdrState{}; ///< HDR state staged by SetHdrOutputState(); consumed by MaybeAppendHdrOutputState
+
+    // OSD-over-HDR commit policy (display-thread-only; see AtomicCommit). On bandwidth-limited GPUs
+    // (e.g. Intel N100) the OSD plane beside the 4K 10-bpc video plane forces a CDCLK-bump modeset;
+    // no static cap predicts it, so it's detected at runtime. Reset on mode change and Initialize().
+    bool osdHdrNeedsModeset{}; ///< OSD-over-HDR commits must use ALLOW_MODESET (CDCLK bump needed).
+    bool osdHdrSuppressed{};   ///< Modeset fails too (bandwidth ceiling): block OSD enables under HDR.
 };
 
 #endif // VDR_VAAPIVIDEO_DISPLAY_H

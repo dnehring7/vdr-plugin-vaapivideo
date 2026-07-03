@@ -333,6 +333,9 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     lastVideoColorRange = kCacheSentinel;
     lastVideoSrcW = lastVideoSrcH = kCacheSentinel;
     lastVideoCrtcX = lastVideoCrtcY = lastVideoCrtcW = lastVideoCrtcH = kCacheSentinel;
+    // Re-arm the OSD-over-HDR commit-path probe (see AtomicCommit).
+    osdHdrNeedsModeset = false;
+    osdHdrSuppressed = false;
     // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
     // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
     // are coupled; changing one without the other desyncs the A/V controllers.
@@ -876,18 +879,19 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     return true;
 }
 
-[[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags) -> bool {
+[[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags, bool osdHdrCommit) -> bool {
     if (req.Count() == 0) {
         return true; // empty commit -- nothing to do, treat as success
     }
 
     // flags==0: async page-flip (PAGE_FLIP_EVENT | NONBLOCK), event clears isFlipPending. Covers
     //   steady-state video frames, plane-position updates (ScaleVideo), color encoding/range
-    //   updates, and OSD show/hide -- all fastset-eligible because scale_vaapi emits the final
+    //   updates, and OSD show/hide -- fastset-eligible because scale_vaapi emits the final
     //   framebuffer size, so SRC == CRTC and KMS does not need to drive a plane scaler.
     // flags==DRM_MODE_ATOMIC_ALLOW_MODESET (sync, no event): used for ApplyDisplayMode, CRTC
-    //   disable on shutdown, and HDR connector-state changes that may link-retrain. Display
-    //   thread blocks until applied.
+    //   disable on shutdown, HDR connector-state changes that may link-retrain, and (via the
+    //   osdHdrCommit fallback below) OSD-over-HDR frames on GPUs that need a CDCLK bump for them.
+    //   Display thread blocks until applied.
     // ATOMIC_ASYNC is unused -- it requires linear buffers, our VAAPI surfaces are tiled.
     const uint32_t commitFlags = (flags == 0) ? PAGE_FLIP_COMMIT_FLAGS : flags;
     if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, this) == 0) {
@@ -902,10 +906,37 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     if (origErrno == EBUSY) {
         return false;
     }
-    // No EINVAL fallback to sync ALLOW_MODESET: with scale_vaapi emitting the final-sized
-    // framebuffer, every page-flip commit is fastset-eligible. An EINVAL here means either an
-    // invalid plane state or an unintended scaler/crop path -- surface it loud rather than
-    // hide it behind a modeset retry that would silently degrade to a real modeset.
+
+    // OSD-over-HDR EINVAL recovery (e.g. Intel N100 / Alder Lake-N): the OSD plane beside the 4K
+    // 10-bpc video plane forces a CDCLK bump that only a modeset can apply, so the NONBLOCK flip is
+    // rejected every frame. Retry the same req (drmModeAtomicCommit leaves it intact on failure)
+    // under ALLOW_MODESET -- accepted even though parts without cdclk-squash may briefly retrain the
+    // link at OSD show/hide, since otherwise the menu is unusable over HDR. Latch so later frames
+    // skip the doomed NONBLOCK attempt.
+    if (origErrno == EINVAL && osdHdrCommit) [[unlikely]] {
+        if ((commitFlags & DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
+            if (!osdHdrNeedsModeset) {
+                isyslog("vaapivideo/display: OSD over HDR needs a modeset on this GPU -- using "
+                        "synchronous commits while the OSD is shown (brief A/V interruption possible)");
+                osdHdrNeedsModeset = true;
+            }
+            if (drmModeAtomicCommit(drmFd, req.Handle(), DRM_MODE_ATOMIC_ALLOW_MODESET, this) == 0) {
+                return true; // sync path carries no PAGE_FLIP_EVENT -> isFlipPending stays clear
+            }
+        }
+        // A modeset was rejected too: the config exceeds the hardware bandwidth ceiling, which no
+        // flag can fix. Drop the OSD plane (PresentBuffer honours the latch) so the thread stops
+        // spinning on a doomed sync commit that would also stall video -- menu hidden, video plays.
+        if (!osdHdrSuppressed) {
+            esyslog("vaapivideo/display: OSD over HDR exceeds the display bandwidth on this GPU -- "
+                    "hiding the OSD while HDR is active so video keeps playing");
+            osdHdrSuppressed = true;
+        }
+        return false;
+    }
+
+    // Pure-video / SDR / HDR-transition flips are fastset-eligible (scale_vaapi emits the final fb
+    // size), so an EINVAL here is a genuinely invalid plane state -- surface it loud, no retry.
     esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
     return false;
 }
@@ -954,6 +985,9 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // fast path and preventing spurious AVR retrains during IEC61937 lock-in.
     appliedHdrState = HdrStreamInfo{};
     appliedHdrBlobId = 0;
+    // Fresh CDCLK headroom: re-probe so a smaller HDR mode isn't needlessly forced onto sync commits.
+    osdHdrNeedsModeset = false;
+    osdHdrSuppressed = false;
     return true;
 }
 
@@ -1812,10 +1846,11 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // Plane state: write each stateful property only on change. Some drivers treat redundant
     // rewrites as transitions and reject them on the steady-state page-flip path. Cache advances
     // only on commit success so a failed commit retries cleanly next frame.
-    const uint64_t stagedColorEncoding =
-        (appliedHdrState.kind != StreamHdrKind::Sdr && videoProps.colorEncodingBt2020Valid)
-            ? videoProps.colorEncodingBt2020
-            : videoProps.colorEncodingBt709;
+    // appliedHdrState is display-thread-owned here, so this read needs no hdrStateMutex.
+    const bool hdrActive = appliedHdrState.kind != StreamHdrKind::Sdr;
+    const uint64_t stagedColorEncoding = (hdrActive && videoProps.colorEncodingBt2020Valid)
+                                             ? videoProps.colorEncodingBt2020
+                                             : videoProps.colorEncodingBt709;
     const uint64_t stagedSrcW = static_cast<uint64_t>(planeW) << 16;
     const uint64_t stagedSrcH = static_cast<uint64_t>(planeH) << 16;
     if (videoProps.colorEncodingValid && stagedColorEncoding != lastVideoColorEncoding) {
@@ -1849,12 +1884,18 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // vblank and tear over moving video. osdFbId reflects what the kernel will actually scan out
     // after this commit lands: if AppendOsdPlane hides (clipped off-screen / no OSD plane), it
     // reports false and we record 0 instead of currentOsd.fbId.
+    // osdHdrSuppressed blocks only OSD *enables* (doomed commits); hides always land -- they only
+    // reduce plane load, and a plane enabled before HDR must stay closable. Queued enables
+    // (osdDirty stays set) land once HDR ends.
+    const bool osdHidden = osdHdrSuppressed && hdrActive;
     bool osdCommitted = false;
     uint32_t osdFbId = 0;
+    uint32_t prevOsdFbId = 0;
     {
         const cMutexLock lock(&osdMutex);
-        osdFbId = lastCommittedOsdFbId;
-        if (osdDirty) {
+        prevOsdFbId = lastCommittedOsdFbId;
+        osdFbId = prevOsdFbId;
+        if (osdDirty && (currentOsd.fbId == 0 || !osdHidden)) {
             osdCommitted = true;
             if (currentOsd.fbId != 0) {
                 osdFbId = AppendOsdPlane(req, currentOsd) ? currentOsd.fbId : 0;
@@ -1870,8 +1911,16 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // HDR connector-state changes that may link-retrain. Plane/OSD updates ride the page-flip
     // path because scale_vaapi already emits the final framebuffer size, so KMS sees SRC == CRTC
     // and no plane scaler is involved -- the kernel internally picks fastset where applicable.
-    const uint32_t commitFlags = hdrStateChanged ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0U;
-    const bool success = AtomicCommit(req, commitFlags);
+    //
+    // Exception: an OSD plane transition over HDR may need a CDCLK-bump modeset (see AtomicCommit).
+    // Once latched, only transitions pay the sync cost -- steady repaints keep their data rate and
+    // stay fastset on the async path. HDR-transition commits (already ALLOW_MODESET) carry
+    // osdHdrCommit for suppression eligibility, so a bandwidth-ceiling GPU can't spin forever.
+    const bool osdHdrCommit = hdrActive && osdCommitted;
+    const bool osdTransition = osdFbId != prevOsdFbId;
+    const uint32_t commitFlags =
+        (hdrStateChanged || (osdHdrCommit && osdTransition && osdHdrNeedsModeset)) ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0U;
+    const bool success = AtomicCommit(req, commitFlags, osdHdrCommit);
     if (success) {
         if (promoteVideoRect) {
             const cMutexLock lock(&videoRectMutex);
