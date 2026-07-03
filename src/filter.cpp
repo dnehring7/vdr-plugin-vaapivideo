@@ -308,11 +308,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     if (!isUhd) {
         if (params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-            denoiseLevel = 16;   // empirical: removes MPEG-2 blocking without smearing motion
-            sharpnessLevel = 36; // empirical: compensates for heavy chroma subsampling
+            denoiseLevel = 12;   // 576i->1080 upscale magnifies DCT blocking; higher smears motion
+            sharpnessLevel = 26; // restores upscale-softened edges without ringing on titles
         } else {
-            denoiseLevel = 6;    // subtle: reduces H.264/H.265 ringing at bitrate-starved edges
-            sharpnessLevel = 30; // mild enhancement; strong values halate bright HD content
+            denoiseLevel = 4;    // 1080i is near-native; just tame ringing at bitrate-starved edges
+            sharpnessLevel = 20; // mild -- stronger values halate bright HD content
         }
     }
 
