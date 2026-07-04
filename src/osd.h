@@ -21,6 +21,7 @@
 
 // C++ Standard Library
 #include <atomic>
+#include <memory>
 #include <vector>
 
 // VDR
@@ -31,6 +32,18 @@
 #pragma GCC diagnostic pop
 
 class cVaapiOsd;
+
+// ============================================================================
+// === PROVIDER SHARED STATE ===
+// ============================================================================
+
+/// Shared via shared_ptr between provider and OSDs: VDR's cOsdProvider ctor deletes the old
+/// provider while cVaapiOsd objects may still live, so the mutex must not die with it.
+struct cVaapiOsdProviderState {
+    std::vector<cVaapiOsd *> activeOsds; ///< Live OSDs holding DRM resources; guarded by mutex
+    cMutex mutex;                        ///< Serializes activeOsds, provider_ writes, and all dumb-buffer pixel
+                                         ///< access (VDR main thread vs. SVDRP grab/detach/provider teardown)
+};
 
 // ============================================================================
 // === OSD PROVIDER ===
@@ -53,9 +66,9 @@ class cVaapiOsdProvider : public cOsdProvider {
     // === PUBLIC API ===
     // ========================================================================
     auto AttachDisplay(cVaapiDisplay *display) noexcept -> void; ///< Swap in a new display after SVDRP ATTA
-    /// Alpha-blend the cVaapiOsd whose framebuffer matches @p fbId onto a tightly-packed RGB24
-    /// buffer (size @p width x @p height, row pitch @p stride bytes). No-op when @p fbId is 0
-    /// or no matching OSD is allocated. Used by GrabImage to include the visible OSD in screen captures.
+    /// Alpha-blend the cVaapiOsd whose framebuffer matches @p fbId onto an RGB24 buffer
+    /// (@p width x @p height, row pitch @p stride >= width*3). No-op when @p fbId is 0, nothing
+    /// matches, or the geometry is malformed. Lets GrabImage include the OSD in captures.
     auto CompositeOntoRgb24(uint8_t *rgb24, int width, int height, int stride, uint32_t fbId) -> void;
     auto DetachDisplay() noexcept -> void; ///< Null the display ref; Flush() becomes a no-op
     auto ReleaseAllOsdResources() -> void; ///< Force-free DRM buffers of all live OSDs before drmDropMaster
@@ -68,7 +81,7 @@ class cVaapiOsdProvider : public cOsdProvider {
     [[nodiscard]] auto ProvidesTrueColor() -> bool override { return true; } ///< Enables RenderPixmaps() fast path
 
   private:
-    friend class cVaapiOsd; ///< ~cVaapiOsd calls HideOsd/AwaitOsdHidden; Flush() calls UpdateOsd
+    friend class cVaapiOsd; ///< cVaapiOsd ctor copies state_; dtor calls HideOsd/GetDisplay; Flush() calls UpdateOsd
 
     // ========================================================================
     // === INTERNAL METHODS ===
@@ -76,18 +89,16 @@ class cVaapiOsdProvider : public cOsdProvider {
     [[nodiscard]] auto GetDisplay() const noexcept -> cVaapiDisplay *;
     auto HideOsd(uint32_t fbId) -> void;          ///< Clears OSD plane only if fbId is the currently scanned-out FB
     auto UpdateOsd(cVaapiOsd &osd) const -> void; ///< Push FB id + geometry to display for the next atomic commit
-    auto TrackOsd(cVaapiOsd *osd) -> void;        ///< Register OSD so ReleaseAllOsdResources() can reach it
-    auto UntrackOsd(cVaapiOsd *osd) -> void;
 
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    std::vector<cVaapiOsd *> activeOsds_;  ///< Live OSDs holding DRM resources; guarded by osdListMutex_
     std::atomic<cVaapiDisplay *> display_; ///< Borrowed; nulled on Detach -- never outlives the device.
                                            ///< Atomic: SVDRP thread writes via Attach/Detach, VDR main thread
                                            ///< reads from CreateOsd/Flush/destructor. Lifetime is guaranteed
                                            ///< separately (display outlives the provider while attached).
-    cMutex osdListMutex_;                  ///< Guards activeOsds_ (SVDRP thread vs. VDR main thread)
+    std::shared_ptr<cVaapiOsdProviderState> state_{std::make_shared<cVaapiOsdProviderState>()};
+    ///< Shared with every cVaapiOsd it creates; keeps mutex + list alive past provider destruction
 };
 
 // ============================================================================
@@ -129,15 +140,17 @@ class cVaapiOsd : public cOsd {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    int drmFd_;                   ///< Borrowed from display; outlives all OSDs (see device Detach order)
-    uint32_t framebufferId_{};    ///< KMS FB registered with drmModeAddFB2; 0 = not allocated
-    uint32_t gemHandle_{};        ///< GEM dumb-buffer handle; 0 = not allocated
-    uint32_t height_{};           ///< FB height = screen height - Top() (not the visible pixmap height)
-    size_t mappedSize_{};         ///< Byte length of the mmap region (driver-aligned, >= stride*height)
-    uint8_t *pixels_{};           ///< mmap'd ARGB8888 scanout memory; nullptr = released or not yet allocated
-    cVaapiOsdProvider *provider_; ///< Borrowed; used for UpdateOsd/HideOsd -- valid while device is attached
-    uint32_t stride_{};           ///< Row pitch in bytes from DRM_IOCTL_MODE_CREATE_DUMB; may exceed width*4
-    uint32_t width_{};            ///< FB width = screen width - Left()
+    int drmFd_;                ///< Borrowed from display; outlives all OSDs (see device Detach order)
+    uint32_t framebufferId_{}; ///< KMS FB registered with drmModeAddFB2; 0 = not allocated
+    uint32_t gemHandle_{};     ///< GEM dumb-buffer handle; 0 = not allocated
+    uint32_t height_{};        ///< FB height = screen height - Top() (not the visible pixmap height)
+    size_t mappedSize_{};      ///< Byte length of the mmap region (driver-aligned, >= stride*height)
+    uint8_t *pixels_{};        ///< mmap'd ARGB8888 scanout memory; nullptr = released or not yet allocated
+    std::atomic<cVaapiOsdProvider *> provider_; ///< Borrowed; nulled by ~cVaapiOsdProvider if it dies first --
+                                                ///< read/written only under providerState_->mutex
+    std::shared_ptr<cVaapiOsdProviderState> providerState_; ///< Keeps mutex + OSD list alive past provider death
+    uint32_t stride_{}; ///< Row pitch in bytes from DRM_IOCTL_MODE_CREATE_DUMB; may exceed width*4
+    uint32_t width_{};  ///< FB width = screen width - Left()
 };
 
 // ============================================================================

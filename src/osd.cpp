@@ -90,6 +90,28 @@ cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
         ::osdProvider = nullptr;
     }
 
+    // VDR's cOsdProvider ctor deletes the old provider while cVaapiOsd objects may still live
+    // (e.g. open menu): hide+await+free each framebuffer while a display is still reachable
+    // (scanout rule, see ~cVaapiOsd), then orphan so Flush()/~cVaapiOsd skip the dead provider.
+    // The mutex also holds off an in-flight Flush() that already snapshotted provider_.
+    {
+        const cMutexLock lock(&state_->mutex);
+        for (auto *osd : state_->activeOsds) {
+            if (const uint32_t fbId = osd->framebufferId_; fbId != 0) {
+                HideOsd(fbId);
+                if (auto *display = GetDisplay(); display && display->IsInitialized()) {
+                    display->AwaitOsdHidden(fbId);
+                }
+            }
+            osd->DestroyDumbBuffer();
+            osd->provider_.store(nullptr, std::memory_order_release);
+        }
+        if (!state_->activeOsds.empty()) {
+            isyslog("vaapivideo/osd: provider destroyed with %zu OSDs still alive (orphaned)",
+                    state_->activeOsds.size());
+        }
+    }
+
     dsyslog("vaapivideo/osd: provider destroyed");
 }
 
@@ -110,12 +132,15 @@ auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
 
 auto cVaapiOsdProvider::CompositeOntoRgb24(uint8_t *rgb24, const int width, const int height, const int stride,
                                            const uint32_t fbId) -> void {
-    if (!rgb24 || fbId == 0 || width <= 0 || height <= 0) [[unlikely]] {
+    // A pitch below width*3 would push the row offsets out of the caller's canvas; compare
+    // in size_t because width * 3 in int could overflow before the check protects anything.
+    if (!rgb24 || fbId == 0 || width <= 0 || height <= 0 || stride <= 0 ||
+        static_cast<size_t>(stride) < static_cast<size_t>(width) * 3U) [[unlikely]] {
         return;
     }
 
-    const cMutexLock lock(&osdListMutex_);
-    for (auto *osd : activeOsds_) {
+    const cMutexLock lock(&state_->mutex);
+    for (auto *osd : state_->activeOsds) {
         // Match the framebuffer that's actually being scanned out; ignore background OSDs whose
         // dumb buffers are still allocated but not visible. pixels_ is null for OSDs whose buffer
         // was force-released by ReleaseAllOsdResources() during a SVDRP DETA -- skip those too.
@@ -174,21 +199,11 @@ auto cVaapiOsdProvider::ReleaseAllOsdResources() -> void {
     // Called from cVaapiDevice::Detach() before drmDropMaster. Dumb buffer GEM handles hold
     // kernel refs that block the fd close; force-free them in place. The cVaapiOsd objects
     // stay alive (VDR owns them) but become no-ops (pixels_==nullptr) until VDR destroys them.
-    const cMutexLock lock(&osdListMutex_);
-    for (auto *osd : activeOsds_) {
+    const cMutexLock lock(&state_->mutex);
+    for (auto *osd : state_->activeOsds) {
         osd->DestroyDumbBuffer();
     }
-    dsyslog("vaapivideo/osd: released DRM resources for %zu active OSDs", activeOsds_.size());
-}
-
-auto cVaapiOsdProvider::TrackOsd(cVaapiOsd *osd) -> void {
-    const cMutexLock lock(&osdListMutex_);
-    activeOsds_.push_back(osd);
-}
-
-auto cVaapiOsdProvider::UntrackOsd(cVaapiOsd *osd) -> void {
-    const cMutexLock lock(&osdListMutex_);
-    std::erase(activeOsds_, osd);
+    dsyslog("vaapivideo/osd: released DRM resources for %zu active OSDs", state_->activeOsds.size());
 }
 
 [[nodiscard]] auto cVaapiOsdProvider::GetDisplay() const noexcept -> cVaapiDisplay * {
@@ -270,28 +285,33 @@ cVaapiOsd::cVaapiOsd(const int posX, const int posY, const uint lvl, const int f
     // cOsd has no width/height accessors after construction; width_/height_ are the dumb-buffer
     // extent (screen minus OSD origin), not the visible pixmap region.
     : cOsd(posX, posY, lvl), drmFd_(fd), height_(static_cast<uint32_t>(fbHeight)), provider_(provider),
-      width_(static_cast<uint32_t>(fbWidth)) {
-    provider_->TrackOsd(this);
+      providerState_(provider->state_), width_(static_cast<uint32_t>(fbWidth)) {
+    const cMutexLock lock(&providerState_->mutex);
+    providerState_->activeOsds.push_back(this);
 }
 
 cVaapiOsd::~cVaapiOsd() noexcept {
-    if (provider_) {
-        provider_->UntrackOsd(this);
-    }
+    uint32_t logFbId = 0;
+    {
+        // Whole teardown under the state mutex: no window where this OSD is untracked yet
+        // still touching a provider that ~cVaapiOsdProvider may be freeing concurrently.
+        const cMutexLock lock(&providerState_->mutex);
 
-    if (provider_ && framebufferId_ != 0) [[likely]] {
-        provider_->HideOsd(framebufferId_);
+        if (auto *provider = provider_.load(std::memory_order_acquire); provider && framebufferId_ != 0) [[likely]] {
+            provider->HideOsd(framebufferId_);
 
-        // STRICT ordering: hide -> await -> destroy. KMS continues scanning the GEM
-        // buffer until the next atomic commit completes; freeing it before AwaitOsdHidden
-        // returns races the display thread and causes the kernel to read freed memory.
-        if (cVaapiDisplay *display = provider_->GetDisplay(); display && display->IsInitialized()) {
-            display->AwaitOsdHidden(framebufferId_);
+            // STRICT ordering: hide -> await -> destroy. KMS continues scanning the GEM
+            // buffer until the next atomic commit completes; freeing it before AwaitOsdHidden
+            // returns races the display thread and causes the kernel to read freed memory.
+            if (cVaapiDisplay *display = provider->GetDisplay(); display && display->IsInitialized()) {
+                display->AwaitOsdHidden(framebufferId_);
+            }
         }
-    }
 
-    const uint32_t logFbId = framebufferId_; // capture before DestroyDumbBuffer() zeroes it
-    DestroyDumbBuffer();
+        std::erase(providerState_->activeOsds, this);
+        logFbId = framebufferId_; // capture before DestroyDumbBuffer() zeroes it
+        DestroyDumbBuffer();
+    }
     dsyslog("vaapivideo/osd: destroyed fbId=%u", logFbId);
 }
 
@@ -326,7 +346,13 @@ cVaapiOsd::~cVaapiOsd() noexcept {
 }
 
 auto cVaapiOsd::Flush() -> void {
-    if (!pixels_) [[unlikely]] {
+    // The state mutex spans all pixel writes: ReleaseAllOsdResources() (SVDRP DETA thread)
+    // munmaps the buffer in place and ~cVaapiOsdProvider frees the provider, both under this
+    // lock -- so pixels_/provider_ stay valid for the whole flush. Cheap to hold across
+    // UpdateOsd(): only the rare SVDRP grab/detach contends it, never the display thread.
+    const cMutexLock bufferLock(&providerState_->mutex);
+    auto *const provider = provider_.load(std::memory_order_acquire);
+    if (!provider || !pixels_) [[unlikely]] {
         return;
     }
 
@@ -370,7 +396,7 @@ auto cVaapiOsd::Flush() -> void {
     // VDR pixmap operations on vsync. Only fbId + geometry is passed; KMS scans the dumb
     // buffer directly so no pixel copy is needed here.
     if (rendered) {
-        provider_->UpdateOsd(*this);
+        provider->UpdateOsd(*this);
         return;
     }
 
@@ -415,7 +441,7 @@ auto cVaapiOsd::Flush() -> void {
     }
 
     if (anyDirty) {
-        provider_->UpdateOsd(*this);
+        provider->UpdateOsd(*this);
     }
 }
 
@@ -445,6 +471,16 @@ auto cVaapiOsd::Flush() -> void {
     // Use driver-returned pitch verbatim; recomputing as fbWidth*4 misses hardware row padding.
     stride_ = createReq.pitch;
     mappedSize_ = createReq.size;
+
+    // All Flush()/CompositeOntoRgb24() bounds rest on pitch >= width*4 and size >=
+    // pitch*height (kernel-guaranteed); verify once rather than trusting a buggy driver.
+    if (stride_ < static_cast<size_t>(fbWidth) * 4U || mappedSize_ < static_cast<size_t>(stride_) * fbHeight)
+        [[unlikely]] {
+        esyslog("vaapivideo/osd: implausible dumb-buffer geometry stride=%u size=%zu for %ux%u", stride_, mappedSize_,
+                fbWidth, fbHeight);
+        DestroyDumbBuffer();
+        return false;
+    }
 
     // Register as a KMS FB. ARGB8888 is single-plane so only handles[0] is populated.
     const uint32_t handles[4] = {gemHandle_, 0, 0, 0};
