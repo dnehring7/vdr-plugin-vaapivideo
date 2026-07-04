@@ -127,13 +127,15 @@ class cVideoFilterChain {
     [[nodiscard]] auto IsBuilt() const noexcept -> bool { return filterGraph_ != nullptr; }
 
     /// Move the active graph to the keep-alive slot without destroying it. The old graph
-    /// is released on the next Build() or destructor, giving the display thread time to
-    /// finish DMA-BUF mapping. Idempotent; never overwrites a saved graph with null.
+    /// is released when a later Reset() saves a successor graph (or in the destructor),
+    /// giving the display thread time to finish DMA-BUF mapping. Idempotent; never
+    /// overwrites a saved graph with null.
     auto Reset() noexcept -> void;
 
     /// Approximate output frame duration in milliseconds (1000 / outputFps), computed in
-    /// Build() from framerate, interlaced flag, and upconvert decision. Returns 20 (50 fps)
-    /// before Build() succeeds. Used by the A/V sync controller.
+    /// Build() from framerate, interlaced flag, and upconvert decision. Returns the 20 ms
+    /// (50 fps) fallback before the first successful Build(), after Reset(), and after a
+    /// failed Build(). Used by the A/V sync controller.
     [[nodiscard]] auto GetOutputFrameDurationMs() const noexcept -> int { return outputFrameDurationMs_; }
 
     /// True iff the active chain contains a temporal filter whose internal state survives a
@@ -143,10 +145,13 @@ class cVideoFilterChain {
     /// triggering long stale-jitter / catch-up cascades. bwdif / yadif retain at most 1-2
     /// fields of pre-seek content and self-clear inside a filter window -- not flagged.
     /// FlushForSeek consults this to decide whether to pay the ~100 ms filter-rebuild cost.
-    [[nodiscard]] auto HasFpsFilter() const noexcept -> bool { return hasFpsFilter_; }
+    /// Atomic (relaxed): FlushForSeek reads it from the mediaplayer thread before taking
+    /// codecMutex, while Build()/Reset() write it on the decode thread.
+    [[nodiscard]] auto HasFpsFilter() const noexcept -> bool { return hasFpsFilter_.load(std::memory_order_relaxed); }
 
   private:
-    /// Drop a partially-built graph and return false. Used on every Build() failure path; does NOT
+    /// Drop a partially-built graph, reset the derived state (hasFpsFilter_ / outputFrameDurationMs_)
+    /// to the unbuilt defaults, and return false. Used on every Build() failure path; does NOT
     /// touch previousFilterGraph_ (that slot owns the last good graph whose hw_frames_ctx keeps
     /// in-flight VPP surfaces PRIME-exportable -- routing through Reset() would clobber it).
     [[nodiscard]] auto FailBuild() noexcept -> bool;
@@ -157,7 +162,7 @@ class cVideoFilterChain {
     AVFilterContext *bufferSrcCtx_{};  ///< owned by filterGraph_; raw pointer valid only while filterGraph_ is live
     AVFilterContext *bufferSinkCtx_{}; ///< owned by filterGraph_; same lifetime constraint
     int outputFrameDurationMs_{20};    ///< 20 = 50 fps fallback; updated by Build()
-    bool hasFpsFilter_{false};         ///< true iff the active chain ends with `fps=N`; updated by Build() / Reset()
+    std::atomic<bool> hasFpsFilter_{false}; ///< true iff the active chain ends with `fps=N`; Build()/Reset() write it
 };
 
 #endif // VDR_VAAPIVIDEO_FILTER_H

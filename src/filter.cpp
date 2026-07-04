@@ -12,7 +12,7 @@
 
 // C++ Standard Library
 #include <algorithm>
-#include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -128,13 +128,6 @@ auto ExtractHdrInfo(const AVFrame *frame) noexcept -> HdrStreamInfo {
 
 namespace {
 
-/// Stack-allocated FFmpeg error string; avoids heap allocation on every error path.
-[[nodiscard]] auto FmtErr(int ret) noexcept -> std::array<char, AV_ERROR_MAX_STRING_SIZE> {
-    std::array<char, AV_ERROR_MAX_STRING_SIZE> buf{};
-    av_make_error_string(buf.data(), buf.size(), ret);
-    return buf;
-}
-
 /// Resolve the GPU deinterlacer for a requested VppDeintMode rank, choosing ONLY modes the driver
 /// advertises in @p supportedMask -- emitting an unadvertised mode makes VAAPI reject the whole graph
 /// (some iHD GPUs expose just motion_compensated). The VppDeintMode value is its rank (lower = better);
@@ -197,6 +190,8 @@ auto cVideoFilterChain::FailBuild() noexcept -> bool {
     bufferSrcCtx_ = nullptr;
     bufferSinkCtx_ = nullptr;
     filterGraph_.reset();
+    hasFpsFilter_.store(false, std::memory_order_relaxed);
+    outputFrameDurationMs_ = 20;
     return false;
 }
 
@@ -286,18 +281,21 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     // NV12/P010 chroma is 4:2:0 (2x2-subsampled); odd dimensions produce artifacts.
     // Minimum 2 so scale_vaapi never receives a 0-size surface.
-    filterWidth = std::max(filterWidth & ~1U, 2U);
-    filterHeight = std::max(filterHeight & ~1U, 2U);
+    const auto evenAtLeastTwo = [](uint32_t value) noexcept -> uint32_t { return std::max(value & ~1U, 2U); };
+    filterWidth = evenAtLeastTwo(filterWidth);
+    filterHeight = evenAtLeastTwo(filterHeight);
 
     // Snap to the exact rect when the fit lands within ~1%: integer crop-offset / aspect rounding
     // otherwise leaves a 2-6 px black sliver on an image that should fill the screen (most visibly a
     // zoomed 16:9 source -> 1920x1076 instead of 1920x1080). The implied <=1% stretch is invisible;
     // genuine letterbox/pillarbox (4:3, scope, ...) is far larger than 1% and stays untouched.
-    if (dstWidth - filterWidth <= dstWidth / 100) {
-        filterWidth = dstWidth;
+    // The <= dst guard makes the no-underflow precondition explicit (the min-2 clamp above can push a
+    // dimension past a degenerate 1-px rect); snapping keeps the 4:2:0 evenness/minimum invariant.
+    if (filterWidth <= dstWidth && dstWidth - filterWidth <= dstWidth / 100) {
+        filterWidth = evenAtLeastTwo(dstWidth);
     }
-    if (dstHeight - filterHeight <= dstHeight / 100) {
-        filterHeight = dstHeight;
+    if (filterHeight <= dstHeight && dstHeight - filterHeight <= dstHeight / 100) {
+        filterHeight = evenAtLeastTwo(dstHeight);
     }
 
     // UHD: GPU already saturated by 4K decode/scale; skip denoise/sharpen to avoid stutter.
@@ -334,14 +332,39 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         scaleColorArgs = std::format("format={}:out_color_matrix=bt709:out_range=tv", pixFmt);
     }
 
+    // Trick/still drop denoise/sharpness (minimal chain). Deinterlacing differs (see the GPU VPP
+    // block): trick keeps a spatial deinterlacer (1x, frame rate) so interlaced FF/RW/slow doesn't
+    // comb; still drops it -- a lone frame has no field-pair partner and the temporal VPP delay
+    // swallows it.
+    const bool minimalChain = params.trickMode || params.stillPicture;
+    const bool useSpatialDeinterlace = params.trickMode;
+
+    // SW post-processing block decision. Any effective sw-* post-process choice pulls the needed prefix
+    // into one hwdownload..hwupload block. Forced off for HDR (no P010/BT.2020 in the SW chain), UHD
+    // (SW filters stutter at 4K), and trick/still (minimal chain).
+    const bool swDeintRequested =
+        params.userDeint == DeinterlaceMode::SwBwdif || params.userDeint == DeinterlaceMode::SwW3fdif;
+    const bool swDenoiseRequested =
+        params.denoise == DenoiseMode::SwMinimal || params.denoise == DenoiseMode::SwEnhanced;
+    const bool swSharpenRequested = params.sharpen == SharpenMode::SwMild || params.sharpen == SharpenMode::SwMedium;
+    const bool swScaleRequested = params.scale == ScaleMode::SwQuality || params.scale == ScaleMode::SwFast;
+    const bool useSwPost =
+        !minimalChain && !params.hdrPassthrough && !isUhd &&
+        ((swDeintRequested && isInterlaced) || swDenoiseRequested || swSharpenRequested || swScaleRequested);
+
     // VBR DVB streams (and some cable muxes) omit framerate; 50/1 is the DVB-S/T baseline (= 25i).
     const int fpsNum = params.fpsNum > 0 ? params.fpsNum : 50;
     const int fpsDen = params.fpsDen > 0 ? params.fpsDen : 1;
 
     // rate=field doubles interlaced pairs (25i -> 50p); auto=1/deint=interlaced pass progressive frames
-    // 1:1, so this is the output-rate upper bound. Round naturalOutputFps so NTSC rates (30000/1001,
-    // 60000/1001) resolve to 30/60 rather than truncating to 29/59.
-    const int fieldRateFactor = isInterlaced ? 2 : 1;
+    // 1:1, so this is the output-rate upper bound. The doubling only applies when a field-rate (2x)
+    // deinterlacer is actually emitted: trick/still use a spatial 1x one (or none at all), and the
+    // HW-decode GPU path skips the deinterlacer entirely when the driver advertises no mode. Round
+    // naturalOutputFps so NTSC rates (30000/1001, 60000/1001) resolve to 30/60 rather than truncating
+    // to 29/59.
+    const bool hasHwDeinterlace = !params.deinterlaceMode.empty() && params.deinterlaceModeMask != 0U;
+    const bool fieldRateDeint = isInterlaced && !minimalChain && (useSwPost || isSoftwareDecode || hasHwDeinterlace);
+    const int fieldRateFactor = fieldRateDeint ? 2 : 1;
     const int64_t outputRateNum = static_cast<int64_t>(fpsNum) * fieldRateFactor;
     const int64_t outputRateDen = std::max<int64_t>(fpsDen, 1);
     const int naturalOutputFps = static_cast<int>((outputRateNum + (outputRateDen / 2)) / outputRateDen);
@@ -360,7 +383,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // eliminates "catch-up cycling sustained" log spam from the routine source>display drop work).
     const int64_t displayRateInSourceDen = static_cast<int64_t>(displayFps) * outputRateDen;
     const bool ratesDiffer = outputRateNum > 0 && displayFps > 0 && outputRateNum != displayRateInSourceDen;
-    const int outputFps = ratesDiffer ? displayFps : naturalOutputFps;
+    // Trick/still never get the fps filter (minimal chain), so their output stays at the natural rate.
+    const bool insertFpsFilter = !minimalChain && ratesDiffer;
+    const int outputFps = insertFpsFilter ? displayFps : naturalOutputFps;
 
     // Filter chain (comma-joined, two domains chosen by useSwPost below):
     //   GPU VPP: [deinterlace_vaapi|bwdif(SW-decode)] -> [denoise_vaapi] -> [crop] -> scale_vaapi
@@ -379,29 +404,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
     };
 
-    // Trick/still drop denoise/sharpness. Deinterlacing differs (see the GPU VPP block): trick keeps a
-    // spatial deinterlacer (bob/yadif, 1x, no temporal buffer) so interlaced FF/RW/slow doesn't comb;
-    // still drops it -- a lone frame has no field-pair partner and the temporal VPP delay swallows it.
-    const bool useSimpleDeinterlace = params.trickMode || params.stillPicture;
-
     // Effective GPU VPP levels for the active policy (0 = skip). Only Auto applies HW denoise/sharpen;
     // Off skips and the Sw* values never reach the GPU domain (they force the SW block). UHD leaves the
     // base at 0.
     const int gpuDenoiseLevel = (params.denoise == DenoiseMode::Auto) ? denoiseLevel : 0;
     const int gpuSharpenLevel = (params.sharpen == SharpenMode::Auto) ? sharpnessLevel : 0;
-
-    // SW post-processing block decision. Any explicit sw-* choice pulls the whole post-process into one
-    // hwdownload..hwupload block. Forced off for HDR (no P010/BT.2020 in the SW chain), UHD (SW filters
-    // stutter at 4K), and trick/still (minimal chain).
-    const bool swDeintRequested =
-        params.userDeint == DeinterlaceMode::SwBwdif || params.userDeint == DeinterlaceMode::SwW3fdif;
-    const bool swDenoiseRequested =
-        params.denoise == DenoiseMode::SwMinimal || params.denoise == DenoiseMode::SwEnhanced;
-    const bool swSharpenRequested = params.sharpen == SharpenMode::SwMild || params.sharpen == SharpenMode::SwMedium;
-    const bool swScaleRequested = params.scale == ScaleMode::SwQuality || params.scale == ScaleMode::SwFast;
-    const bool useSwPost =
-        !useSimpleDeinterlace && !params.hdrPassthrough && !isUhd &&
-        ((swDeintRequested && isInterlaced) || swDenoiseRequested || swSharpenRequested || swScaleRequested);
 
     if (useSwPost) {
         // --- Hybrid SW/HW post-processing: ONE hwdownload, ONE hwupload ---
@@ -416,11 +423,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         // boundary: sw sharpen (post-scale) pulls scale into SW; sw scale pulls denoise's slot into SW.
         // An "auto" denoise/sharpen that lands inside the SW segment is dropped (auto = HW-only); scale
         // inside the segment runs as swscale because it is mandatory.
-        const bool swDenoise = params.denoise == DenoiseMode::SwMinimal || params.denoise == DenoiseMode::SwEnhanced;
-        const bool swScale = params.scale == ScaleMode::SwQuality || params.scale == ScaleMode::SwFast;
-        const bool swSharpen = params.sharpen == SharpenMode::SwMild || params.sharpen == SharpenMode::SwMedium;
-        const bool scaleInSw = swScale || swSharpen;     // sharpen must follow scale; keep them together in SW
-        const bool denoiseInSw = swDenoise || scaleInSw; // denoise precedes scale; keep the SW segment contiguous
+        const bool scaleInSw = swScaleRequested || swSharpenRequested; // sharpen follows the scale slot; keep boundary
+        const bool denoiseInSw = swDenoiseRequested || scaleInSw;      // denoise precedes scale; keep SW contiguous
 
         // -- single hwdownload (HW decode only; an already-SW-decoded frame is in system memory) --
         if (!isSoftwareDecode) {
@@ -432,7 +436,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             filters.emplace_back(params.userDeint == DeinterlaceMode::SwW3fdif ? SW_DEINT_W3FDIF : SW_DEINT_BWDIF);
         }
         // Denoise (software hqdn3d) -- only the explicit sw-* presets.
-        if (swDenoise) {
+        if (swDenoiseRequested) {
             filters.emplace_back(params.denoise == DenoiseMode::SwEnhanced ? SW_DENOISE_ENHANCED : SW_DENOISE_MINIMAL);
         }
         // Scale (software swscale) -- only when it is pulled into the SW segment. Emitted only when it
@@ -454,7 +458,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             }
         }
         // Sharpen (software unsharp) -- only the explicit sw-* presets.
-        if (swSharpen) {
+        if (swSharpenRequested) {
             filters.emplace_back(params.sharpen == SharpenMode::SwMedium ? SW_SHARPEN_MEDIUM : SW_SHARPEN_MILD);
         }
         // -- single hwupload: back onto a VAAPI surface --
@@ -478,7 +482,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
             }
         }
-        if (!swSharpen && gpuSharpenLevel > 0 && params.hasSharpness) {
+        if (!swSharpenRequested && gpuSharpenLevel > 0 && params.hasSharpness) {
             filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
         }
     } else {
@@ -489,12 +493,18 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             if (isSoftwareDecode) {
                 // SW-decoded frame in system memory: VAAPI can't deinterlace it. Normal play: bwdif
                 // (temporal, 2x). Trick: yadif spatial 1x, but only on frames marked interlaced.
-                filters.emplace_back(useSimpleDeinterlace ? "yadif=deint=interlaced" : SW_DEINT_BWDIF);
-            } else if (useSimpleDeinterlace) {
-                // Trick: bob spatial deinterlace at frame rate (1x) -- no temporal buffer, keeps cadence,
-                // and auto=1 leaves progressive frames untouched inside mixed streams.
-                filters.emplace_back("deinterlace_vaapi=mode=bob:rate=frame:auto=1");
-            } else if (!params.deinterlaceMode.empty()) {
+                filters.emplace_back(useSpatialDeinterlace ? "yadif=deint=interlaced" : SW_DEINT_BWDIF);
+            } else if (useSpatialDeinterlace && hasHwDeinterlace) {
+                // Trick: bob spatial deinterlace at frame rate (1x); auto=1 leaves progressive frames
+                // untouched inside mixed streams. Clamp to an advertised mode -- some iHD GPUs expose
+                // only motion_compensated, and an unadvertised bob would fail the whole graph (no video
+                // in trick mode). The temporal fallback costs 1-2 frames of latency, which trick's
+                // continuous frame flow absorbs; rate=frame keeps the 1x cadence either way.
+                const std::string_view deintMode =
+                    ClampDeinterlaceMode(VppDeintModeArg(VppDeintMode::Bob), static_cast<int>(VppDeintMode::Bob),
+                                         params.deinterlaceModeMask);
+                filters.push_back(std::format("deinterlace_vaapi=mode={}:rate=frame:auto=1", deintMode));
+            } else if (!useSpatialDeinterlace && hasHwDeinterlace) {
                 // User HW selection clamped to a driver-advertised mode (Auto = best advertised).
                 // auto=1 passes progressive frames through, so per-GOP progressive_frame toggles need no rebuild.
                 const std::string_view deintMode = ClampDeinterlaceMode(
@@ -503,7 +513,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             }
         }
 
-        const bool wantDenoise = !useSimpleDeinterlace && gpuDenoiseLevel > 0;
+        const bool wantDenoise = !minimalChain && gpuDenoiseLevel > 0;
         if (isSoftwareDecode) {
             // SW-decode sysmem tail. MPEG-2 hqdn3d fall-back only when the GPU lacks denoise_vaapi:
             // SW decode is cheap and block-artefact removal is worth the per-frame CPU cost (~5 ms
@@ -545,13 +555,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
         }
 
-        if (!useSimpleDeinterlace && gpuSharpenLevel > 0 && params.hasSharpness) {
+        if (!minimalChain && gpuSharpenLevel > 0 && params.hasSharpness) {
             filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
         }
     }
 
-    hasFpsFilter_ = !useSimpleDeinterlace && ratesDiffer;
-    if (hasFpsFilter_) {
+    if (insertFpsFilter) {
         // Nearest-neighbor sample/duplicate to the display rate. Drops for source>display, dupes
         // for source<display (exact 2x for 25->50/24->48, or uneven cadence for inexact ratios).
         // No pixel work on the duplicated frame.
@@ -627,21 +636,21 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         av_buffer_unref(&hwFramesParams->hw_frames_ctx);
         av_free(hwFramesParams);
         if (setRet < 0) [[unlikely]] {
-            esyslog("vaapivideo/filter: av_buffersrc_parameters_set failed: %s", FmtErr(setRet).data());
+            esyslog("vaapivideo/filter: av_buffersrc_parameters_set failed: %s", AvErr(setRet).data());
             return FailBuild();
         }
     }
 
     int ret = avfilter_init_str(bufferSrcCtx_, bufferSrcArgs.c_str());
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to init buffer source '%s': %s", bufferSrcArgs.c_str(), FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to init buffer source '%s': %s", bufferSrcArgs.c_str(), AvErr(ret).data());
         return FailBuild();
     }
 
     ret = avfilter_graph_create_filter(&bufferSinkCtx_, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr,
                                        filterGraph_.get());
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to create buffer sink: %s", FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to create buffer sink: %s", AvErr(ret).data());
         return FailBuild();
     }
 
@@ -653,14 +662,13 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     AVFilterGraphSegment *segment = nullptr;
     ret = avfilter_graph_segment_parse(filterGraph_.get(), filterChain.c_str(), 0, &segment);
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to parse filter chain '%s': %s", filterChain.c_str(), FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to parse filter chain '%s': %s", filterChain.c_str(), AvErr(ret).data());
         return FailBuild();
     }
 
     ret = avfilter_graph_segment_create_filters(segment, 0);
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to create segment filters '%s': %s", filterChain.c_str(),
-                FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to create segment filters '%s': %s", filterChain.c_str(), AvErr(ret).data());
         avfilter_graph_segment_free(&segment);
         return FailBuild();
     }
@@ -688,7 +696,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     AVFilterInOut *segmentOutputs = nullptr;
     ret = avfilter_graph_segment_apply(segment, 0, &segmentInputs, &segmentOutputs);
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to apply segment '%s': %s", filterChain.c_str(), FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to apply segment '%s': %s", filterChain.c_str(), AvErr(ret).data());
         avfilter_inout_free(&segmentInputs);
         avfilter_inout_free(&segmentOutputs);
         avfilter_graph_segment_free(&segment);
@@ -718,17 +726,20 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     avfilter_graph_segment_free(&segment);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to link buffersrc/buffersink to chain '%s': %s", filterChain.c_str(),
-                FmtErr(ret).data());
+                AvErr(ret).data());
         return FailBuild();
     }
 
     ret = avfilter_graph_config(filterGraph_.get(), nullptr);
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/filter: failed to configure filter graph '%s': %s", filterChain.c_str(),
-                FmtErr(ret).data());
+        esyslog("vaapivideo/filter: failed to configure filter graph '%s': %s", filterChain.c_str(), AvErr(ret).data());
         return FailBuild();
     }
 
+    // Commit derived state only after the graph is fully configured: a failed Build() must not leave
+    // hasFpsFilter_ describing a chain that doesn't exist (FlushForSeek consults it for the rebuild
+    // decision).
+    hasFpsFilter_.store(insertFpsFilter, std::memory_order_relaxed);
     outputFrameDurationMs_ = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20; // 20 ms = 50 fps fallback
 
     if (compactLog) {
@@ -743,17 +754,20 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         // Non-compact => Clear / channel switch (trick/zoom set compactLog). Log it even when the
         // chain is byte-for-byte identical, so every switch surfaces its settings.
         const char *cadenceTag = "";
-        if (ratesDiffer) {
+        if (insertFpsFilter) {
             if (outputRateNum < displayRateInSourceDen) {
                 cadenceTag = (displayRateInSourceDen % outputRateNum) == 0 ? ", duplicated" : ", uneven cadence";
             } else {
                 cadenceTag = ", decimated";
             }
         }
-        // "deinterlaced" reflects the chain, not the source: only still drops the deinterlacer.
+        // "deinterlaced" reflects the chain, not the source: still drops the deinterlacer, and a
+        // HW-decode path without an advertised VPP mode has none to emit.
+        const bool chainDeinterlaces =
+            isInterlaced && !params.stillPicture && (useSwPost || isSoftwareDecode || hasHwDeinterlace);
         isyslog("vaapivideo/filter: VAAPI filter initialized (%dx%d -> %ux%u%s%s, out=%s %s)", srcWidth, srcHeight,
-                filterWidth, filterHeight, (isInterlaced && !params.stillPicture) ? ", deinterlaced" : "", cadenceTag,
-                pixFmt, params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
+                filterWidth, filterHeight, chainDeinterlaces ? ", deinterlaced" : "", cadenceTag, pixFmt,
+                params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
     }
     // Always surface the actual chain so trick/still/zoom/seek rebuilds are verifiable in the log.
     dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
@@ -786,11 +800,13 @@ auto cVideoFilterChain::ReceiveFrame(AVFrame *out) noexcept -> int {
 auto cVideoFilterChain::Reset() noexcept -> void {
     bufferSrcCtx_ = nullptr;
     bufferSinkCtx_ = nullptr;
-    hasFpsFilter_ = false;
+    hasFpsFilter_.store(false, std::memory_order_relaxed);
+    outputFrameDurationMs_ = 20;
     // Keep the old graph alive in previousFilterGraph_: destroying it immediately causes
     // -EIO on iHD because the VPP output surfaces are still DMA-BUF mapped by the display
-    // thread. The saved graph (and its hw_frames_ctx) is released on the next Build() or
-    // destructor, by which time the display thread has finished mapping.
+    // thread. The saved graph (and its hw_frames_ctx) is released when a later Reset()
+    // saves a successor graph here (or in the destructor). Build() deliberately never
+    // touches this slot: freeing it during the Reset->Build gap would hit the same race.
     // Guard: a double-reset (Clear -> drain -> EOS) must not overwrite the saved graph with null.
     if (filterGraph_) {
         previousFilterGraph_ = std::move(filterGraph_);

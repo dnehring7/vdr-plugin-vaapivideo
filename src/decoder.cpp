@@ -2207,13 +2207,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         }
     }
 
-    if (!filterChain.Build(firstFrame, params)) {
-        return false;
-    }
-
+    const bool built = filterChain.Build(firstFrame, params);
     // Relaxed: standalone scalar read by the present-thread sync math; no happens-before role.
+    // Stored on failure too, so a failed rebuild reports the chain's 20 ms fallback instead of
+    // keeping the previous graph's cadence in the sync math.
     outputFrameDurationMs.store(filterChain.GetOutputFrameDurationMs(), std::memory_order_relaxed);
-    return true;
+    return built;
 }
 
 [[nodiscard]] auto cVaapiDecoder::ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept -> bool {
