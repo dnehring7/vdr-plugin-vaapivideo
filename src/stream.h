@@ -211,6 +211,8 @@ class IMediaSource {
     /// Pull one tracked packet in demux order. Returns 0 on success, AVERROR(EAGAIN) when
     /// no packet is available yet (network sources), or AVERROR_EOF at end of input.
     /// On success, @p stream is set to whether @p out is a video, audio, or subtitle packet.
+    /// @p out must be blank on entry (freshly allocated or unref'd -- av_read_frame's own
+    /// precondition); on any non-success return it stays blank, never holding stale refs.
     /// Untracked streams (data, and subtitles when no subtitle track is selected) are skipped.
     [[nodiscard]] virtual auto ReadPacket(AVPacket *out, MediaPacketStream &stream) -> int = 0;
 

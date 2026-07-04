@@ -44,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -120,7 +121,10 @@ constexpr int OSD_REFRESH_INTERVAL_MS = 500; ///< Replay-bar update cadence; ~2 
 /// start_time is the *lowest* across all streams; we need each stream's own first PTS so the
 /// caller can pick the latest (= sync point) and drop pre-sync leading packets.
 [[nodiscard]] auto StreamStart90k(const AVStream *stream) noexcept -> int64_t {
-    if (stream == nullptr || stream->start_time == AV_NOPTS_VALUE) {
+    // time_base guard as in Rebase90k: damaged container metadata with den == 0 would make
+    // av_rescale_q divide by zero (SIGFPE).
+    if (stream == nullptr || stream->start_time == AV_NOPTS_VALUE || stream->time_base.num <= 0 ||
+        stream->time_base.den <= 0) {
         return AV_NOPTS_VALUE;
     }
     constexpr AVRational k90kHz{.num = 1, .den = 90000};
@@ -252,6 +256,10 @@ constexpr std::array<std::string_view, 7> MEDIA_EXTENSIONS{{".mp4", ".mkv", ".av
 
 constexpr std::array<std::string_view, 2> PLAYLIST_EXTENSIONS{{".m3u", ".m3u8"}};
 
+/// Cap on the in-memory playlist read. Real .m3u files are tiny; the browser filters only by
+/// extension, so a mislabeled huge file must not balloon VDR's memory.
+constexpr size_t MAX_PLAYLIST_BYTES = 8U * 1024U * 1024U;
+
 // URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
 // HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
 // file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
@@ -297,8 +305,15 @@ constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "ht
 }
 
 [[nodiscard]] auto Dirname(std::string_view path) -> std::string {
+    // Strip trailing slashes first ("/media/" -> "/media", "foo/" -> "foo") so the split below
+    // matches POSIX dirname(); a lone "/" stays intact.
+    while (path.size() > 1 && path.back() == '/') {
+        path.remove_suffix(1);
+    }
     if (const auto pos = path.find_last_of('/'); pos != std::string_view::npos) {
-        return std::string{path.substr(0, pos)};
+        // A slash only at position 0 ("/media") must yield "/" like POSIX dirname();
+        // substr(0, 0) would yield "" and break walking up to the filesystem root.
+        return pos == 0 ? std::string{"/"} : std::string{path.substr(0, pos)};
     }
     return ".";
 }
@@ -403,12 +418,57 @@ auto ParseM3U(std::string_view playlistPath) -> std::vector<PlaylistEntry> {
         return result;
     }
 
+    // Read the whole file up front and split on '\n' below: a fixed fgets() line buffer
+    // would silently split an over-long URI (e.g. a URL with a long query string) into two
+    // bogus entries. Playlists are small, so buffering the file is cheap.
+    std::string content;
+    std::array<char, 4096> chunk{};
+    bool readOk = true;
+    // The common exit is the short-read break: fread coming up short means EOF or error.
+    // The feof/ferror gate exists so fread is never called again once EOF or an error is
+    // already flagged (a failed read leaves the file position indeterminate; and some
+    // implementations flag EOF on the full final read of an exact-multiple-sized file).
+    while (std::feof(fp) == 0 && std::ferror(fp) == 0) {
+        const size_t n = std::fread(chunk.data(), 1, chunk.size(), fp);
+        if (content.size() + n > MAX_PLAYLIST_BYTES) {
+            esyslog("vaapivideo/mediaplayer: playlist %s larger than %zu bytes -- rejected", canonical.c_str(),
+                    MAX_PLAYLIST_BYTES);
+            readOk = false;
+            break;
+        }
+        content.append(chunk.data(), n);
+        if (n < chunk.size()) {
+            break;
+        }
+    }
+    // Distinguish clean EOF from a truncated read (disk error mid-playlist) -- parsing a
+    // partial file would look like a successful short playlist.
+    if (std::ferror(fp) != 0) {
+        esyslog("vaapivideo/mediaplayer: read error in playlist %s: %s", canonical.c_str(), std::strerror(errno));
+        readOk = false;
+    }
+    if (std::fclose(fp) != 0) {
+        esyslog("vaapivideo/mediaplayer: fclose(%s): %s", canonical.c_str(), std::strerror(errno));
+        readOk = false;
+    }
+    if (!readOk) {
+        return result;
+    }
+    // Binary data misnamed .m3u: a NUL can't occur in a valid playlist, and letting one through
+    // would embed NULs in URIs/titles that downstream C-string consumers silently truncate.
+    if (content.find('\0') != std::string::npos) {
+        esyslog("vaapivideo/mediaplayer: NUL byte in playlist %s -- rejected", canonical.c_str());
+        return result;
+    }
+
     // M3U grammar we accept: any line not starting with '#' is a URI; "#EXTINF:duration,title"
     // optionally precedes a URI and supplies its display title. All other '#'-lines are ignored.
     std::string pendingTitle;
-    std::array<char, 4096> lineBuf{};
-    while (std::fgets(lineBuf.data(), static_cast<int>(lineBuf.size()), fp) != nullptr) {
-        const auto line = Trim(std::string_view{lineBuf.data()});
+    std::string_view rest{content};
+    while (!rest.empty()) {
+        const auto newline = rest.find('\n');
+        const auto line = Trim(rest.substr(0, newline));
+        rest = (newline == std::string_view::npos) ? std::string_view{} : rest.substr(newline + 1);
         if (line.empty()) {
             continue;
         }
@@ -437,16 +497,6 @@ auto ParseM3U(std::string_view playlistPath) -> std::vector<PlaylistEntry> {
         entry.title = pendingTitle.empty() ? Basename(entry.uri) : pendingTitle;
         pendingTitle.clear();
         result.push_back(std::move(entry));
-    }
-    // Distinguish clean EOF from a truncated read (disk error mid-playlist) -- the latter
-    // sets ferror but leaves earlier entries looking like a successful partial parse.
-    if (std::ferror(fp) != 0) {
-        esyslog("vaapivideo/mediaplayer: read error in playlist %s: %s", canonical.c_str(), std::strerror(errno));
-        result.clear();
-    }
-    if (std::fclose(fp) != 0) {
-        esyslog("vaapivideo/mediaplayer: fclose(%s): %s", canonical.c_str(), std::strerror(errno));
-        result.clear();
     }
 
     isyslog("vaapivideo/mediaplayer: playlist %s -- %zu entries", canonical.c_str(), result.size());
@@ -598,6 +648,11 @@ auto cVaapiMediaSource::Close() noexcept -> void {
 }
 
 auto cVaapiMediaSource::PopulateStreamInfo() -> void {
+    // Only called from Open() with a live context; the guard documents that precondition
+    // (and keeps GCC's null-dereference analysis quiet about formatCtx->streams below).
+    if (!formatCtx) [[unlikely]] {
+        return;
+    }
     videoInfo = VideoStreamInfo{};
     audioInfo = AudioStreamInfo{};
     videoExtradataStorage.clear();
@@ -617,8 +672,10 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     // ReadPacket) starts both streams together, no audio-only intro.
     // Falls back to formatCtx->start_time if neither stream advertises start_time, then
     // to the first packet seen by ReadPacket's lazy-set path if even that is unknown.
-    const int64_t videoStart =
-        videoStreamIndex >= 0 ? StreamStart90k(formatCtx->streams[videoStreamIndex]) : AV_NOPTS_VALUE;
+    // One load + explicit null guard for the video stream: StreamStart90k tolerates nullptr,
+    // and reusing the guarded pointer below keeps the deref provably safe (-Wnull-dereference).
+    const AVStream *videoStream = videoStreamIndex >= 0 ? formatCtx->streams[videoStreamIndex] : nullptr;
+    const int64_t videoStart = StreamStart90k(videoStream);
     const int64_t audioStart =
         audioStreamIndex >= 0 ? StreamStart90k(formatCtx->streams[audioStreamIndex]) : AV_NOPTS_VALUE;
     ptsOrigin90k = FormatStart90k(formatCtx.get()); // fall-back
@@ -630,8 +687,8 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     }
 
     videoFps = 0.0;
-    if (videoStreamIndex >= 0) {
-        const AVStream *stream = formatCtx->streams[videoStreamIndex];
+    if (videoStream != nullptr) {
+        const AVStream *stream = videoStream;
         videoTimeBase = stream->time_base;
         // avg_frame_rate is the most reliable container-level fps. Fall back to r_frame_rate
         // (raw frame rate) only when avg is unset; some MKV files lack avg but have r.
@@ -848,6 +905,9 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
     // reads across separate video/audio methods would need per-stream side FIFOs that drop
     // packets when one stream races ahead -- audible glitches in practice. Demux-order
     // delivery lets libavformat pace the pump and avoids artificial drops.
+    // Reads go straight into @p out (clean on entry: the caller unrefs it before every new
+    // read, and av_read_frame leaves it blank on failure) -- no per-packet AVPacket
+    // allocation on this hot path.
     while (true) {
         // Interruptibility for local files: av_read_frame() polls the InterruptOnStop
         // callback only when libavformat performs blocking I/O. Streams composed of many
@@ -857,11 +917,7 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
         if (stopFlag != nullptr && stopFlag->load(std::memory_order_acquire)) {
             return AVERROR_EXIT;
         }
-        std::unique_ptr<AVPacket, FreeAVPacket> pkt{av_packet_alloc()};
-        if (!pkt) [[unlikely]] {
-            return AVERROR(ENOMEM);
-        }
-        const int ret = av_read_frame(formatCtx.get(), pkt.get());
+        const int ret = av_read_frame(formatCtx.get(), out);
         if (ret == AVERROR_EOF) {
             eofReached = true;
             return AVERROR_EOF;
@@ -893,52 +949,55 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
 
         // Skip empty / padding packets. Corrupt TS streams (e.g. tvheadend recordings) sometimes
         // emit size=0 packets that FFmpeg interprets downstream as drain markers.
-        if (pkt->data == nullptr || pkt->size <= 0) {
+        if (out->data == nullptr || out->size <= 0) {
+            av_packet_unref(out);
             continue;
         }
 
         AVRational tb{};
-        if (pkt->stream_index == videoStreamIndex) {
+        if (out->stream_index == videoStreamIndex) {
             tb = videoTimeBase;
             stream = MediaPacketStream::Video;
-        } else if (pkt->stream_index == audioStreamIndex) {
+        } else if (out->stream_index == audioStreamIndex) {
             tb = audioTimeBase;
             stream = MediaPacketStream::Audio;
-        } else if (currentSubtitleTrack >= 0 && pkt->stream_index == subtitleStreamIndex) {
+        } else if (currentSubtitleTrack >= 0 && out->stream_index == subtitleStreamIndex) {
             tb = subtitleTimeBase; // MUST set before Rebase90k -- else tb stays {0,0} and pts -> NOPTS
             // Subtitle cue. Rebase pts AND duration to 90 kHz (cues carry a display duration),
             // then hand straight to the consumer: subtitles bypass the pre-sync / audio-discard gates
             // below -- the converter keys display off cue start/end vs the clock, so a stale cue simply
             // never matches the clock. duration uses the same 90 kHz target as Rebase90k's pts path.
-            pkt->pts = Rebase90k(pkt->pts, tb, false); // never let a subtitle seed the timeline origin
-            pkt->dts = Rebase90k(pkt->dts, tb, false);
-            if (pkt->duration > 0) {
+            // The tb validity check mirrors Rebase90k: a damaged tb would SIGFPE in av_rescale_q.
+            out->pts = Rebase90k(out->pts, tb, false); // never let a subtitle seed the timeline origin
+            out->dts = Rebase90k(out->dts, tb, false);
+            if (out->duration > 0 && tb.num > 0 && tb.den > 0) {
                 constexpr AVRational k90kHz{.num = 1, .den = 90000};
-                pkt->duration = av_rescale_q(pkt->duration, tb, k90kHz);
+                out->duration = av_rescale_q(out->duration, tb, k90kHz);
             }
             stream = MediaPacketStream::Subtitle;
-            av_packet_move_ref(out, pkt.get());
             return 0;
         } else {
-            continue; // untracked (unselected subtitle / data)
+            av_packet_unref(out); // untracked (unselected subtitle / data)
+            continue;
         }
 
         // Rebase to a zero-based 90 kHz timeline. Files with non-zero container start_time
         // (TS recordings, some MP4s) would otherwise hand huge absolute PTS values to the
         // downstream audio clock and break GetIndex() / Seek() math.
-        pkt->pts = Rebase90k(pkt->pts, tb);
-        pkt->dts = Rebase90k(pkt->dts, tb);
+        out->pts = Rebase90k(out->pts, tb);
+        out->dts = Rebase90k(out->dts, tb);
         // Audio packets sometimes carry DTS only (TS containers). Audio has no B-frame
         // reorder so PTS == DTS; video keeps its real PTS to preserve reorder offset.
-        if (stream == MediaPacketStream::Audio && pkt->pts == AV_NOPTS_VALUE) {
-            pkt->pts = pkt->dts;
+        if (stream == MediaPacketStream::Audio && out->pts == AV_NOPTS_VALUE) {
+            out->pts = out->dts;
         }
 
-        const int64_t clock90k = PacketClock90k(pkt.get());
+        const int64_t clock90k = PacketClock90k(out);
         // Drop pre-sync prefix (rebased clock < 0): PopulateStreamInfo() picks
         // ptsOrigin90k = MAX(stream.start_time) so the trailing stream defines t=0 and the
         // leading stream's prefix is discarded here -- both streams start together.
         if (clock90k != AV_NOPTS_VALUE && clock90k < 0) {
+            av_packet_unref(out);
             continue;
         }
         // Post-seek audio discard: keep video preroll (rebuilds H.264/HEVC reference chain)
@@ -947,12 +1006,12 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
         // freerun loop until audio plays forward to the requested target.
         if (stream == MediaPacketStream::Audio && discardAudioBefore90k != AV_NOPTS_VALUE) {
             if (clock90k == AV_NOPTS_VALUE || clock90k < discardAudioBefore90k) {
+                av_packet_unref(out);
                 continue;
             }
             discardAudioBefore90k = AV_NOPTS_VALUE;
         }
 
-        av_packet_move_ref(out, pkt.get());
         return 0;
     }
 }
@@ -994,16 +1053,29 @@ auto cVaapiMediaSource::Flush() -> void {
     // talks the zero-based timeline; we re-add the origin offset so we land at the matching
     // wall-clock keyframe inside the container's native timeline.
     const AVRational dstTb = formatCtx->streams[videoStreamIndex]->time_base;
+    // Same damaged-metadata guard as Rebase90k: av_rescale_q divides by dstTb.num here,
+    // so a zero would raise SIGFPE on a corrupt file.
+    if (dstTb.num <= 0 || dstTb.den <= 0) {
+        esyslog("vaapivideo/mediaplayer: seek rejected -- invalid video time base %d/%d", dstTb.num, dstTb.den);
+        return false;
+    }
     constexpr AVRational k90kHz{.num = 1, .den = 90000};
     const int64_t origin = (ptsOrigin90k == AV_NOPTS_VALUE) ? 0 : ptsOrigin90k;
-    const int64_t seekTs = av_rescale_q(std::max<int64_t>(targetPts90k, 0) + origin, k90kHz, dstTb);
+    const int64_t target = std::max<int64_t>(targetPts90k, 0);
+    // Corrupt container start_time can saturate the origin to INT64_MAX (av_rescale_q clamps),
+    // so adding blindly would be signed-overflow UB before av_rescale_q could saturate again.
+    if (origin > 0 && target > std::numeric_limits<int64_t>::max() - origin) [[unlikely]] {
+        esyslog("vaapivideo/mediaplayer: seek rejected -- timestamp overflow");
+        return false;
+    }
+    const int64_t seekTs = av_rescale_q(target + origin, k90kHz, dstTb);
     const int ret = av_seek_frame(formatCtx.get(), videoStreamIndex, seekTs, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         esyslog("vaapivideo/mediaplayer: av_seek_frame: %s", AvErr(ret).data());
         return false;
     }
     Flush();
-    discardAudioBefore90k = audioStreamIndex >= 0 ? std::max<int64_t>(targetPts90k, 0) : AV_NOPTS_VALUE;
+    discardAudioBefore90k = audioStreamIndex >= 0 ? target : AV_NOPTS_VALUE;
     return true;
 }
 
