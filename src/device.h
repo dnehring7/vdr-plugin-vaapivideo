@@ -326,13 +326,15 @@ class cVaapiDevice : public cDevice {
     std::atomic<uint32_t> radioSplashEventId{
         0}; ///< EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
 
-    cTimeMs radioSplashPoll;                   ///< Next EPG re-check; touched only on the PlayAudio thread
-    std::atomic<bool> encryptedPending{false}; ///< Armed on pmAudioVideo; monitors for an undecodable (encrypted) video
-                                               ///< stream. One-shot: cleared when video decodes, when the notice fires,
-                                               ///< or on the next SetPlayMode.
-    cTimeMs encryptedTimer;                    ///< Grace period before declaring a non-decoding channel encrypted
-    std::atomic<int> trickSpeed;               ///< VDR trick speed; 0 = normal
-    VaapiContext vaapi{};                      ///< Shared VAAPI context
+    cTimeMs radioSplashPoll; ///< Next EPG re-check; touched only on the PlayAudio thread
+    std::atomic<uint64_t> encryptedDeadlineMs{
+        0}; ///< Encrypted-notice watchdog, armed on pmAudioVideo/pmAudioOnly: grace deadline on the
+            ///< cTimeMs::Now() clock; 0 = disarmed. Deliberately ONE word: the decoder tick thread
+            ///< outlives play modes, so it disarms/claims via CAS against the deadline it observed --
+            ///< a concurrent re-arm stores a strictly-future value an expired observation never
+            ///< matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
+    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};                                         ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
     std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec

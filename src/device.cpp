@@ -137,7 +137,8 @@ constexpr uint32_t RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::m
 constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
 
 /// Grace period after a channel switch before a video stream that never decodes is declared
-/// encrypted/undecodable and the on-screen notice is shown. Matches the radio black-frame delay.
+/// encrypted/undecodable and the on-screen notice is shown. Also the radio black-frame delay:
+/// SetPlayMode arms both watchdogs from this constant so the two graces cannot drift apart.
 constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 
 /// Fallback ES window for DetectAudioCodec(), used only when a single payload is inconclusive.
@@ -430,30 +431,35 @@ auto cVaapiDevice::RefreshRadioSplash(bool force) -> void {
 auto cVaapiDevice::CheckEncryptionTimeout() -> void {
     // Driven by the decode loop's per-iteration tick (decoder.SetLoopTickCallback), which keeps
     // firing on the ~100 ms idle waits even when a fully scrambled channel delivers no PES at all --
-    // the case PlayAudio/PlayVideo never see (plenty for the 3 s grace below). The leading load
-    // short-circuits the unarmed case.
-    if (!encryptedPending.load(std::memory_order_relaxed)) {
+    // the case PlayAudio/PlayVideo never see (plenty for the grace period). The leading load
+    // short-circuits the disarmed case. Every disarm below is a CAS against the deadline observed
+    // here: this decoder thread outlives play modes, and a plain store could cancel a fresh re-arm
+    // by SetPlayMode. A re-arm's deadline lies strictly in the future, so it never matches an
+    // observation this tick found expired -- the CAS claims exactly the arm it decided on.
+    uint64_t deadline = encryptedDeadlineMs.load(std::memory_order_relaxed);
+    if (deadline == 0) {
         return;
     }
-    // Plainly decoding (both audio and video up) -> not stuck, disarm. A channel missing one (radio
-    // with no video, or scrambled-video + FTA-audio) is decided by ShowEncryptedScreen at the timer.
-    if (videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE &&
+    // Any decoding elementary stream proves the CAM descrambles this service (a DVB service
+    // scrambles under one ECM) -- the same rule ShowEncryptedScreen applies. Disarm now instead of
+    // re-deciding at the deadline.
+    if (videoCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE ||
         audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE) {
-        encryptedPending.store(false, std::memory_order_relaxed);
+        encryptedDeadlineMs.compare_exchange_strong(deadline, 0, std::memory_order_relaxed);
         return;
     }
-    if (!encryptedTimer.TimedOut()) {
+    if (cTimeMs::Now() < deadline) {
         return; // still inside the grace period
     }
     // Only live broadcast can be encrypted (a recording just fails to decode, and CurrentChannel()
     // would be a stale live channel during replay).
     if (!Transferring()) {
-        encryptedPending.store(false, std::memory_order_relaxed);
+        encryptedDeadlineMs.compare_exchange_strong(deadline, 0, std::memory_order_relaxed);
         return;
     }
     // Claim the one-shot, then paint. No further monitoring needed: once the stream descrambles,
     // PlayVideo's codec detection decodes it and those frames overwrite the notice on screen.
-    if (encryptedPending.exchange(false, std::memory_order_relaxed)) {
+    if (encryptedDeadlineMs.compare_exchange_strong(deadline, 0, std::memory_order_relaxed)) {
         ShowEncryptedScreen();
     }
 }
@@ -508,7 +514,8 @@ auto cVaapiDevice::ResetNoVideoMonitors() noexcept -> void {
     radioBlackPending.store(false, std::memory_order_relaxed);
     radioSplashActive.store(false, std::memory_order_relaxed);
     radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
-    encryptedPending.store(false, std::memory_order_relaxed);
+    // Plain store, not CAS: a lifecycle boundary means disarm WHATEVER is armed, by design.
+    encryptedDeadlineMs.store(0, std::memory_order_relaxed);
 }
 
 auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
@@ -871,6 +878,14 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
 
 namespace {
 
+/// Upper bounds on GRAB's requested output dimensions (DCI-8K width, 8K UHD height). VDR's SVDRP
+/// CmdGRAB forwards SizeX/SizeY with only a numeric check, so an absurd request must not drive a
+/// multi-gigabyte scale allocation (remote OOM via an exposed SVDRP port). Oversize requests are
+/// rejected outright -- silently clamping would return an image the caller did not ask for. The
+/// per-axis caps also bound the pixel count (<= 8192*4320) with no separate area check needed.
+constexpr int GRAB_MAX_WIDTH = 8192;
+constexpr int GRAB_MAX_HEIGHT = 4320;
+
 /// One-shot filter graph: feed @p in, pull a single frame whose pixel format is enforced
 /// by appending `,format=<outFmt>` to @p chainPrefix. Caller-supplied chain stages
 /// (e.g. "scale=W:H") run before that terminal format conversion. @p srcColorspace and
@@ -1081,6 +1096,14 @@ namespace {
         return nullptr;
     }
 
+    // Reject oversize requests up front, before the (expensive) surface grab and HDR tonemap --
+    // see GRAB_MAX_WIDTH/GRAB_MAX_HEIGHT for why VDR core does not bound these itself.
+    if (SizeX > GRAB_MAX_WIDTH || SizeY > GRAB_MAX_HEIGHT) [[unlikely]] {
+        esyslog("vaapivideo/device: GrabImage - requested size %dx%d exceeds limit %dx%d", SizeX, SizeY, GRAB_MAX_WIDTH,
+                GRAB_MAX_HEIGHT);
+        return nullptr;
+    }
+
     // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010).
     auto srcFrame = display->GrabDisplayedFrame();
     if (!srcFrame) [[unlikely]] {
@@ -1138,7 +1161,7 @@ namespace {
                                      display->GetActiveOsdFbId());
     }
 
-    // 4. Encode. SizeX/SizeY <= 0 = native display resolution.
+    // 4. Encode. SizeX/SizeY <= 0 = native display resolution (upper bounds enforced at entry).
     const int outW = (SizeX > 0) ? SizeX : rgb24->width;
     const int outH = (SizeY > 0) ? SizeY : rgb24->height;
     const bool needScale = (outW != rgb24->width) || (outH != rgb24->height);
@@ -1327,7 +1350,7 @@ auto cVaapiDevice::Play() -> void {
                     audioDetectBuffer.begin() +
                         static_cast<std::ptrdiff_t>(audioDetectBuffer.size() - AUDIO_DETECT_WINDOW));
             }
-            detectedCodec = ::DetectAudioCodec(audioDetectBuffer);
+            detectedCodec = ::DetectAudioCodec({audioDetectBuffer.data(), audioDetectBuffer.size()});
         }
 
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
@@ -1794,8 +1817,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             Clear();
             // Encrypted radio: arm the watchdog too, so a scrambled audio-only channel that never
             // decodes gets the "encrypted" notice instead of a silent radio splash.
-            encryptedTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
-            encryptedPending.store(true, std::memory_order_relaxed);
+            encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
             // Poll deadline is left to the PlayAudio thread (which owns radioSplashPoll); its first
             // refresh after entry recomputes the same event and no-ops, then arms the 2 s cadence.
             RefreshRadioSplash(/*force=*/true);
@@ -1807,13 +1829,12 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             ResetNoVideoMonitors(); // a video stream is starting; re-armed below for the no-video grace
             ResetZoom(); // Before Clear(): belt-and-braces so a new stream starts at Off even if pmNone was skipped.
             Clear();
-            // 3 s grace: if no video arrives, PlayAudio() paints black (radio channel).
-            radioBlackTimer.Set(3000);
+            // Shared grace: if no video arrives, PlayAudio() paints black (radio channel).
+            radioBlackTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
             radioBlackPending.store(true, std::memory_order_relaxed);
             // Same grace for the encrypted-channel notice: armed unconditionally, it self-cancels
             // when a codec opens and only paints if the channel turns out encrypted with a video PID.
-            encryptedTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
-            encryptedPending.store(true, std::memory_order_relaxed);
+            encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
             dsyslog("vaapivideo/device: pmAudioVideo -- armed no-video watchdogs (grace %d ms)",
                     ENCRYPTED_NOTICE_DELAY_MS);
             break;
@@ -1842,6 +1863,11 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
     bool wasPaused = false;
     if (isOuterCall) {
         inStillPicture = true;
+        // Mirror the decoder reset below in the device's own trick state: VDR's Goto(..., Still) calls
+        // Play() only when paused (vdr/dvbplayer.c cDvbPlayer::Goto), so a mark-jump out of FF/REW would
+        // otherwise leave PlayVideo/Poll applying trick pacing to the still frames while the decoder
+        // already runs at normal speed.
+        trickSpeed.store(0, std::memory_order_release);
         if (decoder) [[likely]] {
             decoder->Clear();
             decoder->SetTrickSpeed(0);
