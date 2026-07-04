@@ -121,7 +121,7 @@ class cVaapiDecoder : public cThread {
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the A/V sync master clock. Stored as atomic pointer.
     auto SetLoopTickCallback(std::function<void()> callback)
-        -> void; ///< Called once per decode-loop iteration (incl. the ~10 ms idle ticks when no packets arrive),
+        -> void; ///< Called once per decode-loop iteration (incl. the ~100 ms idle ticks when no packets arrive),
                  ///< giving the device a thread that ticks even when a scrambled channel delivers no PES. Must be
                  ///< set before Initialize() starts the thread.
     auto SetDevicePaused(bool paused) noexcept

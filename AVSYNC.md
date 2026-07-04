@@ -566,7 +566,11 @@ The sync gate is bypassed (frame submitted unpaced) in:
 
 Audio codec / track change preserves the buffer — catch-up silently realigns
 against the new clock once it arrives, so dropping ~1 s of still-valid video buys
-nothing.
+nothing. The same path is also entered mid-stream when the audio sink forces a
+re-detect: after repeated decode-failure cascades with no decoded frame
+(`cAudioProcessor::TakeCodecRedetectRequest`, a misdetected/changed codec), the
+device resets the audio codec, `Clear()`s the sink, and calls `NotifyAudioChange()`
+— so the clock re-anchors and video freeruns exactly as on a track switch.
 
 Mediaplayer seek calls `cVaapiDevice::FlushForSeek()`, which fans out to
 `decoder->FlushForSeek()` + `audioProcessor->Clear()`: same drain semantics as a

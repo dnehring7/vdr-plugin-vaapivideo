@@ -93,6 +93,11 @@ constexpr uint64_t AUDIO_CLOCK_STALE_MS = 1000;
 constexpr int AUDIO_DECODER_DRAIN_TIMEOUT_MS =
     200; ///< CloseDecoder() spin-wait ceiling for in-flight DecodeToPcm() callers (ms)
 constexpr int AUDIO_DECODER_ERROR_LIMIT = 50; ///< Consecutive avcodec_send_packet failures before flush + parser reset
+
+/// Recovery cascades tolerated with no decoded frame before the sink asks the PES feed to
+/// re-detect. Each cascade is AUDIO_DECODER_ERROR_LIMIT failures, so >= 150 packets yielding
+/// nothing -- a mismatched codec, not a transient discontinuity (any decoded frame resets it).
+constexpr int AUDIO_CASCADE_RECOVERY_LIMIT = 3;
 constexpr int AUDIO_DECODER_GRACE_PACKETS =
     3; ///< Error logs suppressed after decoder (re)init; absorbs parser priming garbage on the first few frames
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between repeated decode-error log messages (ms)
@@ -129,6 +134,9 @@ auto cAudioProcessor::Clear() -> void {
     DrainPacketQueue();
     // The parser recreate below subsumes any pending reset requested by Action().
     parserNeedsReset.store(false, std::memory_order_relaxed);
+    // Stream boundary (seek / channel change): pre-boundary failure evidence must not carry over.
+    cascadeRecoveryCount.store(0, std::memory_order_relaxed);
+    codecRedetectRequested.store(false, std::memory_order_relaxed);
 
     // avcodec_flush_buffers() must run on the Action thread: calling it here races
     // against an in-flight DecodeToPcm() that already passed the refcount gate.
@@ -160,6 +168,17 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         RecreateParser();
         DrainPacketQueue();
         clearGeneration.fetch_add(1, std::memory_order_release);
+        // Cascades with no decoded frame (DecodeToPcm() zeroes the count on each emitted frame)
+        // mean the bitstream does not match the opened codec, which no parser recreate can fix.
+        // Hand the verdict to the PES feed and stop parsing: the next PlayAudio() consumes the
+        // request first, so feeding more bytes into the known-wrong pipeline is pure waste.
+        if (cascadeRecoveryCount.fetch_add(1, std::memory_order_relaxed) + 1 >= AUDIO_CASCADE_RECOVERY_LIMIT) {
+            esyslog("vaapivideo/audio: %d recovery cascades without a decoded frame -- requesting codec re-detection",
+                    AUDIO_CASCADE_RECOVERY_LIMIT);
+            cascadeRecoveryCount.store(0, std::memory_order_relaxed);
+            codecRedetectRequested.store(true, std::memory_order_release);
+            return;
+        }
         if (!parserCtx) {
             return;
         }
@@ -423,6 +442,10 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     if (streamParams.codecId == params.codecId && streamParams.sampleRate == params.sampleRate &&
         streamParams.channels == params.channels && extradataMatches && wantPassthrough == currentlyPassthrough &&
         hasActivePipeline) {
+        // This fast path skips OpenDecoder()'s reset, so clear recovery evidence here too --
+        // a redetect flag raised in a prior era but never consumed would else fire spuriously.
+        cascadeRecoveryCount.store(0, std::memory_order_relaxed);
+        codecRedetectRequested.store(false, std::memory_order_relaxed);
         return true;
     }
 
@@ -587,6 +610,8 @@ auto cAudioProcessor::CloseDevice() -> void {
     alsaErrorCount.store(0, std::memory_order_relaxed);
     ResetPlaybackClock();
     parserNeedsReset.store(false, std::memory_order_relaxed); // CloseDecoder() above already destroyed the parser
+    cascadeRecoveryCount.store(0, std::memory_order_relaxed); // device boundary: wrong-codec evidence is void
+    codecRedetectRequested.store(false, std::memory_order_relaxed);
     alsaPassthroughActive.store(false, std::memory_order_release);
     alsaFrameBytes.store(0, std::memory_order_release);
     alsaChannels.store(0, std::memory_order_relaxed);
@@ -1239,6 +1264,9 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
     }
 
     while (avcodec_receive_frame(decoder.get(), frame.get()) == 0) {
+        // Only an emitted FRAME clears the cascade counter: a wrong codec can swallow packets
+        // (send returns 0/EAGAIN) yet never decode, which must still escalate to re-detection.
+        cascadeRecoveryCount.store(0, std::memory_order_relaxed);
         if (frame->nb_samples <= 0) [[unlikely]] {
             av_frame_unref(frame.get());
             continue;
@@ -1663,6 +1691,9 @@ auto cAudioProcessor::OpenDecoder() -> void {
     }
 
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
+    // Fresh codec era: failure evidence gathered against the previous codec is void.
+    cascadeRecoveryCount.store(0, std::memory_order_relaxed);
+    codecRedetectRequested.store(false, std::memory_order_relaxed);
     // nb_channels is 0 until the first frame for codecs whose layout rides in the frame header
     // (DVB MP2/AAC) rather than extradata; show "?" instead of a misleading "0ch".
     const int openChannels = ctx->ch_layout.nb_channels;

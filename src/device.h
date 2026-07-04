@@ -303,7 +303,13 @@ class cVaapiDevice : public cDevice {
     int osdWidth{};                                        ///< Cached display width (px)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
-    std::atomic<unsigned> clearsSinceLog{0};                      ///< Clear()s coalesced since the last burst log
+    std::vector<uint8_t> audioDetectBuffer;   ///< AAC-LATM fallback window for DetectAudioCodec() (see
+                                              ///< AUDIO_DETECT_WINDOW). Owned solely by the PlayAudio feed thread;
+                                              ///< the reset paths never touch it (see audioDetectGen).
+    uint32_t audioDetectGenSeen{};            ///< PlayAudio's last-seen audioDetectGen; a mismatch clears the window
+    std::atomic<uint32_t> audioDetectGen{0};  ///< Bumped by ResetAudioCodecState() to invalidate the window across
+                                              ///< threads without racing the vector
+    std::atomic<unsigned> clearsSinceLog{0};  ///< Clear()s coalesced since the last burst log
     std::atomic<uint64_t> lastClearLogMs{0};  ///< Walltime of the last Clear() diagnostic log (rate-limit)
     std::atomic<uint64_t> lastClearMs{0};     ///< Last Clear() timestamp (diagnostic)
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change

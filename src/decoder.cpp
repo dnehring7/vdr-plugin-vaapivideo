@@ -105,6 +105,15 @@ extern "C" {
 constexpr size_t DECODER_QUEUE_CAPACITY =
     200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to DECODER_TRICK_QUEUE_DEPTH.
 constexpr int DECODER_SUBMIT_TIMEOUT_MS = 100; ///< VSync backpressure budget inside display->SubmitFrame().
+constexpr int DECODER_IDLE_WAIT_MS =
+    100; ///< Fallback TimedWait bound for the decode/present loops when idle or held. Every producer and
+         ///< control path Broadcasts its condvar (enqueue/drain -> packetCondition; handoff push, Clear,
+         ///< trick, pause, audio change -> handoffCondition; presenter drain -> handoffNotFull), so the
+         ///< waits are wake-driven and this only (a) bounds reaction to a Broadcast racing the brief
+         ///< window between a loop's predicate reads and its TimedWait, (b) bounds reaction to changes
+         ///< nothing Broadcasts (AV-delay knob, audio-clock anomalies), and (c) paces the
+         ///< loopTickCallback watchdog (device encryption notice, 3 s grace -- 30x margin). 10 Hz idle
+         ///< keeps the CPU burn negligible; do not lower this back toward a poll.
 
 // --- Sync controller: catch-up ---
 constexpr int DECODER_SYNC_CATCHUP_LOG_INTERVAL_MS =
@@ -286,6 +295,9 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
     // path (extradata present); reintroducing a parser mid-stream would corrupt AU boundaries.
     if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
         parserCtx.reset(av_parser_init(currentCodecId));
+        if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
+            esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+        }
     } else if (currentCodecId == AV_CODEC_ID_NONE) {
         parserCtx.reset();
     }
@@ -672,7 +684,14 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     return cTimeMs::Now() >= dueTime;
 }
 
-auto cVaapiDecoder::RequestCodecDrain() -> void { codecDrainPending.store(true, std::memory_order_release); }
+auto cVaapiDecoder::RequestCodecDrain() -> void {
+    codecDrainPending.store(true, std::memory_order_release);
+    // Wake the decode thread: with an empty packetQueue it parks on packetCondition for up to
+    // DECODER_IDLE_WAIT_MS, and the still-picture path needs the drain (single-I-frame surfacing)
+    // promptly, not on the fallback tick. packetMutex is an innermost lock; taking it alone is safe.
+    const cMutexLock lock(&packetMutex);
+    packetCondition.Broadcast();
+}
 
 auto cVaapiDecoder::SetStillPictureMode(bool mode) -> void { stillPictureMode.store(mode, std::memory_order_release); }
 
@@ -797,6 +816,28 @@ namespace {
         // Context is shared across an MPEG-2 -> MPEG-2 switch, so refresh the hint here; the
         // preceding Clear() reset the graph, which rebuilds with this value on the next frame.
         streamInterlaced = info.streamInterlaced;
+        // VP9/AV1 carry no extradata, so two DIFFERENT files reuse this context; without a refresh
+        // the rebuilt graph and HDR_OUTPUT_METADATA blob keep the old file's mastering metadata/fps.
+        // Refresh codecCtx->color_* too, not just the hint mirror: FFmpeg stamps these onto frames
+        // whose bitstream leaves them UNSPECIFIED, and such a frame bypasses ApplyContainerColorHints()
+        // (which only fills UNSPECIFIED) -- so a stale seed leaks the old file's HDR/SDR tags.
+        codecCtx->color_primaries = info.primaries;
+        codecCtx->color_trc = info.transfer;
+        codecCtx->colorspace = info.colorSpace;
+        codecCtx->color_range = info.range;
+        hintColorPrimaries = info.primaries;
+        hintColorTransfer = info.transfer;
+        hintColorSpace = info.colorSpace;
+        hintColorRange = info.range;
+        hintHasMasteringDisplay = info.hasMasteringDisplay;
+        hintMasteringDisplay = info.masteringDisplay;
+        hintHasContentLight = info.hasContentLight;
+        hintContentLight = info.contentLight;
+        // Reset to 0/1 (the fresh-alloc default) when the new file has no fps, so the filter graph
+        // falls back to DVB 50/1 instead of pacing at the previous file's rate. Fallback only --
+        // the decoder overwrites it from VUI for h.264/HEVC.
+        codecCtx->framerate = (info.fpsNum > 0 && info.fpsDen > 0) ? AVRational{.num = info.fpsNum, .den = info.fpsDen}
+                                                                   : AVRational{.num = 0, .den = 1};
         return true;
     }
     forceCodecReopen = false;
@@ -1055,6 +1096,9 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
             // Null parserCtx = mediaplayer path; must not introduce one mid-stream.
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
+                if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
+                    esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+                }
             }
         } else if (generationBoundary && display && filterChain.IsBuilt()) {
             // Slow-forward entry, or any exit to normal play: the codec stream stays contiguous (no flush),
@@ -1070,6 +1114,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         // parserMutex is held, so a concurrent EnqueueData() never parses non-keyframes against a
         // stale trickSpeed in the window just after the flush. Flags before the trickSpeed release-
         // store: an acquire reader that sees the new speed sees a consistent (mode, direction).
+        trickAwaitSecondField = false; // mode/direction change: forget any pending PAFF field-pair (parserMutex held)
         isTrickFastForward.store(newFastForward, std::memory_order_relaxed);
         isTrickReverse.store(newReverse, std::memory_order_relaxed);
         prevTrickPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -1173,6 +1218,15 @@ auto cVaapiDecoder::Shutdown() -> void {
     {
         const cMutexLock lock(&handoffMutex);
         handoffQueue.clear();
+        // jitterBuf is presenter-owned, but PresentAction() has exited (checked below), so no
+        // thread touches it anymore -- and it must be released HERE: its frames pin VAAPI
+        // surfaces that callers expect freed after Shutdown(), same contract as the handoff
+        // clear above. Skipped only if the presenter had to be pthread_cancel'ed (spin timeout,
+        // presentExited never set), where its state may be mid-mutation. handoffMutex serializes
+        // concurrent Shutdown() callers on the clear itself.
+        if (presentExited.load(std::memory_order_acquire)) {
+            jitterBuf.clear();
+        }
     }
 }
 
@@ -1201,9 +1255,9 @@ auto cVaapiDecoder::Action() -> void {
     };
 
     while (!stopping.load(std::memory_order_acquire)) {
-        // Device hook ticked every iteration -- including the ~10 ms idle waits when no packets
-        // arrive -- so the device gets a reliable tick even on a scrambled channel that delivers no
-        // PES. No decoder lock is held here; the callback is a cheap no-op unless armed.
+        // Device hook ticked every iteration -- including the idle waits (DECODER_IDLE_WAIT_MS) when
+        // no packets arrive -- so the device gets a reliable tick even on a scrambled channel that
+        // delivers no PES. No decoder lock is held here; the callback is a cheap no-op unless armed.
         if (loopTickCallback) {
             loopTickCallback();
         }
@@ -1231,10 +1285,12 @@ auto cVaapiDecoder::Action() -> void {
             // DECODER_TRICK_QUEUE_DEPTH by the handoffQueue check, and publishedDecodedReserveSize lags one
             // (long) present iteration -- so skip the total check there to avoid stalling fast FF/REW
             // on a stale value (steady playback republishes every ~frame, so the lag is harmless).
+            // Wake-driven: every handoffNotFull.Broadcast() holds handoffMutex and this predicate
+            // re-checks under the same lock, so no wakeup can be lost -- the timeout is a pure fallback.
             while ((handoffQueue.size() >= handoffCap ||
                     (!inTrick && publishedDecodedReserveSize.load(std::memory_order_relaxed) >= handoffCap)) &&
                    !stopping.load(std::memory_order_acquire)) {
-                handoffNotFull.TimedWait(handoffMutex, 50);
+                handoffNotFull.TimedWait(handoffMutex, DECODER_IDLE_WAIT_MS);
             }
         }
         if (stopping.load(std::memory_order_acquire)) {
@@ -1243,13 +1299,17 @@ auto cVaapiDecoder::Action() -> void {
 
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
 
-        // The presentation thread owns the due-gate pacing now, so the decode thread only needs to
-        // wake promptly on new input. 10 ms cap keeps the loopTickCallback watchdog cadence on a
-        // scrambled no-PES channel.
+        // Wake-driven: every enqueue and RequestCodecDrain Broadcasts packetCondition under
+        // packetMutex, and this empty-check runs under the same lock, so no arrival is missed.
+        // codecDrainPending is part of the predicate because it is stored OUTSIDE this mutex: a
+        // request that lands before we lock has already fired its unheard Broadcast, and without
+        // the check the still-picture drain would sleep out the full timeout. The timeout itself
+        // only paces loopTickCallback on a scrambled no-PES channel (3 s grace -> 30x margin).
         {
             const cMutexLock lock(&packetMutex);
-            if (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
-                packetCondition.TimedWait(packetMutex, 10);
+            if (packetQueue.empty() && !codecDrainPending.load(std::memory_order_acquire) &&
+                !stopping.load(std::memory_order_acquire)) {
+                packetCondition.TimedWait(packetMutex, DECODER_IDLE_WAIT_MS);
             }
 
             if (stopping.load(std::memory_order_acquire)) {
@@ -1632,32 +1692,45 @@ auto cVaapiDecoder::PresentAction() -> void {
         }
 
         // Sleep until the head frame is due, or a new handoff batch / control-path change wakes us.
-        // waitMs is clamped to [1,18] ms: the upper bound avoids 50 Hz vsync beating; the lower bound
-        // (>=1) bounds CPU even when the head is perpetually "due". Do NOT gate the sleep on "!due" --
-        // that is exactly what would spin at 100%.
-        int waitMs = 10; // jitterBuf empty: deep-ish sleep, woken by the next handoff Broadcast.
+        // The waits are wake-driven (a handoff push re-checks the predicate under handoffMutex below;
+        // every control path Broadcasts via WakePresenter), so the timeouts are fallbacks, not polls
+        // the pipeline relies on. waitMs is clamped to [1, DECODER_IDLE_WAIT_MS]: the upper bound caps
+        // reaction to the few things no Broadcast covers (audio-clock progress and anomalies, an
+        // AV-delay knob change); the lower bound (>=1) bounds CPU even when the head is perpetually
+        // "due". Do NOT gate the sleep on "!due" -- that is exactly what would spin at 100%.
+        int waitMs = DECODER_IDLE_WAIT_MS; // jitterBuf empty: park; the next handoff Broadcast wakes us.
         if (devicePaused.load(std::memory_order_acquire)) {
             // Freeze pins GetClock() to a valid (non-NOPTS) PTS and the drain loop holds (no submits),
             // so the clock path below would clamp waitMs to 1 and wake ~1 kHz for the whole pause.
-            // Poll at the ceiling instead; SetDevicePaused(false) Broadcasts handoffCondition, so
-            // resume latency stays bounded to one tick.
-            waitMs = 18;
+            // Park at the fallback tick instead; SetDevicePaused(false) Broadcasts handoffCondition,
+            // so resume stays wake-driven rather than waiting out the tick.
+            waitMs = DECODER_IDLE_WAIT_MS;
         } else if (!jitterBuf.empty()) {
             const bool consumingDrop = pendingDrops > 0;
             const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
             if (consumingDrop || canFreerun || !ap) {
+                // Near-unreachable: with these flags the drain loop above only exits on empty jitterBuf
+                // or an epoch race (Clear/trick-exit landed mid-iteration); the next iteration purges.
                 waitMs = 1;
             } else {
                 const int64_t clock = ap->GetClock();
                 const int64_t headPts = jitterBuf.front()->pts;
                 if (clock == AV_NOPTS_VALUE || headPts == AV_NOPTS_VALUE) {
+                    // Genuine poll: the audio-clock anchor has no Broadcast, and first-frame latency
+                    // after a seek rides on spotting it. Transient -- the no-clock hold is bounded by
+                    // DECODER_NO_CLOCK_HOLD_MS, after which no-clock freerun paces via the display.
                     waitMs = 18;
                 } else {
                     const int64_t dueIn90k = headPts - clock - SyncLatency90k(ap);
                     const int64_t wakeThreshold = PresentWakeThreshold90k();
+                    // Exact remaining-time sleep: the audio clock advances ~1:1 with wall time, so the
+                    // wake lands at the release threshold. Near due this computes the same small values
+                    // as ever; the cap only stretches far-from-due holds (video ahead, up to the 3 s
+                    // future-drop bound) from an 18 ms poll to the 10 Hz fallback tick.
                     waitMs = (dueIn90k <= wakeThreshold)
                                  ? 1
-                                 : std::clamp(static_cast<int>((dueIn90k - wakeThreshold) / PTS_TICKS_PER_MS), 1, 18);
+                                 : std::clamp(static_cast<int>((dueIn90k - wakeThreshold) / PTS_TICKS_PER_MS), 1,
+                                              DECODER_IDLE_WAIT_MS);
                 }
             }
         }
@@ -1682,13 +1755,18 @@ auto cVaapiDecoder::PresentAction() -> void {
             publishedDecodedReserveSize.store(decodedReserve, std::memory_order_relaxed);
             // Wake a backpressured decode thread now that the reserve total is republished: the splice
             // only broadcasts when it empties handoffQueue, so after a hard-ahead sleep / no-clock hold
-            // drained jitterBuf below the cap, the producer would otherwise sleep out its 50 ms slice.
+            // drained jitterBuf below the cap, the producer would otherwise sleep out its fallback slice.
             const size_t reserveCap = (trickSpeed.load(std::memory_order_acquire) != 0) ? DECODER_TRICK_QUEUE_DEPTH
                                                                                         : DECODER_RESERVE_HARD_CAP;
             if (decodedReserve < reserveCap) {
                 handoffNotFull.Broadcast();
             }
-            if (handoffQueue.empty() && !stopping.load(std::memory_order_acquire)) {
+            // Wait also when frames remain in handoffQueue but the splice is blocked (jitterBuf at
+            // cap while the drain holds: device paused, or head ahead of the audio clock). Skipping
+            // the wait there busy-spins this loop at 100% CPU for the whole hold -- no frame can
+            // move until THIS thread drains jitterBuf, so the bounded TimedWait costs no latency.
+            if ((handoffQueue.empty() || jitterBuf.size() >= DECODER_RESERVE_HARD_CAP) &&
+                !stopping.load(std::memory_order_acquire)) {
                 handoffCondition.TimedWait(handoffMutex, waitMs);
             }
         }
@@ -2207,6 +2285,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             }
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
+                if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
+                    esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+                }
             }
         } else if (display && filterChain.IsBuilt()) {
             // Slow-forward deferred exit (contiguous, no codec flush): still rebuild the filter so normal
@@ -2218,6 +2299,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         // Publish normal-play state. Flags before the trickSpeed release-store so an acquire reader
         // that observes speed==0 sees a consistent (mode, direction). Epoch BEFORE NOPTS (Clear-race
         // guard), exactly like SetTrickSpeed()'s generation-boundary publish.
+        trickAwaitSecondField = false; // trick session over: forget any pending PAFF field-pair (parserMutex held)
         isTrickFastForward.store(false, std::memory_order_relaxed);
         isTrickReverse.store(false, std::memory_order_relaxed);
         prevTrickPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -2273,11 +2355,17 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             PublishLastPts(pts);
         }
 
-        // Block until pacing deadline, then arm the next one.
+        // Block until the pacing deadline, then arm the next one. Sleep the remaining hold in bounded
+        // chunks: near-exact wake at the deadline, with stopping / trick-exit re-checked at least every
+        // kTrickWaitChunkMs (holds reach 2000 ms; a fixed 10 ms poll burned 100 wakes/s for nothing).
+        constexpr uint64_t kTrickWaitChunkMs = 50;
         const uint64_t due = nextTrickFrameDue.load(std::memory_order_relaxed);
-        while (cTimeMs::Now() < due && !stopping.load(std::memory_order_relaxed) &&
-               trickSpeed.load(std::memory_order_relaxed) != 0) {
-            cCondWait::SleepMs(10);
+        while (!stopping.load(std::memory_order_relaxed) && trickSpeed.load(std::memory_order_relaxed) != 0) {
+            const uint64_t nowMs = cTimeMs::Now();
+            if (nowMs >= due) {
+                break;
+            }
+            cCondWait::SleepMs(static_cast<int>(std::min(due - nowMs, kTrickWaitChunkMs)));
         }
 
         // Fast: hold = |ptsDelta| / PTS_TICKS_PER_MS / mult, clamped to [10, 2000] ms.
@@ -2320,10 +2408,18 @@ auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_
             break;
         }
         const int64_t freshClock = ap->GetClock();
-        if (freshClock == AV_NOPTS_VALUE || (pts - freshClock - latency) <= 0) {
+        if (freshClock == AV_NOPTS_VALUE) {
             break;
         }
-        cCondWait::SleepMs(10);
+        const int64_t remaining90k = pts - freshClock - latency;
+        if (remaining90k <= 0) {
+            break;
+        }
+        // Adaptive chunks: sleep most of the remaining gap in one go, final approach in 10 ms steps
+        // for exit precision. Each wake re-checks stopping/freerun/clock, so reaction to a Clear()
+        // or Shutdown() stays bounded by the chunk size (this wait can span seconds).
+        cCondWait::SleepMs(
+            static_cast<int>(std::clamp<int64_t>(remaining90k / PTS_TICKS_PER_MS, 10, DECODER_IDLE_WAIT_MS)));
     }
     if (display) {
         display->SetSyncSleeping(false);

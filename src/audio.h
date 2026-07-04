@@ -126,6 +126,10 @@ class cAudioProcessor : public cThread {
     auto Shutdown() -> void; ///< Stops the processing thread and closes ALSA + decoder + parser. Idempotent;
                              ///< called by the destructor. Initialize()'s device-swap path calls CloseDevice()
                              ///< directly instead, keeping the thread alive across the swap.
+    [[nodiscard]] auto TakeCodecRedetectRequest() noexcept -> bool {
+        return codecRedetectRequested.exchange(false, std::memory_order_acq_rel);
+    } ///< Consumes the sink's "wrong codec" verdict (true once, after AUDIO_CASCADE_RECOVERY_LIMIT
+      ///< cascades with no decoded frame). Only the PES feed can reset audioCodecId and re-detect.
 
   protected:
     // ========================================================================
@@ -235,7 +239,11 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === DECODER ===
     // ========================================================================
-    int consecutiveDecodeErrors{};                               ///< Consecutive avcodec_send_packet failures
+    std::atomic<int> cascadeRecoveryCount{0}; ///< Parser-recreate cascades since the last decoded frame; written by
+                                              ///< Decode() (producer) and DecodeToPcm() (Action thread)
+    std::atomic<bool> codecRedetectRequested{false}; ///< Set at the cascade limit (opened codec != bitstream); consumed
+                                                     ///< by the PES feed via TakeCodecRedetectRequest()
+    int consecutiveDecodeErrors{};                   ///< Consecutive avcodec_send_packet failures
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> decoder; ///< FFmpeg decoder context
     int decoderGracePackets{0};                                  ///< Packets to silently discard after (re)init
     std::atomic<int> decoderRefCount{0};                         ///< In-flight DecodeToPcm() callers

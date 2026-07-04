@@ -154,9 +154,13 @@ static_assert(std::ranges::all_of(VIDEO_BACKEND_TABLE,
 // === CODEC DETECTION ===
 // ============================================================================
 
-/// Identify an audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2/TrueHD).
-/// Linear sync-word scan; first decisive match wins. Returns AV_CODEC_ID_NONE if
-/// nothing is recognized.
+/// Identify an audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2 Layer II/
+/// TrueHD). Linear sync-word scan; a sync hit is decisive only when its declared frame
+/// length is corroborated (a chained valid header one frame ahead, an exact payload fill
+/// from offset 0, or -- Dolby only -- a head frame spanning past the payload) -- a lone
+/// short sync inside compressed payload bytes is noise, not evidence. Returns
+/// AV_CODEC_ID_NONE if nothing is corroborated; callers should treat that as "wait for
+/// the next payload".
 [[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID;
 
 /// Identify a video codec from ES bytes (HEVC/H.264/MPEG-2). Weighted multi-codec

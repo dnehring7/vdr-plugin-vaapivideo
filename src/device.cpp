@@ -140,6 +140,13 @@ constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
 /// encrypted/undecodable and the on-screen notice is shown. Matches the radio black-frame delay.
 constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 
+/// Fallback ES window for DetectAudioCodec(), used only when a single payload is inconclusive.
+/// Sized for AAC-LATM alone: its AudioMuxElements span PES boundaries, so the LOAS sync chains
+/// only across payloads and needs ~2 frames (~1 KB) visible at once. ADTS/MP2/AC-3 resolve on one
+/// payload and must NOT reach here -- the window's front-erase lands mid-frame and a ~1.5 KB AC-3
+/// frame can't fit a corroborating pair in 2 KB.
+constexpr size_t AUDIO_DETECT_WINDOW = 2048;
+
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
 // to VDR's KBD. DETA: yield to tty1 so the user lands on getty. Needs the
@@ -422,8 +429,9 @@ auto cVaapiDevice::RefreshRadioSplash(bool force) -> void {
 
 auto cVaapiDevice::CheckEncryptionTimeout() -> void {
     // Driven by the decode loop's per-iteration tick (decoder.SetLoopTickCallback), which keeps
-    // firing on the ~10 ms idle waits even when a fully scrambled channel delivers no PES at all --
-    // the case PlayAudio/PlayVideo never see. The leading load short-circuits the unarmed case.
+    // firing on the ~100 ms idle waits even when a fully scrambled channel delivers no PES at all --
+    // the case PlayAudio/PlayVideo never see (plenty for the 3 s grace below). The leading load
+    // short-circuits the unarmed case.
     if (!encryptedPending.load(std::memory_order_relaxed)) {
         return;
     }
@@ -1273,8 +1281,24 @@ auto cVaapiDevice::Play() -> void {
 
     // audioCodecId == NONE triggers detection; reset by SetPlayMode(pmNone),
     // HandleAudioTrackChange(), or Clear() (replay audi-N path).
-    const AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
+    AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
     bool isLive = liveMode.load(std::memory_order_relaxed);
+
+    // Sink escalation: repeated decode-failure cascades with no decoded frame mean the confirmed
+    // codec is a misdetection (or the PID's payload changed). Reset the whole audio codec domain
+    // like a track change -- stale clock and wrong-codec packets must not survive into re-detection.
+    // Clearing previousAudioCodec forces the fresh confirmation to log even on the same id.
+    if (currentCodec != AV_CODEC_ID_NONE && audioProcessor->TakeCodecRedetectRequest()) [[unlikely]] {
+        esyslog("vaapivideo/device: audio codec %s never produced a frame -- re-detecting",
+                avcodec_get_name(currentCodec));
+        ResetAudioCodecState();
+        previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+        audioProcessor->Clear();
+        if (decoder) [[likely]] {
+            decoder->NotifyAudioChange();
+        }
+        currentCodec = AV_CODEC_ID_NONE;
+    }
 
     if (currentCodec == AV_CODEC_ID_NONE) {
         // pmAudioOnly skips PlayVideo() entirely, so latch liveMode on first audio PES.
@@ -1286,8 +1310,31 @@ auto cVaapiDevice::Play() -> void {
             }
         }
 
-        const AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
+        // Payload-first: AC-3/MP2/ADTS carry whole frames per PES payload, so one is decisive and
+        // the window would only hurt them (see AUDIO_DETECT_WINDOW). Only AAC-LATM, whose frames
+        // span PES boundaries, needs the cross-payload window -- reached solely on a NONE here.
+        AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
+        if (detectedCodec == AV_CODEC_ID_NONE) {
+            // A reset on another thread bumps audioDetectGen; drop stale bytes before mixing PIDs.
+            if (const uint32_t gen = audioDetectGen.load(std::memory_order_relaxed); gen != audioDetectGenSeen) {
+                audioDetectGenSeen = gen;
+                audioDetectBuffer.clear();
+            }
+            audioDetectBuffer.insert(audioDetectBuffer.end(), pes.payload, pes.payload + pes.payloadSize);
+            if (audioDetectBuffer.size() > AUDIO_DETECT_WINDOW) {
+                audioDetectBuffer.erase(
+                    audioDetectBuffer.begin(),
+                    audioDetectBuffer.begin() +
+                        static_cast<std::ptrdiff_t>(audioDetectBuffer.size() - AUDIO_DETECT_WINDOW));
+            }
+            detectedCodec = ::DetectAudioCodec(audioDetectBuffer);
+        }
+
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
+            // Reset the candidate so 2-of-2 means two CONSECUTIVE decisive payloads -- else two
+            // uncorrelated false positives minutes apart could accumulate into a bogus confirmation.
+            audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+            audioCodecCandidateCount.store(0, std::memory_order_relaxed);
             return Length;
         }
 
@@ -1318,6 +1365,8 @@ auto cVaapiDevice::Play() -> void {
 
         audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
         audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+        audioDetectBuffer.clear(); // detection done; free the window until the next codec-less phase
+        audioDetectBuffer.shrink_to_fit();
 
         if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
@@ -2307,7 +2356,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Decoder starts codec-less; PlayVideo() opens the codec on the first PES.
     decoder = std::make_unique<cVaapiDecoder>(display.get(), &vaapi);
     // Drive the encrypted-channel watchdog off the decode loop's idle tick: a fully scrambled channel
-    // delivers no PES to PlayAudio/PlayVideo, but the decode thread still wakes ~every 10 ms with an
+    // delivers no PES to PlayAudio/PlayVideo, but the decode thread still wakes ~every 100 ms with an
     // empty queue. Set before Initialize() starts that thread. CheckEncryptionTimeout no-ops unless armed.
     decoder->SetLoopTickCallback([this]() -> void { CheckEncryptionTimeout(); });
     if (!decoder->Initialize()) [[unlikely]] {
@@ -2531,6 +2580,10 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     audioCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+    // Invalidate the PlayAudio detection window across threads without touching the vector:
+    // it drops its accumulated bytes when it next sees this counter move (old-PID ES must not
+    // corroborate against new-PID ES).
+    audioDetectGen.fetch_add(1, std::memory_order_relaxed);
 }
 
 // SelectDrmConnector() helper: validate one connector and, when it carries the wanted mode, latch the

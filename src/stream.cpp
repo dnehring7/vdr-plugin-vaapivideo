@@ -83,6 +83,92 @@ struct CodecEvidence {
     }
 };
 
+/// Byte-length of one MPEG audio Layer II frame (ISO 11172-3 / 13818-3 LSF Table B.1).
+/// Layer-II-only: the detector opens AV_CODEC_ID_MP2 and DVB (TS 101 154) mandates Layer II,
+/// so accepting Layer I/III or MPEG2.5 would confirm an id the bitstream does not match.
+/// Returns 0 for any reserved/free-format field (a 0 length is uncorroboratable).
+[[nodiscard]] auto Mp2FrameLength(uint32_t header) noexcept -> size_t {
+    const uint32_t versionBits = (header >> 19) & 0x03; // 00=MPEG2.5, 01=reserved, 10=MPEG2, 11=MPEG1
+    const uint32_t layerBits = (header >> 17) & 0x03;   // 00=reserved, 01=III, 10=II, 11=I
+    const uint32_t bitrateIdx = (header >> 12) & 0x0F;
+    const uint32_t samplerateIdx = (header >> 10) & 0x03;
+    const uint32_t padding = (header >> 9) & 0x01;
+
+    if (versionBits < 2 || layerBits != 2 || bitrateIdx == 0 || bitrateIdx == 15 || samplerateIdx == 3) {
+        return 0;
+    }
+
+    constexpr std::array<std::array<uint16_t, 14>, 2> kBitrateKbps{{
+        {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},      // MPEG2 LSF
+        {32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384}, // MPEG1
+    }};
+    constexpr std::array<uint32_t, 3> kMpeg1SampleRates{44100, 48000, 32000};
+
+    const size_t isMpeg1 = versionBits == 3 ? 1 : 0;
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- indices range-checked above
+    const uint32_t bitrate = static_cast<uint32_t>(kBitrateKbps[isMpeg1][bitrateIdx - 1]) * 1000U;
+    const uint32_t sampleRate = kMpeg1SampleRates[samplerateIdx] / (isMpeg1 != 0 ? 1U : 2U); // LSF halves the rate
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return (144U * bitrate / sampleRate) + padding; // Layer II is always 1152 samples -> coefficient 144
+}
+
+/// Byte-length of one ADTS frame (ISO 14496-3 sec.1.A.2.2); @p hdr must expose >= 6 bytes.
+/// Returns 0 for a reserved sampling_frequency_index or a length below the header size --
+/// which is 9, not 7, when protection_absent == 0, since aac_frame_length counts the CRC.
+[[nodiscard]] auto AdtsFrameLength(const uint8_t *hdr) noexcept -> size_t {
+    if (((AV_RB8(hdr + 2) >> 2) & 0x0F) >= 13) { // sampling_frequency_index: 13/14 reserved, 15 escape
+        return 0;
+    }
+    const size_t frameLen = (static_cast<size_t>(AV_RB8(hdr + 3) & 0x03) << 11) |
+                            (static_cast<size_t>(AV_RB8(hdr + 4)) << 3) | (AV_RB8(hdr + 5) >> 5);
+    const size_t headerLen = (AV_RB8(hdr + 1) & 0x01) != 0 ? 7U : 9U;
+    return frameLen >= headerLen ? frameLen : 0;
+}
+
+/// Syncframe byte-length from AC-3 fscod/frmsizecod (ATSC A/52 sec.5.4.1 / Table 5.18).
+/// Returns 0 for reserved fscod 3 or out-of-range frmsizecod.
+[[nodiscard]] auto Ac3FrameLength(uint8_t fscod, uint8_t frmsizecod) noexcept -> size_t {
+    if (fscod == 3 || frmsizecod > 37) {
+        return 0;
+    }
+    constexpr std::array<uint16_t, 19> kAc3Kbps{32,  40,  48,  56,  64,  80,  96,  112, 128, 160,
+                                                192, 224, 256, 320, 384, 448, 512, 576, 640};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- frmsizecod <= 37 checked above
+    const uint32_t kbps = kAc3Kbps[frmsizecod >> 1];
+    uint32_t words = 0;
+    if (fscod == 0) { // 48 kHz
+        words = 2U * kbps;
+    } else if (fscod == 1) { // 44.1 kHz: Table 5.18 values; odd frmsizecod adds one pad word
+        words = ((320U * kbps) / 147U) + (frmsizecod & 1U);
+    } else { // 32 kHz
+        words = 3U * kbps;
+    }
+    return static_cast<size_t>(words) * 2U;
+}
+
+/// Corroborate a sync candidate at @p pos declaring @p frameLen bytes. A lone short-sync hit
+/// is not decisive -- compressed payload aliases 11/12-bit sync words constantly. Accepted only
+/// on: a valid chained header one frame ahead; an exact payload fill from offset 0 (the DVB
+/// one-AU-per-PES shape); or, with @p allowHeadSpan, a head frame overrunning the payload.
+/// Head-span carries only the header as evidence, so it is Dolby-only (16-bit exact sync) --
+/// extending it to the short syncs would reopen the alias hole. All three anchor at offset 0
+/// or a validated neighbour; a length that merely lands on the boundary deeper in is coincidence.
+template <typename SyncPredicate>
+[[nodiscard]] auto FrameLengthCorroborates(size_t pos, size_t frameLen, size_t size, bool allowHeadSpan,
+                                           const SyncPredicate &syncAt) noexcept -> bool {
+    const size_t next = pos + frameLen;
+    if (next > size) {
+        return allowHeadSpan && pos == 0;
+    }
+    if (next == size) {
+        return pos == 0;
+    }
+    if (next + 2 <= size) {
+        return syncAt(next);
+    }
+    return false;
+}
+
 /// Returns 3 for `00 00 01`, 4 for `00 00 00 01`, 0 otherwise.
 /// Shared by DetectVideoCodec() and FindNal() to walk Annex-B NAL boundaries.
 [[nodiscard]] constexpr auto AnnexBStartCodeLength(const uint8_t *data, size_t size, size_t offset) noexcept -> size_t {
@@ -104,8 +190,9 @@ struct CodecEvidence {
 } // namespace
 
 auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
-    // Linear sync-word scan; first decisive match wins. Test order is intentional --
-    // see the AAC-vs-MP2 and AAC-LATM disambiguation comments below.
+    // Linear scan; first FrameLengthCorroborates() match wins. A raw sync hit is never enough:
+    // AAC-LATM payloads alias the 11-bit MPEG audio sync (0xFFE?) every few packets, which used
+    // to misconfirm mp2 on HE-AAC services and permanently mute audio.
     if (data.size() < 4) [[unlikely]] {
         return AV_CODEC_ID_NONE;
     }
@@ -116,39 +203,75 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
     for (size_t i = 0; i + 4 <= size; ++i) {
         const uint16_t sync = AV_RB16(p + i);
 
-        // AAC ADTS sync: layer field == 00 (masked 0xFFF6 == 0xFFF0). MP2 uses layer 01/10/11
-        // with the looser 0xFFE0 mask, which would also hit every ADTS frame -- test ADTS first.
         if ((sync & 0xFF00) == 0xFF00) [[unlikely]] {
-            if ((sync & 0xFFF6) == 0xFFF0) [[unlikely]] {
-                return AV_CODEC_ID_AAC;
+            // ADTS (layer 00, mask 0xFFF6) tested before MPEG audio (layer 01/10/11, mask 0xFFE0):
+            // the two are mutually exclusive on the layer bits, but ordering keeps intent clear.
+            // Every chained predicate re-parses the neighbour header, not just its sync bits, so a
+            // random second sync-alike one frame ahead cannot confirm a false first header.
+            if ((sync & 0xFFF6) == 0xFFF0 && i + 6 <= size) [[unlikely]] {
+                const size_t frameLen = AdtsFrameLength(p + i);
+                if (frameLen != 0 && FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/false,
+                                                             [p, size](size_t pos) noexcept -> bool {
+                                                                 return pos + 6 <= size &&
+                                                                        (AV_RB16(p + pos) & 0xFFF6) == 0xFFF0 &&
+                                                                        AdtsFrameLength(p + pos) != 0;
+                                                             })) {
+                    return AV_CODEC_ID_AAC;
+                }
             }
-            // (sync & 0x06) != 0: layer field != 00 (reserved), rejects random 0xFFE? bytes.
-            if ((sync & 0xFFE0) == 0xFFE0 && (sync & 0x06) != 0x00) [[likely]] {
-                return AV_CODEC_ID_MP2;
+            if ((sync & 0xFFE0) == 0xFFE0) [[likely]] {
+                const size_t frameLen = Mp2FrameLength(AV_RB32(p + i));
+                // Mask 0xFFFE requires the neighbour to repeat version + layer (drops only protection).
+                if (frameLen != 0 && FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/false,
+                                                             [p, size, sync](size_t pos) noexcept -> bool {
+                                                                 return pos + 4 <= size &&
+                                                                        (AV_RB16(p + pos) & 0xFFFE) ==
+                                                                            (sync & 0xFFFE) &&
+                                                                        Mp2FrameLength(AV_RB32(p + pos)) != 0;
+                                                             })) {
+                    return AV_CODEC_ID_MP2;
+                }
             }
         }
 
-        // AAC-LATM/LOAS (ISO 14496-3 sec.1.7.3): 11-bit syncword is too short for single-frame
-        // confidence. Confirm with a second sync at pos + 3-byte header + audioMuxLengthBytes
-        // (lower 13 bits of the header word).
+        // AAC-LATM/LOAS (ISO 14496-3 sec.1.7.3): 11-bit sync + 13-bit audioMuxLengthBytes. DVB
+        // carries one AudioMuxElement per PES, so exact fill (not the chained sync) usually confirms.
         if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
-            const auto frameLen = static_cast<uint16_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
-            if (frameLen >= 2) {
-                const size_t next = i + 3 + frameLen;
-                if (next + 2 <= size && (AV_RB16(p + next) & 0xFFE0) == 0x56E0) {
-                    return AV_CODEC_ID_AAC_LATM;
-                }
+            const auto muxLen = static_cast<size_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
+            if (muxLen >= 2 &&
+                FrameLengthCorroborates(
+                    i, muxLen + 3, size, /*allowHeadSpan=*/false, [p, size](size_t pos) noexcept -> bool {
+                        if (pos + 3 > size || (AV_RB16(p + pos) & 0xFFE0) != 0x56E0) {
+                            return false;
+                        }
+                        const auto nextMuxLen =
+                            static_cast<size_t>(((AV_RB16(p + pos) & 0x1FU) << 8) | AV_RB8(p + pos + 2));
+                        return nextMuxLen >= 2;
+                    })) {
+                return AV_CODEC_ID_AAC_LATM;
             }
         }
 
         // AC-3 / E-AC-3 share sync 0x0B77 (ATSC A/52). Disambiguated by bsid (5 bits at
         // byte+5 bits 7..3, A/52 sec.A.4.3): bsid <= 10 -> AC-3, 11-15 -> reserved (classified
         // as E-AC-3 to match FFmpeg, but no real stream uses these), 16 -> E-AC-3.
-        if (sync == 0x0B77) [[unlikely]] {
-            if (i + 5 < size && ((AV_RB8(p + i + 5) >> 3) & 0x1F) > 10) [[unlikely]] {
-                return AV_CODEC_ID_EAC3;
+        if (sync == 0x0B77 && i + 6 <= size) [[unlikely]] {
+            const uint8_t bsid = (AV_RB8(p + i + 5) >> 3) & 0x1F;
+            size_t frameLen = 0;
+            AVCodecID dolby = AV_CODEC_ID_NONE;
+            if (bsid <= 10) {
+                frameLen = Ac3FrameLength(AV_RB8(p + i + 4) >> 6, AV_RB8(p + i + 4) & 0x3F);
+                dolby = AV_CODEC_ID_AC3;
+            } else if (bsid <= 16 && (AV_RB8(p + i + 2) >> 6) != 3) { // strmtyp 3 is reserved
+                // E-AC-3 frmsiz (11 bits, bytes +2/+3): frame bytes = (frmsiz + 1) * 2.
+                frameLen = (static_cast<size_t>(AV_RB16(p + i + 2) & 0x07FF) + 1) * 2;
+                dolby = frameLen >= 6 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_NONE;
             }
-            return AV_CODEC_ID_AC3;
+            if (dolby != AV_CODEC_ID_NONE && frameLen != 0 &&
+                FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/true,
+                                        [p](size_t pos) noexcept -> bool { return AV_RB16(p + pos) == 0x0B77; })) {
+                return dolby;
+            }
         }
 
         // DTS Coherent Acoustics core (ETSI TS 102 114). 32-bit sync, no ambiguity.
