@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -63,17 +64,36 @@ namespace {
 // === LOCAL CONSTANTS ===
 // ============================================================================
 
-constexpr int64_t DEFAULT_CUE_DURATION_90K = 270000; ///< 3 s fallback when a cue carries no duration.
-constexpr size_t SUBTITLE_QUEUE_CAPACITY = 256;      ///< Bound future cues from a malformed / front-loaded stream.
-constexpr int SUBTITLE_SHUTDOWN_TIMEOUT_S = 2;       ///< Action() join timeout in Shutdown().
-constexpr int SUBTITLE_TICK_MS = 50;                 ///< Pacing cadence: how often Action() re-checks the cue vs clock.
-constexpr int DVB_SUBTITLE_CANVAS_W = 720;           ///< SD PAL canvas fallback when a DVB stream omits a display
-constexpr int DVB_SUBTITLE_CANVAS_H = 576;           ///< definition segment (so the decoder reports no size).
-constexpr int DVB_SUBTITLE_MAX_COLORS = 256;         ///< 8 bpp palette ceiling for a DVB region bitmap.
+constexpr int64_t DEFAULT_CUE_DURATION_90K = 270000;     ///< 3 s fallback when a cue carries no duration.
+constexpr int64_t MAX_CUE_DURATION_90K = 90000LL * 3600; ///< 1 h window ceiling: even a non-overflowing end far in
+                                                         ///< the future would wedge the queue front unpruneably.
+constexpr uint32_t MAX_CUE_START_DELAY_MS = 60000; ///< start_display_time sanity bound (decoders emit ~0); a corrupt
+                                                   ///< huge delay would break the queue's ascending-start order.
+constexpr size_t SUBTITLE_QUEUE_CAPACITY = 256;    ///< Bound future cues from a malformed / front-loaded stream.
+constexpr int SUBTITLE_SHUTDOWN_TIMEOUT_S = 2;     ///< Action() join timeout in Shutdown().
+constexpr int SUBTITLE_TICK_MS = 50;               ///< Pacing cadence: how often Action() re-checks the cue vs clock.
+constexpr int DVB_SUBTITLE_CANVAS_W = 720;         ///< SD PAL canvas fallback when a DVB stream omits a display
+constexpr int DVB_SUBTITLE_CANVAS_H = 576;         ///< definition segment (so the decoder reports no size).
+constexpr int DVB_SUBTITLE_MAX_COLORS = 256;       ///< 8 bpp palette ceiling for a DVB region bitmap.
+constexpr int DVB_SUBTITLE_MAX_DIM = 4096;         ///< Region w/h ceiling (UHD canvas is 3840x2160): the 16-bit
+                                                   ///< DVB fields allow 65535, which overflows cBitmap's int w*h.
 
 /// Scale @p sourceAlpha by VDR's subtitle transparency (0..10), the mapping cDvbSubtitleConverter uses.
 [[nodiscard]] auto SubtitleAlpha(uint8_t sourceAlpha, int transparency) noexcept -> uint8_t {
     return static_cast<uint8_t>(static_cast<int>(sourceAlpha) * (10 - std::clamp(transparency, 0, 10)) / 10);
+}
+
+/// Checked add for 90 kHz cue timing: pts/duration arrive unvalidated from the container, and a
+/// malformed file must neither overflow (UB) nor yield a saturated value that masquerades as a
+/// real timestamp. nullopt = the sum is not representable; the caller decides how to degrade.
+[[nodiscard]] auto CheckedAdd90k(int64_t a, int64_t b) noexcept -> std::optional<int64_t> {
+    if (b > 0 && a > std::numeric_limits<int64_t>::max() - b) [[unlikely]] {
+        return std::nullopt;
+    }
+    if (b < 0 && a < std::numeric_limits<int64_t>::min() - b) [[unlikely]] {
+        return std::nullopt;
+    }
+    return a + b;
 }
 
 // ============================================================================
@@ -181,6 +201,20 @@ constexpr int DVB_SUBTITLE_MAX_COLORS = 256;         ///< 8 bpp palette ceiling 
     return NamedColor(value);
 }
 
+/// ASCII-only letter test: std::isalpha is locale-sensitive and VDR installs the user's locale, so
+/// UTF-8 lead bytes must never pass as a tag name.
+[[nodiscard]] auto IsAsciiAlpha(char c) noexcept -> bool { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+
+/// Whether the '<' at @p pos opens something tag-shaped ("<letter" / "</letter"). Anything else --
+/// "a < b", "</ >", a trailing '<' -- is literal cue text, not markup.
+[[nodiscard]] auto LooksLikeHtmlTagStart(std::string_view text, size_t pos) noexcept -> bool {
+    size_t name = pos + 1;
+    if (name < text.size() && text[name] == '/') {
+        ++name;
+    }
+    return name < text.size() && IsAsciiAlpha(text[name]);
+}
+
 /// Append @p text (already markup-bearing) to @p out as trimmed, non-empty lines, carrying the
 /// active foreground color per line. Strips ASS override blocks {\...} and HTML-ish tags <...>
 /// (extracting any color they set), converts "\N"/"\n" line breaks and "\h" hard space, and splits
@@ -216,15 +250,20 @@ auto AppendLinesFromMarkup(std::string_view text, std::vector<cSubtitleConverter
                 curColor = col;
             }
             i = close + 1;
-        } else if (c == '<') { // HTML-ish tag (subrip <i>/<b>/<font color>)
+        } else if (c == '<' && LooksLikeHtmlTagStart(text, i)) {
+            // HTML-ish tag (subrip <i>/<b>/<font color>); only tag-shaped openers count, so literal
+            // text such as "a < b and c > d" is not swallowed as a bogus tag.
             const size_t close = text.find('>', i + 1);
             if (close == std::string_view::npos) {
-                cur.push_back(c); // unmatched '<' (e.g. "5 < 10") -> keep as literal text
+                cur.push_back(c); // unmatched '<' -> keep as literal text
                 ++i;
                 continue;
             }
-            if (const int32_t col = ParseHtmlColor(text.substr(i + 1, close - (i + 1))); col >= 0) {
-                curColor = col;
+            const std::string_view tag = text.substr(i + 1, close - (i + 1));
+            if (!tag.starts_with('/')) { // a closing tag (even a malformed "</font color=...>") never sets color
+                if (const int32_t col = ParseHtmlColor(tag); col >= 0) {
+                    curColor = col;
+                }
             }
             i = close + 1;
         } else if (c == '\\' && i + 1 < text.size()) {
@@ -274,11 +313,21 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
 /// Alpha is rescaled by subtitle transparency, mirroring cDvbSubtitleConverter (index 0 = background).
 [[nodiscard]] auto MakeRegionBitmap(const AVSubtitleRect *rect) -> std::shared_ptr<const cBitmap> {
     // nb_colors <= 0 would cast to a huge span size; linesize < width would run the row subspan
-    // off the pixel buffer (and guarantees stride > 0 for the overflow check below).
-    if (rect == nullptr || rect->w <= 0 || rect->h <= 0 || rect->linesize[0] < rect->w || rect->nb_colors <= 0 ||
+    // off the pixel buffer (and guarantees stride > 0 for the overflow check below). The dimension
+    // ceiling keeps cBitmap::SetSize's int w*h from overflowing into an undersized allocation.
+    if (rect == nullptr || rect->w <= 0 || rect->h <= 0 || rect->w > DVB_SUBTITLE_MAX_DIM ||
+        rect->h > DVB_SUBTITLE_MAX_DIM || rect->linesize[0] < rect->w || rect->nb_colors <= 0 ||
         rect->data[0] == nullptr || rect->data[1] == nullptr) {
         return nullptr;
     }
+    // Validate the pixel-span math before allocating the bitmap: no point paying a (up to 16 MB)
+    // allocation for input the span construction below would reject anyway.
+    const auto stride = static_cast<size_t>(rect->linesize[0]);
+    const auto height = static_cast<size_t>(rect->h);
+    if (height > std::numeric_limits<size_t>::max() / stride) {
+        return nullptr; // guard the span size against a malformed stride*height overflow
+    }
+
     auto bitmap = std::make_shared<cBitmap>(rect->w, rect->h, 8); // 8 bpp: up to 256 palette colors
 
     const auto scaleAlpha = [](uint32_t argb, int transparency) -> tColor {
@@ -295,16 +344,13 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
         ++index;
     }
 
-    const auto stride = static_cast<size_t>(rect->linesize[0]);
-    const auto height = static_cast<size_t>(rect->h);
-    if (height > std::numeric_limits<size_t>::max() / stride) {
-        return nullptr; // guard the span size against a malformed stride*height overflow
-    }
     const std::span<const uint8_t> pixels{rect->data[0], stride * height};
     for (int y = 0; y < rect->h; ++y) {
         int x = 0;
-        for (const uint8_t paletteIndex :
-             pixels.subspan(static_cast<size_t>(y) * stride, static_cast<size_t>(rect->w))) {
+        for (uint8_t paletteIndex : pixels.subspan(static_cast<size_t>(y) * stride, static_cast<size_t>(rect->w))) {
+            if (paletteIndex >= colors) [[unlikely]] {
+                paletteIndex = 0; // out-of-palette pixel: map to background, not an uninitialized cPalette entry
+            }
             bitmap->SetIndex(x, y, paletteIndex);
             ++x;
         }
@@ -376,11 +422,19 @@ auto cSubtitleConverter::Close() -> void {
 }
 
 auto cSubtitleConverter::Reset() -> void {
+    // Clear the queue and request the hide first, so the stale overlay disappears as soon as Action()
+    // ticks; only then drop decoder state.
     {
         const cMutexLock lock(&cueMutex_);
         cues_.clear();
     }
     hideRequested_.store(true, std::memory_order_release);
+    if (codecCtx_) {
+        // Same stream, new position: the decoder state is stale too. ffmpeg's text decoders dedup on
+        // ASS ReadOrder (after a backward seek every re-seen cue would be silently dropped as a
+        // duplicate) and dvbsub keeps page/region state from the old position.
+        avcodec_flush_buffers(codecCtx_.get());
+    }
 }
 
 auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
@@ -406,34 +460,63 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
         return;
     }
 
-    const int64_t start90k = packetPts90k + (static_cast<int64_t>(sub.start_display_time) * PTS_TICKS_PER_MS);
+    // start_display_time is ~always 0 (an offset from the packet pts); a corrupt huge delay (incl.
+    // an all-ones sentinel) would schedule the cue days ahead, breaking the queue's ascending-start
+    // invariant and wedging Action()'s scan behind a far-future front cue.
+    if (sub.start_display_time > MAX_CUE_START_DELAY_MS) [[unlikely]] {
+        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        return;
+    }
+    // All window arithmetic is checked, not saturated: pts/duration are unvalidated container data,
+    // and a saturated INT64_MAX would masquerade as a real (unpruneable) timestamp. The display-time
+    // products themselves can't overflow (uint32 ms * 90 < 2^39).
+    const auto startOpt = CheckedAdd90k(packetPts90k, static_cast<int64_t>(sub.start_display_time) * PTS_TICKS_PER_MS);
+    const auto defaultEndOpt = CheckedAdd90k(packetPts90k, DEFAULT_CUE_DURATION_90K);
+    if (!startOpt || !defaultEndOpt) [[unlikely]] {
+        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        return;
+    }
+    const int64_t start90k = *startOpt;
     // DVB trusts the decoder's page timeout (sub.end_display_time, like VDR core) over a possibly-wrong
     // container duration; text trusts packet duration first (muxers set it to the cue length). Each
-    // falls back to the other, then to the default.
+    // falls back to the other, then to the default; an absent or overflowing source stays nullopt.
     const bool preferDecoderTiming = codecCtx_->codec_id == AV_CODEC_ID_DVB_SUBTITLE;
-    const bool haveDuration = packet->duration > 0;
-    const bool haveDecoder = sub.end_display_time != 0 && sub.end_display_time != UINT32_MAX;
-    const int64_t durationEnd = packetPts90k + packet->duration;
-    const int64_t decoderEnd = packetPts90k + (static_cast<int64_t>(sub.end_display_time) * PTS_TICKS_PER_MS);
-    int64_t end90k = packetPts90k + DEFAULT_CUE_DURATION_90K; // when neither source carries timing
+    std::optional<int64_t> durationEnd;
+    if (packet->duration > 0) {
+        durationEnd = CheckedAdd90k(packetPts90k, packet->duration);
+    }
+    std::optional<int64_t> decoderEnd;
+    if (sub.end_display_time != 0 && sub.end_display_time != UINT32_MAX) {
+        decoderEnd = CheckedAdd90k(packetPts90k, static_cast<int64_t>(sub.end_display_time) * PTS_TICKS_PER_MS);
+    }
+    int64_t end90k = *defaultEndOpt; // when neither source carries usable timing
     if (preferDecoderTiming) {
-        if (haveDecoder) {
-            end90k = decoderEnd;
-        } else if (haveDuration) {
-            end90k = durationEnd;
+        if (decoderEnd) {
+            end90k = *decoderEnd;
+        } else if (durationEnd) {
+            end90k = *durationEnd;
         }
     } else {
-        if (haveDuration) {
-            end90k = durationEnd;
-        } else if (haveDecoder) {
-            end90k = decoderEnd;
+        if (durationEnd) {
+            end90k = *durationEnd;
+        } else if (decoderEnd) {
+            end90k = *decoderEnd;
         }
     }
     // Guard malformed timing (end <= start): without a positive window the cue's [start,end) test in
-    // Action() never matches the clock, so it would silently never appear.
-    if (end90k <= start90k) {
-        end90k = start90k + DEFAULT_CUE_DURATION_90K;
+    // Action() never matches the clock, so it would silently never appear. Then cap the window: even
+    // a checked, non-overflowing end far in the future would park an unpruneable cue at the queue
+    // front for the rest of playback.
+    const auto fallbackEndOpt = CheckedAdd90k(start90k, DEFAULT_CUE_DURATION_90K);
+    const auto maxEndOpt = CheckedAdd90k(start90k, MAX_CUE_DURATION_90K);
+    if (!fallbackEndOpt || !maxEndOpt) [[unlikely]] {
+        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        return;
     }
+    if (end90k <= start90k) {
+        end90k = *fallbackEndOpt;
+    }
+    end90k = std::min(end90k, *maxEndOpt);
 
     Cue cue;
     cue.start90k = start90k;

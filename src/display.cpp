@@ -1151,14 +1151,14 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         // [header end, blob length] so a buggy driver blob can't cause an OOB
                         // read or alias header fields as fourccs; memcpy because a malformed
                         // offset may be unaligned.
-                        const uint64_t formatsBegin = static_cast<uint64_t>(modBlob->formats_offset);
+                        const auto formatsBegin = static_cast<uint64_t>(modBlob->formats_offset);
                         const uint64_t formatsEnd =
-                            formatsBegin + static_cast<uint64_t>(modBlob->count_formats) * sizeof(uint32_t);
+                            formatsBegin + (static_cast<uint64_t>(modBlob->count_formats) * sizeof(uint32_t));
                         if (formatsBegin >= sizeof(*modBlob) && formatsEnd <= blob->length) {
                             for (uint32_t k = 0; k < modBlob->count_formats; ++k) {
                                 uint32_t planeFormat = 0;
                                 const size_t formatOffset =
-                                    static_cast<size_t>(formatsBegin) + static_cast<size_t>(k) * sizeof(planeFormat);
+                                    static_cast<size_t>(formatsBegin) + (static_cast<size_t>(k) * sizeof(planeFormat));
                                 std::memcpy(&planeFormat, base + formatOffset, sizeof(planeFormat));
                                 if (planeFormat == DRM_FORMAT_P010) {
                                     tempProps.supportsP010 = true;
