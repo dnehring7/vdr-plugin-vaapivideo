@@ -80,6 +80,7 @@ constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
 constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
 constexpr uint32_t PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+constexpr int DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS = 1000; ///< Commit-failure log rate limit (retry path ~200 Hz)
 
 // --- Underrun / warmup-grace tracking (display consumer thread) ---
 constexpr uint64_t DISPLAY_UNDERRUN_IDLE_MAX_MS =
@@ -140,8 +141,10 @@ AtomicRequest::~AtomicRequest() noexcept {
     }
 }
 
-AtomicRequest::AtomicRequest(AtomicRequest &&other) noexcept : propCount(other.propCount), request(other.request) {
+AtomicRequest::AtomicRequest(AtomicRequest &&other) noexcept
+    : failed(other.failed), propCount(other.propCount), request(other.request) {
     other.request = nullptr; // prevents double-free in moved-from destructor
+    other.failed = false;
     other.propCount = 0;
 }
 
@@ -150,8 +153,10 @@ auto AtomicRequest::operator=(AtomicRequest &&other) noexcept -> AtomicRequest &
         if (request) {
             drmModeAtomicFree(request);
         }
+        failed = other.failed;
         request = other.request;
         propCount = other.propCount;
+        other.failed = false;
         other.request = nullptr;
         other.propCount = 0;
     }
@@ -165,15 +170,25 @@ auto AtomicRequest::operator=(AtomicRequest &&other) noexcept -> AtomicRequest &
 auto AtomicRequest::AddProperty(uint32_t objId, uint32_t propId, uint64_t value) -> void {
     // propId==0 means the driver doesn't expose this optional property (e.g. zpos, blend mode,
     // COLOR_RANGE on older kernels). Skipping silently avoids per-driver branches at every caller.
-    if (!request || propId == 0) {
+    if (propId == 0) {
+        return;
+    }
+    // A requested property that can't be staged poisons the request: a partial commit would
+    // apply a torn plane state.
+    if (!request) [[unlikely]] {
+        failed = true;
         return;
     }
     if (drmModeAtomicAddProperty(request, objId, propId, value) >= 0) {
         propCount++;
+    } else {
+        failed = true;
     }
 }
 
 [[nodiscard]] auto AtomicRequest::Count() const noexcept -> int { return propCount; }
+
+[[nodiscard]] auto AtomicRequest::Failed() const noexcept -> bool { return failed; }
 
 [[nodiscard]] auto AtomicRequest::Handle() const noexcept -> drmModeAtomicReq * { return request; }
 
@@ -289,7 +304,9 @@ auto cVaapiDisplay::BeginStreamSwitch() -> void {
         pendingDepth.store(0, std::memory_order_release);
         frameSlotCond.Broadcast();
     }
-    WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS);
+    if (!WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS)) [[unlikely]] {
+        esyslog("vaapivideo/display: timed out waiting for page flip before stream switch");
+    }
     importMutex.Lock();
     // Reset under importMutex so an in-flight fresh commit cannot republish a pre-Clear timestamp.
     lastFrameCommitMs.store(0, std::memory_order_release);
@@ -310,6 +327,26 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     if (fileDescriptor < 0 || !hwDevice) [[unlikely]] {
         esyslog("vaapivideo/display: invalid parameters");
         return false;
+    }
+
+    if (ready.load(std::memory_order_acquire)) [[unlikely]] {
+        esyslog("vaapivideo/display: Initialize called while already initialized");
+        return false;
+    }
+
+    // Wipe probe state from a failed prior attempt: BindDrmPlane assigns the video slot only
+    // while videoPlaneId==0, so a stale ID would route NV12 to the OSD slot on retry.
+    displayCaps = {};
+    hdrProps = {};
+    modesetProps = {};
+    osdPlaneId = 0;
+    osdProps = {};
+    videoPlaneId = 0;
+    videoProps = {};
+    {
+        const cMutexLock lock(&osdMutex);
+        currentOsd = {};
+        osdDirty = false;
     }
 
     drmFd = fileDescriptor;
@@ -342,8 +379,10 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     refreshRate = displayMode.vrefresh > 0 ? displayMode.vrefresh : 50;
     aspectRatio = static_cast<double>(outputWidth) / static_cast<double>(outputHeight);
 
-    hwDeviceRef = av_buffer_ref(hwDevice);
-    if (!hwDeviceRef) {
+    // Local guard until init succeeds: failure paths never set ready, so Shutdown() -- the
+    // usual owner of the unref -- would early-return and leak a member ref.
+    std::unique_ptr<AVBufferRef, FreeAVBufferRef> hwDeviceGuard{av_buffer_ref(hwDevice)};
+    if (!hwDeviceGuard) {
         esyslog("vaapivideo/display: failed to ref hw device");
         return false;
     }
@@ -375,6 +414,7 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         return false;
     }
 
+    hwDeviceRef = hwDeviceGuard.release();
     ready.store(true, std::memory_order_release);
     Start();
 
@@ -599,21 +639,29 @@ auto cVaapiDisplay::Shutdown() -> void {
             return false;
         }
 
-        // Slice infinite waits into 1 s windows so a stream switch isn't blocked indefinitely.
-        const int waitMs = (timeoutMs < 0) ? 1000 : timeoutMs;
-        const cTimeMs deadline(waitMs);
-        while (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS && ready.load(std::memory_order_relaxed) &&
-               !deadline.TimedOut()) {
+        // timeoutMs < 0 blocks until a slot opens; per-slice isClearing/ready checks keep an
+        // "infinite" wait from outliving a stream switch or shutdown.
+        const cTimeMs deadline(timeoutMs > 0 ? timeoutMs : 0);
+        while (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS && ready.load(std::memory_order_relaxed)) {
             if (isClearing.load(std::memory_order_relaxed)) {
                 return false;
+            }
+            if (timeoutMs > 0 && deadline.TimedOut()) {
+                break;
             }
             frameSlotCond.TimedWait(bufferMutex, 10);
         }
 
-        if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS || isClearing.load(std::memory_order_relaxed))
-            [[unlikely]] {
+        if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS) [[unlikely]] {
             return false;
         }
+    }
+
+    // Re-check under bufferMutex: both teardown paths set their flag before taking bufferMutex
+    // to drop the queue, so either the flag is visible here or this push is swept by the
+    // clear -- a stale frame can never survive into the new stream.
+    if (!ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
+        return false;
     }
 
     pendingFrames.push_back(std::move(frame));
@@ -771,8 +819,9 @@ auto cVaapiDisplay::Action() -> void {
             {
                 const cMutexLock lock(&bufferMutex);
                 if (pendingBuffer.IsValid()) {
-                    (void)PresentBuffer(pendingBuffer);
-                    didPresent = true;
+                    // Failure falls through to the SleepMs(5) below -- an immediate retry
+                    // would busy-spin while the kernel keeps rejecting the plane state.
+                    didPresent = PresentBuffer(pendingBuffer);
                 }
             }
             // bufferMutex is intentionally released BEFORE the underrun tracking and the
@@ -880,6 +929,15 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags, bool osdHdrCommit) -> bool {
+    if (!req.Handle() || req.Failed()) [[unlikely]] {
+        // Incomplete request (alloc failure): reporting success would let PresentBuffer RmFB
+        // the framebuffer KMS still scans out. No errno -- the failure was at build time.
+        if (atomicFailureLogCooldown.TimedOut()) {
+            esyslog("vaapivideo/display: failed to build atomic request (out of memory?)");
+            atomicFailureLogCooldown.Set(DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS);
+        }
+        return false;
+    }
     if (req.Count() == 0) {
         return true; // empty commit -- nothing to do, treat as success
     }
@@ -937,7 +995,11 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
     // Pure-video / SDR / HDR-transition flips are fastset-eligible (scale_vaapi emits the final fb
     // size), so an EINVAL here is a genuinely invalid plane state -- surface it loud, no retry.
-    esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
+    // Rate-limited: the 5 ms re-present retry path would otherwise emit this at up to 200 Hz.
+    if (atomicFailureLogCooldown.TimedOut()) {
+        esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
+        atomicFailureLogCooldown.Set(DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS);
+    }
     return false;
 }
 
@@ -976,6 +1038,10 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 
     if (!AtomicCommit(req, DRM_MODE_ATOMIC_ALLOW_MODESET)) {
         esyslog("vaapivideo/display: failed to set mode");
+        if (drmModeDestroyPropertyBlob(drmFd, modeBlobId) != 0) [[unlikely]] {
+            esyslog("vaapivideo/display: failed to destroy rejected mode blob: %s", std::strerror(errno));
+        }
+        modeBlobId = 0;
         return false;
     }
 
@@ -1074,20 +1140,29 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                 if (blobId != 0) {
                     auto blob = std::unique_ptr<drmModePropertyBlobRes, decltype(&drmModeFreePropertyBlob)>(
                         drmModeGetPropertyBlob(drmFd, blobId), drmModeFreePropertyBlob);
-                    if (blob && blob->data) {
+                    if (blob && blob->data && blob->length >= sizeof(drm_format_modifier_blob)) {
                         const auto *modBlob = static_cast<const drm_format_modifier_blob *>(blob->data);
                         const auto *base = static_cast<const uint8_t *>(blob->data);
-                        // drm_format_modifier_blob: formats_offset is a byte offset into the same
-                        // buffer where the uint32_t format[] array begins (DRM ABI, not a pointer).
-                        const auto *formats =
-                            reinterpret_cast<const uint32_t *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-                                base + modBlob->formats_offset);
-
-                        for (uint32_t k = 0; k < modBlob->count_formats; ++k) {
-                            if (formats[k] == format) {
-                                hasFormatSupport = true;
-                            } else if (formats[k] == DRM_FORMAT_P010) {
-                                tempProps.supportsP010 = true;
+                        // drm_format_modifier_blob: formats_offset is a byte offset to the
+                        // uint32_t format[] array (DRM ABI, not a pointer). Bound it to
+                        // [header end, blob length] so a buggy driver blob can't cause an OOB
+                        // read or alias header fields as fourccs; memcpy because a malformed
+                        // offset may be unaligned.
+                        const uint64_t formatsBegin = static_cast<uint64_t>(modBlob->formats_offset);
+                        const uint64_t formatsEnd =
+                            formatsBegin + static_cast<uint64_t>(modBlob->count_formats) * sizeof(uint32_t);
+                        if (formatsBegin >= sizeof(*modBlob) && formatsEnd <= blob->length) {
+                            for (uint32_t k = 0; k < modBlob->count_formats; ++k) {
+                                uint32_t planeFormat = 0;
+                                const size_t formatOffset =
+                                    static_cast<size_t>(formatsBegin) + static_cast<size_t>(k) * sizeof(planeFormat);
+                                std::memcpy(&planeFormat, base + formatOffset, sizeof(planeFormat));
+                                if (planeFormat == DRM_FORMAT_P010) {
+                                    tempProps.supportsP010 = true;
+                                }
+                                if (planeFormat == format) {
+                                    hasFormatSupport = true;
+                                }
                             }
                         }
                     }
@@ -1980,19 +2055,20 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     return success;
 }
 
-auto cVaapiDisplay::WaitForPageFlip(int timeoutMs) -> void {
+[[nodiscard]] auto cVaapiDisplay::WaitForPageFlip(int timeoutMs) -> bool {
     // Called from BeginStreamSwitch() on the main thread BEFORE taking importMutex (the
     // ordering rule documented at the top of this file). DrainDrmEvents() here works
     // because the consumer thread runs poll() too -- only one caller actually sees a
     // given event, and isFlipPending's release/acquire serializes the result.
     const cTimeMs deadline(timeoutMs);
-    while (isFlipPending.load(std::memory_order_relaxed) && !deadline.TimedOut()) {
-        // Bail on shutdown / stream-switch so callers don't sit through the full timeout
-        // when the answer is "tearing down anyway".
-        if (stopping.load(std::memory_order_relaxed) || !ready.load(std::memory_order_relaxed) ||
-            isClearing.load(std::memory_order_relaxed)) {
-            break;
+    while (isFlipPending.load(std::memory_order_acquire) && !deadline.TimedOut()) {
+        // Shutdown bail reports success -- "tearing down anyway" is not a drain failure.
+        // isClearing must NOT bail: BeginStreamSwitch() sets it before calling, so bailing
+        // would make this wait a no-op for its only caller.
+        if (stopping.load(std::memory_order_relaxed) || !ready.load(std::memory_order_relaxed)) {
+            return true;
         }
         (void)DrainDrmEvents(5);
     }
+    return !isFlipPending.load(std::memory_order_acquire);
 }

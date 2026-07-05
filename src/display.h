@@ -45,12 +45,14 @@ class AtomicRequest {
     auto AddProperty(uint32_t objId, uint32_t propId, uint64_t value)
         -> void; ///< Append (objId, propId, value); silently skips propId==0 (optional property absent on this driver)
     [[nodiscard]] auto Count() const noexcept -> int;
+    [[nodiscard]] auto Failed() const noexcept -> bool; ///< True if any requested property could not be staged
     [[nodiscard]] auto Handle() const noexcept -> drmModeAtomicReq *;
 
   private:
     // ========================================================================
     // === STATE ===
     // ========================================================================
+    bool failed{};               ///< True once alloc or a property append failed (request incomplete)
     int propCount{};             ///< Properties accumulated so far
     drmModeAtomicReq *request{}; ///< Owned DRM atomic request handle
 };
@@ -338,9 +340,9 @@ class cVaapiDisplay : public cThread {
     static auto OnPageFlipEvent(int fd, unsigned int seq, unsigned int sec, unsigned int usec, void *data) -> void;
     /// Submit a page-flip for @p fb, bundling any pending OSD change in the same atomic commit.
     [[nodiscard]] auto PresentBuffer(const DrmFramebuffer &fb) -> bool;
-    /// Spin-drain DRM events until the in-flight flip completes or @p timeoutMs elapses.
-    /// Must be called before taking importMutex in BeginStreamSwitch().
-    auto WaitForPageFlip(int timeoutMs) -> void;
+    /// Spin-drain DRM events until the in-flight flip completes or @p timeoutMs elapses;
+    /// false iff the flip is still pending. Must precede importMutex in BeginStreamSwitch().
+    [[nodiscard]] auto WaitForPageFlip(int timeoutMs) -> bool;
 
     // ========================================================================
     // === STATE ===
@@ -348,18 +350,19 @@ class cVaapiDisplay : public cThread {
 
     drmModeModeInfo activeMode{};                     ///< Currently programmed display mode
     double aspectRatio{DISPLAY_DEFAULT_ASPECT_RATIO}; ///< Output pixel aspect ratio (width/height)
-    mutable cMutex bufferMutex;                       ///< Guards pendingFrames, pendingBuffer, displayedBuffer
-    uint32_t connectorId{};                           ///< DRM connector object ID
-    uint32_t crtcId{};                                ///< DRM CRTC object ID
-    OsdOverlay currentOsd{};                          ///< OSD staged for the next commit (guarded by osdMutex)
-    DrmFramebuffer displayedBuffer; ///< Front buffer currently being scanned out; kept alive until flip completes
-    int drmFd{-1};                  ///< Borrowed DRM fd; lifetime owned by cVaapiDevice
-    drmEventContext eventContext{}; ///< libdrm event dispatch table; only page_flip_handler is wired
-    cCondVar frameSlotCond;         ///< Signaled when a pendingFrames slot opens up (under bufferMutex)
-    std::atomic<bool> hasExited;    ///< Set by Action() just before return; Shutdown() polls this
-    AVBufferRef *hwDeviceRef{};     ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
-    mutable cMutex importMutex;     ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
-                                ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
+    cTimeMs atomicFailureLogCooldown{0}; ///< Rate-limits commit-failure logs; display-thread-only like AtomicCommit
+    mutable cMutex bufferMutex;          ///< Guards pendingFrames, pendingBuffer, displayedBuffer
+    uint32_t connectorId{};              ///< DRM connector object ID
+    uint32_t crtcId{};                   ///< DRM CRTC object ID
+    OsdOverlay currentOsd{};             ///< OSD staged for the next commit (guarded by osdMutex)
+    DrmFramebuffer displayedBuffer;      ///< Front buffer currently being scanned out; kept alive until flip completes
+    int drmFd{-1};                       ///< Borrowed DRM fd; lifetime owned by cVaapiDevice
+    drmEventContext eventContext{};      ///< libdrm event dispatch table; only page_flip_handler is wired
+    cCondVar frameSlotCond;              ///< Signaled when a pendingFrames slot opens up (under bufferMutex)
+    std::atomic<bool> hasExited;         ///< Set by Action() just before return; Shutdown() polls this
+    AVBufferRef *hwDeviceRef{};          ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
+    mutable cMutex importMutex;   ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
+                                  ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
     mutable cMutex vaDriverMutex; ///< Serializes VA-driver calls: MapVaapiFrame (display) vs VPP pull (decoder).
                                   ///< iHD VEBOX is not re-entrant when shared with filter execution.
     std::atomic<bool> isClearing; ///< Set during stream switch; gates new frame imports in Action() and SubmitFrame()
