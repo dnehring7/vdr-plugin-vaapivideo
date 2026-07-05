@@ -84,7 +84,9 @@ struct VideoPlacement {
 ///
 /// Thread safety: SubmitFrame(), SetOsd(), BeginStreamSwitch(), EndStreamSwitch() are
 /// safe from any thread. Initialize() and Shutdown() must be called from the same thread.
-/// Lock order: importMutex -> bufferMutex -> osdMutex; videoRectMutex is leaf. See display.cpp.
+/// Lock order: importMutex -> vaDriverMutex; importMutex -> bufferMutex; bufferMutex may
+/// precede videoRectMutex/osdMutex/hdrStateMutex, which are never nested with each other.
+/// See display.cpp.
 class cVaapiDisplay : public cThread {
   public:
     // ========================================================================
@@ -174,14 +176,12 @@ class cVaapiDisplay : public cThread {
     /// While set, the underrun detector ignores re-presents -- they reflect the sleep, not a stall.
     /// Decoder pairs each SleepMs with on/off so the suppression window matches the actual sleep.
     auto SetSyncSleeping(bool enable) noexcept -> void { syncSleeping.store(enable, std::memory_order_relaxed); }
-    /// Device is paused (cVaapiDevice::Freeze() / Play()): the decoder is intentionally holding
-    /// the drain so no fresh frames arrive. While set, the underrun detector ignores re-presents
-    /// so a pause does not spam "queue empty Nms; total=N" at vsync rate for the DISPLAY_UNDERRUN_IDLE_MAX_MS
-    /// window (the existing 10 s catch-all already handles longer pauses, but a normal pause is
-    /// short enough that the per-vsync log fires several times before the catch-all kicks in).
+    /// Device is paused (cVaapiDevice::Freeze()/Play()): the drain holds deliberately, so the
+    /// underrun detector ignores re-presents -- a short pause would otherwise spam "queue empty"
+    /// before the idle catch-all kicks in.
     auto SetDevicePaused(bool enable) noexcept -> void { devicePaused.store(enable, std::memory_order_relaxed); }
-    /// Hand a decoded frame to the display thread (single-slot queue).
-    /// timeoutMs: -1 = block indefinitely (decoder's VSync backpressure), 0 = non-blocking, >0 = ms.
+    /// Hand a decoded frame to the display thread (DISPLAY_PRERENDER_SLOTS-deep queue).
+    /// timeoutMs: -1 = block until a slot opens (VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
     /// Lock-free pendingFrames depth poll. Decoder uses depth==0 to decide whether to pre-submit
     /// one frame ahead of strict-due (avoids a VSync re-present from audio-clock vs VSync drift).
@@ -340,8 +340,10 @@ class cVaapiDisplay : public cThread {
     static auto OnPageFlipEvent(int fd, unsigned int seq, unsigned int sec, unsigned int usec, void *data) -> void;
     /// Submit a page-flip for @p fb, bundling any pending OSD change in the same atomic commit.
     [[nodiscard]] auto PresentBuffer(const DrmFramebuffer &fb) -> bool;
-    /// Spin-drain DRM events until the in-flight flip completes or @p timeoutMs elapses;
-    /// false iff the flip is still pending. Must precede importMutex in BeginStreamSwitch().
+    /// Wait until the consumer drains the in-flight flip or @p timeoutMs elapses. Returns false
+    /// only when normal stream-switch waiting timed out with the flip still pending; teardown
+    /// returns true because the wait result no longer matters. Observe-only (never touches the
+    /// DRM fd -- see the regression note in the definition).
     [[nodiscard]] auto WaitForPageFlip(int timeoutMs) -> bool;
 
     // ========================================================================
@@ -359,19 +361,20 @@ class cVaapiDisplay : public cThread {
     int drmFd{-1};                       ///< Borrowed DRM fd; lifetime owned by cVaapiDevice
     drmEventContext eventContext{};      ///< libdrm event dispatch table; only page_flip_handler is wired
     cCondVar frameSlotCond;              ///< Signaled when a pendingFrames slot opens up (under bufferMutex)
-    std::atomic<bool> hasExited;         ///< Set by Action() just before return; Shutdown() polls this
+    std::atomic<bool> hasExited{false};  ///< Set by Action() just before return; Shutdown() polls this
     AVBufferRef *hwDeviceRef{};          ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
     mutable cMutex importMutex;   ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
                                   ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
     mutable cMutex vaDriverMutex; ///< Serializes VA-driver calls: MapVaapiFrame (display) vs VPP pull (decoder).
                                   ///< iHD VEBOX is not re-entrant when shared with filter execution.
-    std::atomic<bool> isClearing; ///< Set during stream switch; gates new frame imports in Action() and SubmitFrame()
-    std::atomic<bool> isFlipPending;             ///< True between commit and page-flip event; Action() waits on this
+    std::atomic<bool> isClearing{
+        false}; ///< Set during stream switch; gates new frame imports in Action() and SubmitFrame()
+    std::atomic<bool> isFlipPending{false};      ///< True between commit and page-flip event; Action() waits on this
     std::atomic<uint64_t> flipPendingSinceMs{0}; ///< cTimeMs::Now() when isFlipPending was set; 0 = not pending.
                                                  ///< Action() force-clears the flag if no event arrives within a
                                                  ///< few vblanks (kernel can swallow events on first plane attach).
-    std::atomic<bool> ready;                     ///< True after Initialize() succeeds; cleared first in Shutdown()
-    std::atomic<bool> stopping; ///< Tells Action() to exit; set after isClearing to avoid import/exit race
+    std::atomic<bool> ready{false};              ///< True after Initialize() succeeds; cleared first in Shutdown()
+    std::atomic<bool> stopping{false}; ///< Tells Action() to exit; set after isClearing to avoid import/exit race
     std::atomic<bool> trickActive{
         false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses underrun log
     std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
@@ -386,6 +389,9 @@ class cVaapiDisplay : public cThread {
     ModesetProps modesetProps{};                ///< Cached CRTC + connector prop IDs for modeset commits
     mutable cMutex osdMutex;                    ///< Guards currentOsd and osdDirty
     bool osdDirty{};                            ///< True from SetOsd() until PresentBuffer() commits it
+    uint64_t osdGeneration{};                   ///< Bumps on every staged OSD update (guarded by osdMutex);
+                                                ///< PresentBuffer clears osdDirty only for the generation it
+                                                ///< committed, so a SetOsd racing the commit stays queued.
     uint32_t osdPlaneId{};                      ///< DRM plane object ID for OSD (0 = no overlay plane on this hardware)
     DrmPlaneProps osdProps{};                   ///< Cached atomic prop IDs for the OSD plane
     uint32_t outputHeight{DISPLAY_DEFAULT_HEIGHT}; ///< Active display height in pixels

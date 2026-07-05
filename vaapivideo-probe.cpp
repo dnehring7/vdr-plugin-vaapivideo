@@ -904,6 +904,33 @@ auto PrintSinkHdrCaps(int fd, const std::vector<PropEntry> &props) -> void {
     std::printf("      Dolby Vision (sink)     %s\n", yn(caps.dolbyVision));
 }
 
+// The connector only carries its mode *list*; the mode actually scanning out lives on the
+// CRTC reached through the connector's active encoder.
+auto PrintCurrentConnectorMode(int fd, const drmModeConnector *c) -> void {
+    uint32_t crtcId = 0;
+    if (c->encoder_id != 0) {
+        if (drmModeEncoder *enc = drmModeGetEncoder(fd, c->encoder_id); enc != nullptr) {
+            crtcId = enc->crtc_id;
+            drmModeFreeEncoder(enc);
+        }
+    }
+    if (crtcId == 0) {
+        std::printf("    current mode:             (no CRTC active)\n");
+        return;
+    }
+    drmModeCrtc *crtc = drmModeGetCrtc(fd, crtcId);
+    if (crtc == nullptr) {
+        return;
+    }
+    if (crtc->mode_valid != 0) {
+        std::printf("    current mode:             %ux%u@%uHz (crtc %u)\n", crtc->mode.hdisplay, crtc->mode.vdisplay,
+                    crtc->mode.vrefresh, crtcId);
+    } else {
+        std::printf("    current mode:             (crtc %u active, no mode programmed)\n", crtcId);
+    }
+    drmModeFreeCrtc(crtc);
+}
+
 auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
     std::printf("\n--- DRM Connectors ---\n");
     uint32_t disconnected = 0;
@@ -923,6 +950,7 @@ auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
             const drmModeModeInfo &m = c->modes[0];
             std::printf("    preferred mode:           %ux%u@%uHz\n", m.hdisplay, m.vdisplay, m.vrefresh);
         }
+        PrintCurrentConnectorMode(fd, c);
         const auto props = LoadObjectProps(fd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR);
         std::printf("    HDR_OUTPUT_METADATA       %s\n",
                     FindProp(props, "HDR_OUTPUT_METADATA") != nullptr ? "yes" : "no");

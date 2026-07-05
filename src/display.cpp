@@ -10,10 +10,12 @@
  *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down.
  *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
- * Lock order: importMutex -> bufferMutex -> osdMutex; videoRectMutex is leaf.
- * WaitForPageFlip() MUST complete before BeginStreamSwitch() takes importMutex;
- * reversing that order deadlocks because the consumer cannot drain DRM events while
- * importMutex is held by the main thread.
+ * Lock order: importMutex -> vaDriverMutex (frame import); importMutex -> bufferMutex.
+ * PresentBuffer() may run under bufferMutex; its leaf locks
+ * {videoRectMutex, osdMutex, hdrStateMutex} are never nested with each other.
+ * DRM fd rule: the consumer thread is the ONLY drmHandleEvent dispatcher while Action()
+ * runs; WaitForPageFlip() observes isFlipPending without touching the fd. A second reader
+ * was bisect-verified to permanently halve the post-switch present cadence on i915/UHD.
  */
 
 #include "display.h"
@@ -294,8 +296,8 @@ auto cVaapiDisplay::AwaitOsdHidden(uint32_t fbId) -> void {
 }
 
 auto cVaapiDisplay::BeginStreamSwitch() -> void {
-    // Order matters: gate consumer, drop queue (unblock submitters), drain flip BEFORE
-    // taking importMutex (reversed = deadlock), then hold importMutex for codec teardown.
+    // Order matters: gate consumer, drop queue (unblock submitters), try to let the consumer
+    // drain the in-flight flip, then hold importMutex for codec teardown.
     // displayedBuffer/pendingBuffer stay alive so the last frame remains on screen.
     isClearing.store(true, std::memory_order_release);
     {
@@ -304,6 +306,8 @@ auto cVaapiDisplay::BeginStreamSwitch() -> void {
         pendingDepth.store(0, std::memory_order_release);
         frameSlotCond.Broadcast();
     }
+    // Best-effort (see WaitForPageFlip): if this times out, old buffers remain alive and
+    // the consumer still owns DRM event dispatch, but the drain was not confirmed.
     if (!WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS)) [[unlikely]] {
         esyslog("vaapivideo/display: timed out waiting for page flip before stream switch");
     }
@@ -347,6 +351,7 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         const cMutexLock lock(&osdMutex);
         currentOsd = {};
         osdDirty = false;
+        osdGeneration = 0;
     }
 
     drmFd = fileDescriptor;
@@ -373,6 +378,13 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     // Re-arm the OSD-over-HDR commit-path probe (see AtomicCommit).
     osdHdrNeedsModeset = false;
     osdHdrSuppressed = false;
+    // Re-arm lifecycle flags: Shutdown() leaves stopping/isClearing latched and hasExited set,
+    // so a re-Initialize()'d consumer thread would otherwise exit immediately.
+    hasExited.store(false, std::memory_order_release);
+    isClearing.store(false, std::memory_order_release);
+    isFlipPending.store(false, std::memory_order_release);
+    flipPendingSinceMs.store(0, std::memory_order_release);
+    stopping.store(false, std::memory_order_release);
     // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
     // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
     // are coupled; changing one without the other desyncs the A/V controllers.
@@ -481,6 +493,7 @@ auto cVaapiDisplay::ClearOsdIfActive(uint32_t fbId) -> void {
         dsyslog("vaapivideo/display: OSD hide (conditional) - fbId=%u", fbId);
         currentOsd = {};
         osdDirty = true;
+        ++osdGeneration;
     }
 }
 
@@ -505,6 +518,7 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
     // compressed pixels remain on screen.
     currentOsd = osd;
     osdDirty = true;
+    ++osdGeneration;
 }
 
 auto cVaapiDisplay::Shutdown() -> void {
@@ -548,8 +562,14 @@ auto cVaapiDisplay::Shutdown() -> void {
     }
 
     // Drain residual page-flip events: without this the kernel keeps them pending on the fd
-    // and the next process to open the DRM device inherits stale events.
-    for (int i = 0; i < DISPLAY_MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
+    // and the next process to open the DRM device inherits stale events. Only once the
+    // consumer has exited -- a wedged consumer may still be inside drmHandleEvent, and a
+    // second concurrent reader on the DRM fd is forbidden (see the file-header DRM fd rule).
+    if (hasExited.load(std::memory_order_acquire)) {
+        for (int i = 0; i < DISPLAY_MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
+        }
+    } else {
+        esyslog("vaapivideo/display: skipping residual DRM event drain -- display thread still running");
     }
 
     // Blank planes, reset HDR state, and deactivate the CRTC so fbcon or the next DRM client
@@ -676,31 +696,21 @@ auto cVaapiDisplay::Shutdown() -> void {
 auto cVaapiDisplay::Action() -> void {
     dsyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
 
-    // Queue-underrun tracker: measures the wall-clock duration of consecutive empty VSyncs
-    // during active playback. Warmup grace suppresses spurious counts after Clear/cold-start
-    // while the filter graph + audio anchor.
-    //
-    // Duration is taken directly from (nowMs - lastCommitMs) -- a wall-clock delta -- rather
-    // than a VSync count multiplied by a nominal vsyncMs. The latter lies when the consumer
-    // loop is preempted or page_flip events arrive late: a 4 s real-time stall could be
-    // mis-reported as 25 vsyncs * 20 ms (=500 ms) or, with a stale-reset bug, as 238 * 20 ms.
-    // Wall-clock makes the printed value true by construction.
-    // Tunables for this tracker are file-scope constants above (DISPLAY_UNDERRUN_* / DISPLAY_WARMUP_*).
-    //
-    // refreshRate is set once in Initialize() before Action() starts and stays constant for
-    // the consumer-thread lifetime, so vsyncMs / thresholdMs are loop invariants -- hoisted.
+    // Queue-underrun tracker: wall-clock duration of consecutive empty VSyncs during active
+    // playback; warmup grace suppresses spurious counts after Clear/cold-start while the
+    // filter graph + audio anchor. Durations are wall-clock deltas, never vsyncCount * nominal
+    // vsyncMs -- counts lie when the loop is preempted or flip events arrive late.
+    // refreshRate is set before Start() and never changes, so these are loop invariants.
     const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
     const uint64_t thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
     uint64_t gapStartMs = 0;      ///< Wall-clock baseline for the current gap; 0 = "anchor on next re-present".
-                                  ///< Reset on commit / isClearing / inTrick / inSyncSleep so a deliberate sleep
-                                  ///< or trick-pace exit does not surface its duration as a fake underrun.
+                                  ///< Reset on commit / isClearing / inTrick / inSyncSleep / inPause so deliberate
+                                  ///< holds do not surface their duration as a fake underrun.
     uint64_t peakGapMs = 0;       ///< Wall-clock peak duration of the current gap; reset on commit.
     unsigned emptyVSyncTotal = 0; ///< Cumulative empty-VSync count since the display thread started.
-    // cTimeMs(0) constructs a timer that's already timed out (begin == end == Now()), so
-    // TimedOut() returns true immediately. underrunLogCooldown: first log fires without delay.
-    // warmupGraceUntil: no grace active until the first fresh commit arms it via the
-    // prevCommitMs==0 branch below; before that the IsValid() gate on pendingBuffer prevents
-    // the underrun counter from running, so "no grace at construction" is the safe state.
+    // cTimeMs(0) starts timed-out: the first underrun log fires undelayed, and no warmup
+    // grace exists until the first fresh commit arms it (pendingBuffer.IsValid() gates the
+    // counter before that, so "no grace at construction" is safe).
     cTimeMs underrunLogCooldown(0);
     cTimeMs warmupGraceUntil(0);
 
@@ -738,13 +748,9 @@ auto cVaapiDisplay::Action() -> void {
             continue;
         }
 
-        // Trick play: decoder commits at the trick hold (60-2000 ms), so most VSyncs re-present.
-        // That's not an underrun; clear the counters so trick-exit doesn't carry a stale peak
-        // OR a stale gapStartMs (which would otherwise log the trick hold itself as an underrun).
-        // Sync sleep (hard-ahead / soft-ahead): decoder is deliberately paused inside a correction
-        // sleep, so re-presents during that window are intentional, not underruns. Same reset --
-        // gapStartMs=0 means the post-sleep re-present re-anchors instead of reporting the
-        // sleep duration as a gap.
+        // Trick hold, sync-correction sleep, and pause all re-present deliberately -- not
+        // underruns. Reset both counters so the window's duration doesn't surface as a fake
+        // underrun the moment it ends (gapStartMs=0 re-anchors on the next re-present).
         const bool inTrick = trickActive.load(std::memory_order_relaxed);
         const bool inSyncSleep = syncSleeping.load(std::memory_order_relaxed);
         const bool inPause = devicePaused.load(std::memory_order_relaxed);
@@ -824,19 +830,14 @@ auto cVaapiDisplay::Action() -> void {
                     didPresent = PresentBuffer(pendingBuffer);
                 }
             }
-            // bufferMutex is intentionally released BEFORE the underrun tracking and the
-            // SleepMs() below. Holding it across the sleep on the pre-first-frame startup
-            // path (when pendingBuffer is invalid every iteration) starves SubmitFrame()
-            // for seconds -- pthread mutexes are not FIFO, and re-acquiring tightly in
-            // this loop won the race against the decoder thread reliably enough to push
-            // first-picture latency from ms to seconds.
+            // bufferMutex is released BEFORE the tracking and SleepMs below: pthread mutexes
+            // are not FIFO, and holding it across the pre-first-frame sleep starved
+            // SubmitFrame() badly enough to push first-picture latency from ms to seconds.
             if (didPresent) {
-                // Only count an underrun when decoder was previously active AND past warmup
-                // grace. Gap duration is measured from gapStartMs (NOT lastFrameCommitMs):
-                // anchoring on the first re-present in a streak means a deliberate hard-ahead
-                // sleep, trick hold or stream-switch does not surface its own duration as a fake
-                // underrun the moment it ends. Beyond DISPLAY_UNDERRUN_IDLE_MAX_MS we stop accumulating so
-                // a paused stream doesn't grow peakGapMs without bound.
+                // Count only when the decoder was active AND past warmup grace. Gaps anchor on
+                // gapStartMs (first re-present), NOT lastFrameCommitMs, so a deliberate sleep /
+                // trick hold / stream switch doesn't surface its own duration as a fake
+                // underrun. Past DISPLAY_UNDERRUN_IDLE_MAX_MS stop accumulating (paused stream).
                 const uint64_t nowMs = cTimeMs::Now();
                 const uint64_t lastCommitMs = lastFrameCommitMs.load(std::memory_order_acquire);
                 if (!inTrick && !inSyncSleep && !inPause && lastCommitMs != 0 && warmupGraceUntil.TimedOut()) {
@@ -853,10 +854,9 @@ auto cVaapiDisplay::Action() -> void {
                             underrunLogCooldown.Set(DISPLAY_UNDERRUN_LOG_INTERVAL_MS);
                         }
                     } else {
-                        // Gap exceeded DISPLAY_UNDERRUN_IDLE_MAX_MS: treat as paused / stopped, not as an
-                        // underrun. Clear peak so the recovery log stays silent on resume;
-                        // gapStartMs stays put so we don't re-anchor and start a fresh accounting
-                        // window every iteration during a long pause.
+                        // Paused/stopped, not an underrun: clear peak so the recovery log stays
+                        // silent on resume; gapStartMs stays put to avoid re-anchoring a fresh
+                        // accounting window every iteration.
                         peakGapMs = 0;
                     }
                 } else {
@@ -1049,7 +1049,10 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // Mark applied state as Sdr so MaybeAppendHdrOutputState() skips the first frame's
     // HDR write (staged==applied), keeping subsequent page flips in the non-ALLOW_MODESET
     // fast path and preventing spurious AVR retrains during IEC61937 lock-in.
-    appliedHdrState = HdrStreamInfo{};
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        appliedHdrState = HdrStreamInfo{};
+    }
     appliedHdrBlobId = 0;
     // Fresh CDCLK headroom: re-probe so a smaller HDR mode isn't needlessly forced onto sync commits.
     osdHdrNeedsModeset = false;
@@ -1295,15 +1298,21 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
 }
 
 [[nodiscard]] auto cVaapiDisplay::DrainDrmEvents(int timeoutMs) -> bool {
-    // Single-consumer in steady state. Shutdown() also calls this from the main thread,
-    // but only after hasExited is set, so there is never concurrent access.
+    // The consumer thread is the ONLY caller while Action() runs; Shutdown() drains from
+    // the main thread only after hasExited. WaitForPageFlip() deliberately does NOT call
+    // this (see the regression note there) -- never add a second concurrent reader.
+    if (drmFd < 0) [[unlikely]] {
+        return false;
+    }
     pollfd pfd{.fd = drmFd, .events = POLLIN, .revents = 0};
     const int ret = poll(&pfd, 1, timeoutMs);
 
-    if (ret > 0 && (pfd.revents & POLLIN)) {
-        return drmHandleEvent(drmFd, &eventContext) == 0;
+    // Reject error revents: dispatching after POLLERR/POLLHUP (device gone, TTY switch)
+    // would hand drmHandleEvent a dead fd.
+    if (ret <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 || (pfd.revents & POLLIN) == 0) {
+        return false;
     }
-    return false;
+    return drmHandleEvent(drmFd, &eventContext) == 0;
 }
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
@@ -1577,10 +1586,16 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 
 [[nodiscard]] auto cVaapiDisplay::MaybeAppendHdrOutputState(AtomicRequest &req, bool &failed) -> bool {
     failed = false;
-    // Held across staged-read and appliedHdrState write so GetActiveHdrKind() never sees a torn snapshot.
-    const cMutexLock lock(&hdrStateMutex);
-    const HdrStreamInfo staged = stagedHdrState;
-    if (HdrOutputStateEqual(staged, appliedHdrState)) {
+    // hdrStateMutex guards the multi-word struct snapshots; keep the blob-create ioctl below
+    // outside the lock so it can't stall the decoder's SetHdrOutputState.
+    HdrStreamInfo staged;
+    HdrStreamInfo applied;
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        staged = stagedHdrState;
+        applied = appliedHdrState;
+    }
+    if (HdrOutputStateEqual(staged, applied)) {
         return false; // ApplyDisplayMode() pre-programmed the SDR baseline, so the first
                       // real frame with staged == Sdr legitimately skips the write here.
     }
@@ -1620,11 +1635,14 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     }
 
     // Optimistically promote the new blob; PresentBuffer() rolls back on commit failure.
-    // Blob IDs (uint32_t) are display-thread-only, no SVDRP reader, so the lock above is
-    // strictly for appliedHdrState.
+    // Blob IDs are display-thread-only (no lock); appliedHdrState is only ever touched
+    // under hdrStateMutex.
     pendingDestroyHdrBlobId = appliedHdrBlobId;
     appliedHdrBlobId = newBlobId;
-    appliedHdrState = staged;
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        appliedHdrState = staged;
+    }
     if (appended) {
         isyslog("vaapivideo/display: HDR state -- committing kind=%s blob=%u", StreamHdrKindName(staged.kind),
                 newBlobId);
@@ -1789,10 +1807,9 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] unsigned int seq,
                                     [[maybe_unused]] unsigned int sec, [[maybe_unused]] unsigned int usec, void *data)
     -> void {
-    // libdrm dispatches this from drmHandleEvent() on the consumer thread (drmHandleEvent is
-    // never called from anywhere else). The `data` cookie is the `this` pointer passed to
-    // drmModeAtomicCommit. Release-store on isFlipPending makes the consumer's next
-    // acquire-load see "flip done" and submit the next frame.
+    // Dispatched from drmHandleEvent() on the consumer thread (sole reader while Action()
+    // runs -- file-header DRM fd rule). `data` is the `this` cookie from drmModeAtomicCommit.
+    // Release-store on isFlipPending publishes "flip done" to acquire-loaders.
     auto *display = static_cast<cVaapiDisplay *>(data);
     if (display) {
         display->lastVSyncTimeMs.store(cTimeMs::Now(), std::memory_order_release);
@@ -1910,7 +1927,11 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 
     // HDR connector signaling: must precede the plane color-space write so the kernel sees one
     // coherent HDR picture per commit. Snapshot for rollback on commit failure.
-    const HdrStreamInfo previousHdrState = appliedHdrState;
+    HdrStreamInfo previousHdrState;
+    {
+        const cMutexLock lock(&hdrStateMutex);
+        previousHdrState = appliedHdrState;
+    }
     const uint32_t previousHdrBlobId = appliedHdrBlobId;
     bool hdrStateFailed = false;
     const bool hdrStateChanged = MaybeAppendHdrOutputState(req, hdrStateFailed);
@@ -1921,8 +1942,9 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // Plane state: write each stateful property only on change. Some drivers treat redundant
     // rewrites as transitions and reject them on the steady-state page-flip path. Cache advances
     // only on commit success so a failed commit retries cleanly next frame.
-    // appliedHdrState is display-thread-owned here, so this read needs no hdrStateMutex.
-    const bool hdrActive = appliedHdrState.kind != StreamHdrKind::Sdr;
+    // Read AFTER MaybeAppendHdrOutputState: the plane color space must match the connector
+    // state staged in this same commit.
+    const bool hdrActive = GetActiveHdrKind() != StreamHdrKind::Sdr;
     const uint64_t stagedColorEncoding = (hdrActive && videoProps.colorEncodingBt2020Valid)
                                              ? videoProps.colorEncodingBt2020
                                              : videoProps.colorEncodingBt709;
@@ -1965,6 +1987,7 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     const bool osdHidden = osdHdrSuppressed && hdrActive;
     bool osdCommitted = false;
     uint32_t osdFbId = 0;
+    uint64_t osdCommitGeneration = 0;
     uint32_t prevOsdFbId = 0;
     {
         const cMutexLock lock(&osdMutex);
@@ -1972,6 +1995,7 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         osdFbId = prevOsdFbId;
         if (osdDirty && (currentOsd.fbId == 0 || !osdHidden)) {
             osdCommitted = true;
+            osdCommitGeneration = osdGeneration;
             if (currentOsd.fbId != 0) {
                 osdFbId = AppendOsdPlane(req, currentOsd) ? currentOsd.fbId : 0;
             } else if (osdPlaneId != 0) {
@@ -2010,19 +2034,18 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
         lastVideoCrtcW = planeW;
         lastVideoCrtcH = planeH;
         if (osdCommitted) {
+            // osdDirty clears only on a landed commit -- a failed one (e.g. EBUSY) must keep
+            // the OSD update queued -- and only for the generation this commit actually staged:
+            // a SetOsd racing the commit (e.g. in-place repaint of the same fbId) must stay dirty.
             const cMutexLock lock(&osdMutex);
             lastCommittedOsdFbId = osdFbId;
+            if (osdGeneration == osdCommitGeneration) {
+                osdDirty = false;
+            }
             if (osdFbId != 0) {
                 lastOsdPixelBlendMode = 1; // AppendOsdPlane wrote it iff it differed.
             }
         }
-    }
-
-    // Only clear osdDirty when the commit actually landed -- a failed commit (e.g. EBUSY)
-    // must keep the OSD update queued for the next attempt.
-    if (success && osdCommitted) {
-        const cMutexLock lock(&osdMutex);
-        osdDirty = false;
     }
 
     // HDR blob lifecycle. On success the kernel has taken over the reference; drop the
@@ -2056,19 +2079,18 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 }
 
 [[nodiscard]] auto cVaapiDisplay::WaitForPageFlip(int timeoutMs) -> bool {
-    // Called from BeginStreamSwitch() on the main thread BEFORE taking importMutex (the
-    // ordering rule documented at the top of this file). DrainDrmEvents() here works
-    // because the consumer thread runs poll() too -- only one caller actually sees a
-    // given event, and isFlipPending's release/acquire serializes the result.
+    // Observe-only wait for the consumer to drain the in-flight flip before BeginStreamSwitch()
+    // takes importMutex (its flip-pending branch runs ahead of the isClearing check, so it
+    // drains even mid-switch). NEVER drain the fd from here: a second drmHandleEvent reader
+    // was bisect-verified to permanently halve the post-switch present cadence on i915/UHD.
+    // Best-effort: a commit racing importMutex.Lock() can leave a flip in flight; old buffers
+    // stay alive while the consumer continues to own DRM event dispatch.
     const cTimeMs deadline(timeoutMs);
     while (isFlipPending.load(std::memory_order_acquire) && !deadline.TimedOut()) {
-        // Shutdown bail reports success -- "tearing down anyway" is not a drain failure.
-        // isClearing must NOT bail: BeginStreamSwitch() sets it before calling, so bailing
-        // would make this wait a no-op for its only caller.
         if (stopping.load(std::memory_order_relaxed) || !ready.load(std::memory_order_relaxed)) {
-            return true;
+            return true; // teardown no longer needs a stream-switch drain result
         }
-        (void)DrainDrmEvents(5);
+        cCondWait::SleepMs(1);
     }
     return !isFlipPending.load(std::memory_order_acquire);
 }
