@@ -178,6 +178,6 @@ auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) noexcept
 /// Render a CEA-861 speaker-allocation mask (AudioSinkCaps::speakerAlloc) as a human-readable list of the
 /// speaker groups it advertises, e.g. "FL/FR LFE FC RL/RR RC RLC/RRC"; "none" when the mask is zero. Pure;
 /// used only for the sink-capabilities diagnostic log.
-[[nodiscard]] auto DescribeSpeakerAlloc(uint8_t alloc) -> std::string;
+[[nodiscard]] auto DescribeSpeakerAlloc(uint8_t alloc) noexcept -> std::string;
 
 #endif // VDR_VAAPIVIDEO_CAPS_H

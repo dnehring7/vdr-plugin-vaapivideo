@@ -495,7 +495,7 @@ auto cSubtitleConverter::Shutdown() -> void {
     stopping_.store(true, std::memory_order_release);
     Cancel(SUBTITLE_SHUTDOWN_TIMEOUT_S); // join Action(): from here this thread solely owns the OSD
     if (!hasExited_.load(std::memory_order_acquire)) {
-        // Cancel() timed out and force-cancelled mid-Action(); the OSD it owns may be half-torn-down.
+        // Cancel() timed out and force-canceled mid-Action(); the OSD it owns may be half-torn-down.
         esyslog("vaapivideo/subtitle: subtitle thread did not exit cleanly");
     }
 

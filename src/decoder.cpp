@@ -1804,7 +1804,7 @@ auto cVaapiDecoder::PresentAction() -> void {
 
 namespace {
 // DVB streams routinely omit color_description. Tag the matrix the resolution implies so scale_vaapi's
-// BT.709/tv conversion neither desaturates the colour nor washes out the levels: SD (<=576 lines) is
+// BT.709/tv conversion neither desaturates the color nor washes out the levels: SD (<=576 lines) is
 // BT.601 (BT.470BG PAL, by DVB convention), HD/UHD is BT.709 -- limited (MPEG) range either way. Only
 // UNSPECIFIED fields are filled, so an explicit bitstream/container value always wins; without this an
 // untagged buffersrc leaves scale_vaapi's input->BT.709 conversion driver-dependent.

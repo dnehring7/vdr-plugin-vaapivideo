@@ -983,7 +983,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             }
         }
         // A modeset was rejected too: the config exceeds the hardware bandwidth ceiling, which no
-        // flag can fix. Drop the OSD plane (PresentBuffer honours the latch) so the thread stops
+        // flag can fix. Drop the OSD plane (PresentBuffer honors the latch) so the thread stops
         // spinning on a doomed sync commit that would also stall video -- menu hidden, video plays.
         if (!osdHdrSuppressed) {
             esyslog("vaapivideo/display: OSD over HDR exceeds the display bandwidth on this GPU -- "

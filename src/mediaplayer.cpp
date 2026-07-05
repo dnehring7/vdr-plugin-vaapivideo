@@ -328,7 +328,7 @@ constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "ht
     return cString::sprintf("%d:%02d:%02d", sec / 3600, (sec / 60) % 60, sec % 60);
 }
 
-/// Format a byte count as a whole number of MiB (rounded to nearest), labelled "MB".
+/// Format a byte count as a whole number of MiB (rounded to nearest), labeled "MB".
 /// Used by the file browser to annotate each media file. A non-empty file never
 /// rounds to "0 MB": sub-half-MiB sizes are floored up to "1 MB" so the column
 /// always reflects that there is content.

@@ -409,7 +409,7 @@ by libswresample otherwise. The output never fabricates surround from stereo
 (mono is carried as stereo for HDMI/ALSA compatibility), and is snapped to a
 standard HDMI layout (stereo / 5.1 / 7.1). For
 multichannel output the plugin reads the device's channel order
-(`snd_pcm_get_chmap()`) and reorders libswresample's output to match, so centre
+(`snd_pcm_get_chmap()`) and reorders libswresample's output to match, so center
 and LFE land on the right speakers — this needs a direct `hw:`/`plughw:` device,
 since the system `default` route blocks the query and would mis-route those channels.
 
@@ -434,7 +434,7 @@ cropping away the black bars that broadcasters bake into the frame (2.39:1 scope
 uniformly (aspect preserved) and the overflow is cropped equally off all sides.
 The value is in tenths-of-a-percent of enlargement, so `344` = **+34.4%** (the
 picture is 1.34× its size). The crop is rounded to the nearest 2-pixel-aligned
-rectangle (NV12/P010 chroma alignment), so the realised factor matches the
+rectangle (NV12/P010 chroma alignment), so the realized factor matches the
 configured one to within a pixel; a residual ≤1% gap to a full-screen fit is
 absorbed by a single uniform stretch (imperceptible — genuine letterbox is far
 larger and stays untouched). Out of the box, level 1 is **+34.4%** (fills 2.39:1
@@ -469,7 +469,7 @@ Cycling the zoom:
 
 Four independent policies control deinterlace, denoise, sharpen, and scaling. They
 all default to **auto**, which keeps the zero-copy VAAPI VPP path (the original
-behaviour). Decoding always stays on the GPU; these options only shape the
+behavior). Decoding always stays on the GPU; these options only shape the
 post-processing that follows it.
 
 The chain runs in one of two **domains**, chosen automatically:
@@ -491,7 +491,7 @@ path; `software:` routes the whole post-process through the SW block.
 **Deinterlace**
 
 - **auto** — best deinterlace mode the driver advertises (motion-compensated when
-  present). This reproduces the original behaviour exactly.
+  present). This reproduces the original behavior exactly.
 - **hardware: motion adaptive / weave / bob** — request a specific VAAPI mode (there is
   no separate "motion compensated" entry — `auto` already picks it when available). The
   request is clamped to a mode the driver actually advertises (some iHD GPUs expose just
@@ -516,7 +516,7 @@ fast` drops `mode=hq` for a cheaper GPU scale; `software: HQ` uses `swscale` lan
 and `software: fast` uses `swscale` bilinear (both route through the SW block). In the
 SW block the software scale is emitted only when it does real work (a resize, a manual
 zoom, or a BT.601→BT.709 / range conversion); a 1080i broadcast already at 1920×1080
-BT.709 skips it. `scale_vaapi` always normalises pixel format and colorimetry on the GPU
+BT.709 skips it. `scale_vaapi` always normalizes pixel format and colorimetry on the GPU
 path. The `software:` scalers are niche — `auto` (hardware `scale_vaapi`) is both cheaper
 and better; reach for them only when a GPU's `scale_vaapi` itself is suspect.
 
@@ -731,18 +731,18 @@ content forced through the SDR pipeline (HdrMode::Off, or `auto` with any gate
 failing) will show clipped highlights and compressed primaries because no
 PQ/HLG inverse EOTF is applied. This is why `auto` is the default.
 
-### HDR signalling sources
+### HDR signaling sources
 
 HDR10 / HLG is detected from BT.2020 primaries + a PQ/HLG transfer + ≥10-bit
 samples. That metadata reaches the decoded frame from one of two places:
 
 - **In-bitstream** (HEVC/AV1 VUI + SEI) — the common case for HEVC HDR10.
 - **Container tags** (Matroska/MP4/WebM `Colour` element + mastering/CLL side
-  data) — required for **VP9**, whose bitstream signals only a colour-space
-  matrix and no transfer function. The mediaplayer seeds the decoder's colour
+  data) — required for **VP9**, whose bitstream signals only a color-space
+  matrix and no transfer function. The mediaplayer seeds the decoder's color
   fields and the `HDR_OUTPUT_METADATA` mastering luminance from these container
   tags, so a properly tagged VP9 HDR file engages HDR10 with correct mastering
-  metadata. An untagged HDR file (no in-bitstream and no container colour info)
+  metadata. An untagged HDR file (no in-bitstream and no container color info)
   cannot be distinguished from SDR and plays as SDR.
 
 ### Dolby Vision and the VAAPI limit
@@ -760,11 +760,11 @@ logs on open (`Dolby Vision profile N (BL compatibility id M)`):
 | 8.1        | HDR10 (id 1)     | Plays as **HDR10** via the base layer's standard HDR10 metadata (no dynamic DV) |
 | 8.4        | HLG (id 4)       | Plays as **HLG** |
 | 7          | HDR10 (id 1)     | Base layer plays as **HDR10**; the BD enhancement layer is ignored |
-| 5          | none (id 0)      | **SDR fallback** — the base is IPT-PQ with no standard colour signalling |
+| 5          | none (id 0)      | **SDR fallback** — the base is IPT-PQ with no standard color signaling |
 | 4          | none (id 0)      | **SDR fallback** — dual-layer, no HDR10-compatible base |
 
 So DV files that carry an HDR10/HLG-compatible base play correctly as HDR10/HLG;
-profile 4/5 (compatibility id 0) carry their colour only in the RPU and fall back
+profile 4/5 (compatibility id 0) carry their color only in the RPU and fall back
 to SDR. Full DV would require a DV-capable decode + a DV output path neither of
 which exists for VAAPI/DRM, so it is **out of scope** rather than planned.
 

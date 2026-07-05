@@ -397,7 +397,7 @@ auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
             presentEventId = present->EventID();
             if (const char *title = present->Title(); title != nullptr && *title != '\0') {
                 // Line 2: "11:00-12:00 Title" -- the present event's schedule plus title. GetTimeString()
-                // honours the user's 12/24 h setting; the cString temporaries live through the format call.
+                // honors the user's 12/24 h setting; the cString temporaries live through the format call.
                 const cString start = present->GetTimeString();
                 const cString end = present->GetEndTimeString();
                 text += std::format("\n{}-{} {}", *start, *end, title);

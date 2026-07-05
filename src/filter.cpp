@@ -299,7 +299,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     }
 
     // UHD: GPU already saturated by 4K decode/scale; skip denoise/sharpen to avoid stutter.
-    // MPEG-2 SD: DCT-block and analog-tape artefacts warrant heavier processing.
+    // MPEG-2 SD: DCT-block and analog-tape artifacts warrant heavier processing.
     // H.264/H.265 HD: lighter touch preserves encoder-intended detail.
     int denoiseLevel = 0;
     int sharpnessLevel = 0;
@@ -449,7 +449,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                                       firstFrame->color_range == AVCOL_RANGE_JPEG;
             if (swNeedsScale) {
                 // Fast (bilinear) for SwFast / HwFast; HQ (lanczos) otherwise. HwFast can only appear
-                // here when a sw sharpen pulled scale into the SW segment -- honour the "fast" intent.
+                // here when a sw sharpen pulled scale into the SW segment -- honor the "fast" intent.
                 const bool fastScale = params.scale == ScaleMode::SwFast || params.scale == ScaleMode::HwFast;
                 const char *swScaleFlags = fastScale ? "bilinear" : "lanczos+full_chroma_int+accurate_rnd";
                 filters.push_back(
@@ -516,7 +516,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         const bool wantDenoise = !minimalChain && gpuDenoiseLevel > 0;
         if (isSoftwareDecode) {
             // SW-decode sysmem tail. MPEG-2 hqdn3d fall-back only when the GPU lacks denoise_vaapi:
-            // SW decode is cheap and block-artefact removal is worth the per-frame CPU cost (~5 ms
+            // SW decode is cheap and block-artifact removal is worth the per-frame CPU cost (~5 ms
             // @ 1080p25). Crop in system memory before uploading so zoom adds no GPU readback.
             if (wantDenoise && !params.hasDenoise && params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
                 filters.emplace_back("hqdn3d=5");

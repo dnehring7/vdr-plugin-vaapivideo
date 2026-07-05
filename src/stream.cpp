@@ -152,7 +152,7 @@ struct CodecEvidence {
 /// one-AU-per-PES shape); or, with @p allowHeadSpan, a head frame overrunning the payload.
 /// Head-span carries only the header as evidence, so it is Dolby-only (16-bit exact sync) --
 /// extending it to the short syncs would reopen the alias hole. All three anchor at offset 0
-/// or a validated neighbour; a length that merely lands on the boundary deeper in is coincidence.
+/// or a validated neighbor; a length that merely lands on the boundary deeper in is coincidence.
 template <typename SyncPredicate>
 [[nodiscard]] auto FrameLengthCorroborates(size_t pos, size_t frameLen, size_t size, bool allowHeadSpan,
                                            const SyncPredicate &syncAt) noexcept -> bool {
@@ -206,7 +206,7 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
         if ((sync & 0xFF00) == 0xFF00) [[unlikely]] {
             // ADTS (layer 00, mask 0xFFF6) tested before MPEG audio (layer 01/10/11, mask 0xFFE0):
             // the two are mutually exclusive on the layer bits, but ordering keeps intent clear.
-            // Every chained predicate re-parses the neighbour header, not just its sync bits, so a
+            // Every chained predicate re-parses the neighbor header, not just its sync bits, so a
             // random second sync-alike one frame ahead cannot confirm a false first header.
             if ((sync & 0xFFF6) == 0xFFF0 && i + 6 <= size) [[unlikely]] {
                 const size_t frameLen = AdtsFrameLength(p + i);
@@ -221,7 +221,7 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
             }
             if ((sync & 0xFFE0) == 0xFFE0) [[likely]] {
                 const size_t frameLen = Mp2FrameLength(AV_RB32(p + i));
-                // Mask 0xFFFE requires the neighbour to repeat version + layer (drops only protection).
+                // Mask 0xFFFE requires the neighbor to repeat version + layer (drops only protection).
                 if (frameLen != 0 && FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/false,
                                                              [p, size, sync](size_t pos) noexcept -> bool {
                                                                  return pos + 4 <= size &&
@@ -475,7 +475,7 @@ namespace {
 /// 0x03 is inserted by the encoder to prevent accidental start-code prefixes inside
 /// RBSP payloads; stripping it is required before bit-field parsing (H.264 sec.7.4.1.1,
 /// HEVC sec.7.4.2.4).
-[[nodiscard]] auto StripEmulationPreventionBytes(std::span<const uint8_t> nal) -> std::vector<uint8_t> {
+[[nodiscard]] auto StripEmulationPreventionBytes(std::span<const uint8_t> nal) noexcept -> std::vector<uint8_t> {
     std::vector<uint8_t> rbsp;
     rbsp.reserve(nal.size());
     const size_t n = nal.size();
@@ -613,10 +613,7 @@ class BitReader {
             // EPB sequences 00 00 03 which are interior to the NAL payload.
             size_t end = size;
             for (size_t j = payloadStart; j + 2 < size; ++j) {
-                if (p[j] != 0x00 || p[j + 1] != 0x00) {
-                    continue;
-                }
-                if (p[j + 2] == 0x01 || (j + 3 < size && p[j + 2] == 0x00 && p[j + 3] == 0x01)) {
+                if (AnnexBStartCodeLength(p, size, j) != 0) {
                     end = j;
                     break;
                 }

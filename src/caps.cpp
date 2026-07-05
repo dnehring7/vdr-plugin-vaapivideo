@@ -696,7 +696,7 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
     return caps;
 }
 
-auto DescribeSpeakerAlloc(uint8_t alloc) -> std::string {
+auto DescribeSpeakerAlloc(uint8_t alloc) noexcept -> std::string {
     // CEA-861 / ELD speaker-allocation bitmask (ELD byte 7, bits 6:0): one bit per speaker group present.
     static constexpr std::array<std::string_view, 7> kSpeakerNames{"FL/FR", "LFE",     "FC",     "RL/RR",
                                                                    "RC",    "FLC/FRC", "RLC/RRC"};

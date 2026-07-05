@@ -34,6 +34,8 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+namespace {
+
 // Byte offsets and sizes within a PES packet header (ISO 13818-1 sec.2.4.3.6/7).
 constexpr size_t PES_HEADER_MIN_SIZE = 6U;     ///< prefix(3) + stream_id(1) + PES_packet_length(2)
 constexpr size_t PES_OFFSET_FLAGS2 = 7U;       ///< Flags byte 2; PTS_DTS_flags in bits 7--6
@@ -52,8 +54,6 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< MPEG video base; mask 0
 // ============================================================================
 // === INTERNAL HELPERS ===
 // ============================================================================
-
-namespace {
 
 [[nodiscard]] inline auto ParseTimestamp(const uint8_t *bytes) noexcept -> int64_t {
     // 33-bit value packed as three fragments (3+15+15 bits), each word ending with a
