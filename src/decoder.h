@@ -112,6 +112,13 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto IsReady() const noexcept -> bool;  ///< True after Initialize() succeeds.
     [[nodiscard]] auto IsReadyForNextTrickFrame() const noexcept
         -> bool; ///< True when trick-mode pacing timer has expired.
+    [[nodiscard]] auto TakeTrickStep(int64_t pts, int64_t prevPts)
+        -> bool; ///< Claim the next paced trick step from outside the present thread; an audio-only replay
+                 ///< never reaches SubmitTrickFrame() and drives this pacing state from the feed instead.
+                 ///< Non-blocking (a feed thread must not sleep): false = hold still running, true = due,
+                 ///< next deadline armed from the pts/prevPts content distance (fast: divided by the rate,
+                 ///< slow forward: stretched by the slowdown). @p prevPts is the caller's own previous
+                 ///< step (AV_NOPTS_VALUE on entry).
     [[nodiscard]] auto OpenCodec(AVCodecID codecId)
         -> bool; ///< PES path wrapper: no extradata, 8-bit profile assumed; delegates to OpenCodecWithInfo().
     [[nodiscard]] auto OpenCodecWithInfo(const VideoStreamInfo &info)
@@ -217,6 +224,9 @@ class cVaapiDecoder : public cThread {
                  ///< (returns true so callers don't count it as a submit failure).
     [[nodiscard]] auto SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Pacing: wait deadline, skip reverse-GOP duplicates, arm next deadline; then submit.
+    [[nodiscard]] auto TrickHoldMsFor(int64_t pts, int64_t prevPts) const noexcept
+        -> uint64_t; ///< Per-step hold for the current trick mode. Fast: |pts - prevPts| / trickMultiplier,
+                     ///< clamped. Slow (multiplier 0) or unusable PTS: the precomputed trickHoldMs.
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Audio-master A/V sync gate (four regimes; see decoder.cpp file comment and AVSYNC.md).
     [[nodiscard]] auto SyncLatency90k(const cAudioProcessor *ap) const noexcept

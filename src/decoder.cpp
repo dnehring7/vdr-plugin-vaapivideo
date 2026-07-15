@@ -168,6 +168,10 @@ constexpr int VDR_SLOW_REVERSE_SPEED_MULT =
     12; ///< VDR dvbplayer.c SPEED_MULT. Slow FORWARD passes the bare slowdown factor (2/4/8); slow REVERSE
         ///< passes slowdown * this, clamped to MAX_VIDEO_SLOWMOTION (24/48/96 -> 63). Divided back out in
         ///< SetTrickSpeed to recover the 1..3 slowdown level (2/4/5 after the clamp) for reverse pacing.
+constexpr uint64_t DECODER_TRICK_PTS_HOLD_MIN_MS =
+    10; ///< Floor on any PTS-derived trick hold: a near-zero step would compute a zero hold and free-run.
+constexpr uint64_t DECODER_TRICK_PTS_HOLD_MAX_MS =
+    2000; ///< Ceiling on same: a PTS discontinuity (recording join, PCR break) can measure minutes per step.
 constexpr uint64_t DECODER_TRICK_SLOW_HOLD_MAX_MS =
     200; ///< Safety cap on the slow-FORWARD per-frame hold (>= 5 fps): keeps pacing responsive even if VDR sends
          ///< an unexpected speed scaling. The slowest intended slow forward (/8 = 160 ms) stays under it, so this
@@ -682,6 +686,42 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     }
     const uint64_t dueTime = nextTrickFrameDue.load(std::memory_order_relaxed);
     return cTimeMs::Now() >= dueTime;
+}
+
+[[nodiscard]] auto cVaapiDecoder::TrickHoldMsFor(int64_t pts, int64_t prevPts) const noexcept -> uint64_t {
+    // Fast pacing keys off CONTENT covered, not source frames, so multiplier == playback rate whatever the
+    // stride is -- which is what lets a video I-frame stride and a radio audio step share this. Slow modes
+    // carry a precomputed hold and leave the multiplier at 0.
+    const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
+    if (mult == 0 || pts == AV_NOPTS_VALUE || prevPts == AV_NOPTS_VALUE) {
+        return trickHoldMs.load(std::memory_order_relaxed);
+    }
+    const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
+    return std::clamp(ptsDelta / (static_cast<uint64_t>(PTS_TICKS_PER_MS) * mult), DECODER_TRICK_PTS_HOLD_MIN_MS,
+                      DECODER_TRICK_PTS_HOLD_MAX_MS);
+}
+
+[[nodiscard]] auto cVaapiDecoder::TakeTrickStep(int64_t pts, int64_t prevPts) -> bool {
+    // prevTrickPts stays untouched: it belongs to the present thread's SubmitTrickFrame(), this runs on
+    // the feed thread. Hence the caller-supplied prevPts.
+    if (!IsReadyForNextTrickFrame()) {
+        return false;
+    }
+    uint64_t holdMs = TrickHoldMsFor(pts, prevPts);
+    // Slow FORWARD can't use the precomputed hold here: it assumes one ~20 ms video frame per step, but an
+    // audio step carries ~85 ms of content, so speed * 20 ms would run the position FASTER than play at
+    // slowdown 2. The feed is contiguous with back-to-back PTS, so stretch the content distance by the
+    // slowdown instead. Slow reverse keeps its precomputed hold: it steps ~0.5 s like fast reverse, which
+    // is what that hold was tuned for.
+    if (trickMultiplier.load(std::memory_order_relaxed) == 0 && !isTrickReverse.load(std::memory_order_relaxed) &&
+        pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
+        const auto slowdown = static_cast<uint64_t>(std::max(1, trickSpeed.load(std::memory_order_relaxed)));
+        const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
+        holdMs = std::clamp((ptsDelta / static_cast<uint64_t>(PTS_TICKS_PER_MS)) * slowdown,
+                            DECODER_TRICK_PTS_HOLD_MIN_MS, DECODER_TRICK_PTS_HOLD_MAX_MS);
+    }
+    nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
+    return true;
 }
 
 auto cVaapiDecoder::RequestCodecDrain() -> void {
@@ -2367,18 +2407,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             cCondWait::SleepMs(static_cast<int>(std::min(due - nowMs, kTrickWaitChunkMs)));
         }
 
-        // Fast: hold = |ptsDelta| / PTS_TICKS_PER_MS / mult, clamped to [10, 2000] ms.
+        // Fast: hold = |ptsDelta| / PTS_TICKS_PER_MS / mult, clamped.
         // Slow: precomputed trickHoldMs = speed * DECODER_TRICK_HOLD_MS.
-        const uint64_t mult = trickMultiplier.load(std::memory_order_relaxed);
-        if (mult > 0 && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
-            const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
-            const uint64_t holdMs =
-                std::clamp(ptsDelta / (static_cast<uint64_t>(PTS_TICKS_PER_MS) * mult), uint64_t{10}, uint64_t{2000});
-            nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
-        } else {
-            nextTrickFrameDue.store(cTimeMs::Now() + trickHoldMs.load(std::memory_order_relaxed),
-                                    std::memory_order_relaxed);
-        }
+        nextTrickFrameDue.store(cTimeMs::Now() + TrickHoldMsFor(pts, prevPts), std::memory_order_relaxed);
     }
 
     // Clear-race guard: pacing wait above may have been raced by SetTrickSpeed(0) / Clear().

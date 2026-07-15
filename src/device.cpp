@@ -714,6 +714,11 @@ auto cVaapiDevice::Clear() -> void {
     // trickSpeed intentionally NOT reset: Clear() is a buffer flush, not a mode change.
     // VDR calls Clear() at the start of trick play; resetting here would cancel the mode.
 
+    // trickAudioPts IS position state, so it must go: keeping it would pin the radio STC at wherever the
+    // trick stopped. Safe here because cDvbPlayer::Empty() reads GetSTC() for its resume index BEFORE
+    // calling DeviceClear().
+    trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+
     // Force audio codec re-detection. This is the only place that catches the replay
     // track-switch path: "audi N" -> cDvbPlayer::SetAudioTrack -> Goto -> Empty ->
     // DeviceClear -> here. VDR routes around SetAudioTrackDevice() when a cPlayer is
@@ -843,15 +848,31 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
 }
 
 [[nodiscard]] auto cVaapiDevice::GetSTC() -> int64_t {
-    // Returns 90 kHz PTS of the last decoded video frame. The true STC would be the audio
-    // clock, but cDvbPlayer only uses this for editing-mark / position math where one-frame
-    // accuracy is sufficient, and it avoids AV_NOPTS_VALUE during the audio prime window.
-    // Do NOT use for A/V sync: lags real audio output by decoder+display pipeline depth.
-    if (!decoder) [[unlikely]] {
-        return -1;
+    // Video PTS outranks the audio clock (the truer STC) because cDvbPlayer only wants editing-mark /
+    // position math, where one-frame accuracy is enough and video is already valid during the audio prime
+    // window. Do NOT use for A/V sync: lags real audio output by decoder+display pipeline depth.
+    if (decoder) [[likely]] {
+        if (const int64_t pts = decoder->GetLastPts(); pts != AV_NOPTS_VALUE) {
+            return pts;
+        }
     }
-    const int64_t pts = decoder->GetLastPts();
-    return pts != AV_NOPTS_VALUE ? pts : -1;
+
+    // Audio-only (radio) replay: nothing ever stamps lastPts, and VDR requires a valid STC in normal AND
+    // trick modes (vdr/device.h) -- cDvbPlayer maps it back to a frame index for the position display and
+    // for the resume point after a trick. While a trick runs, output is dropped and the DAC clock decays
+    // to stale, so the last stepped PTS is the position; once trickSpeed is 0 the advancing audio clock
+    // must win again (slow-forward exits without a Clear(), so the latch can outlive its trick).
+    if (trickSpeed.load(std::memory_order_relaxed) != 0) {
+        if (const int64_t trickPts = trickAudioPts.load(std::memory_order_relaxed); trickPts != AV_NOPTS_VALUE) {
+            return trickPts;
+        }
+    }
+    if (audioProcessor) {
+        if (const int64_t clock = audioProcessor->GetClock(); clock != AV_NOPTS_VALUE) {
+            return clock;
+        }
+    }
+    return -1;
 }
 
 auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) -> void {
@@ -1200,7 +1221,19 @@ constexpr int GRAB_MAX_HEIGHT = 4320;
     return HardwareReady() && decoder && decoder->IsReady();
 }
 
-[[nodiscard]] auto cVaapiDevice::HasIBPTrickSpeed() -> bool { return true; }
+[[nodiscard]] auto cVaapiDevice::HasIBPTrickSpeed() -> bool {
+    // True promises cDvbPlayer we pace its contiguous feed ourselves -- a promise only the decoder's
+    // per-frame pacing can keep. An audio-only replay has no frame to pace on, so false instead puts
+    // cDvbPlayer on its seeking path (~0.4 s of content per delivered frame), which PlayTrickAudio() can
+    // pace and which is the better radio FF anyway.
+    // The device cannot know a replay is audio-only up front (VDR replays radio recordings under
+    // pmAudioVideo too), so this has to be inferred from the stream. IsPlayingVideo() is VDR's own latch,
+    // set on the FIRST video TS packet -- earlier than videoCodecId, which waits for detection + SPS +
+    // codec open -- and it is the same predicate cDvbPlayer's VideoOnly delivery gate keys off, so player
+    // and device always agree. A trick started in the brief window before a video replay's first packet
+    // begins on the seeking path and converges as soon as the first delivered packet flips the latch.
+    return IsPlayingVideo();
+}
 
 auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
     dsyslog("vaapivideo/device: MakePrimaryDevice(%s) called", On ? "true" : "false");
@@ -1287,9 +1320,39 @@ auto cVaapiDevice::Play() -> void {
     }
 }
 
+[[nodiscard]] auto cVaapiDevice::PlayTrickAudio(const uchar *Data, int Length) -> int {
+    // Without video the decoder paces nothing, leaving this the only brake on cDvbPlayer's feed and the
+    // only source of a position. Audio stays dropped (TrickSpeed() -> DropOutput).
+    const auto pes = ParsePes({Data, static_cast<size_t>(Length)});
+    if (!pes.isAudio || pes.payloadSize == 0) [[unlikely]] {
+        return Length; // nothing to pace on; swallow it so the player moves to the next frame
+    }
+
+    // On the seeking path one PES == one ~0.4 s content step, so gating these calls IS the trick speed.
+    // A mode's first step has no reference and passes straight through.
+    const int64_t prevPts = trickAudioPts.load(std::memory_order_relaxed);
+    if (decoder && !decoder->TakeTrickStep(pes.pts, prevPts)) {
+        return 0; // hold still running: VDR parks on Poll(), which gates on the same deadline
+    }
+    if (pes.pts != AV_NOPTS_VALUE) {
+        trickAudioPts.store(pes.pts, std::memory_order_relaxed);
+    }
+    return Length;
+}
+
 [[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar /*Id*/) -> int {
-    if (!Data || Length <= 0 || paused.load(std::memory_order_relaxed) ||
-        trickSpeed.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+    if (!Data || Length <= 0) [[unlikely]] {
+        return Length;
+    }
+
+    // Trick output is dropped either way; a video replay is already paced and positioned by PlayVideo(),
+    // an audio-only one needs PlayTrickAudio() to do both. Ahead of `paused` for the same reason
+    // PlayVideo() allows paused+trick: VDR freezes before entering a slow trick mode.
+    if (trickSpeed.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        return IsPlayingVideo() ? Length : PlayTrickAudio(Data, Length);
+    }
+
+    if (paused.load(std::memory_order_relaxed)) [[unlikely]] {
         return Length;
     }
 
@@ -1559,6 +1622,11 @@ auto cVaapiDevice::Play() -> void {
 [[nodiscard]] auto cVaapiDevice::HasFeedSpace(int currentSpeed) const -> bool {
     // Trick: also gate on the per-frame pacing timer to avoid burst-feeding past display rate.
     if (currentSpeed != 0) {
+        // Audio-only trick is paced solely by that timer; its decoder queue stays empty, so the depth
+        // check would only add packetMutex traffic to the Poll() spin.
+        if (!IsPlayingVideo()) {
+            return decoder->IsReadyForNextTrickFrame();
+        }
         return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
     }
     return !decoder->IsQueueFull() && (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
@@ -1788,6 +1856,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
+            trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
             if (decoder) [[likely]] {
                 decoder->SetTrickSpeed(0);
                 decoder->SetLiveMode(false);
@@ -1917,6 +1986,9 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     const bool isFast = !paused.load(std::memory_order_relaxed);
 
     trickSpeed.store(Speed, std::memory_order_release);
+    // A reference surviving from an earlier trick would fake the first step's content distance (slow-
+    // forward exits without a Clear(); speed/direction changes never see one). NOPTS = free first step.
+    trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 
     if (decoder) [[likely]] {
         decoder->SetTrickSpeed(Speed, Forward, isFast);
@@ -2024,6 +2096,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
     ResetAudioCodecState();
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
+    trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     paused.store(false, std::memory_order_relaxed);
     lastHandledAudioTrack = ttNone;
     lastHandledAudioPid = 0;

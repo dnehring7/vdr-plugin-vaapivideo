@@ -112,7 +112,8 @@ class cVaapiDevice : public cDevice {
                              ///< Returns malloc()'d buffer of @p Size bytes; caller (VDR core) free()s.
     [[nodiscard]] auto HasDecoder() const -> bool override; ///< True when a VAAPI codec context is open and ready
     [[nodiscard]] auto HasIBPTrickSpeed()
-        -> bool override; ///< Always true: all I/B/P frame types are submitted in trick mode
+        -> bool override; ///< True while the replay carries video: all I/B/P frame types are submitted in trick
+                          ///< mode and the decoder paces them. False for an audio-only replay -- see definition.
     [[nodiscard]] auto HardwareReady() const noexcept -> bool {
         return initState.load(std::memory_order_acquire) == 2;
     } ///< True once hardware is attached and decoder/display/audio are live -- the plugin's real
@@ -258,6 +259,9 @@ class cVaapiDevice : public cDevice {
         -> void; ///< Log + re-detect audio on track change. @p enteringDolby works around VDR firing the hook
                  ///< BEFORE assigning currentAudioTrack from SetDigitalAudioDevice(true).
     [[nodiscard]] auto OpenHardware() -> bool; ///< Open DRM fd, create VAAPI hw device context, find render node
+    [[nodiscard]] auto PlayTrickAudio(const uchar *Data, int Length)
+        -> int; ///< PlayAudio()'s trick branch for an audio-only replay: paces cDvbPlayer's feed and latches the
+                ///< step PTS for GetSTC(); audio stays dropped. PlayAudio()'s return contract (0 = not due yet).
     [[nodiscard]] auto ProbeVppCapabilities(std::string_view renderNode)
         -> bool;                         ///< Query VAAPI decode profiles and VPP filter capabilities
     auto ReleaseHardware() -> void;      ///< Close VAAPI device reference and DRM file descriptor
@@ -333,8 +337,12 @@ class cVaapiDevice : public cDevice {
             ///< outlives play modes, so it disarms/claims via CAS against the deadline it observed --
             ///< a concurrent re-arm stores a strictly-future value an expired observation never
             ///< matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
-    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
-    VaapiContext vaapi{};                                         ///< Shared VAAPI context
+    std::atomic<int64_t> trickAudioPts{
+        AV_NOPTS_VALUE};         ///< PTS of the last step PlayTrickAudio() let through, 90 kHz; AV_NOPTS_VALUE = none.
+                                 ///< Serves as both the audio-only replay's trick STC (read only while trickSpeed != 0)
+                                 ///< and the pacing hold's previous-step reference. Reset by Clear() and TrickSpeed().
+    std::atomic<int> trickSpeed; ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};        ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
     std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
