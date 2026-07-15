@@ -862,7 +862,9 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
     // for the resume point after a trick. While a trick runs, output is dropped and the DAC clock decays
     // to stale, so the last stepped PTS is the position; once trickSpeed is 0 the advancing audio clock
     // must win again (slow-forward exits without a Clear(), so the latch can outlive its trick).
-    if (trickSpeed.load(std::memory_order_relaxed) != 0) {
+    // Acquire pairs with TrickSpeed()'s release-store, which resets the latch first -- a reader that
+    // sees a new trick's speed cannot read the previous trick's position.
+    if (trickSpeed.load(std::memory_order_acquire) != 0) {
         if (const int64_t trickPts = trickAudioPts.load(std::memory_order_relaxed); trickPts != AV_NOPTS_VALUE) {
             return trickPts;
         }
@@ -1985,10 +1987,12 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     // paused==true here therefore implies slow mode.
     const bool isFast = !paused.load(std::memory_order_relaxed);
 
-    trickSpeed.store(Speed, std::memory_order_release);
     // A reference surviving from an earlier trick would fake the first step's content distance (slow-
     // forward exits without a Clear(); speed/direction changes never see one). NOPTS = free first step.
+    // BEFORE the trickSpeed release-store: GetSTC()'s acquire pairs with it, so a reader seeing the new
+    // speed can no longer read the previous trick's position.
     trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+    trickSpeed.store(Speed, std::memory_order_release);
 
     if (decoder) [[likely]] {
         decoder->SetTrickSpeed(Speed, Forward, isFast);

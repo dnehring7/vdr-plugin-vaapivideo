@@ -704,6 +704,15 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
 [[nodiscard]] auto cVaapiDecoder::TakeTrickStep(int64_t pts, int64_t prevPts) -> bool {
     // prevTrickPts stays untouched: it belongs to the present thread's SubmitTrickFrame(), this runs on
     // the feed thread. Hence the caller-supplied prevPts.
+    //
+    // Acquire FIRST, like every other lock-free reader of the pacing flags: SetTrickSpeed()'s release-
+    // store of trickSpeed publishes (trickMultiplier, isTrickReverse, trickHoldMs), so the relaxed flag
+    // loads below are consistent with the speed seen here -- without leaning on the caller's (VDR player)
+    // lock for ordering.
+    const int speed = trickSpeed.load(std::memory_order_acquire);
+    if (speed == 0) [[unlikely]] {
+        return true; // decoder already left trick (deferred exit resolved); nothing to pace
+    }
     if (!IsReadyForNextTrickFrame()) {
         return false;
     }
@@ -715,9 +724,8 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     // is what that hold was tuned for.
     if (trickMultiplier.load(std::memory_order_relaxed) == 0 && !isTrickReverse.load(std::memory_order_relaxed) &&
         pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE) {
-        const auto slowdown = static_cast<uint64_t>(std::max(1, trickSpeed.load(std::memory_order_relaxed)));
         const auto ptsDelta = static_cast<uint64_t>(std::abs(pts - prevPts));
-        holdMs = std::clamp((ptsDelta / static_cast<uint64_t>(PTS_TICKS_PER_MS)) * slowdown,
+        holdMs = std::clamp((ptsDelta / static_cast<uint64_t>(PTS_TICKS_PER_MS)) * static_cast<uint64_t>(speed),
                             DECODER_TRICK_PTS_HOLD_MIN_MS, DECODER_TRICK_PTS_HOLD_MAX_MS);
     }
     nextTrickFrameDue.store(cTimeMs::Now() + holdMs, std::memory_order_relaxed);
