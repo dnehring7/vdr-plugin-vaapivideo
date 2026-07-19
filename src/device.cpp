@@ -718,6 +718,9 @@ auto cVaapiDevice::Clear() -> void {
     // trick stopped. Safe here because cDvbPlayer::Empty() reads GetSTC() for its resume index BEFORE
     // calling DeviceClear().
     trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+    // A seek jumps the PTS timeline; drop the baseline so the first frame at the new position isn't
+    // mistaken for the old position's EOF repeat.
+    ResetReplayAudioEofBaseline();
 
     // Force audio codec re-detection. This is the only place that catches the replay
     // track-switch path: "audi N" -> cDvbPlayer::SetAudioTrack -> Goto -> Empty ->
@@ -1380,6 +1383,7 @@ auto cVaapiDevice::Play() -> void {
         esyslog("vaapivideo/device: audio codec %s never produced a frame -- re-detecting",
                 avcodec_get_name(currentCodec));
         ResetAudioCodecState();
+        ResetReplayAudioEofBaseline();
         previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
         audioProcessor->Clear();
         if (decoder) [[likely]] {
@@ -1502,12 +1506,26 @@ auto cVaapiDevice::Play() -> void {
         RefreshRadioSplash(/*force=*/false);
     }
 
+    // End-of-replay flush: at EOF cDvbPlayer continuously re-pushes the last PES to drain the device
+    // (vdr/dvbplayer.c). Decoding the repeats keeps the DAC clock advancing, so GetSTC() never stalls and
+    // radio replay never hits VDR's StuckAtEof (no video PTS pins the STC). Drop the repeat -- the real tail
+    // is already queued, ALSA drains, the clock ages stale, replay auto-stops. Audio PTS is strictly rising
+    // in normal replay (trick play uses PlayTrickAudio), so an exact repeat is the EOF re-push, never a real
+    // frame. Reset on every timeline break via ResetReplayAudioEofBaseline().
+    if (!isLive && pes.pts != AV_NOPTS_VALUE && pes.pts == lastReplayAudioPts.load(std::memory_order_relaxed))
+        [[unlikely]] {
+        return Length;
+    }
+
     // Replay backpressure: cap queue to avoid tail-drops that create PTS gaps. Live: always accept.
     if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) [[unlikely]] {
         return 0;
     }
 
     audioProcessor->Decode(pes.payload, pes.payloadSize, pes.pts);
+    if (!isLive && pes.pts != AV_NOPTS_VALUE) {
+        lastReplayAudioPts.store(pes.pts, std::memory_order_relaxed);
+    }
     return Length;
 }
 
@@ -1859,6 +1877,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             liveMode.store(false, std::memory_order_relaxed);
             trickSpeed.store(0, std::memory_order_release);
             trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+            ResetReplayAudioEofBaseline(); // fresh session: no stale flush-repeat baseline
             if (decoder) [[likely]] {
                 decoder->SetTrickSpeed(0);
                 decoder->SetLiveMode(false);
@@ -2098,6 +2117,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
     // here too -- otherwise a stale splash flag could fire against the next attached stream.
     ResetNoVideoMonitors();
     ResetAudioCodecState();
+    ResetReplayAudioEofBaseline();
     liveMode.store(false, std::memory_order_relaxed);
     trickSpeed.store(0, std::memory_order_relaxed);
     trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -2570,6 +2590,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     }
 
     ResetAudioCodecState();
+    ResetReplayAudioEofBaseline();
     if (audioProcessor) [[likely]] {
         audioProcessor->Clear();
     }
@@ -2687,6 +2708,10 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
     // it drops its accumulated bytes when it next sees this counter move (old-PID ES must not
     // corroborate against new-PID ES).
     audioDetectGen.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
+    lastReplayAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 }
 
 // SelectDrmConnector() helper: validate one connector and, when it carries the wanted mode, latch the

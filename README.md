@@ -65,7 +65,10 @@ replay traffic enters via PES through `cVaapiDevice::PlayVideo` / `PlayAudio`; t
 integrated mediaplayer demuxes files and URLs with libavformat and pushes
 pre-framed access units straight into the decoder via a narrow feed surface
 (`SubmitVideoPacket` / `SubmitAudioPacket`). Codec selection, HDR routing, A/V
-sync — all path-agnostic.
+sync — all path-agnostic, with one deliberate replay exception: at EOF VDR
+re-pushes the last audio PES to flush the device, and `PlayAudio` drops those
+repeats so the audio clock goes quiet — that stall is how VDR's STC-driven EOF
+detection stops an audio-only (radio) replay.
 
 Inside `cVaapiDecoder`, decode and presentation run on **separate threads**: the
 decode thread filters frames into a decode-ahead reserve, and a presentation

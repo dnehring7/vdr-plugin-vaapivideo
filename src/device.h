@@ -242,6 +242,8 @@ class cVaapiDevice : public cDevice {
                  ///< force=true always paints (channel entry); force=false paints only when the present event changed.
     auto ResetNoVideoMonitors() noexcept
         -> void; ///< Clear all radio-splash + encrypted-notice state; call on every lifecycle boundary.
+    auto ResetReplayAudioEofBaseline() noexcept
+        -> void; ///< Clear the replay EOF-repeat baseline; call on every replay-audio timeline reset.
     [[nodiscard]] auto HasFeedSpace(int currentSpeed) const
         -> bool; ///< Poll() gate: true when the decoder can accept another packet. Trick mode (currentSpeed != 0)
                  ///< also gates on the per-frame pacing timer; normal replay gates on the packet + audio highwater.
@@ -337,6 +339,11 @@ class cVaapiDevice : public cDevice {
             ///< outlives play modes, so it disarms/claims via CAS against the deadline it observed --
             ///< a concurrent re-arm stores a strictly-future value an expired observation never
             ///< matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
+    std::atomic<int64_t> lastReplayAudioPts{
+        AV_NOPTS_VALUE}; ///< PTS of the last replay PES fed to the decoder, 90 kHz. At EOF cDvbPlayer re-pushes
+                         ///< the last PES; decoding the repeats keeps the DAC clock alive, so radio replay never
+                         ///< hits VDR's StuckAtEof. Dropping an exact PTS repeat lets the clock stall instead.
+                         ///< Reset via ResetReplayAudioEofBaseline() on every replay-audio timeline break.
     std::atomic<int64_t> trickAudioPts{
         AV_NOPTS_VALUE};         ///< PTS of the last step PlayTrickAudio() let through, 90 kHz; AV_NOPTS_VALUE = none.
                                  ///< Serves as both the audio-only replay's trick STC (read only while trickSpeed != 0)

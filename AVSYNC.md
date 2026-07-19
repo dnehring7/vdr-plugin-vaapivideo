@@ -80,6 +80,15 @@ Three invariants:
    The reopen is one-shot per layout change — passthrough is never affected (it is a
    fixed 2-channel IEC61937 carrier).
 
+   Audio-only replay EOF is a deliberate exception to "keep the clock advancing":
+   VDR core ends a replay only when `GetSTC()` reaches the last frame or stalls
+   for 3 s (`StuckAtEof`), and with no video the STC *is* this audio clock. At EOF
+   `cDvbPlayer` continuously re-pushes the last PES to flush the device, so
+   decoding those repeats would keep the DAC clock advancing forever and radio
+   replay would never auto-stop. `PlayAudio()` drops the re-delivered PES by exact
+   repeated PTS (best-effort; baseline reset on every timeline boundary) so
+   `GetClock()` ages stale and VDR ends the replay itself.
+
 2. **Audio is never *adaptively* resampled.** No `swr_set_compensation`, no software PLL.
    The PCM path may do fixed format/channel/rate conversion to the negotiated ALSA format
    (e.g. 44.1 kHz radio to a 48 kHz device), but the rate ratio is constant — only video
