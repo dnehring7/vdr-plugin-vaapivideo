@@ -643,15 +643,16 @@ relative to video, per `config.h`).
 
 Every constant below is file-scope — in [src/config.h](src/config.h),
 [src/audio.h](src/audio.h), [src/audio.cpp](src/audio.cpp),
-[src/decoder.h](src/decoder.h), [src/decoder.cpp](src/decoder.cpp), or
+[src/mediaplayer.h](src/mediaplayer.h), [src/decoder.h](src/decoder.h),
+[src/decoder.cpp](src/decoder.cpp), [src/device.cpp](src/device.cpp), or
 [src/display.cpp](src/display.cpp) — and each carries a `///<` comment with
 purpose and unit. Within each file they are grouped by sub-function under
 `// --- label ---` rulers; the groups below mirror that layout.
 
 Naming conventions:
 
-- A module prefix (`PTS_` / `AUDIO_` / `DECODER_` / `DISPLAY_` / `CONFIG_` /
-  `VDR_`) names the owning subsystem.
+- A module prefix (`PTS_` / `AUDIO_` / `MEDIAPLAYER_` / `DECODER_` / `DISPLAY_` /
+  `CONFIG_` / `VDR_`) names the owning subsystem.
 - `_MS` — milliseconds; `_90K` — 90 kHz PTS ticks (matches code variables like
   `rawDelta`, `smoothedDelta90k`, `latency90k`); `_VSYNCS` — display refresh
   periods; no suffix — dimensionless (sample / frame / slot counts, depths).
@@ -679,6 +680,9 @@ Naming conventions:
 | ------------------------------------------- | ------ | ------- |
 | `MEDIAPLAYER_MAX_LOOKAHEAD_90K`             | 135000 | Real-time demux brake: max audio lookahead (1.5 s @ 90 kHz) of the latest pushed audio PTS over the audio clock before the demux throttles; keeps libavformat's fast file reads from overrunning the reserve |
 | `MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES` | 48     | Pre-anchor video-depth gate (¾ of `DECODER_RESERVE_HARD_CAP`); the sole demux brake for VIDEO-ONLY streams while no audio clock exists yet |
+| `MEDIAPLAYER_BACKPRESSURE_SLEEP_MS`         | 5      | Demux-thread back-off when the device queues are full, the lookahead brake trips, or the EOF drain is waiting on the presenter |
+| `MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS`          | 20000  | Hard cap on the natural-EOF tail drain (`DrainTailAtEof`); backstop so a wedged pipeline can't hang teardown (covers the ~5 s queue + reserve tail) |
+| `MEDIAPLAYER_EOF_DRAIN_STALL_MS`            | 1500   | EOF tail-drain stall bail-out: give up once buffered depth stops shrinking for this long (must exceed one frame interval) |
 
 **Video queues & decode-ahead reserve** (decoder.h, decoder.cpp)
 

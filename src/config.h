@@ -298,6 +298,22 @@ inline constexpr int CONFIG_ZOOM_LEVEL_MIN = 0;   ///< Min zoom-in factor (tenth
 inline constexpr int CONFIG_ZOOM_LEVEL_MAX = 499; ///< Max zoom-in factor (tenths-of-%, = +49.9% / 1.499x)
 
 // ============================================================================
+// === MEDIA BOOKMARK ===
+// ============================================================================
+
+/// Single-slot resume bookmark, persisted in setup.conf as vaapivideo.BookmarkUri /
+/// vaapivideo.BookmarkPositionMs. Direct field access is safe only during startup SetupParse()
+/// (single-threaded); once playback is live, go through the mutex-serialized accessors below and in
+/// mediaplayer.cpp.
+struct MediaBookmark {
+    std::string uri;   ///< Origin URI the user selected (file, .m3u path, or URL); empty = none
+    int positionMs{0}; ///< Resume position; 0 = from the start (playlist / stream / EOF / no bookmark)
+};
+
+/// Thread-safe snapshot of the current bookmark; defined in mediaplayer.cpp with the persistence machinery.
+[[nodiscard]] auto LoadBookmark() -> MediaBookmark;
+
+// ============================================================================
 // === PLUGIN CONFIGURATION ===
 // ============================================================================
 
@@ -306,6 +322,7 @@ inline constexpr int CONFIG_ZOOM_LEVEL_MAX = 499; ///< Max zoom-in factor (tenth
 /// re-written from the VDR main thread at any time via the setup menu; consumers on other
 /// threads use relaxed loads (scalar tunables on slow paths, no ordering dependency).
 struct VaapiConfig {
+    MediaBookmark bookmark; ///< Resume bookmark; access serialized in mediaplayer.cpp -- see MediaBookmark
     std::atomic<bool> clearOnChannelSwitch{false}; ///< Black frame on channel switch instead of leaving the last frame
     DisplayConfig display;                         ///< Display geometry; init-time only, not thread-safe after that
     std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< Re-read on every codec change / filter-graph rebuild

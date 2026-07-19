@@ -15,8 +15,14 @@
  *
  * Entry points:
  *   - main menu     -> cVaapiQuickMenu -> cVaapiFileBrowser
- *   - replay end    -> MainMenuAction reopens cVaapiFileBrowser via pending return state
+ *   - replay stop   -> MainMenuAction reopens cVaapiFileBrowser (cursor on the persistent bookmark)
  *   - SVDRP PLAY    -> StartPlayback(...) launches cVaapiControl
+ *
+ * Resume: a single bookmark (origin URI + position) persists in setup.conf, staged at control
+ * teardown and flushed inline on the main thread or via Housekeeping() for SVDRP-thread teardown.
+ * Starting the bookmarked local file resumes at the saved position; the browser opens with
+ * the cursor on it. Playlists and non-local URLs bookmark the origin URI only; bookmarks are replaced,
+ * not auto-cleared.
  *
  * Threading: the demux thread is the only writer for the source FIFO; the player
  * thread reads from the source and pushes packets to the device. The control
@@ -28,12 +34,12 @@
 #define VDR_VAAPIVIDEO_MEDIAPLAYER_H
 
 #include "common.h"
+#include "config.h"
 #include "stream.h"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -104,19 +110,24 @@ struct PlaylistEntry {
 /// True for @c .m3u / @c .m3u8 paths (case-insensitive).
 [[nodiscard]] auto IsPlaylistUri(std::string_view path) noexcept -> bool;
 
-/// Launch playback. @p entries.size()==1 plays a single file/URL; >1 is a playlist.
-/// Wraps cControl::Launch(); does not block. Returns false iff there is no primary
-/// vaapivideo device to attach to.
-auto StartPlayback(std::vector<PlaylistEntry> entries) -> bool;
+/// Outcome of StartPlayback(); lets callers surface a precise OSD / SVDRP error.
+enum class StartPlaybackResult : uint8_t { Started, EmptyPlaylist, DeviceNotReady };
 
-/// Ask the file browser to reopen (instead of live TV) on VDR's next main-menu hook, cursor on
-/// @p jumpToPath -- or the media-dir root when that path is a URL/unreachable. Wraps
-/// cRemote::CallPlugin(); call before returning osEnd. VDR main thread only.
-auto RequestReturnToBrowser(std::string jumpToPath) -> void;
+/// Launch playback of @p origin -- a media file, URL, or .m3u playlist (expanded here so the origin
+/// URI survives into the bookmark). Resumes at the bookmarked position when @p origin matches the
+/// bookmark. Wraps cControl::Launch(); does not block.
+[[nodiscard]] auto StartPlayback(PlaylistEntry origin) -> StartPlaybackResult;
 
-/// Consume a pending RequestReturnToBrowser(): the jump-to path if one was set (and clear it), else
-/// std::nullopt. MainMenuAction() uses it to choose the browser over the quick menu.
-[[nodiscard]] auto TakeReturnToBrowser() -> std::optional<std::string>;
+/// Ask the file browser to reopen (instead of live TV) on VDR's next main-menu hook; the browser
+/// places its cursor on the bookmark itself. Wraps cRemote::CallPlugin(). VDR main thread only.
+auto RequestBrowserReopen() -> void;
+
+/// Consume a pending RequestBrowserReopen(): true (and clear it) if one was set, else false.
+[[nodiscard]] auto TakeBrowserReopen() noexcept -> bool;
+
+/// Flush a bookmark staged off-thread (SVDRP teardown) to setup.conf; no-op when nothing is pending.
+/// Called from the plugin's Housekeeping(). VDR main thread only.
+auto FlushPendingBookmarkSave() -> void;
 
 // ============================================================================
 // === MEDIA SOURCE ===
@@ -256,9 +267,14 @@ class cVaapiMediaSource final : public IMediaSource {
 // NOLINTNEXTLINE(misc-multiple-inheritance) -- standard VDR pattern; cf. cDvbPlayer in VDR core.
 class cVaapiPlayer final : public cPlayer, public cThread {
   public:
-    enum class State : uint8_t { Opening, Playing, Paused, Seeking, Eof, Stopped };
+    /// Only the phases anyone observes (IsFinished / Action's EOF checks). Transient pause/seek
+    /// phases are NOT states -- they live in the dedicated `paused` / `seekPending` atomics; folding
+    /// them in here made two threads write one variable for values nobody read.
+    enum class State : uint8_t { Running, Eof, Stopped };
 
-    explicit cVaapiPlayer(std::vector<PlaylistEntry> entries);
+    /// @p uri is what the user selected (media file, .m3u path, or URL) -- the bookmark identity.
+    /// @p startMs is the absolute resume position for the FIRST entry (0 = start).
+    explicit cVaapiPlayer(std::string uri, std::vector<PlaylistEntry> entries, int startMs);
     ~cVaapiPlayer() noexcept override;
     cVaapiPlayer(const cVaapiPlayer &) = delete;
     cVaapiPlayer(cVaapiPlayer &&) noexcept = delete;
@@ -273,9 +289,10 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     auto Seek(int64_t deltaMs) -> void; ///< Relative seek; deltaMs may be negative
     auto Next() -> void;                ///< Skip to next playlist entry, if any
     [[nodiscard]] auto Title() const -> std::string;
-    /// URI of the current entry (clamped to the last on EOF, so Stop after a file ends still
-    /// resolves to it). Empty only for an empty playlist. Used by cVaapiControl to reopen the browser.
-    [[nodiscard]] auto CurrentUri() const -> std::string;
+    /// Snapshot the resume bookmark. A position is captured only for a single seekable local file
+    /// still playing; playlists, streams, EOF and failed opens yield position 0 (URI only). Lock-free
+    /// (cached atomics + STC) so the control dtor never blocks behind a stalled demux read.
+    [[nodiscard]] auto MakeBookmark() const -> MediaBookmark;
     /// True once playback can no longer continue: natural EOF, fatal open failure, or shutdown.
     /// cVaapiControl uses this to exit on its next key event.
     [[nodiscard]] auto IsFinished() const noexcept -> bool {
@@ -311,6 +328,10 @@ class cVaapiPlayer final : public cPlayer, public cThread {
   private:
     [[nodiscard]] auto OpenCurrentEntry() -> bool;
     auto CloseCurrentEntry() noexcept -> void;
+    /// Seek the just-opened first entry to the one-shot resume position before the demux thread starts.
+    /// Consumes startPositionMs (playlist advancement unaffected); skipped for live / at-or-past-end.
+    /// Takes sourceMutex.
+    auto ApplyStartPosition() -> void;
     /// Current playback position in milliseconds from the device's audio-mastered STC.
     /// Returns 0 when no vaapivideo device is attached or the audio clock has not anchored.
     [[nodiscard]] auto CurrentPositionMs() const noexcept -> int;
@@ -341,12 +362,14 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     auto DrainTailAtEof() -> void;
     auto AdvancePlaylist() -> void;
 
+    const std::string originUri; ///< What the user selected (file / .m3u path / URL); the bookmark identity
+    int startPositionMs{0};      ///< First-entry resume position; consumed once in Activate(true) before Start()
     std::vector<PlaylistEntry> playlist;
     std::atomic<size_t> currentIndex{0};
 
     std::unique_ptr<cVaapiMediaSource> source;
     std::unique_ptr<cSubtitleConverter> subtitles; ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
-    std::atomic<State> state{State::Opening};
+    std::atomic<State> state{State::Running};
     std::atomic<bool> paused{false};
     std::atomic<bool> seekPending{false};
     std::atomic<int64_t> seekDeltaMs{0};
@@ -377,6 +400,12 @@ class cVaapiPlayer final : public cPlayer, public cThread {
                                               ///< Clear() and the first decoded frame at the new position. Without
                                               ///< this, rapid follow-up Seek()s read position 0 and the playhead
                                               ///< snaps to the file start.
+    // Entry-metadata snapshots (set on open, cleared on close). Main-thread queries -- GetIndex,
+    // FramesPerSecond, MakeBookmark -- read these instead of taking sourceMutex, which the demux
+    // thread holds across blocking network I/O (cf. cDvbPlayer, which serves GetIndex from cached
+    // indexes for the same reason).
+    std::atomic<int> cachedDurationMs{-1};   ///< Current entry's duration; -1 = no entry open, 0 = live/unknown
+    std::atomic<double> cachedVideoFps{0.0}; ///< Current entry's container fps; 0.0 = unknown
 
     mutable cMutex sourceMutex; ///< Guards source-pointer swaps across Action() and command methods
     cCondVar pauseCondition;    ///< Wakes Action() out of pause loop
@@ -395,7 +424,8 @@ class cVaapiPlayer final : public cPlayer, public cThread {
 /// osEnd or after Stop() (kBlue / kBack / kStop).
 class cVaapiControl final : public cControl {
   public:
-    explicit cVaapiControl(std::vector<PlaylistEntry> entries) : cVaapiControl(new cVaapiPlayer(std::move(entries))) {}
+    cVaapiControl(std::string originUri, std::vector<PlaylistEntry> entries, int startPositionMs)
+        : cVaapiControl(new cVaapiPlayer(std::move(originUri), std::move(entries), startPositionMs)) {}
     ~cVaapiControl() noexcept override;
     cVaapiControl(const cVaapiControl &) = delete;
     cVaapiControl(cVaapiControl &&) noexcept = delete;
@@ -434,9 +464,9 @@ class cVaapiControl final : public cControl {
 /// playlists. kOk enters a directory or launches playback. kBack pops to parent.
 class cVaapiFileBrowser final : public cOsdMenu {
   public:
-    /// @p startDir is the root / fallback (the -m media-dir). When @p selectPath is a reachable local
-    /// file, open its parent dir with the cursor on it; otherwise fall back to @p startDir.
-    explicit cVaapiFileBrowser(std::string startDir, const std::string &selectPath = {});
+    /// @p startDir is the root / fallback (the -m media-dir). Opens on the bookmark when it is a
+    /// reachable local file (parent dir, cursor on it), else falls back to @p startDir.
+    explicit cVaapiFileBrowser(std::string startDir);
     ~cVaapiFileBrowser() noexcept override = default;
     cVaapiFileBrowser(const cVaapiFileBrowser &) = delete;
     cVaapiFileBrowser(cVaapiFileBrowser &&) noexcept = delete;

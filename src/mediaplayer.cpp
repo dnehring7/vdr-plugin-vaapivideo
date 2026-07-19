@@ -24,6 +24,10 @@
  *   3. cVaapiMediaSource emits a zero-based 90 kHz timeline so GetIndex/Seek math is
  *      stable across files with non-zero container start_time.
  *   4. Network I/O is interruptible via InterruptOnStop on cVaapiPlayer::stopping.
+ *   5. sourceMutex may be held across blocking demux I/O (ReadPacket/Seek), but never across the
+ *      container open (OpenCurrentEntry opens unlocked, publishes locked). Main-thread hot paths
+ *      (GetIndex, FramesPerSecond, MakeBookmark) are lock-free via cached atomics -- they must
+ *      never take sourceMutex, or a stalled network read freezes the VDR main loop.
  */
 
 #include "mediaplayer.h"
@@ -46,7 +50,6 @@
 #include <format>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -88,6 +91,7 @@ extern "C" {
 #include <vdr/menu.h>
 #include <vdr/osdbase.h>
 #include <vdr/player.h>
+#include <vdr/plugin.h>
 #include <vdr/remote.h>
 #include <vdr/skins.h>
 #include <vdr/status.h>
@@ -287,6 +291,17 @@ constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "ht
     return std::ranges::any_of(URL_SCHEMES, [path](std::string_view scheme) noexcept -> bool {
         return path.size() >= scheme.size() && IEquals(path.substr(0, scheme.size()), scheme);
     });
+}
+
+// One canonical spelling for the bookmark identity (matches the browser's canonicalized currentDir).
+// URLs and unresolvable paths pass through, so an SVDRP "PLAY ../a.mkv" still plays.
+[[nodiscard]] auto NormalizeBookmarkUri(std::string uri) -> std::string {
+    if (uri.empty() || HasUrlScheme(uri)) {
+        return uri;
+    }
+    std::error_code ec;
+    const auto canonical = std::filesystem::canonical(uri, ec);
+    return ec ? uri : canonical.string();
 }
 
 /// Typed accessor for the primary device. The mediaplayer feed surface (OpenForMediaPlayer,
@@ -520,53 +535,139 @@ auto IsPlaylistUri(std::string_view path) noexcept -> bool {
                                [path](std::string_view ext) noexcept -> bool { return HasExtension(path, ext); });
 }
 
-auto StartPlayback(std::vector<PlaylistEntry> entries) -> bool {
-    if (entries.empty()) [[unlikely]] {
-        esyslog("vaapivideo/mediaplayer: StartPlayback called with empty playlist");
-        return false;
+// ============================================================================
+// === BOOKMARK PERSISTENCE ===
+// ============================================================================
+namespace {
+// Guards vaapiConfig.bookmark + BookmarkDirty(): SVDRP PLAY tears a control down on the SVDRP thread,
+// racing the main thread. Function-local static: lazy init stays off the throwing-static-init path.
+[[nodiscard]] auto BookmarkMutex() -> cMutex & {
+    static cMutex mutex;
+    return mutex;
+}
+
+// Set while vaapiConfig.bookmark differs from setup.conf on disk.
+[[nodiscard]] auto BookmarkDirty() -> bool & {
+    static bool dirty = false;
+    return dirty;
+}
+
+// Stage, then flush inline on the main thread (survives the emergency-exit path that skips VDR's own
+// Setup.Save()) or defer to Housekeeping() for off-thread SVDRP teardown. Empty/unchanged URI: no-op.
+auto PersistBookmark(const MediaBookmark &bm) -> void {
+    if (bm.uri.empty()) [[unlikely]] {
+        return;
     }
-    // Reject up front when the device is absent OR not yet attached to hardware: launching the
-    // control would close the file browser (osEnd) and only then fail in Activate(true), leaving
-    // the user staring at the previous channel with no error. Checking IsReady() here lets the
-    // caller keep the menu open and surface "Cannot start playback" immediately.
+    bool onMainThread = false;
+    {
+        const cMutexLock lock(&BookmarkMutex());
+        if (vaapiConfig.bookmark.uri == bm.uri && vaapiConfig.bookmark.positionMs == bm.positionMs &&
+            !BookmarkDirty()) {
+            return;
+        }
+        vaapiConfig.bookmark = bm;
+        BookmarkDirty() = true;
+        onMainThread = cThread::IsMainThread();
+    }
+    if (onMainThread) {
+        FlushPendingBookmarkSave();
+    }
+}
+} // namespace
+
+auto LoadBookmark() -> MediaBookmark {
+    const cMutexLock lock(&BookmarkMutex());
+    return vaapiConfig.bookmark;
+}
+
+auto FlushPendingBookmarkSave() -> void {
+    // Main thread only: SetupStore/Setup.Save mutate VDR's global setup store.
+    MediaBookmark bm;
+    {
+        const cMutexLock lock(&BookmarkMutex());
+        if (!BookmarkDirty()) {
+            return;
+        }
+        bm = vaapiConfig.bookmark;
+    }
+    // SetupStore writes the keys; only Setup.Save() hits disk. On failure the dirty flag stays set to retry.
+    auto *plugin = cPluginManager::GetPlugin(PLUGIN_NAME);
+    if (plugin == nullptr) [[unlikely]] {
+        esyslog("vaapivideo/mediaplayer: plugin instance missing -- cannot save bookmark");
+        return;
+    }
+    plugin->SetupStore("BookmarkUri", bm.uri.c_str());
+    plugin->SetupStore("BookmarkPositionMs", bm.positionMs);
+    if (!Setup.Save()) [[unlikely]] {
+        esyslog("vaapivideo/mediaplayer: cannot save bookmark to setup.conf");
+        return;
+    }
+    {
+        const cMutexLock lock(&BookmarkMutex());
+        if (vaapiConfig.bookmark.uri == bm.uri && vaapiConfig.bookmark.positionMs == bm.positionMs) {
+            BookmarkDirty() = false; // keep dirty if a newer bookmark was staged mid-save
+        }
+    }
+    dsyslog("vaapivideo/mediaplayer: bookmark saved -- %s @ %dms", bm.uri.c_str(), bm.positionMs);
+}
+
+auto StartPlayback(PlaylistEntry origin) -> StartPlaybackResult {
+    if (origin.uri.empty()) [[unlikely]] {
+        esyslog("vaapivideo/mediaplayer: StartPlayback called with empty URI");
+        return StartPlaybackResult::EmptyPlaylist;
+    }
+    origin.uri = NormalizeBookmarkUri(std::move(origin.uri)); // spelling-independent bookmark identity
+    // Reject before Launch: launching closes the browser (osEnd) and only then fails in Activate(true),
+    // stranding the user on the old channel with no error. IsReady() here keeps the menu open to report it.
     auto *vaapiDev = FindPrimaryVaapiDevice();
     if (vaapiDev == nullptr || !vaapiDev->IsReady()) [[unlikely]] {
         esyslog("vaapivideo/mediaplayer: no ready primary vaapivideo device -- playback rejected");
-        return false;
+        return StartPlaybackResult::DeviceNotReady;
     }
+
+    // Expand playlists here, not at the call sites, so the origin .m3u path survives into the bookmark.
+    std::vector<PlaylistEntry> entries;
+    if (IsPlaylistUri(origin.uri)) {
+        entries = ParseM3U(origin.uri);
+        if (entries.empty()) [[unlikely]] {
+            return StartPlaybackResult::EmptyPlaylist;
+        }
+    } else {
+        entries.push_back(origin);
+    }
+
+    // Resume exactly where we stopped when the origin matches the bookmark; playlists/streams save
+    // position 0, so they stay at resumeMs 0 by construction.
+    int resumeMs = 0;
+    if (const MediaBookmark bm = LoadBookmark(); origin.uri == NormalizeBookmarkUri(bm.uri)) {
+        resumeMs = bm.positionMs;
+    }
+
     // cControl::Launch takes ownership and destroys via cControl::Shutdown / next Launch.
-    cControl::Launch(new cVaapiControl(std::move(entries)));
-    return true;
+    cControl::Launch(new cVaapiControl(std::move(origin.uri), std::move(entries), resumeMs));
+    return StartPlaybackResult::Started;
 }
 
-// One-shot "return to browser" target. Set on Stop/EOF, consumed by MainMenuAction(); both run on
-// the VDR main thread (never concurrent), so no lock is needed.
+// One-shot "reopen the browser, not live TV" flag. Set on Stop/EOF, consumed by MainMenuAction() --
+// both main-thread, no lock. The browser reads the bookmark itself to place its cursor.
 namespace {
-[[nodiscard]] auto PendingBrowserReturn() -> std::optional<std::string> & {
-    static std::optional<std::string> pending;
+[[nodiscard]] auto PendingBrowserReopen() -> bool & {
+    static bool pending = false;
     return pending;
 }
 } // namespace
 
-auto RequestReturnToBrowser(std::string jumpToPath) -> void {
-    PendingBrowserReturn() = std::move(jumpToPath);
-    // CallPlugin queues a k_Plugin key -> MainMenuAction() next main-loop pass. Fails only if another
-    // plugin call is pending; drop our request then so an unrelated menu open won't show the browser.
+auto RequestBrowserReopen() -> void {
+    PendingBrowserReopen() = true;
+    // CallPlugin queues a k_Plugin key for MainMenuAction(). Fails only if another plugin call is
+    // pending; drop our flag then so an unrelated menu open won't show the browser.
     if (!cRemote::CallPlugin(PLUGIN_NAME)) [[unlikely]] {
         esyslog("vaapivideo/mediaplayer: CallPlugin busy -- cannot reopen file browser");
-        PendingBrowserReturn().reset();
+        PendingBrowserReopen() = false;
     }
 }
 
-auto TakeReturnToBrowser() -> std::optional<std::string> {
-    auto &pending = PendingBrowserReturn();
-    if (!pending.has_value()) {
-        return std::nullopt;
-    }
-    std::optional<std::string> result = std::move(pending);
-    pending.reset();
-    return result;
-}
+auto TakeBrowserReopen() noexcept -> bool { return std::exchange(PendingBrowserReopen(), false); }
 
 // ============================================================================
 // === cVaapiMediaSource ===
@@ -1083,8 +1184,9 @@ auto cVaapiMediaSource::Flush() -> void {
 // === cVaapiPlayer ===
 // ============================================================================
 
-cVaapiPlayer::cVaapiPlayer(std::vector<PlaylistEntry> entries)
-    : cPlayer(pmAudioVideo), cThread("vaapi mediaplayer demux"), playlist(std::move(entries)) {
+cVaapiPlayer::cVaapiPlayer(std::string uri, std::vector<PlaylistEntry> entries, int startMs)
+    : cPlayer(pmAudioVideo), cThread("vaapi mediaplayer demux"), originUri(std::move(uri)), startPositionMs(startMs),
+      playlist(std::move(entries)) {
     if (playlist.empty()) {
         esyslog("vaapivideo/mediaplayer: cVaapiPlayer constructed with empty playlist");
     }
@@ -1146,13 +1248,14 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
 }
 
 [[nodiscard]] auto cVaapiPlayer::OpenCurrentEntry() -> bool {
-    const cMutexLock lock(&sourceMutex);
     const size_t idx = currentIndex.load(std::memory_order_relaxed);
     if (idx >= playlist.size()) {
         return false;
     }
-    // Commit `source` only after every step succeeds, so other threads never observe a
-    // partially-initialized source between Open and OpenForMediaPlayer.
+    // Everything up to the publish below runs UNLOCKED: nextSource is invisible to other threads,
+    // and avformat_open_input can block for seconds on a network URL -- holding sourceMutex across
+    // it would stall every main-thread reader (e.g. InfoText) for the whole connect. Only this
+    // thread (demux; main pre-Start) ever opens/replaces the source, so there is no writer race.
     auto nextSource = std::make_unique<cVaapiMediaSource>(&stopping, &ioInterrupt);
     if (!nextSource->Open(playlist.at(idx).uri)) {
         return false;
@@ -1164,7 +1267,7 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         return false;
     }
     // Pick the preferred-language track BEFORE OpenForMediaPlayer so the right codec opens directly
-    // (no startup reopen). nextSource is unpublished, so SelectAudioTrack needs no lock.
+    // (no startup reopen).
     if (const int preferred = ChoosePreferredAudioTrack(*nextSource); preferred >= 0) {
         (void)nextSource->SelectAudioTrack(preferred);
     }
@@ -1172,7 +1275,12 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         vaapiDev->ClearForMediaPlayer();
         return false;
     }
+    // Publish + per-entry resets under the lock: readers see either the old source or the fully
+    // initialized new one, never a half-open state.
+    const cMutexLock lock(&sourceMutex);
     source = std::move(nextSource);
+    cachedDurationMs.store(source->DurationMs(), std::memory_order_release);
+    cachedVideoFps.store(source->VideoFps(), std::memory_order_release);
     // New entry = new PTS timeline; the throttle's high-water mark and the seek-target
     // fallback must not carry over from the previous entry.
     latestAudioPts90k.store(AV_NOPTS_VALUE, std::memory_order_release);
@@ -1207,6 +1315,8 @@ auto cVaapiPlayer::CloseCurrentEntry() noexcept -> void {
     audioSwitch.trackCount.store(0, std::memory_order_release);
     subtitleSwitch.trackCount.store(0, std::memory_order_release);
     subtitleSwitch.menuIndex.store(-1, std::memory_order_release);
+    cachedDurationMs.store(-1, std::memory_order_release); // -1 = no entry open (GetIndex reports false)
+    cachedVideoFps.store(0.0, std::memory_order_release);
     source.reset();
 }
 
@@ -1220,7 +1330,8 @@ auto cVaapiPlayer::Activate(bool On) -> void {
             state.store(State::Stopped, std::memory_order_release);
             return;
         }
-        state.store(State::Playing, std::memory_order_release);
+        ApplyStartPosition(); // resume the first entry before the demux thread submits any packet
+        state.store(State::Running, std::memory_order_release);
         Start();
     } else {
         stopping.store(true, std::memory_order_release);
@@ -1245,13 +1356,12 @@ auto cVaapiPlayer::SetPaused(bool wantPaused) -> void {
     }
     // BOTH halves are required: DeviceFreeze() halts the audio master clock (else resume
     // re-anchors with a stutter); the demux flag halts packet flow (else queues fill while
-    // frozen and OOM on long pauses).
+    // frozen and OOM on long pauses). Pause lives in `paused` only -- `state` tracks lifecycle,
+    // not transient phases, so this main-thread path never writes it.
     if (wantPaused) {
         DeviceFreeze();
-        state.store(State::Paused, std::memory_order_release);
     } else {
         DevicePlay();
-        state.store(State::Playing, std::memory_order_release);
     }
     const cMutexLock lock(&pauseMutex);
     pauseCondition.Broadcast();
@@ -1284,29 +1394,51 @@ auto cVaapiPlayer::Next() -> void {
     return (idx < playlist.size()) ? playlist.at(idx).title : std::string{};
 }
 
-[[nodiscard]] auto cVaapiPlayer::CurrentUri() const -> std::string {
-    // Unlocked read like Title() (`playlist` is fixed after construction). Clamp the index: EOF
-    // leaves it one past the end, so a Stop after a file finishes still resolves to that file.
-    if (playlist.empty()) {
-        return {};
+auto cVaapiPlayer::ApplyStartPosition() -> void {
+    const int targetMs = std::exchange(startPositionMs, 0); // first entry only; playlist advance stays fresh
+    if (targetMs <= 0) {
+        return;
     }
-    size_t idx = currentIndex.load(std::memory_order_relaxed);
-    if (idx >= playlist.size()) {
-        idx = playlist.size() - 1;
+    const cMutexLock lock(&sourceMutex);
+    if (!source) {
+        return;
     }
-    return playlist.at(idx).uri;
+    // Live/unseekable or at/past the tail: start from 0. The 1 s margin mirrors SeekToMs.
+    const int totalMs = source->DurationMs();
+    if (totalMs <= 0 || targetMs >= totalMs - 1000) {
+        return;
+    }
+    // Bare container seek: no demux thread yet and nothing submitted, so no FlushForSeek / state dance.
+    // Seek() arms the audio-discard window so the clock anchors at the target, not the earlier keyframe.
+    if (!source->Seek(static_cast<int64_t>(targetMs) * PTS_TICKS_PER_MS)) {
+        esyslog("vaapivideo/mediaplayer: resume seek to %dms failed -- starting from 0", targetMs);
+        return;
+    }
+    pendingSeekTargetMs.store(targetMs, std::memory_order_release); // read until GetSTC() anchors
+    isyslog("vaapivideo/mediaplayer: resuming at %dms (bookmark)", targetMs);
+}
+
+[[nodiscard]] auto cVaapiPlayer::MakeBookmark() const -> MediaBookmark {
+    MediaBookmark bm{.uri = originUri, .positionMs = 0};
+    // A position is meaningful only for a single seekable local file mid-playback; playlists, streams,
+    // EOF and failed opens keep 0 (bookmark the URI only).
+    if (bm.uri.empty() || HasUrlScheme(originUri) || IsPlaylistUri(originUri) || IsFinished()) {
+        return bm;
+    }
+    // Lock-free: the control dtor calls this on every teardown; sourceMutex could be held by a demux
+    // thread parked in a stalled network read, delaying the stop for seconds.
+    if (cachedDurationMs.load(std::memory_order_acquire) <= 0) {
+        return bm; // no entry open, or live/unseekable
+    }
+    bm.positionMs = CurrentPositionMs(); // resume lands here exactly on the next start
+    return bm;
 }
 
 [[nodiscard]] auto cVaapiPlayer::FramesPerSecond() -> double {
     // Skins use this for the ".ff" frame-count suffix; fall back to cPlayer's default 25.
-    const cMutexLock lock(&sourceMutex);
-    if (source) {
-        const double fps = source->VideoFps();
-        if (fps > 0.0) {
-            return fps;
-        }
-    }
-    return cPlayer::FramesPerSecond();
+    // Lock-free (cached at open) -- main-thread caller, same rationale as GetIndex.
+    const double fps = cachedVideoFps.load(std::memory_order_acquire);
+    return fps > 0.0 ? fps : cPlayer::FramesPerSecond();
 }
 
 [[nodiscard]] auto cVaapiPlayer::InfoText() const -> std::string {
@@ -1373,11 +1505,14 @@ auto cVaapiPlayer::Next() -> void {
 [[nodiscard]] auto cVaapiPlayer::GetIndex(int &Current, int &Total, bool /*SnapToIFrame*/) -> bool {
     Current = 0;
     Total = 0;
-    const cMutexLock lock(&sourceMutex);
-    if (!source) {
-        return false;
+    // Lock-free: this runs on the VDR main thread on every replay-bar refresh, and sourceMutex may
+    // be held by the demux thread across a blocking network read -- taking it here would freeze the
+    // whole main loop until the read times out.
+    const int durationMs = cachedDurationMs.load(std::memory_order_acquire);
+    if (durationMs < 0) {
+        return false; // no entry open
     }
-    Total = source->DurationMs();
+    Total = durationMs;
     // CurrentPositionMs() falls back to pendingSeekTargetMs during the post-Clear NOPTS
     // window. Reading GetSTC() directly would snap the bar to 0 every time the OSD opens
     // during a seek burst.
@@ -1412,13 +1547,10 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     }
     const int64_t targetPts90k = targetMs * PTS_TICKS_PER_MS;
 
-    state.store(State::Seeking, std::memory_order_release);
-
     // Seek the source FIRST; if it fails we leave the device state untouched so the user keeps
     // playing the old position instead of staring at a blanked frame after a wiped pipeline.
     if (!source->Seek(targetPts90k)) {
         esyslog("vaapivideo/mediaplayer: seek to %lldms failed", static_cast<long long>(targetMs));
-        state.store(paused.load(std::memory_order_acquire) ? State::Paused : State::Playing, std::memory_order_release);
         return;
     }
 
@@ -1435,7 +1567,6 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     // it a rapid follow-up Seek() would compute its delta against 0.
     pendingSeekTargetMs.store(static_cast<int>(targetMs), std::memory_order_release);
     dsyslog("vaapivideo/mediaplayer: seek -> %lldms (total=%dms)", static_cast<long long>(targetMs), totalMs);
-    state.store(paused.load(std::memory_order_acquire) ? State::Paused : State::Playing, std::memory_order_release);
 }
 
 auto cVaapiPlayer::SetAudioTrack(eTrackType Type, const tTrackId * /*TrackId*/) -> void {
@@ -1931,6 +2062,11 @@ cVaapiControl::cVaapiControl(cVaapiPlayer *typedPlayer) : cControl(typedPlayer),
 }
 
 cVaapiControl::~cVaapiControl() noexcept {
+    // The single save hook, covering every teardown path (Stop, EOF, channel switch, shutdown, SVDRP
+    // replace). Runs while the player (device attachment / STC) is still alive.
+    if (player) {
+        PersistBookmark(player->MakeBookmark());
+    }
     HideReplayBar();
     cStatus::MsgReplaying(this, nullptr, nullptr, false);
     // Null the base alias BEFORE deleting the player (cf. cDvbPlayerControl::Stop in
@@ -2014,7 +2150,7 @@ auto cVaapiControl::RefreshReplayBar() -> void {
     }
     if (player->IsFinished()) {
         // EOF / failed open: reopen the browser instead of dropping to live TV, like Stop below.
-        RequestReturnToBrowser(player->CurrentUri());
+        RequestBrowserReopen();
         return osEnd;
     }
 
@@ -2085,10 +2221,9 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 
         case kBack:
         case kStop:
-            // Reopen the browser at the played file instead of live TV; URLs / non-selectable
-            // paths fall back to the media-dir in cVaapiFileBrowser.
+            // Reopen the browser (cursor on the bookmark, set by the dtor) instead of live TV.
             dsyslog("vaapivideo/mediaplayer: key Back/Stop -- return to file browser");
-            RequestReturnToBrowser(player->CurrentUri());
+            RequestBrowserReopen();
             return osEnd;
 
         default:
@@ -2100,19 +2235,18 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 // === cVaapiFileBrowser ===
 // ============================================================================
 
-cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir, const std::string &selectPath) : cOsdMenu("") {
+cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir) : cOsdMenu("") {
     if (startDir.empty()) {
         startDir = "/";
     }
-    // Jump back to a specific file (Stop from replay): open its parent dir, cursor on it. A URL or a
-    // non-selectable path isn't browseable -- fall back to the start folder (svdrpsend / URL case).
-    if (!selectPath.empty() && !HasUrlScheme(selectPath)) {
+    // Open on the bookmark (parent dir, cursor on the file); a URL / deleted file / gone m3u entry
+    // falls back to the start folder. Read here so every browser open lands on the bookmark.
+    if (const std::string mark = NormalizeBookmarkUri(LoadBookmark().uri); !mark.empty() && !HasUrlScheme(mark)) {
         std::error_code ec;
-        const std::string parent = Dirname(selectPath);
-        if (std::filesystem::is_regular_file(selectPath, ec) && !ec && std::filesystem::is_directory(parent, ec) &&
-            !ec) {
+        const std::string parent = Dirname(mark);
+        if (std::filesystem::is_regular_file(mark, ec) && !ec && std::filesystem::is_directory(parent, ec) && !ec) {
             LoadDirectory(parent);
-            if (SelectEntryByName(Basename(selectPath))) {
+            if (SelectEntryByName(Basename(mark))) {
                 return;
             }
         }
@@ -2303,24 +2437,20 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
                 case EntryKind::Directory:
                     LoadDirectory(fullPath);
                     return osContinue;
-                case EntryKind::Playlist: {
-                    auto playlist = ParseM3U(fullPath);
-                    if (playlist.empty()) {
-                        Skins.Message(mtError, tr("Empty or unreadable playlist"));
-                        return osContinue;
-                    }
-                    if (!StartPlayback(std::move(playlist))) {
-                        Skins.Message(mtError, tr("Cannot start playback"));
-                        return osContinue;
-                    }
-                    return osEnd;
-                }
+                case EntryKind::Playlist:
                 case EntryKind::File:
-                    if (!StartPlayback({PlaylistEntry{.uri = fullPath, .title = entry->name}})) {
-                        Skins.Message(mtError, tr("Cannot start playback"));
-                        return osContinue;
+                    // StartPlayback expands a .m3u itself, so both kinds share one path.
+                    switch (StartPlayback(PlaylistEntry{.uri = fullPath, .title = entry->name})) {
+                        case StartPlaybackResult::Started:
+                            return osEnd;
+                        case StartPlaybackResult::EmptyPlaylist:
+                            Skins.Message(mtError, tr("Empty or unreadable playlist"));
+                            return osContinue;
+                        case StartPlaybackResult::DeviceNotReady:
+                            Skins.Message(mtError, tr("Cannot start playback"));
+                            return osContinue;
                     }
-                    return osEnd;
+                    return osContinue;
             }
             return osContinue;
         }

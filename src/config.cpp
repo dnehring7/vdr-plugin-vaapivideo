@@ -121,6 +121,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 // ============================================================================
 
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
+    const MediaBookmark bookmarkSnapshot = LoadBookmark(); // locked: a teardown thread may be writing it
     // Zoom levels are stored in tenths-of-% zoom-in factor; render as a human-readable list.
     std::string zoom;
     for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
@@ -137,13 +138,16 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
                                              DenoiseModeName(denoiseMode.load(std::memory_order_relaxed)),
                                              SharpenModeName(sharpenMode.load(std::memory_order_relaxed)),
                                              ScaleModeName(scaleMode.load(std::memory_order_relaxed)));
+    const std::string mark = bookmarkSnapshot.uri.empty()
+                                 ? std::string{"none"}
+                                 : std::format("{} @ {}ms", bookmarkSnapshot.uri, bookmarkSnapshot.positionMs);
     return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, PCM channels: {}, HDR: {}, "
-                       "Clear on channel switch: {}, Post-proc: {}, Zoom levels (0=off): {}",
+                       "Clear on channel switch: {}, Post-proc: {}, Zoom levels (0=off): {}, Bookmark: {}",
                        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
                        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
                        PcmChannelModeName(pcmChannelMode.load(std::memory_order_relaxed)),
                        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom);
+                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom, mark);
 }
 
 namespace {
@@ -206,6 +210,21 @@ namespace {
         return false;
     }
     target.store(parsed, std::memory_order_relaxed);
+    return true;
+}
+
+/// Parse a non-negative integer (e.g. a bookmark position in ms) into @p target. Leaves @p target
+/// untouched and logs on garbage or a negative value. Plain int, not atomic: the bookmark is only
+/// touched at startup (here) and via the serialized accessors in mediaplayer.cpp.
+[[nodiscard]] auto ParseNonNegativeIntValue(const char *key, const char *value, int &target) -> bool {
+    int parsed{};
+    const auto *end = value + std::strlen(value);
+    const auto [ptr, ec] = std::from_chars(value, end, parsed);
+    if (ec != std::errc{} || ptr != end || parsed < 0) {
+        esyslog("vaapivideo/config: invalid %s value '%s'", key, value);
+        return false;
+    }
+    target = parsed;
     return true;
 }
 
@@ -273,6 +292,13 @@ template <typename EnumT>
     }
     if (key == "ClearOnChannelSwitch") {
         return ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);
+    }
+    if (key == "BookmarkUri") {
+        bookmark.uri = value; // free-form path/URL; validated at use (browser open / StartPlayback)
+        return true;
+    }
+    if (key == "BookmarkPositionMs") {
+        return ParseNonNegativeIntValue("BookmarkPositionMs", value, bookmark.positionMs);
     }
     if (key == "DeinterlaceMode") {
         return ParseEnumValue("DeinterlaceMode", value, deinterlaceMode, CONFIG_DEINTERLACE_MODE_COUNT);

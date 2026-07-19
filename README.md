@@ -868,8 +868,18 @@ PLAY` via SVDRP accepts any URI libavformat can open. Audio-only
 formats are not supported — the source requires a video stream.
 
 After playback ends, or when leaving playback with `Back` / `Stop`, the browser
-reopens at the played local file. URLs and non-selectable paths fall back to `--media-dir`.
-Inside the browser, `Back` moves to the parent directory and `Stop` exits to live TV.
+reopens on the persisted bookmark: for a local file it opens that file's parent
+directory with the cursor on the file. URLs, deleted files, and other
+non-selectable paths fall back to `--media-dir`. Inside the browser, `Back`
+moves to the parent directory and `Stop` exits to live TV.
+
+The mediaplayer keeps a single resume bookmark in `setup.conf`, as
+`vaapivideo.BookmarkUri` and `vaapivideo.BookmarkPositionMs`. It is updated
+whenever playback stops. Restarting the bookmarked local file resumes exactly at
+the saved position; playing to the end resets the position to the start. Playlists
+and non-local URLs bookmark only the origin URI, so they restart from the
+beginning. The bookmark is replaced by the most recent playback and is not
+auto-cleared.
 
 ### Playlist format
 
@@ -907,8 +917,8 @@ duplicated or dropped as needed — there is no motion interpolation.
   DVB LOAS/LATM and container/raw AAC before `WrapIec61937()`, passthrough
   policy entries for the supported AAC codec IDs, and `AudioSinkCaps::Supports()`
   wiring — strictly gated on a sink that advertises AAC-family support.
-- Mediaplayer: subtitle rendering, trick-speed (fast/slow forward and
-  reverse) and persistent resume position.
+- Mediaplayer: subtitle rendering and trick-speed (fast/slow forward and
+  reverse).
 
 
 ## Credits

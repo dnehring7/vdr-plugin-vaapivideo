@@ -35,12 +35,10 @@
 #include <charconv>
 #include <cstring>
 #include <format>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 // FFmpeg
 #pragma GCC diagnostic push
@@ -464,17 +462,19 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
     return kHelp.c_str();
 }
 
-auto cVaapiVideoPlugin::Housekeeping() -> void {}
+auto cVaapiVideoPlugin::Housekeeping() -> void {
+    FlushPendingBookmarkSave(); // flush a bookmark staged off-thread (SVDRP teardown); else a no-op
+}
 
 auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("VAAPI Video"); }
 
 auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
     // The dir falls back to "/" if empty.
     std::string dir = isempty(*mediaDir) ? std::string{"/"} : std::string{*mediaDir};
-    // A pending return-to-browser (Stop in the replay control, or a file ended) opens the browser at
-    // the played file instead of the quick menu; the browser falls back to `dir` if unreachable.
-    if (auto jumpTo = TakeReturnToBrowser(); jumpTo.has_value()) {
-        return new cVaapiFileBrowser(std::move(dir), *jumpTo);
+    // A pending browser reopen (Stop in the replay control, or a file ended) opens the browser
+    // instead of the quick menu; the browser positions its cursor on the persistent bookmark itself.
+    if (TakeBrowserReopen()) {
+        return new cVaapiFileBrowser(std::move(dir));
     }
     // Otherwise the quick menu (line 1 zoom, line 2 mediaplayer); one @vaapivideo hook exposes both.
     return new cVaapiQuickMenu(vaapiDevice, std::move(dir));
@@ -776,24 +776,20 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
             return "VAAPI device not ready -- cannot start playback";
         }
 
-        std::vector<PlaylistEntry> entries;
-        const std::string_view uri{option};
-        if (IsPlaylistUri(uri)) {
-            entries = ParseM3U(uri);
-            if (entries.empty()) {
+        // StartPlayback expands a .m3u itself and preserves the origin URI for the bookmark.
+        switch (StartPlayback(PlaylistEntry{.uri = std::string{option}, .title = std::string{option}})) {
+            case StartPlaybackResult::Started:
+                replyCode = 900;
+                return cString::sprintf("Playing %s", option);
+            case StartPlaybackResult::EmptyPlaylist:
                 replyCode = 550;
                 return cString::sprintf("Empty or unreadable playlist: %s", option);
-            }
-        } else {
-            entries.push_back(PlaylistEntry{.uri = std::string{uri}, .title = std::string{uri}});
+            case StartPlaybackResult::DeviceNotReady:
+                replyCode = 550;
+                return "Could not start mediaplayer (no primary vaapivideo device?)";
         }
-
-        if (!StartPlayback(std::move(entries))) {
-            replyCode = 550;
-            return "Could not start mediaplayer (no primary vaapivideo device?)";
-        }
-        replyCode = 900;
-        return cString::sprintf("Playing %s", option);
+        replyCode = 550;
+        return "Could not start mediaplayer";
     }
 
     if (strcasecmp(command, "ZOOM") == 0) {
