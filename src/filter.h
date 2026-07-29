@@ -78,9 +78,16 @@ class cVideoFilterChain {
         bool streamInterlaced{false};        ///< Positive sequence/container hint; forces deinterlace when set
 
         // --- Target surface ---
-        uint32_t outputWidth{0};     ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout
-        uint32_t outputHeight{0};    ///< Target video rect height
-        uint32_t outputRefreshHz{0}; ///< Used to decide whether to insert an exact-cadence fps duplicate filter
+        uint32_t outputWidth{0};  ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout
+        uint32_t outputHeight{0}; ///< Target video rect height
+        uint32_t outputParNum{1}; ///< Scanout pixel aspect (num:den), from ModePixelAspectRatio(). 1:1 on every
+        uint32_t outputParDen{1}; ///< square-pixel timing; 64:45 on a 720x576 flagged 16:9. The DAR fit below has
+                                  ///< to account for it -- KMS scanout is 1:1, so an anamorphic raster can only be
+                                  ///< compensated here, and the TV stretches the result back out on its own.
+        uint32_t outputRefreshMilliHz{0}; ///< Display refresh in millihertz; decides whether an fps re-timing filter
+                                          ///< is needed. Millihertz, not Hz: on a display running a genuine 59.94 Hz
+                                          ///< mode an integer 60 would look like a mismatch and insert an fps=60
+                                          ///< filter that duplicates a frame roughly every 1000.
 
         // --- HDR decisions (resolved by caller before Build) ---
         bool hdrPassthrough{false}; ///< true -> emit P010 + BT.2020 color directives; false -> NV12 BT.709
@@ -149,6 +156,15 @@ class cVideoFilterChain {
     /// codecMutex, while Build()/Reset() write it on the decode thread.
     [[nodiscard]] auto HasFpsFilter() const noexcept -> bool { return hasFpsFilter_.load(std::memory_order_relaxed); }
 
+    /// Rate the chain emits in millihertz, before any fps re-timing: source rate times the
+    /// field-rate factor (2x when a field-rate deinterlacer is active, so 1080i25 reports 50000).
+    /// Display-independent by construction, which is what makes it usable as the mode-matcher's
+    /// input -- feeding back the post-fps-filter rate would just re-assert the current mode.
+    /// Returns 0 before the first successful Build() and after Reset().
+    [[nodiscard]] auto NaturalOutputRateMilliHz() const noexcept -> uint32_t {
+        return naturalOutputRateMilliHz_.load(std::memory_order_relaxed);
+    }
+
   private:
     /// Drop a partially-built graph, reset the derived state (hasFpsFilter_ / outputFrameDurationMs_)
     /// to the unbuilt defaults, and return false. Used on every Build() failure path; does NOT
@@ -163,6 +179,8 @@ class cVideoFilterChain {
     AVFilterContext *bufferSinkCtx_{}; ///< owned by filterGraph_; same lifetime constraint
     int outputFrameDurationMs_{20};    ///< 20 = 50 fps fallback; updated by Build()
     std::atomic<bool> hasFpsFilter_{false}; ///< true iff the active chain ends with `fps=N`; Build()/Reset() write it
+    std::atomic<uint32_t> naturalOutputRateMilliHz_{0}; ///< Pre-fps-filter output rate; read by the decode thread to
+                                                        ///< publish the stream format for display-mode matching
 };
 
 #endif // VDR_VAAPIVIDEO_FILTER_H

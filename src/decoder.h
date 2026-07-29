@@ -131,6 +131,12 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Called once per decode-loop iteration (incl. the ~100 ms idle ticks when no packets arrive),
                  ///< giving the device a thread that ticks even when a scrambled channel delivers no PES. Must be
                  ///< set before Initialize() starts the thread.
+    auto SetStreamFormatCallback(std::function<void(uint32_t width, uint32_t height, uint32_t rateMilliHz)> callback)
+        -> void; ///< Called from the decode thread after every successful filter-graph build with the coded size and
+                 ///< the chain's pre-fps-filter output rate (field rate when deinterlacing, so 1080i25 reports
+                 ///< 50000 mHz). The device runs it through the display-mode policy. This is the reactive path for
+                 ///< live TV and recordings, where no frame rate is known until FFmpeg has parsed the VUI. Must be
+                 ///< set before Initialize() starts the thread.
     auto SetDevicePaused(bool paused) noexcept
         -> void; ///< Mirror cVaapiDevice::Freeze() / Play() into the drain loop. While paused the drain HOLDS
                  ///< the jitterBuf (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift while
@@ -307,6 +313,9 @@ class cVaapiDecoder : public cThread {
     cVaapiDisplay *display;                 ///< Receives completed VaapiFrames via SubmitFrame().
     VaapiContext *vaapiContext;             ///< Shared VAAPI hw_device_ctx and GpuCaps.
     std::function<void()> loopTickCallback; ///< Per-iteration device hook; set before Initialize(), then read-only.
+    std::function<void(uint32_t, uint32_t, uint32_t)>
+        streamFormatCallback; ///< Post-filter-build device hook (w, h, rate in mHz) for display-mode matching;
+                              ///< set before Initialize(), then read-only.
 
     // ========================================================================
     // === FFMPEG STATE ===

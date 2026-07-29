@@ -25,7 +25,6 @@
 #include "decoder.h"
 
 // POSIX
-#include <pthread.h>
 #include <sys/poll.h>
 
 // C++ Standard Library
@@ -75,6 +74,19 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+namespace {
+
+// --- Prerender queue ---
+constexpr size_t DISPLAY_PRERENDER_SLOTS =
+    8; ///< Decoder->display handoff queue depth (= 160 ms tolerance @ 50 fps). Sized to absorb a
+       ///< single UHD VPP/memory-bandwidth spike (observed ~80 ms in replay) AND the per-frame
+       ///< variance of CPU-side SW decoders (libdav1d 1080p50 spikes 30-40 ms on complex frames)
+       ///< without draining the cache and forcing a re-present. SubmitFrame blocks when all slots
+       ///< are full so audio clock stays in lipsync (the whole pipeline is delayed in lockstep, not
+       ///< just video). FHD HW paths never fill past 1-2 slots; the extra depth is a no-op there.
+       ///< COUPLED to DISPLAY_UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2) below; revisit that margin if
+       ///< you change this (the relationship is not linear -- see the note at that definition).
+
 // --- Page flip ---
 constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
 constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
@@ -83,6 +95,13 @@ constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
 constexpr uint32_t PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 constexpr int DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS = 1000; ///< Commit-failure log rate limit (retry path ~200 Hz)
+
+// --- Runtime mode change ---
+constexpr uint64_t DISPLAY_MODE_RESIZE_WAIT_MS =
+    2000; ///< Watchdog on awaitingResizedFb. After a mode change the video plane stays dark until a
+          ///< framebuffer matching the new scanout rect arrives (a stale-sized one would be cropped,
+          ///< not scaled). Should take a frame or two; past this the gate opens unconditionally so a
+          ///< filter chain that never delivers the expected size cannot strand the screen on black.
 
 // --- Underrun / warmup-grace tracking (display consumer thread) ---
 constexpr uint64_t DISPLAY_UNDERRUN_IDLE_MAX_MS =
@@ -107,8 +126,6 @@ constexpr int DISPLAY_WARMUP_GRACE_MS =
 // ============================================================================
 // === HELPER FUNCTIONS ===
 // ============================================================================
-
-namespace {
 
 [[nodiscard]] auto GetPlaneTypeName(uint32_t type) -> const char * {
     switch (type) {
@@ -325,8 +342,10 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
 
 [[nodiscard]] auto cVaapiDisplay::Initialize(int fileDescriptor, AVBufferRef *hwDevice, uint32_t crtcIdentifier,
                                              uint32_t connectorIdentifier, const drmModeModeInfo &displayMode) -> bool {
-    dsyslog("vaapivideo/display: initializing %ux%u@%uHz", displayMode.hdisplay, displayMode.vdisplay,
-            displayMode.vrefresh);
+    // Rate from the timings, not drmModeModeInfo::vrefresh: that field is rounded to whole Hz, so it
+    // would print this one line as "@50Hz" while every other mode line in the log says "@50.000Hz".
+    dsyslog("vaapivideo/display: initializing %ux%u@%.3fHz", displayMode.hdisplay, displayMode.vdisplay,
+            static_cast<double>(ModeRefreshMilliHz(displayMode)) / 1000.0);
 
     if (fileDescriptor < 0 || !hwDevice) [[unlikely]] {
         esyslog("vaapivideo/display: invalid parameters");
@@ -352,29 +371,30 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
         currentOsd = {};
         osdDirty = false;
         osdGeneration = 0;
+        // Nothing is on screen on a fresh CRTC. Reset here rather than in ResetPlaneStateCaches(),
+        // which must not touch this field (see its comment); a stale id would make AwaitOsdHidden()
+        // block for its full timeout on the first OSD destroyed after a re-attach.
+        lastCommittedOsdFbId = 0;
     }
 
     drmFd = fileDescriptor;
     crtcId = crtcIdentifier;
     connectorId = connectorIdentifier;
-    activeMode = displayMode;
-    outputWidth = displayMode.hdisplay;
-    outputHeight = displayMode.vdisplay;
     {
-        const cMutexLock lock(&videoRectMutex);
-        const cRect fullRect(0, 0, static_cast<int>(outputWidth), static_cast<int>(outputHeight));
-        videoRect = fullRect;
-        targetVideoRect = fullRect;
+        const cMutexLock lock(&modeRequestMutex);
+        activeMode = displayMode;
+        modeRequest = {};
     }
+    modeRequestPending.store(false, std::memory_order_release);
+    modesetActive.store(false, std::memory_order_release);
+    modeGeneration.store(0, std::memory_order_release);
+    geometryChanged.store(false, std::memory_order_release);
+    awaitingResizedFb = false;
+    resizeWaitSince = 0;
+    PublishOutputGeometry(displayMode);
     // Reset plane-state caches so the first commit re-writes every stateful property regardless
     // of any leftover values the kernel may carry from a prior session.
-    constexpr uint64_t kCacheSentinel = ~uint64_t{0};
-    lastCommittedOsdFbId = 0;
-    lastOsdPixelBlendMode = kCacheSentinel;
-    lastVideoColorEncoding = kCacheSentinel;
-    lastVideoColorRange = kCacheSentinel;
-    lastVideoSrcW = lastVideoSrcH = kCacheSentinel;
-    lastVideoCrtcX = lastVideoCrtcY = lastVideoCrtcW = lastVideoCrtcH = kCacheSentinel;
+    ResetPlaneStateCaches();
     // Re-arm the OSD-over-HDR commit-path probe (see AtomicCommit).
     osdHdrNeedsModeset = false;
     osdHdrSuppressed = false;
@@ -385,11 +405,6 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     isFlipPending.store(false, std::memory_order_release);
     flipPendingSinceMs.store(0, std::memory_order_release);
     stopping.store(false, std::memory_order_release);
-    // vrefresh==0 occurs for non-CEA modes on some EDIDs. 50 Hz is the DVB baseline and
-    // must match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values
-    // are coupled; changing one without the other desyncs the A/V controllers.
-    refreshRate = displayMode.vrefresh > 0 ? displayMode.vrefresh : 50;
-    aspectRatio = static_cast<double>(outputWidth) / static_cast<double>(outputHeight);
 
     // Local guard until init succeeds: failure paths never set ready, so Shutdown() -- the
     // usual owner of the unref -- would early-return and leak a member ref.
@@ -421,8 +436,11 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     // Must run after BindDrmPlane(NV12): needs videoPlaneId to check IN_FORMATS for P010.
     ProbeHdrCapabilities();
 
-    if (!ApplyDisplayMode(displayMode)) {
-        esyslog("vaapivideo/display: failed to set display mode");
+    // blankPlanes=false: nothing is attached yet at init time, and adding plane properties for
+    // planes the kernel has never seen only widens the surface for a rejected first commit.
+    // No log here: ApplyDisplayMode already reported the rejected mode with its geometry, and the
+    // attach path reports the overall failure. A third line would just say the same thing twice.
+    if (!ApplyDisplayMode(displayMode, /*blankPlanes=*/false)) {
         return false;
     }
 
@@ -430,12 +448,62 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     ready.store(true, std::memory_order_release);
     Start();
 
-    isyslog("vaapivideo/display: initialized %ux%u@%uHz", outputWidth, outputHeight, refreshRate);
+    isyslog("vaapivideo/display: initialized %ux%u@%.3fHz", GetOutputWidth(), GetOutputHeight(),
+            static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
     return true;
 }
 
 [[nodiscard]] auto cVaapiDisplay::IsInitialized() const noexcept -> bool {
     return ready.load(std::memory_order_acquire);
+}
+
+auto cVaapiDisplay::GetOutputGeometry(uint32_t &width, uint32_t &height) const noexcept -> void {
+    const uint64_t packed = outputGeometry.load(std::memory_order_acquire);
+    width = static_cast<uint32_t>(packed >> 32);
+    height = static_cast<uint32_t>(packed & 0xFFFFFFFFULL);
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetOutputWidth() const noexcept -> uint32_t {
+    return static_cast<uint32_t>(outputGeometry.load(std::memory_order_acquire) >> 32);
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetOutputHeight() const noexcept -> uint32_t {
+    return static_cast<uint32_t>(outputGeometry.load(std::memory_order_acquire) & 0xFFFFFFFFULL);
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetAspectRatio() const noexcept -> double {
+    // Raster shape times pixel aspect, NOT width/height: an anamorphic CEA timing (720x576 flagged
+    // 16:9) is shown 42% wider than its raster. Derived rather than stored so there is one fewer
+    // atomic to keep coherent with the geometry across a mode change.
+    uint32_t width = 0;
+    uint32_t height = 0;
+    GetOutputGeometry(width, height);
+    const AspectRatio par = GetOutputPixelAspect();
+    if (height == 0 || par.den == 0) [[unlikely]] {
+        return DISPLAY_DEFAULT_ASPECT_RATIO;
+    }
+    return (static_cast<double>(width) * par.num) / (static_cast<double>(height) * par.den);
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetOutputRefreshRate() const noexcept -> uint32_t {
+    return (outputRefreshMilliHz.load(std::memory_order_acquire) + 500U) / 1000U;
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetActiveMode() const -> drmModeModeInfo {
+    const cMutexLock lock(&modeRequestMutex);
+    return activeMode;
+}
+
+auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
+    if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
+        return;
+    }
+    {
+        const cMutexLock lock(&modeRequestMutex);
+        modeRequest = mode;
+    }
+    // Published after the mode itself so the display thread never reads a half-written request.
+    modeRequestPending.store(true, std::memory_order_release);
 }
 
 [[nodiscard]] auto cVaapiDisplay::GetActiveHdrKind() const noexcept -> StreamHdrKind {
@@ -490,7 +558,7 @@ auto cVaapiDisplay::ClearOsdIfActive(uint32_t fbId) -> void {
 
     const cMutexLock lock(&osdMutex);
     if (currentOsd.fbId == fbId) {
-        dsyslog("vaapivideo/display: OSD hide (conditional) - fbId=%u", fbId);
+        dsyslog("vaapivideo/display: OSD hide (conditional) -- fbId=%u", fbId);
         currentOsd = {};
         osdDirty = true;
         ++osdGeneration;
@@ -506,10 +574,10 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
     const bool hiding = !wasHidden && nowHidden;
 
     if (showing) {
-        dsyslog("vaapivideo/display: OSD show - fbId=%u pos=(%d,%d) size=%ux%u", osd.fbId, osd.x, osd.y, osd.width,
+        dsyslog("vaapivideo/display: OSD show -- fbId=%u pos=(%d,%d) size=%ux%u", osd.fbId, osd.x, osd.y, osd.width,
                 osd.height);
     } else if (hiding) {
-        dsyslog("vaapivideo/display: OSD hide - fbId=%u", currentOsd.fbId);
+        dsyslog("vaapivideo/display: OSD hide -- fbId=%u", currentOsd.fbId);
     }
 
     // Always mark dirty, even for an unchanged (fbId, geometry) pair. VDR may repaint
@@ -558,7 +626,7 @@ auto cVaapiDisplay::Shutdown() -> void {
     }
 
     if (!hasExited.load(std::memory_order_acquire)) {
-        esyslog("vaapivideo/display: thread did not exit - may cause resource leak");
+        esyslog("vaapivideo/display: thread did not exit -- may cause resource leak");
     }
 
     // Drain residual page-flip events: without this the kernel keeps them pending on the fd
@@ -647,7 +715,10 @@ auto cVaapiDisplay::Shutdown() -> void {
 
 [[nodiscard]] auto cVaapiDisplay::SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs) -> bool {
     // Relaxed pre-checks (cheap); bufferMutex below provides the actual memory ordering.
-    if (!frame || !ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
+    // Two independent gates: isClearing (owned by BeginStreamSwitch) and modesetActive (owned by
+    // the display thread's ChangeDisplayMode). They can overlap, so each owner clears only its own.
+    if (!frame || !ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed) ||
+        modesetActive.load(std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
@@ -663,7 +734,7 @@ auto cVaapiDisplay::Shutdown() -> void {
         // "infinite" wait from outliving a stream switch or shutdown.
         const cTimeMs deadline(timeoutMs > 0 ? timeoutMs : 0);
         while (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS && ready.load(std::memory_order_relaxed)) {
-            if (isClearing.load(std::memory_order_relaxed)) {
+            if (isClearing.load(std::memory_order_relaxed) || modesetActive.load(std::memory_order_relaxed)) {
                 return false;
             }
             if (timeoutMs > 0 && deadline.TimedOut()) {
@@ -677,10 +748,11 @@ auto cVaapiDisplay::Shutdown() -> void {
         }
     }
 
-    // Re-check under bufferMutex: both teardown paths set their flag before taking bufferMutex
+    // Re-check under bufferMutex: every teardown path sets its flag before taking bufferMutex
     // to drop the queue, so either the flag is visible here or this push is swept by the
-    // clear -- a stale frame can never survive into the new stream.
-    if (!ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed)) [[unlikely]] {
+    // clear -- a stale frame can never survive into the new stream (or the new mode).
+    if (!ready.load(std::memory_order_relaxed) || isClearing.load(std::memory_order_relaxed) ||
+        modesetActive.load(std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
@@ -694,15 +766,16 @@ auto cVaapiDisplay::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDisplay::Action() -> void {
-    dsyslog("vaapivideo/display: thread started (thread=%lu)", (unsigned long)pthread_self());
+    // No thread id: VDR already prefixes every line with the tid, and the sibling threads
+    // (present, decoder, audio) log this same bare phrase.
+    dsyslog("vaapivideo/display: thread started");
 
     // Queue-underrun tracker: wall-clock duration of consecutive empty VSyncs during active
     // playback; warmup grace suppresses spurious counts after Clear/cold-start while the
     // filter graph + audio anchor. Durations are wall-clock deltas, never vsyncCount * nominal
     // vsyncMs -- counts lie when the loop is preempted or flip events arrive late.
-    // refreshRate is set before Start() and never changes, so these are loop invariants.
-    const auto vsyncMs = refreshRate > 0 ? 1000U / refreshRate : 20U;
-    const uint64_t thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
+    // Re-derived every iteration rather than hoisted: a runtime mode change moves the refresh
+    // rate under this thread, and a stale threshold would mis-scale every underrun verdict.
     uint64_t gapStartMs = 0;      ///< Wall-clock baseline for the current gap; 0 = "anchor on next re-present".
                                   ///< Reset on commit / isClearing / inTrick / inSyncSleep / inPause so deliberate
                                   ///< holds do not surface their duration as a fake underrun.
@@ -715,6 +788,10 @@ auto cVaapiDisplay::Action() -> void {
     cTimeMs warmupGraceUntil(0);
 
     while (!stopping.load(std::memory_order_relaxed) && ready.load(std::memory_order_relaxed)) {
+        const auto refreshHz = GetOutputRefreshRate();
+        const auto vsyncMs = refreshHz > 0 ? 1000U / refreshHz : 20U;
+        const uint64_t thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
+
         // Non-blocking drain so isFlipPending is up-to-date before the gate check below.
         while (DrainDrmEvents(0)) {
         }
@@ -734,6 +811,18 @@ auto cVaapiDisplay::Action() -> void {
                 flipPendingSinceMs.store(0, std::memory_order_release);
                 isFlipPending.store(false, std::memory_order_release);
             }
+            continue;
+        }
+
+        // Runtime mode change, serviced here and nowhere else: this thread owns every DRM commit
+        // and is the sole drmHandleEvent dispatcher, so doing the ALLOW_MODESET inline needs no
+        // extra lock and cannot stall the VDR main loop. Placed after the flip gate above so the
+        // previous flip has always completed before the CRTC is reprogrammed.
+        if (modeRequestPending.load(std::memory_order_acquire)) [[unlikely]] {
+            ChangeDisplayMode();
+            gapStartMs = 0;
+            peakGapMs = 0;
+            warmupGraceUntil.Set(DISPLAY_WARMUP_GRACE_MS);
             continue;
         }
 
@@ -822,13 +911,22 @@ auto cVaapiDisplay::Action() -> void {
         // No new frame: re-present the previous buffer to keep flip cadence + OSD updates alive.
         if (!frameCommitted && !isClearing.load(std::memory_order_relaxed)) {
             bool didPresent = false;
+            bool haveVideoBuffer = false;
             {
                 const cMutexLock lock(&bufferMutex);
-                if (pendingBuffer.IsValid()) {
+                haveVideoBuffer = pendingBuffer.IsValid();
+                if (haveVideoBuffer) {
                     // Failure falls through to the SleepMs(5) below -- an immediate retry
                     // would busy-spin while the kernel keeps rejecting the plane state.
                     didPresent = PresentBuffer(pendingBuffer);
                 }
+            }
+            // No framebuffer at all: the OSD has nothing to ride on. That is the state right
+            // after a mode change (ChangeDisplayMode drops both buffers) and for any audio-only
+            // stream, and without this the staged overlay -- typically the VDR menu the user is
+            // looking at -- would never reach the screen.
+            if (!haveVideoBuffer) {
+                (void)CommitOsdOnly();
             }
             // bufferMutex is released BEFORE the tracking and SleepMs below: pthread mutexes
             // are not FIFO, and holding it across the pre-first-frame sleep starved
@@ -893,10 +991,14 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // commit doesn't fail over a slightly oversized OSD. If nothing remains visible after clipping,
     // emit a hide commit -- a silent no-op would leave the previously-shown OSD scanned out
     // forever (PresentBuffer clears osdDirty on success).
+    // Snapshot the geometry once: a runtime mode change can move it between reads, and after one
+    // the live OSD is still sized for the previous mode -- this clip is what keeps it committable.
+    const auto screenWidth = GetOutputWidth();
+    const auto screenHeight = GetOutputHeight();
     const bool offScreen =
-        sourceOffsetX >= osd.width || sourceOffsetY >= osd.height || destX >= outputWidth || destY >= outputHeight;
-    const auto clippedW = offScreen ? 0U : std::min(osd.width - sourceOffsetX, outputWidth - destX);
-    const auto clippedH = offScreen ? 0U : std::min(osd.height - sourceOffsetY, outputHeight - destY);
+        sourceOffsetX >= osd.width || sourceOffsetY >= osd.height || destX >= screenWidth || destY >= screenHeight;
+    const auto clippedW = offScreen ? 0U : std::min(osd.width - sourceOffsetX, screenWidth - destX);
+    const auto clippedH = offScreen ? 0U : std::min(osd.height - sourceOffsetY, screenHeight - destY);
     if (clippedW == 0 || clippedH == 0) {
         req.AddProperty(osdPlaneId, osdProps.fbId, 0);
         req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
@@ -997,28 +1099,46 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // size), so an EINVAL here is a genuinely invalid plane state -- surface it loud, no retry.
     // Rate-limited: the 5 ms re-present retry path would otherwise emit this at up to 200 Hz.
     if (atomicFailureLogCooldown.TimedOut()) {
-        esyslog("vaapivideo/display: atomic commit failed - %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
+        esyslog("vaapivideo/display: atomic commit failed -- %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
         atomicFailureLogCooldown.Set(DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS);
     }
     return false;
 }
 
-[[nodiscard]] auto cVaapiDisplay::ApplyDisplayMode(const drmModeModeInfo &mode) -> bool {
-    dsyslog("vaapivideo/display: setting display mode %ux%u@%uHz", mode.hdisplay, mode.vdisplay, mode.vrefresh);
-    // KMS stores the mode as a property blob. Destroy the old one explicitly -- libdrm has no GC.
-    if (modeBlobId != 0) {
-        drmModeDestroyPropertyBlob(drmFd, modeBlobId);
-        modeBlobId = 0;
-    }
+[[nodiscard]] auto cVaapiDisplay::ApplyDisplayMode(const drmModeModeInfo &mode, bool blankPlanes) -> bool {
+    // Deliberately silent on success: both callers log the mode they ended up with ("initialized",
+    // "mode changed to"), so announcing the attempt as well printed every switch twice. The failure
+    // paths below carry the geometry instead, which is where it is actually needed.
+    const double rateHz = static_cast<double>(ModeRefreshMilliHz(mode)) / 1000.0;
 
-    if (drmModeCreatePropertyBlob(drmFd, &mode, sizeof(mode), &modeBlobId) < 0) {
-        esyslog("vaapivideo/display: failed to create mode blob");
+    // KMS stores the mode as a property blob; libdrm has no GC, so the old one is freed by hand.
+    // Keep it alive across the commit: the kernel holds an internal reference while ACTIVE=1, and
+    // it is also the state to fall back on if the new mode is rejected. Freed only once the new
+    // blob is live (or immediately, if the new blob was rejected).
+    const uint32_t previousBlobId = modeBlobId;
+    uint32_t newBlobId = 0;
+    if (drmModeCreatePropertyBlob(drmFd, &mode, sizeof(mode), &newBlobId) < 0) {
+        esyslog("vaapivideo/display: failed to create mode blob for %ux%u@%.3fHz: %s", mode.hdisplay, mode.vdisplay,
+                rateHz, std::strerror(errno));
         return false;
     }
 
     AtomicRequest req;
+    // Detach both planes in the SAME commit as the mode change. On a runtime switch the attached
+    // framebuffers are still sized for the outgoing mode, and a plane larger than the incoming
+    // CRTC makes the kernel reject the whole atomic request with EINVAL.
+    if (blankPlanes) {
+        if (videoPlaneId != 0) {
+            req.AddProperty(videoPlaneId, videoProps.fbId, 0);
+            req.AddProperty(videoPlaneId, videoProps.crtcId, 0);
+        }
+        if (osdPlaneId != 0) {
+            req.AddProperty(osdPlaneId, osdProps.fbId, 0);
+            req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
+        }
+    }
     req.AddProperty(crtcId, modesetProps.crtcActive, 1);
-    req.AddProperty(crtcId, modesetProps.crtcModeId, modeBlobId);
+    req.AddProperty(crtcId, modesetProps.crtcModeId, newBlobId);
     req.AddProperty(connectorId, modesetProps.connectorCrtcId, crtcId);
     // Include the SDR baseline for HDR connector properties in this same ALLOW_MODESET commit
     // to clear any state left by a previous DRM client (e.g. BT.2020 / 10 bpc from HDR
@@ -1037,15 +1157,23 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     }
 
     if (!AtomicCommit(req, DRM_MODE_ATOMIC_ALLOW_MODESET)) {
-        esyslog("vaapivideo/display: failed to set mode");
-        if (drmModeDestroyPropertyBlob(drmFd, modeBlobId) != 0) [[unlikely]] {
+        esyslog("vaapivideo/display: driver rejected mode %ux%u@%.3fHz", mode.hdisplay, mode.vdisplay, rateHz);
+        // Drop only the rejected blob; the previous one is still referenced by the live CRTC.
+        if (drmModeDestroyPropertyBlob(drmFd, newBlobId) != 0) [[unlikely]] {
             esyslog("vaapivideo/display: failed to destroy rejected mode blob: %s", std::strerror(errno));
         }
-        modeBlobId = 0;
         return false;
     }
 
-    activeMode = mode;
+    modeBlobId = newBlobId;
+    if (previousBlobId != 0 && drmModeDestroyPropertyBlob(drmFd, previousBlobId) != 0) [[unlikely]] {
+        esyslog("vaapivideo/display: failed to destroy previous mode blob: %s", std::strerror(errno));
+    }
+
+    {
+        const cMutexLock lock(&modeRequestMutex);
+        activeMode = mode;
+    }
     // Mark applied state as Sdr so MaybeAppendHdrOutputState() skips the first frame's
     // HDR write (staged==applied), keeping subsequent page flips in the non-ALLOW_MODESET
     // fast path and preventing spurious AVR retrains during IEC61937 lock-in.
@@ -1053,11 +1181,210 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         const cMutexLock lock(&hdrStateMutex);
         appliedHdrState = HdrStreamInfo{};
     }
-    appliedHdrBlobId = 0;
+    // The commit above wrote HDR_OUTPUT_METADATA=0, so the kernel has dropped its reference to
+    // whatever infoframe blob was live -- destroy it rather than just forgetting the id. At
+    // Initialize() these are always 0; on the runtime path they are not, and simply zeroing them
+    // leaked one kernel blob per mode change made during HDR playback.
+    for (uint32_t *blobId : {&appliedHdrBlobId, &pendingDestroyHdrBlobId}) {
+        if (*blobId != 0) {
+            if (drmModeDestroyPropertyBlob(drmFd, *blobId) != 0) [[unlikely]] {
+                esyslog("vaapivideo/display: failed to destroy HDR blob on mode change: %s", std::strerror(errno));
+            }
+            *blobId = 0;
+        }
+    }
     // Fresh CDCLK headroom: re-probe so a smaller HDR mode isn't needlessly forced onto sync commits.
     osdHdrNeedsModeset = false;
     osdHdrSuppressed = false;
     return true;
+}
+
+auto cVaapiDisplay::ResetPlaneStateCaches() -> void {
+    // Video-plane caches only. lastCommittedOsdFbId describes what the kernel is really scanning
+    // out (AwaitOsdHidden blocks on it before a dumb buffer is freed) and is guarded by osdMutex,
+    // so it is cleared by the caller -- under that lock, and only once a commit that actually
+    // detached the OSD plane has landed.
+    constexpr uint64_t kCacheSentinel = ~uint64_t{0};
+    lastOsdPixelBlendMode = kCacheSentinel;
+    lastVideoColorEncoding = kCacheSentinel;
+    lastVideoColorRange = kCacheSentinel;
+    lastVideoSrcW = lastVideoSrcH = kCacheSentinel;
+    lastVideoCrtcX = lastVideoCrtcY = lastVideoCrtcW = lastVideoCrtcH = kCacheSentinel;
+}
+
+auto cVaapiDisplay::PublishOutputGeometry(const drmModeModeInfo &mode) -> void {
+    const uint64_t previousGeometry = outputGeometry.load(std::memory_order_acquire);
+    const auto previousWidth = static_cast<uint32_t>(previousGeometry >> 32);
+    const auto previousHeight = static_cast<uint32_t>(previousGeometry & 0xFFFFFFFFULL);
+
+    // Pixel aspect before the geometry, and modeGeneration (bumped by the caller) after both. Store
+    // order alone cannot make the pair coherent for a reader -- it may load one atomic before this
+    // runs and the other after -- so GetOsdSize() brackets its reads with the generation and
+    // retries; publishing in this order is what makes that bracket sufficient.
+    const AspectRatio pixelAspect = ModePixelAspectRatio(mode);
+    outputPixelAspect.store((static_cast<uint64_t>(pixelAspect.num) << 32) | static_cast<uint64_t>(pixelAspect.den),
+                            std::memory_order_release);
+    outputGeometry.store((static_cast<uint64_t>(mode.hdisplay) << 32) | static_cast<uint64_t>(mode.vdisplay),
+                         std::memory_order_release);
+    // A degenerate mode (no clock / zero totals) yields 0. 50 Hz is the DVB baseline and must
+    // match decoder.cpp's framerate fallback in InitFilterGraph() -- the two values are coupled;
+    // changing one without the other desyncs the A/V controllers.
+    const uint32_t rateMilliHz = ModeRefreshMilliHz(mode);
+    outputRefreshMilliHz.store(rateMilliHz > 0 ? rateMilliHz : 50000U, std::memory_order_release);
+
+    const cRect fullRect(0, 0, static_cast<int>(mode.hdisplay), static_cast<int>(mode.vdisplay));
+    const cMutexLock lock(&videoRectMutex);
+    // A skin (e.g. skindesigner) may be holding a scaled video window via ScaleVideo(); the device
+    // keeps no copy of it, so resetting to full-screen here would silently destroy its layout with
+    // nothing left to restore it. Map the request proportionally into the new mode instead, and
+    // only fall back to full-screen when it genuinely was full-screen (or the old size is unknown).
+    const auto remap = [&](const cRect &rect) -> cRect {
+        if (previousWidth == 0 || previousHeight == 0) {
+            return fullRect;
+        }
+        if (rect.X() == 0 && rect.Y() == 0 && rect.Width() == static_cast<int>(previousWidth) &&
+            rect.Height() == static_cast<int>(previousHeight)) {
+            return fullRect;
+        }
+        const auto scale = [](int value, uint32_t from, uint32_t to) -> int {
+            return static_cast<int>((static_cast<int64_t>(value) * to) / from);
+        };
+        return NormalizeVideoRect(
+            {scale(rect.X(), previousWidth, mode.hdisplay), scale(rect.Y(), previousHeight, mode.vdisplay),
+             scale(rect.Width(), previousWidth, mode.hdisplay), scale(rect.Height(), previousHeight, mode.vdisplay)});
+    };
+    videoRect = remap(videoRect);
+    targetVideoRect = remap(targetVideoRect);
+}
+
+[[nodiscard]] auto cVaapiDisplay::CommitOsdOnly() -> bool {
+    // The OSD normally rides the next video commit, but PresentBuffer() needs a framebuffer to
+    // carry it. After a mode change there is none (ChangeDisplayMode drops both), and an
+    // audio-only stream never produces one either, so without this path a staged OSD -- the VDR
+    // menu the user is looking at -- would never reach the screen.
+    if (osdPlaneId == 0) {
+        return false;
+    }
+
+    AtomicRequest req;
+    bool osdCommitted = false;
+    uint32_t osdFbId = 0;
+    uint64_t osdCommitGeneration = 0;
+    const bool hdrActive = GetActiveHdrKind() != StreamHdrKind::Sdr;
+    {
+        const cMutexLock lock(&osdMutex);
+        if (!osdDirty) {
+            return false;
+        }
+        // Same suppression rule as PresentBuffer: hides always land, enables are blocked while a
+        // bandwidth-limited GPU has latched osdHdrSuppressed under HDR.
+        if (currentOsd.fbId != 0 && osdHdrSuppressed && hdrActive) {
+            return false;
+        }
+        osdCommitGeneration = osdGeneration;
+        if (currentOsd.fbId != 0) {
+            osdFbId = AppendOsdPlane(req, currentOsd) ? currentOsd.fbId : 0;
+        } else {
+            req.AddProperty(osdPlaneId, osdProps.fbId, 0);
+            req.AddProperty(osdPlaneId, osdProps.crtcId, 0);
+        }
+        osdCommitted = true;
+    }
+    // Pull the CRTC into the atomic state. The kernel derives the page-flip event we ask for by
+    // walking the request's CRTCs, and an already-detached plane -- exactly what ApplyDisplayMode
+    // leaves behind -- contributes neither an old nor a new one, so the commit would succeed with
+    // no event and latch isFlipPending until the 200 ms watchdog fires. ACTIVE=1 is already its
+    // value, so this stays on the fast non-blocking path.
+    req.AddProperty(crtcId, modesetProps.crtcActive, 1);
+    if (!osdCommitted || req.Count() == 0) {
+        return false;
+    }
+
+    if (!AtomicCommit(req, 0, /*osdHdrCommit=*/hdrActive)) {
+        return false;
+    }
+    const cMutexLock lock(&osdMutex);
+    lastCommittedOsdFbId = osdFbId;
+    if (osdGeneration == osdCommitGeneration) {
+        osdDirty = false;
+    }
+    if (osdFbId != 0) {
+        lastOsdPixelBlendMode = 1; // AppendOsdPlane wrote it iff it differed.
+    }
+    return true;
+}
+
+auto cVaapiDisplay::ChangeDisplayMode() -> void {
+    drmModeModeInfo wanted{};
+    bool alreadyActive = false;
+    {
+        // Take the request and clear the flag under the SAME lock RequestDisplayMode() publishes
+        // under: clearing it afterwards would silently swallow a request that landed in between.
+        const cMutexLock lock(&modeRequestMutex);
+        wanted = modeRequest;
+        modeRequestPending.store(false, std::memory_order_release);
+        alreadyActive = wanted.hdisplay == activeMode.hdisplay && wanted.vdisplay == activeMode.vdisplay &&
+                        ModeRefreshMilliHz(wanted) == ModeRefreshMilliHz(activeMode);
+    }
+    // Requests are idempotent so callers can fire one unconditionally (ResetDisplayModeToDefault
+    // cannot tell whether an earlier change is still in flight). Nothing to do, and skipping the
+    // commit spares the sink a pointless link retrain.
+    if (alreadyActive || wanted.hdisplay == 0 || wanted.vdisplay == 0) {
+        return;
+    }
+
+    // Gate the producer: SubmitFrame() rejects while this is set, so nothing sized for the outgoing
+    // mode can queue up behind our back. Its own flag, not isClearing -- that one belongs to
+    // BeginStreamSwitch(), and a modeset finishing inside a stream-switch window would clear a gate
+    // it never armed, letting pre-Clear frames through.
+    modesetActive.store(true, std::memory_order_release);
+    {
+        const cMutexLock lock(&bufferMutex);
+        pendingFrames.clear();
+        pendingDepth.store(0, std::memory_order_release);
+        frameSlotCond.Broadcast();
+        // Dropping both framebuffers is what makes the transition safe: Action()'s re-present
+        // branch runs outside importMutex, so an invalid pendingBuffer is the one thing that
+        // reliably stops it from committing a stale-sized fb mid-modeset.
+        displayedBuffer = DrmFramebuffer{};
+        pendingBuffer = DrmFramebuffer{};
+    }
+
+    const bool applied = ApplyDisplayMode(wanted, /*blankPlanes=*/true);
+    // Cached plane properties describe state the blank commit just cleared -- invalidate them
+    // even on failure, since a rejected request may still have landed partially.
+    ResetPlaneStateCaches();
+
+    if (applied) {
+        PublishOutputGeometry(wanted);
+        // The commit detached the OSD plane; record that under osdMutex or AwaitOsdHidden() hangs
+        // a cVaapiOsd destructor for its full 500 ms timeout on a stale fbId. currentOsd is kept
+        // and re-armed in the same critical section, so a skin that never repaints gets its overlay
+        // back clipped to the new mode rather than losing it.
+        {
+            const cMutexLock lock(&osdMutex);
+            lastCommittedOsdFbId = 0;
+            osdDirty = true;
+            ++osdGeneration;
+        }
+        awaitingResizedFb = true;
+        resizeWaitSince = cTimeMs::Now();
+        // Publish last: the decoder rebuilds its VPP graph off this edge and must observe the new
+        // geometry when it does.
+        geometryChanged.store(true, std::memory_order_release);
+        modeGeneration.fetch_add(1, std::memory_order_acq_rel);
+        isyslog("vaapivideo/display: mode changed to %ux%u@%.3fHz", GetOutputWidth(), GetOutputHeight(),
+                static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
+    } else {
+        // An atomic commit is all-or-nothing: the old mode is still programmed AND the old OSD fb
+        // still attached, so lastCommittedOsdFbId must keep describing it. The next commit
+        // re-attaches the video plane from the sentinel caches. No retry -- a rejected mode will be
+        // rejected again. ApplyDisplayMode already named it; report only the consequence.
+        esyslog("vaapivideo/display: keeping current mode %ux%u@%.3fHz", GetOutputWidth(), GetOutputHeight(),
+                static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
+    }
+
+    modesetActive.store(false, std::memory_order_release);
 }
 
 [[nodiscard]] auto cVaapiDisplay::BindDrmPlane(int planeIndex, uint32_t format) -> bool {
@@ -1086,7 +1413,11 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return false;
     }
 
-    dsyslog("vaapivideo/display: searching for plane %d (format 0x%08x)", planeIndex, format);
+    // DRM fourccs are four printable ASCII bytes, little-endian, so spell the format out: the raw
+    // 0x3231564e this used to print is the same value but nobody reads it as "NV12".
+    dsyslog("vaapivideo/display: searching for plane index %d (format %c%c%c%c)", planeIndex,
+            static_cast<char>(format & 0xFFU), static_cast<char>((format >> 8U) & 0xFFU),
+            static_cast<char>((format >> 16U) & 0xFFU), static_cast<char>((format >> 24U) & 0xFFU));
 
     // For the NV12 video plane, prefer an HDR-capable plane (P010 + both COLOR_ENCODING enums).
     // Some GPUs put P010 on a later plane and list a SDR-only plane first; taking the first
@@ -1243,7 +1574,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
             continue;
         }
 
-        dsyslog("vaapivideo/display: candidate plane %u type=%s (found=%d, need=%d)", plane->plane_id,
+        dsyslog("vaapivideo/display: candidate plane %u type=%s (match #%d, want #%d)", plane->plane_id,
                 GetPlaneTypeName(planeType), found, planeIndex);
 
         if (preferHdrCapable) {
@@ -1326,7 +1657,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // of any field deploy carries the kernel driver fingerprint relevant to atomic-commit
     // behavior (modifiers, async page-flip, vblank events).
     if (drmVersionPtr v = drmGetVersion(drmFd); v != nullptr) {
-        dsyslog("vaapivideo/display: DRM driver=%.*s %d.%d.%d  caps: addfb2_modifiers=%lu async_flip=%lu "
+        dsyslog("vaapivideo/display: DRM driver=%.*s %d.%d.%d caps: addfb2_modifiers=%lu async_flip=%lu "
                 "vblank_event=%lu prime=%lu dumb=%lu",
                 v->name_len, v->name ? v->name : "?", v->version_major, v->version_minor, v->version_patchlevel,
                 static_cast<unsigned long>(GetDrmCap(drmFd, DRM_CAP_ADDFB2_MODIFIERS)),
@@ -1439,7 +1770,7 @@ auto cVaapiDisplay::ProbeHdrCapabilities() -> void {
     }
 
     if (!edidBlob.empty()) {
-        ParseEdidHdrCaps(std::span<const uint8_t>{edidBlob}, displayCaps);
+        ParseEdidHdrCaps(std::span<const uint8_t>{edidBlob.data(), edidBlob.size()}, displayCaps);
     }
     // P010 and COLOR_ENCODING flags were already sniffed by BindDrmPlane(NV12); copy here.
     displayCaps.planeSupportsP010 = (videoPlaneId != 0) && videoProps.supportsP010;
@@ -1854,8 +2185,8 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
 }
 
 [[nodiscard]] auto cVaapiDisplay::NormalizeVideoRect(const cRect &rect) const -> cRect {
-    const int outW = static_cast<int>(outputWidth);
-    const int outH = static_cast<int>(outputHeight);
+    const int outW = static_cast<int>(GetOutputWidth());
+    const int outH = static_cast<int>(GetOutputHeight());
     // Guard invalid modes; std::clamp() with lo > hi is UB.
     if (outW < 2 || outH < 2) [[unlikely]] {
         return cRect::Null;
@@ -1916,6 +2247,23 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     if (placement.width == 0) [[unlikely]] {
         return false;
     }
+
+    // Post-modeset gate. SRC_W/H are written equal to CRTC_W/H below, an invariant that only holds
+    // because the VPP pre-fits every fb to the scanout rect -- KMS itself does not scale. A frame
+    // that was already in flight when the mode changed does not fit, and committing it would crop
+    // the picture rather than shrink it, so hold the plane dark until the rebuilt chain catches up.
+    if (awaitingResizedFb) [[unlikely]] {
+        if (placement.width == fb.width && placement.height == fb.height) {
+            awaitingResizedFb = false;
+        } else if (cTimeMs::Now() - resizeWaitSince > DISPLAY_MODE_RESIZE_WAIT_MS) {
+            esyslog("vaapivideo/display: no fb matching %ux%u after %llums -- resuming with mismatched geometry",
+                    vr.Width(), vr.Height(), static_cast<unsigned long long>(cTimeMs::Now() - resizeWaitSince));
+            awaitingResizedFb = false;
+        } else {
+            return false; // Action() falls through to its 5 ms sleep and retries with the next fb.
+        }
+    }
+
     const uint32_t destX = placement.destX;
     const uint32_t destY = placement.destY;
     const uint32_t planeW = placement.width;

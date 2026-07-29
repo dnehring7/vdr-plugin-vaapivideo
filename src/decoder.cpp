@@ -101,6 +101,8 @@ extern "C" {
 // === CONSTANTS ===
 // ============================================================================
 
+namespace {
+
 // --- Packet / present queues ---
 constexpr size_t DECODER_QUEUE_CAPACITY =
     200; ///< ~4 s @ 50 fps. Overflow drops oldest; trick mode limits to DECODER_TRICK_QUEUE_DEPTH.
@@ -162,6 +164,11 @@ constexpr uint64_t DECODER_NO_CLOCK_HOLD_MS =
           ///< freerun. Keeps post-seek frames buffered so the head doesn't run ahead of the clock at
           ///< VSync rate. Bounded so a video-only stream (ap non-null, no audio anchor ever) does not
           ///< freeze forever; the nearCap escape additionally bypasses it if jitterBuf hits the cap.
+constexpr uint64_t DECODER_DRAIN_MISS_GRACE_MS =
+    3000; ///< Post-flush grace before drain gaps count toward `miss`: after a Clear()/seek/mediaplayer
+          ///< open the pipeline legitimately stalls (filter rebuild, mode-switch HDMI retrain, audio
+          ///< re-anchor) and those gaps are transition cost, not upstream starvation. Mirrors the
+          ///< display side's DISPLAY_WARMUP_GRACE_MS.
 
 // --- Trick-play pacing ---
 constexpr int VDR_SLOW_REVERSE_SPEED_MULT =
@@ -187,6 +194,8 @@ constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_STEP_MS =
 constexpr uint64_t DECODER_SLOW_REVERSE_HOLD_MAX_MS =
     700; ///< Cap on the slow-reverse hold: keeps the slowest level off the seconds-long slideshow that a genuinely
          ///< 0.25x reverse (~1.6 s/frame) would reintroduce.
+
+} // namespace
 
 // ============================================================================
 // === STRUCTURES ===
@@ -1036,6 +1045,11 @@ auto cVaapiDecoder::SetLoopTickCallback(std::function<void()> callback) -> void 
     loopTickCallback = std::move(callback);
 }
 
+auto cVaapiDecoder::SetStreamFormatCallback(std::function<void(uint32_t, uint32_t, uint32_t)> callback) -> void {
+    // Same contract as loopTickCallback: set once before the thread starts, then read-only.
+    streamFormatCallback = std::move(callback);
+}
+
 auto cVaapiDecoder::SetDevicePaused(bool paused) noexcept -> void {
     // Flips the drain-loop hold gate. See decoder.h declaration for the rationale; the read
     // site lives at the top of the drain `while` in PresentAction().
@@ -1529,6 +1543,7 @@ auto cVaapiDecoder::PresentAction() -> void {
 
     uint64_t noClockBlockedSinceMs{0}; ///< Walltime of the first no-clock hold; 0 = not holding.
     uint64_t lastDrainMs{0};
+    uint64_t missGraceUntilMs{0};    ///< Drain-miss suppression deadline; armed by each consumed flush.
     cTimeMs jitterOverflowLogGate;   ///< Rate-limits the "jitterBuf overflow" syslog spam.
     size_t jitterOverflowSinceLog{}; ///< Frames dropped by the runaway guard since the last overflow log.
     cTimeMs futureDropLogGate;       ///< Rate-limits the "head too far in future" drop log (it can fire per frame).
@@ -1543,6 +1558,7 @@ auto cVaapiDecoder::PresentAction() -> void {
         if (const int flushRequest = jitterFlushRequest.exchange(0, std::memory_order_acquire); flushRequest != 0) {
             ApplyDeferredJitterFlush(lastDrainMs, /*preserveSeekHint=*/flushRequest == 2);
             noClockBlockedSinceMs = 0;
+            missGraceUntilMs = cTimeMs::Now() + DECODER_DRAIN_MISS_GRACE_MS;
         }
         presentEpoch = clearEpoch.load(std::memory_order_acquire);
 
@@ -1726,9 +1742,11 @@ auto cVaapiDecoder::PresentAction() -> void {
             // WaitForAudioCatchUp) in the previous SyncAndSubmitFrame causes the same big gap, so
             // consume sleptInLastSubmit to skip exactly one miss. A still-frame hold resume also
             // carries lastDrainMs==0 (zeroed by the hold above), so the `> 0` guard skips it too.
+            // missGraceUntilMs suppresses the post-flush transition window (filter rebuild,
+            // mode-switch HDMI retrain, audio re-anchor) -- restart cost, not starvation.
             const bool consumedSleep = std::exchange(sleptInLastSubmit, false);
             const uint64_t nowMs = cTimeMs::Now();
-            if (!inTrick && !consumedSleep && lastDrainMs > 0 &&
+            if (!inTrick && !consumedSleep && lastDrainMs > 0 && nowMs >= missGraceUntilMs &&
                 static_cast<int>(nowMs - lastDrainMs) > outputFrameDurationMs.load(std::memory_order_relaxed) * 2) {
                 ++drainMissCount;
             }
@@ -2096,6 +2114,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             // Filter graph is built lazily on first frame and after each Clear() or ScaleVideo() change.
             const int64_t sourcePts = decodedFrame->pts;
             const size_t prevOutCount = outFrames.size();
+            bool filterRebuilt = false;
             {
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
 
@@ -2108,6 +2127,13 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                     filterChain.Reset();
                     compactLog = true;
                 }
+                // The display just changed CRTC mode under us: the whole chain must be rebuilt for
+                // the new output size AND rate. Unlike the ScaleVideo path the display already
+                // reset both rects, so simply resetting here picks the new geometry up.
+                if (display->TakeGeometryChange()) {
+                    filterChain.Reset();
+                    compactLog = true;
+                }
                 // FlushForSeek requested a compact log on this rebuild (the chain parameters
                 // are unchanged across a seek so the full diagnostic is just noise; the new
                 // "filter rebuilt -> WxH" one-liner is enough to confirm the reset happened).
@@ -2115,7 +2141,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                     compactLog = true;
                 }
                 if (!filterChain.IsBuilt()) {
-                    (void)InitFilterGraph(decodedFrame.get(), compactLog);
+                    filterRebuilt = InitFilterGraph(decodedFrame.get(), compactLog);
                 }
 
                 if (filterChain.IsBuilt()) {
@@ -2146,6 +2172,19 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                         anyFrameDecoded = true;
                     }
                 }
+            }
+
+            // Publish the stream format for display-mode matching, OUTSIDE the vaDriverMutex block:
+            // the callback reaches cVaapiDevice, whose lock order runs importMutex -> vaDriverMutex,
+            // so taking anything device-side under vaDriverMutex would invert it. The rate comes
+            // from the chain, not codecCtx -- only the chain knows whether a field-rate deinterlacer
+            // doubled it. Published even at rateMilliHz == 0: the device reads that as "cannot be
+            // matched" and restores the default mode now, instead of leaving the output on the
+            // PREVIOUS stream's mode until the idle watchdog notices seconds later.
+            if (filterRebuilt && streamFormatCallback) {
+                streamFormatCallback(static_cast<uint32_t>(decodedFrame->width),
+                                     static_cast<uint32_t>(decodedFrame->height),
+                                     filterChain.NaturalOutputRateMilliHz());
             }
 
             // bwdif rate=field doubles frame count; assign monotonic PTS to extra fields (source + i*frameDur).
@@ -2226,7 +2265,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     const cRect targetRect = display->GetTargetVideoRect();
     params.outputWidth = static_cast<uint32_t>(targetRect.Width());
     params.outputHeight = static_cast<uint32_t>(targetRect.Height());
-    params.outputRefreshHz = display->GetOutputRefreshRate();
+    // Pixel aspect of the MODE, not of the rect: a ScaleVideo() sub-rect inherits the raster's
+    // anamorphism, it does not create its own.
+    const AspectRatio outputPar = display->GetOutputPixelAspect();
+    params.outputParNum = outputPar.num;
+    params.outputParDen = outputPar.den;
+    params.outputRefreshMilliHz = display->GetOutputRefreshMilliHz();
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;
     params.hasDenoise = vaapiContext->caps.vppDenoise;

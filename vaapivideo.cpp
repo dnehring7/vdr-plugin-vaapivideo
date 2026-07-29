@@ -82,6 +82,15 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                      kDenoiseCount - 1)),
           editHdrMode(
               std::clamp(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed)), 0, kHdrModeCount - 1)),
+          editMatchRefreshRate(vaapiConfig.matchRefreshRate.load(std::memory_order_relaxed) ? 1 : 0),
+          editMatchResolution(vaapiConfig.matchResolution.load(std::memory_order_relaxed) ? 1 : 0),
+          editMaxRefreshRate(std::clamp(static_cast<int>(vaapiConfig.maxRefreshRate.load(std::memory_order_relaxed)), 0,
+                                        kMaxRefreshCount - 1)),
+          editMinResolution(std::clamp(static_cast<int>(vaapiConfig.minResolution.load(std::memory_order_relaxed)), 0,
+                                       kMinResolutionCount - 1)),
+          editModeSwitchLiveTv(vaapiConfig.modeSwitchLiveTv.load(std::memory_order_relaxed) ? 1 : 0),
+          editModeSwitchMediaplayer(vaapiConfig.modeSwitchMediaplayer.load(std::memory_order_relaxed) ? 1 : 0),
+          editModeSwitchReplay(vaapiConfig.modeSwitchReplay.load(std::memory_order_relaxed) ? 1 : 0),
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
           editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
                                          0, kPassthroughModeCount - 1)),
@@ -136,6 +145,22 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         Add(new cMenuEditStraItem(tr("Sharpen"), &editSharpenMode, kSharpenCount, kSharpenLabels.data()));
         Add(new cMenuEditStraItem(tr("HDR Passthrough"), &editHdrMode, kHdrModeCount, kHdrModeLabels.data()));
 
+        // --- Display ---
+        // Runtime CRTC mode switching. The two match policies say WHAT to track; the three source
+        // switches say WHEN it is allowed to happen. Everything defaults to off, so leaving this
+        // group untouched keeps the fixed --resolution mode. Each switch costs an HDMI link retrain
+        // (about a second of black) when it fires, which is why live TV is opt-in separately.
+        addHeader(tr("Display Mode"));
+        Add(new cMenuEditBoolItem(tr("Match refresh rate"), &editMatchRefreshRate, tr("off"), tr("on")));
+        Add(new cMenuEditBoolItem(tr("Match resolution"), &editMatchResolution, tr("off"), tr("on")));
+        Add(new cMenuEditStraItem(tr("Minimum resolution"), &editMinResolution, kMinResolutionCount,
+                                  kMinResolutionLabels.data()));
+        Add(new cMenuEditStraItem(tr("Maximum refresh rate"), &editMaxRefreshRate, kMaxRefreshCount,
+                                  kMaxRefreshLabels.data()));
+        Add(new cMenuEditBoolItem(tr("Switch for live TV"), &editModeSwitchLiveTv, tr("off"), tr("on")));
+        Add(new cMenuEditBoolItem(tr("Switch for recordings"), &editModeSwitchReplay, tr("off"), tr("on")));
+        Add(new cMenuEditBoolItem(tr("Switch for mediaplayer"), &editModeSwitchMediaplayer, tr("off"), tr("on")));
+
         // --- Zoom ---
         // Manual zoom levels: each is a zoom-in factor in tenths-of-% (344 == +34.4% enlargement),
         // applied as an equal crop on all sides; 0 disables the level (skipped while cycling). The
@@ -165,6 +190,17 @@ class cMenuSetupVaapi : public cMenuSetupPage {
             static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed)) != editScaleMode ||
             static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed)) != editSharpenMode;
 
+        // Same idiom for the display-mode group: sample BEFORE the stores, so a bare setup OK
+        // cannot trigger a spurious modeset (which costs a second of black on an HDMI link).
+        const bool displayModeChanged =
+            vaapiConfig.matchRefreshRate.load(std::memory_order_relaxed) != (editMatchRefreshRate != 0) ||
+            vaapiConfig.matchResolution.load(std::memory_order_relaxed) != (editMatchResolution != 0) ||
+            static_cast<int>(vaapiConfig.maxRefreshRate.load(std::memory_order_relaxed)) != editMaxRefreshRate ||
+            static_cast<int>(vaapiConfig.minResolution.load(std::memory_order_relaxed)) != editMinResolution ||
+            vaapiConfig.modeSwitchLiveTv.load(std::memory_order_relaxed) != (editModeSwitchLiveTv != 0) ||
+            vaapiConfig.modeSwitchMediaplayer.load(std::memory_order_relaxed) != (editModeSwitchMediaplayer != 0) ||
+            vaapiConfig.modeSwitchReplay.load(std::memory_order_relaxed) != (editModeSwitchReplay != 0);
+
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
@@ -186,6 +222,21 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SetupStore("DenoiseMode", editDenoiseMode);
         SetupStore("SharpenMode", editSharpenMode);
         SetupStore("ScaleMode", editScaleMode);
+        // Display mode switching; applied at the end of Store() via the primary device.
+        vaapiConfig.matchRefreshRate.store(editMatchRefreshRate != 0, std::memory_order_relaxed);
+        vaapiConfig.matchResolution.store(editMatchResolution != 0, std::memory_order_relaxed);
+        vaapiConfig.maxRefreshRate.store(static_cast<MaxRefreshMode>(editMaxRefreshRate), std::memory_order_relaxed);
+        vaapiConfig.minResolution.store(static_cast<MinResolutionMode>(editMinResolution), std::memory_order_relaxed);
+        vaapiConfig.modeSwitchLiveTv.store(editModeSwitchLiveTv != 0, std::memory_order_relaxed);
+        vaapiConfig.modeSwitchMediaplayer.store(editModeSwitchMediaplayer != 0, std::memory_order_relaxed);
+        vaapiConfig.modeSwitchReplay.store(editModeSwitchReplay != 0, std::memory_order_relaxed);
+        SetupStore("MatchRefreshRate", editMatchRefreshRate);
+        SetupStore("MatchResolution", editMatchResolution);
+        SetupStore("MaxRefreshRate", editMaxRefreshRate);
+        SetupStore("MinResolution", editMinResolution);
+        SetupStore("ModeSwitchLiveTv", editModeSwitchLiveTv);
+        SetupStore("ModeSwitchMediaplayer", editModeSwitchMediaplayer);
+        SetupStore("ModeSwitchReplay", editModeSwitchReplay);
         // Decide whether the *live* level actually changed BEFORE overwriting the atomics -- only
         // then is a filter rebuild warranted (a bare setup OK must not glitch the picture).
         const int activeZoom = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
@@ -217,6 +268,17 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         if (postProcChanged) {
             if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
                 device->RefreshVideoFilters();
+            }
+        }
+        // Apply to whatever is playing right now, so the effect shows on leaving the menu rather
+        // than at the next stream event. One call covers both directions: ReevaluateDisplayMode()
+        // replays the last published format through the new policy, and the evaluation restores
+        // the default whenever the governing scope switch is now off -- otherwise the output would
+        // stay stranded on whatever the last match picked. It also falls back to a plain reset when
+        // no format was ever published.
+        if (displayModeChanged) {
+            if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
+                device->ReevaluateDisplayMode();
             }
         }
         // SetupParse() runs only at startup, so a live setup change would otherwise leave no trace --
@@ -282,17 +344,43 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kScaleCount = static_cast<int>(kScaleLabels.size());
 
-    int editClearOnChannelSwitch; ///< Scratch copy of clearOnChannelSwitch (0/1 for cMenuEditBoolItem).
-    int editDeinterlaceMode;      ///< Scratch copy of deinterlaceMode (index into kDeinterlaceLabels).
-    int editDenoiseMode;          ///< Scratch copy of denoiseMode (index into kDenoiseLabels).
-    int editHdrMode;              ///< Scratch copy of hdrMode as int (index into kHdrModeLabels).
-    int editPassthroughLatency;   ///< Scratch copy of passthroughLatency; not committed until Store().
-    int editPassthroughMode;      ///< Scratch copy of passthroughMode as int (index into kPassthroughModeLabels).
-    int editPcmChannelMode;       ///< Scratch copy of pcmChannelMode as int (index into kPcmChannelModeLabels).
-    int editPcmLatency;           ///< Scratch copy of pcmLatency; not committed until Store().
-    int editScaleMode;            ///< Scratch copy of scaleMode (index into kScaleLabels).
-    int editSharpenMode;          ///< Scratch copy of sharpenMode (index into kSharpenLabels).
-    int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Scratch copies of per-preset zoom level (tenths-of-%).
+    // Display-mode straight-item labels; same enum/setup.conf/menu single-source pattern.
+    static constexpr std::array kMinResolutionLabels{
+        MinResolutionModeName(MinResolutionMode::P576),
+        MinResolutionModeName(MinResolutionMode::P720),
+        MinResolutionModeName(MinResolutionMode::P1080),
+        MinResolutionModeName(MinResolutionMode::P2160),
+    };
+    static constexpr int kMinResolutionCount = static_cast<int>(kMinResolutionLabels.size());
+    static constexpr std::array kMaxRefreshLabels{
+        MaxRefreshModeName(MaxRefreshMode::Hz50),      MaxRefreshModeName(MaxRefreshMode::Hz60),
+        MaxRefreshModeName(MaxRefreshMode::Hz100),     MaxRefreshModeName(MaxRefreshMode::Hz120),
+        MaxRefreshModeName(MaxRefreshMode::Unlimited),
+    };
+    static constexpr int kMaxRefreshCount = static_cast<int>(kMaxRefreshLabels.size());
+
+    // Scratch copies of the vaapiConfig fields of the same name, edited in place by the menu items
+    // above and committed only in Store() -- so leaving the page with Back discards everything.
+    // All int because that is what cMenuEdit*Item binds to: a bool is 0/1, an enum an index into
+    // the k<Name>Labels array, an int the value itself.
+    int editClearOnChannelSwitch;
+    int editDeinterlaceMode;
+    int editDenoiseMode;
+    int editHdrMode;
+    int editMatchRefreshRate;
+    int editMatchResolution;
+    int editMaxRefreshRate;
+    int editMinResolution;
+    int editModeSwitchLiveTv;
+    int editModeSwitchMediaplayer;
+    int editModeSwitchReplay;
+    int editPassthroughLatency;
+    int editPassthroughMode;
+    int editPcmChannelMode;
+    int editPcmLatency;
+    int editScaleMode;
+    int editSharpenMode;
+    int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Per-preset zoom level (tenths-of-%).
 };
 
 // ============================================================================
@@ -751,14 +839,31 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
         double aspect = 1.0;
         vaapiDevice->GetOsdSize(width, height, aspect);
 
+        // Report the LIVE mode, not vaapiConfig.display: with mode switching enabled the configured
+        // --resolution value is only the default, and would go stale the moment a stream drives a
+        // change. Falls back to the configured rate while the display is unavailable.
+        const double refreshHz = static_cast<double>(vaapiDevice->ActiveRefreshMilliHz()) / 1000.0;
         replyCode = 900;
         return cString::sprintf("VAAPI Device Status:\n"
                                 "Type: %s\n"
                                 "Decoder: %s\n"
                                 "Display Resolution: %dx%d\n"
-                                "Refresh Rate: %u Hz",
+                                "Refresh Rate: %.3f Hz",
                                 *vaapiDevice->DeviceType(), vaapiDevice->HasDecoder() ? "Ready" : "Not Ready", width,
-                                height, vaapiConfig.display.GetRefreshRate());
+                                height, refreshHz);
+    }
+
+    if (strcasecmp(command, "MODE") == 0) {
+        if (!vaapiDevice) [[unlikely]] {
+            replyCode = 550;
+            return "No VAAPI device";
+        }
+        if (!vaapiDevice->IsReady()) [[unlikely]] {
+            replyCode = 550;
+            return "VAAPI device detached (hardware not attached) -- use ATTA to attach";
+        }
+        replyCode = 900;
+        return cString::sprintf("%s", vaapiDevice->DisplayModeReport().c_str());
     }
 
     if (strcasecmp(command, "CONF") == 0) {
@@ -832,11 +937,17 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
     static const cString kZoomHelp = cString::sprintf(
         "ZOOM [next|0-%d]\n    Cycle manual zoom or pick a stop (0=off, 1-%d=preset). Resets on content change.",
         CONFIG_ZOOM_PRESET_COUNT, CONFIG_ZOOM_PRESET_COUNT);
+    // Two-line entry built once so the literal stays a single string (a concatenated pair reads as
+    // a missing comma to clang-tidy's bugprone-suspicious-missing-comma).
+    static const cString kModeHelp =
+        cString::sprintf("MODE\n    List the connector's usable display modes with exact refresh rates, the active "
+                         "and default mode, and the mode the matcher would pick for the current stream.");
     static const char *const kHelpPages[] = {
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.",
         "CONF\n    Display current configuration settings.",
+        *kModeHelp,
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
         *kZoomHelp,
         nullptr};

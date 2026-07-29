@@ -39,6 +39,92 @@ struct VaapiContext {
 };
 
 // ============================================================================
+// === DISPLAY MODE MATCHING ===
+// ============================================================================
+// Runtime mode switching splits in two: the device owns the connector's mode inventory and the
+// policy (this section), the display owns applying the winner (cVaapiDisplay::RequestDisplayMode).
+// Everything here is off unless the operator enables it -- see the DISPLAY MODE SWITCHING block
+// in config.h.
+
+/// One connector mode that survived the usability filter, pre-digested for matching.
+/// Built once per attach by BuildModeCandidates(); indices stay valid for cVaapiDevice::connectorModes.
+struct DisplayModeCandidate {
+    uint32_t height{};         ///< vdisplay (px)
+    uint32_t refreshMilliHz{}; ///< Exact rate from ModeRefreshMilliHz(); never the truncated vrefresh
+    bool preferred{};          ///< Mode carries DRM_MODE_TYPE_PREFERRED (the sink's native timing)
+    uint16_t index{};          ///< Index into cVaapiDevice::connectorModes
+    uint32_t width{};          ///< hdisplay (px)
+};
+
+/// What the stream currently playing wants from the output.
+struct StreamModeRequest {
+    uint32_t height{};      ///< Coded frame height (px)
+    uint32_t rateMilliHz{}; ///< VPP *output* rate, i.e. the field rate when the chain deinterlaces --
+                            ///< 1080i25 arrives here as 50000, which is why 25i naturally lands on 50 Hz
+    uint32_t width{};       ///< Coded frame width (px)
+
+    [[nodiscard]] auto operator==(const StreamModeRequest &other) const noexcept -> bool = default;
+    [[nodiscard]] auto IsValid() const noexcept -> bool { return width > 0 && height > 0 && rateMilliHz > 0; }
+};
+
+/// Playback path a request came from; selects which of the three scope switches gates it.
+enum class PlaybackSource : uint8_t {
+    LiveTv = 0,      ///< Transfer Mode (cTransferControl)
+    Replay = 1,      ///< Recording replay (cDvbPlayer)
+    MediaPlayer = 2, ///< The plugin's own mediaplayer
+};
+
+/// Human label for a PlaybackSource; used in the decision log and the SVDRP MODE reply.
+[[nodiscard]] constexpr auto PlaybackSourceName(PlaybackSource source) noexcept -> const char * {
+    switch (source) {
+        case PlaybackSource::LiveTv:
+            return "live";
+        case PlaybackSource::Replay:
+            return "replay";
+        case PlaybackSource::MediaPlayer:
+            return "mediaplayer";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+/// Snapshot of the mode-switching policy, taken from vaapiConfig at evaluation time so one
+/// evaluation can never observe a half-applied setup-menu change.
+struct DisplayModePolicy {
+    uint32_t defaultHeight{};         ///< Fallback mode (the --resolution one) height
+    uint32_t defaultRefreshMilliHz{}; ///< Fallback mode refresh
+    uint32_t defaultWidth{};          ///< Fallback mode width
+    bool matchRefresh{};              ///< Track the source frame rate
+    bool matchResolution{};           ///< Track the source coded size
+    uint32_t maxRefreshMilliHz{};     ///< Ceiling for the k*source search (k==1 may exceed it)
+    uint32_t minHeight{};             ///< Floor for the resolution search
+};
+
+/// Outcome of SelectDisplayMode(): an index into the candidate list plus a human rationale.
+struct DisplayModeMatch {
+    int index{-1};      ///< Candidate index; < 0 means "no usable candidate, keep the current mode"
+    std::string reason; ///< One-line explanation for the decision log / SVDRP MODE
+};
+
+/// Pick the connector mode that best serves @p request under @p policy.
+///
+/// Resolution first: the smallest candidate at or above the stream's coded size, never below
+/// policy.minHeight (setting that to the panel's native height therefore pins the resolution).
+/// Then refresh, restricted to that resolution: the HIGHEST exact integer multiple k*source that
+/// stays at or below policy.maxRefreshMilliHz, so 25p lands on 50 Hz and 29.97 on 59.94 Hz while
+/// 24p stays at 24 (unless the panel offers 48). k==1 is always allowed even above the cap.
+/// Exposed (rather than file-local) so the SVDRP MODE command can explain the current decision.
+[[nodiscard]] auto SelectDisplayMode(std::span<const DisplayModeCandidate> candidates, const StreamModeRequest &request,
+                                     const DisplayModePolicy &policy) -> DisplayModeMatch;
+
+/// Digest a connector's raw mode list into the matchable subset.
+///
+/// Drops interlaced modes -- the VPP always emits progressive frames and the scanout path has no
+/// field interleaving -- and modes whose aspect ratio differs from @p defaultMode's by more than
+/// 2%, so a stray 4:3 timing can never stretch the picture.
+[[nodiscard]] auto BuildModeCandidates(std::span<const drmModeModeInfo> modes, const drmModeModeInfo &defaultMode)
+    -> std::vector<DisplayModeCandidate>;
+
+// ============================================================================
 // === DRM DEVICES CLASS ===
 // ============================================================================
 
@@ -163,6 +249,48 @@ class cVaapiDevice : public cDevice {
                                                  ///< primary promotion during VDR bring-up does not defeat --detached.
 
     // ========================================================================
+    // === DISPLAY MODE SWITCHING ===
+    // ========================================================================
+    // All entry points are cheap and non-blocking: they evaluate the policy and, at most, stage a
+    // request the display thread picks up. Safe from the decode thread, the player thread and the
+    // VDR main thread. Everything is inert until the operator enables a scope switch.
+
+    /// Run @p request through the policy and, if it wins a different mode, stage it on the display.
+    /// @p immediate skips the stability gate -- used for the mediaplayer, where the container has
+    /// already told us the authoritative frame rate before a single frame is decoded.
+    auto EvaluateDisplayMode(const StreamModeRequest &request, PlaybackSource source, bool immediate) -> void;
+    /// Decoder hook: publish the stream format observed after a filter-graph build. Resolves the
+    /// playback source itself and never bypasses the stability gate.
+    auto NotifyStreamFormat(const StreamModeRequest &request) -> void;
+    /// Decode-loop tick hook: mature a candidate armed by NotifyStreamFormat() once it has been
+    /// stable long enough. Required because the reactive publish fires only once per filter-graph
+    /// build -- a steady stream never sends the second notification the gate would otherwise need.
+    auto PollPendingDisplayMode() -> void;
+    /// Re-run the last published request through the (possibly just edited) policy. Called from the
+    /// setup menu so a changed option takes effect without waiting for the next stream event.
+    auto ReevaluateDisplayMode() -> void;
+    /// Drop a stability-gate candidate before it goes stale. Called at every stream boundary
+    /// (Clear, SetPlayMode, trick entry): the gate ages on wall-clock time, so a format armed just
+    /// before a channel switch would otherwise mature afterwards and reprogram the CRTC for a
+    /// stream that is gone. A genuinely stable format is republished by the rebuild that follows.
+    auto InvalidateDisplayModeCandidate() -> void;
+    /// Playback stopped: arm a deadline after which an output still sitting on a non-default mode
+    /// is handed back. Deferred rather than immediate because VDR emits pmNone right before
+    /// pmAudioVideo on a channel zap; anything that starts decoding disarms it, so it only fires
+    /// when playback really ended into a source that decodes nothing (radio, scrambled, no tuner).
+    auto ScheduleIdleModeRestore() -> void;
+    /// Return to the mode selected at attach (the --resolution one) and forget the debounce state.
+    /// Called when playback ends and when the operator disables mode switching.
+    auto ResetDisplayModeToDefault() -> void;
+    /// Which playback path is feeding the device right now; picks the governing scope switch.
+    [[nodiscard]] auto CurrentPlaybackSource() const noexcept -> PlaybackSource;
+    /// Refresh rate actually programmed on the CRTC, in millihertz. Falls back to the configured
+    /// --resolution rate while the display is unavailable. Reported by SVDRP STAT.
+    [[nodiscard]] auto ActiveRefreshMilliHz() const noexcept -> uint32_t;
+    /// Multi-line human-readable mode inventory, active mode, and current decision (SVDRP MODE).
+    [[nodiscard]] auto DisplayModeReport() const -> std::string;
+
+    // ========================================================================
     // === MEDIAPLAYER FEED SURFACE ===
     // ========================================================================
     // Narrow, encapsulated entry points for the libavformat-based mediaplayer path
@@ -269,6 +397,17 @@ class cVaapiDevice : public cDevice {
     auto ReleaseHardware() -> void;      ///< Close VAAPI device reference and DRM file descriptor
     auto ResetAudioCodecState() -> void; ///< Drop the cached audio codec id and any in-flight 2-of-2 confirmation state
                                          ///< so the next PlayAudio() packet re-runs codec detection
+    auto ApplyDisplayModePolicy(const StreamModeRequest &request, PlaybackSource source, uint64_t nowMs)
+        -> void; ///< Run the matcher and stage the winner. Caller holds displayModeMutex and has already
+                 ///< cleared the scope/policy/stability gates; this applies only the rate limit.
+    auto RestoreDefaultModeLocked(uint64_t nowMs)
+        -> void; ///< Hand the output back to defaultMode when mode switching is not in charge of the
+                 ///< current source. Caller holds displayModeMutex.
+    auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs)
+        -> void; ///< Start the stability window for @p request. Caller holds displayModeMutex.
+    auto ClearModeCandidateLocked()
+        -> void; ///< Disarm the stability window. Caller holds displayModeMutex. Both helpers exist so
+                 ///< modeCandidateDueMs can never drift from modeCandidateSinceMs.
     [[nodiscard]] auto SelectDrmConnector()
         -> bool; ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     [[nodiscard]] auto TryAcceptConnector(drmModeConnector *connector, bool allowModeFallback, drmModeRes *resources)
@@ -285,6 +424,13 @@ class cVaapiDevice : public cDevice {
     // === STATE ===
     // ========================================================================
     drmModeModeInfo activeMode{};                          ///< Selected DRM display mode
+    drmModeModeInfo defaultMode{};                         ///< Mode chosen at attach; the mode-matcher's fallback and
+                                                           ///< the target ResetDisplayModeToDefault() returns to
+    std::vector<drmModeModeInfo> connectorModes;           ///< Full mode list of the selected connector, captured
+                                                           ///< during the attach scan. Never re-enumerated: a fresh
+                                                           ///< drmModeGetConnector() forces DDC and costs 100-500 ms
+                                                           ///< per port (seconds on a CEC-standby sink).
+    std::vector<DisplayModeCandidate> modeCandidates;      ///< connectorModes digested for matching
     std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE}; ///< Active audio codec
     std::string audioDevice;                               ///< ALSA device name
     std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
@@ -307,6 +453,26 @@ class cVaapiDevice : public cDevice {
                                                            ///< cVaapiPlayer::SetAudioTrack, not the live-TV reset)
     int osdHeight{};                                       ///< Cached display height (px)
     int osdWidth{};                                        ///< Cached display width (px)
+    uint64_t osdModeGeneration{};                          ///< Display mode generation the osdWidth/osdHeight cache
+                                                           ///< was taken at; a mismatch invalidates it so VDR's 1 Hz
+                                                           ///< UpdateOsdSize() poll sees the new size after a modeset
+
+    // --- Display mode switching (all guarded by displayModeMutex) ---
+    mutable cMutex displayModeMutex;   ///< Serializes the debounce state below; EvaluateDisplayMode() is
+                                       ///< reached from the decode thread, the player thread and the main thread
+    StreamModeRequest modeCandidate{}; ///< Format currently accumulating toward the stability gate
+    uint64_t modeCandidateSinceMs{};   ///< When modeCandidate was first observed (0 = none pending)
+    std::atomic<uint64_t> modeCandidateDueMs{
+        0}; ///< Lock-free mirror of modeCandidateSinceMs + DISPLAY_MODE_STABLE_MS; 0 = nothing armed.
+            ///< PollPendingDisplayMode() runs on every decode-loop iteration, so the (overwhelmingly
+            ///< common) no-candidate case must not cost a mutex acquisition.
+    std::atomic<uint64_t> modeIdleRestoreDueMs{
+        0}; ///< Wall clock at which an idle output on a non-default mode is handed back to defaultMode;
+            ///< 0 = disarmed. Covers playback ending into a source that decodes nothing (radio,
+            ///< scrambled, no free tuner), where no format is ever published to drive the restore.
+    uint64_t lastModeChangeMs{};     ///< Wall clock of the last applied change; enforces the minimum interval
+    StreamModeRequest lastRequest{}; ///< Most recently published format; replayed by ReevaluateDisplayMode()
+    PlaybackSource lastRequestSource{PlaybackSource::LiveTv};     ///< Source that published lastRequest
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
     std::vector<uint8_t> audioDetectBuffer;   ///< AAC-LATM fallback window for DetectAudioCodec() (see

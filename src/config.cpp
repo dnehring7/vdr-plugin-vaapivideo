@@ -27,10 +27,14 @@
 // === CONSTANTS ===
 // ============================================================================
 
+namespace {
+
 // Audio latency bounds live in config.h (CONFIG_AUDIO_LATENCY_{MIN,MAX}_MS) so the parse path
 // here and the setup-menu UI share one source of truth -- keep them in lockstep.
 constexpr uint32_t CONFIG_MAX_VIDEO_HEIGHT = 2160U; ///< 4K UHD ceiling for ParseResolution() (px)
 constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for ParseResolution() (px)
+
+} // namespace
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===
@@ -141,13 +145,35 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
     const std::string mark = bookmarkSnapshot.uri.empty()
                                  ? std::string{"none"}
                                  : std::format("{} @ {}ms", bookmarkSnapshot.uri, bookmarkSnapshot.positionMs);
+    // Display mode switching: render the scope switches as a compact source list so an all-off
+    // (i.e. legacy) configuration is obvious at a glance.
+    std::string modeScope;
+    const auto appendScope = [&modeScope](bool enabled, std::string_view label) -> void {
+        if (!enabled) {
+            return;
+        }
+        if (!modeScope.empty()) {
+            modeScope += '+';
+        }
+        modeScope += label;
+    };
+    appendScope(modeSwitchLiveTv.load(std::memory_order_relaxed), "live");
+    appendScope(modeSwitchReplay.load(std::memory_order_relaxed), "replay");
+    appendScope(modeSwitchMediaplayer.load(std::memory_order_relaxed), "media");
+    const std::string modeSwitch = std::format(
+        "rate={} res={} min={} max={} scope={}", matchRefreshRate.load(std::memory_order_relaxed) ? "on" : "off",
+        matchResolution.load(std::memory_order_relaxed) ? "on" : "off",
+        MinResolutionModeName(minResolution.load(std::memory_order_relaxed)),
+        MaxRefreshModeName(maxRefreshRate.load(std::memory_order_relaxed)), modeScope.empty() ? "none" : modeScope);
     return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, PCM channels: {}, HDR: {}, "
-                       "Clear on channel switch: {}, Post-proc: {}, Zoom levels (0=off): {}, Bookmark: {}",
+                       "Clear on channel switch: {}, Post-proc: {}, Mode switch: {}, Zoom levels (0=off): {}, "
+                       "Bookmark: {}",
                        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
                        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
                        PcmChannelModeName(pcmChannelMode.load(std::memory_order_relaxed)),
                        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, zoom, mark);
+                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, modeSwitch, zoom,
+                       mark);
 }
 
 namespace {
@@ -311,6 +337,29 @@ template <typename EnumT>
     }
     if (key == "ScaleMode") {
         return ParseEnumValue("ScaleMode", value, scaleMode, CONFIG_SCALE_MODE_COUNT);
+    }
+    // Display mode switching. Both match policies and all three scope switches default to off,
+    // so a setup.conf written before this feature existed keeps the legacy fixed-mode behaviour.
+    if (key == "MatchRefreshRate") {
+        return ParseBoolValue("MatchRefreshRate", value, matchRefreshRate);
+    }
+    if (key == "MatchResolution") {
+        return ParseBoolValue("MatchResolution", value, matchResolution);
+    }
+    if (key == "MinResolution") {
+        return ParseEnumValue("MinResolution", value, minResolution, CONFIG_MIN_RESOLUTION_MODE_COUNT);
+    }
+    if (key == "MaxRefreshRate") {
+        return ParseEnumValue("MaxRefreshRate", value, maxRefreshRate, CONFIG_MAX_REFRESH_MODE_COUNT);
+    }
+    if (key == "ModeSwitchLiveTv") {
+        return ParseBoolValue("ModeSwitchLiveTv", value, modeSwitchLiveTv);
+    }
+    if (key == "ModeSwitchMediaplayer") {
+        return ParseBoolValue("ModeSwitchMediaplayer", value, modeSwitchMediaplayer);
+    }
+    if (key == "ModeSwitchReplay") {
+        return ParseBoolValue("ModeSwitchReplay", value, modeSwitchReplay);
     }
     // Per-preset zoom level (tenths-of-% zoom-in factor). Keys mirror the SetupStore() loop in
     // vaapivideo.cpp and scale with CONFIG_ZOOM_PRESET_COUNT. The active cycle stop (zoomActive) is

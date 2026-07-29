@@ -78,6 +78,8 @@ static_assert(PTS_TICKS_PER_MS == PTSTICKS / 1000, "PTS_TICKS_PER_MS must equal 
 // === CONSTANTS ===
 // ============================================================================
 
+namespace {
+
 // Shared AV cushion: the ring stays near-full in steady state, so the audio clock lags
 // real time by ~this much. The video due-gate accumulates the matching frame count in
 // jitterBuf so audio and video share one cushion and lip-sync is preserved. This is a
@@ -103,6 +105,8 @@ constexpr int AUDIO_DECODER_GRACE_PACKETS =
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between repeated decode-error log messages (ms)
 
 // AUDIO_QUEUE_HIGHWATER / AUDIO_QUEUE_CAPACITY live in audio.h (shared with the device feed).
+
+} // namespace
 
 // ============================================================================
 // === AUDIO PROCESSOR CLASS ===
@@ -1695,11 +1699,14 @@ auto cAudioProcessor::OpenDecoder() -> void {
     cascadeRecoveryCount.store(0, std::memory_order_relaxed);
     codecRedetectRequested.store(false, std::memory_order_relaxed);
     // nb_channels is 0 until the first frame for codecs whose layout rides in the frame header
-    // (DVB MP2/AAC) rather than extradata; show "?" instead of a misleading "0ch".
+    // (DVB MP2/AAC) rather than extradata; show "?" instead of a misleading "0ch". For passthrough
+    // the source layout is irrelevant at open (the IEC61937 carrier is always 2ch) -- omit it.
+    const bool passthroughOpen = alsaPassthroughActive.load(std::memory_order_relaxed);
     const int openChannels = ctx->ch_layout.nb_channels;
-    const std::string channelLabel = openChannels > 0 ? std::format("{}ch", openChannels) : "?ch";
-    isyslog("vaapivideo/audio: opened %s @ %dHz %s (%s)", codec->name, ctx->sample_rate, channelLabel.c_str(),
-            alsaPassthroughActive.load(std::memory_order_relaxed) ? "passthrough" : "PCM");
+    const std::string channelLabel =
+        openChannels > 0 ? std::format(" {}ch", openChannels) : (passthroughOpen ? "" : " ?ch");
+    isyslog("vaapivideo/audio: opened %s @ %dHz%s (%s)", codec->name, ctx->sample_rate, channelLabel.c_str(),
+            passthroughOpen ? "passthrough" : "PCM");
 }
 
 auto cAudioProcessor::ProbeSinkCaps() -> void {

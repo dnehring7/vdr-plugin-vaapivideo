@@ -25,15 +25,8 @@ inline constexpr double DISPLAY_DEFAULT_ASPECT_RATIO =
 inline constexpr uint32_t DISPLAY_DEFAULT_HEIGHT = 1080;     ///< Default display height before a mode is selected (px)
 inline constexpr uint32_t DISPLAY_DEFAULT_WIDTH = 1920;      ///< Default display width before a mode is selected (px)
 inline constexpr uint32_t DISPLAY_DEFAULT_REFRESH_RATE = 50; ///< Default refresh rate before a mode is selected (Hz)
-inline constexpr size_t DISPLAY_PRERENDER_SLOTS =
-    8; ///< Decoder->display handoff queue depth (= 160 ms tolerance @ 50 fps). Sized to absorb a
-       ///< single UHD VPP/memory-bandwidth spike (observed ~80 ms in replay) AND the per-frame
-       ///< variance of CPU-side SW decoders (libdav1d 1080p50 spikes 30-40 ms on complex frames)
-       ///< without draining the cache and forcing a re-present. SubmitFrame blocks when all slots
-       ///< are full so audio clock stays in lipsync (the whole pipeline is delayed in lockstep, not
-       ///< just video). FHD HW paths never fill past 1-2 slots; the extra depth is a no-op there.
-       ///< COUPLED to display.cpp's DISPLAY_UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2); revisit that margin if you
-       ///< change this (the relationship is not linear -- see the note at that definition).
+// DISPLAY_PRERENDER_SLOTS (decoder->display handoff queue depth) lives in display.cpp, its only user,
+// next to the DISPLAY_UNDERRUN_THRESHOLD_VSYNCS margin that is derived from it.
 
 // ============================================================================
 // === DISPLAY CONFIGURATION ===
@@ -290,6 +283,110 @@ inline constexpr int CONFIG_SCALE_MODE_COUNT = 4; ///< Number of ScaleMode value
 }
 
 // ============================================================================
+// === DISPLAY MODE SWITCHING ===
+// ============================================================================
+// Runtime CRTC mode switching: pick the connector mode that best matches the stream currently
+// playing instead of staying on the one --resolution mode forever. Refresh and resolution are
+// two independent policies, and each playback source (live TV / recordings / mediaplayer) has
+// its own enable switch -- everything defaults to off, so an untouched install behaves exactly
+// as before. See cVaapiDevice::EvaluateDisplayMode() for the matcher.
+
+/// Lower bound for the dynamic resolution search, as a display height. Setting this to the
+/// panel's native height effectively pins the resolution and leaves only refresh matching
+/// active. Numeric values are part of the setup.conf wire format -- do not renumber.
+enum class MinResolutionMode : uint8_t {
+    P576 = 0,  ///< 576p -- PAL SD; allows SD streams to drive an SD mode
+    P720 = 1,  ///< 720p -- default floor; SD content is upscaled to 720p
+    P1080 = 2, ///< 1080p -- never drop below FHD
+    P2160 = 3, ///< 2160p -- UHD only (pins the resolution on a UHD panel)
+};
+
+inline constexpr int CONFIG_MIN_RESOLUTION_MODE_COUNT = 4; ///< Number of MinResolutionMode values
+
+/// Human label for a MinResolutionMode -- single source for the setup menu AND the log summary.
+[[nodiscard]] constexpr auto MinResolutionModeName(MinResolutionMode mode) noexcept -> const char * {
+    switch (mode) {
+        case MinResolutionMode::P576:
+            return "576p";
+        case MinResolutionMode::P720:
+            return "720p";
+        case MinResolutionMode::P1080:
+            return "1080p";
+        case MinResolutionMode::P2160:
+            return "2160p";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+/// Display height in pixels for a MinResolutionMode; the matcher compares this against each
+/// candidate mode's vdisplay.
+[[nodiscard]] constexpr auto MinResolutionModeHeight(MinResolutionMode mode) noexcept -> uint32_t {
+    switch (mode) {
+        case MinResolutionMode::P576:
+            return 576U;
+        case MinResolutionMode::P720:
+            return 720U;
+        case MinResolutionMode::P1080:
+            return 1080U;
+        case MinResolutionMode::P2160:
+            return 2160U;
+    }
+    return 720U; // unreachable for a valid enum value
+}
+
+/// Upper bound for the refresh-multiple search. The matcher prefers the HIGHEST exact multiple
+/// k*source that stays at or below this cap (25p -> 50 Hz, 29.97 -> 59.94 Hz); k==1 is always
+/// allowed even above the cap so a 120 fps source is never forced down. Numeric values are part
+/// of the setup.conf wire format -- do not renumber.
+enum class MaxRefreshMode : uint8_t {
+    Hz50 = 0,      ///< Cap at 50 Hz
+    Hz60 = 1,      ///< Cap at 60 Hz (default; the usual CEA ceiling)
+    Hz100 = 2,     ///< Cap at 100 Hz
+    Hz120 = 3,     ///< Cap at 120 Hz
+    Unlimited = 4, ///< No cap -- every frequency the connector offers is a candidate
+};
+
+inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT = 5; ///< Number of MaxRefreshMode values
+
+/// Human label for a MaxRefreshMode -- single source for the setup menu AND the log summary.
+[[nodiscard]] constexpr auto MaxRefreshModeName(MaxRefreshMode mode) noexcept -> const char * {
+    switch (mode) {
+        case MaxRefreshMode::Hz50:
+            return "50 Hz";
+        case MaxRefreshMode::Hz60:
+            return "60 Hz";
+        case MaxRefreshMode::Hz100:
+            return "100 Hz";
+        case MaxRefreshMode::Hz120:
+            return "120 Hz";
+        case MaxRefreshMode::Unlimited:
+            return "unlimited";
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+/// Refresh cap in millihertz for a MaxRefreshMode. Millihertz throughout the mode-matching path:
+/// drmModeModeInfo::vrefresh is integer-truncated, so 59.94 and 60 are indistinguishable there.
+[[nodiscard]] constexpr auto MaxRefreshModeMilliHz(MaxRefreshMode mode) noexcept -> uint32_t {
+    switch (mode) {
+        case MaxRefreshMode::Hz50:
+            return 50000U;
+        case MaxRefreshMode::Hz60:
+            return 60000U;
+        case MaxRefreshMode::Hz100:
+            return 100000U;
+        case MaxRefreshMode::Hz120:
+            return 120000U;
+        case MaxRefreshMode::Unlimited:
+            return UINT32_MAX;
+    }
+    return 60000U; // unreachable for a valid enum value
+}
+
+// The DISPLAY_MODE_* runtime mode-switch tunables (stability window, rate-limit, idle restore,
+// matcher tolerances) live in device.cpp, their only user.
+
+// ============================================================================
 // === ZOOM BOUNDS ===
 // ============================================================================
 
@@ -331,6 +428,15 @@ struct VaapiConfig {
     std::atomic<DenoiseMode> denoiseMode{DenoiseMode::Auto};             ///< Denoise strength
     std::atomic<ScaleMode> scaleMode{ScaleMode::Auto};                   ///< Scaler selection
     std::atomic<SharpenMode> sharpenMode{SharpenMode::Auto};             ///< Sharpening selection
+    // Display mode switching: two match policies plus one enable switch per playback source.
+    // Read from the decode and player threads on every filter-graph rebuild / entry open.
+    std::atomic<bool> matchRefreshRate{false}; ///< Track the stream's frame rate with the CRTC refresh rate
+    std::atomic<bool> matchResolution{false};  ///< Track the stream's coded size with the CRTC resolution
+    std::atomic<MaxRefreshMode> maxRefreshRate{MaxRefreshMode::Hz60};      ///< Ceiling for the k*source rate search
+    std::atomic<MinResolutionMode> minResolution{MinResolutionMode::P720}; ///< Floor for the resolution search
+    std::atomic<bool> modeSwitchLiveTv{false};      ///< Allow mode switching while watching live TV
+    std::atomic<bool> modeSwitchMediaplayer{false}; ///< Allow mode switching in the plugin's mediaplayer
+    std::atomic<bool> modeSwitchReplay{false};      ///< Allow mode switching while replaying recordings
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
     std::atomic<PcmChannelMode> pcmChannelMode{

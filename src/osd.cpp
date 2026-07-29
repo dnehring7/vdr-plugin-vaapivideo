@@ -248,7 +248,7 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
 
     const int drmFd = display->GetDrmFd();
     if (drmFd < 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd - invalid DRM fd, returning dummy cOsd");
+        esyslog("vaapivideo/osd: CreateOsd -- invalid DRM fd, returning dummy cOsd");
         return new cVaapiDummyOsd(left, top, level);
     }
 
@@ -260,13 +260,13 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
     const int osdHeight = screenHeight - top;
 
     if (osdWidth <= 0 || osdHeight <= 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd - invalid dimensions %dx%d, returning dummy cOsd", osdWidth, osdHeight);
+        esyslog("vaapivideo/osd: CreateOsd -- invalid dimensions %dx%d, returning dummy cOsd", osdWidth, osdHeight);
         return new cVaapiDummyOsd(left, top, level);
     }
 
     auto *osd = new cVaapiOsd(left, top, level, drmFd, osdWidth, osdHeight, this);
     if (!osd->Allocate()) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateOsd - allocation error, returning dummy cOsd");
+        esyslog("vaapivideo/osd: CreateOsd -- allocation error, returning dummy cOsd");
         delete osd;
         return new cVaapiDummyOsd(left, top, level);
     }
@@ -451,7 +451,7 @@ auto cVaapiOsd::Flush() -> void {
 
 [[nodiscard]] auto cVaapiOsd::CreateDumbBuffer(const uint32_t fbWidth, const uint32_t fbHeight) -> bool {
     if (drmFd_ < 0) [[unlikely]] {
-        esyslog("vaapivideo/osd: CreateDumbBuffer - invalid DRM fd");
+        esyslog("vaapivideo/osd: CreateDumbBuffer -- invalid DRM fd");
         return false;
     }
 

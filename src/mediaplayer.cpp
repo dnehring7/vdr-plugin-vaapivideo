@@ -110,6 +110,31 @@ constexpr int DEMUX_PAUSE_WAKEUP_MS = 100;   ///< Periodic re-check while paused
 constexpr int OSD_DEFAULT_TIMEOUT_S = 4;     ///< Auto-hide delay after a key event; matches VDR replay-control feel.
 constexpr int OSD_REFRESH_INTERVAL_MS = 500; ///< Replay-bar update cadence; ~2 Hz feels live without flicker.
 
+/// Demux thread back-off when the device queues are full or input stalls.
+constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
+
+/// Real-time pacing brake: max AUDIO lookahead (90 kHz ticks) of the latest pushed audio PTS over the
+/// audio master clock before the demux throttles. libavformat reads files far faster than wall-clock, so
+/// without it the decoder queue + jitterBuf overrun their caps. Keyed off the audio tail only
+/// (latestAudioPts90k); the resulting video depth (audio_tail + per-file mux offset) is bounded instead by
+/// DECODER_RESERVE_HARD_CAP, where the excess lead waits COMPRESSED in the packetQueue. 1.5 s (not 1 s) so
+/// the budget still reaches the ~1.3 s reserve cap when interlaced content deinterlaces to 50 fps.
+/// MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES (the pre-anchor video-depth gate) lives in device.cpp, its
+/// only user, derived from DECODER_RESERVE_HARD_CAP so it stays coupled to the buffer it protects.
+constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 135000;
+
+/// Default seek deltas applied by the key bindings (milliseconds).
+constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
+constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
+
+/// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof): at EOF the decode queue (~4 s) and decoded
+/// reserve (~1.3 s) still hold unseen frames, so immediate teardown cuts playback seconds short (worst on
+/// video-only clips, where no audio clock throttles the demuxer). Flush that tail at real-time pace first.
+///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown (covers the ~5 s queue+reserve tail).
+///   - STALL_MS: bail when depth stops shrinking; must exceed one frame interval.
+constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
+constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
+
 /// Convert the container's start_time (AV_TIME_BASE units) to 90 kHz. Returns AV_NOPTS_VALUE
 /// when the demuxer didn't populate start_time (typical for some streams + raw containers).
 [[nodiscard]] auto FormatStart90k(const AVFormatContext *ctx) noexcept -> int64_t {
@@ -931,7 +956,13 @@ auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInf
     -> void {
     const AVCodecParameters *p = stream->codecpar;
     info.codecId = p->codec_id;
-    info.sampleRate = p->sample_rate;
+    // Containers can leave the rate at 0 when it only rides in-band (raw-ADTS AAC in TS is the
+    // classic case -- avformat_find_stream_info can give up before a usable frame). Open at the
+    // DVB-nominal 48 kHz exactly like the live path does (OpenCodec(detected, 48000, 2)): the
+    // decoder re-derives the true rate from each frame and swresample converts at a fixed ratio
+    // (AVSYNC.md invariant 2), so a nominal mismatch costs nothing. SetStreamParams rejects <= 0,
+    // which would needlessly drop the track and play video-only.
+    info.sampleRate = p->sample_rate > 0 ? p->sample_rate : 48000;
     // True channel count; the sink picks the PCM layout (ChooseOutputChannels). 0/unknown -> stereo
     // (SetStreamParams rejects <= 0).
     info.channels = p->ch_layout.nb_channels > 0 ? p->ch_layout.nb_channels : 2;
@@ -1211,6 +1242,13 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         subtitles->Shutdown();
     }
     CloseCurrentEntry();
+    // Back to the default mode, here for the same reason CloseCurrentEntry is (see above): this
+    // destructor is the only teardown path that actually runs, and leaving the output at a film
+    // rate makes the whole VDR UI sluggish. Not inside CloseCurrentEntry() -- a playlist advance
+    // calls that too, and the next entry picks its own mode.
+    if (auto *vaapiDev = FindPrimaryVaapiDevice(); vaapiDev != nullptr) {
+        vaapiDev->ResetDisplayModeToDefault();
+    }
 }
 
 [[nodiscard]] auto cVaapiPlayer::CurrentPositionMs() const noexcept -> int {
@@ -1271,9 +1309,32 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
     if (const int preferred = ChoosePreferredAudioTrack(*nextSource); preferred >= 0) {
         (void)nextSource->SelectAudioTrack(preferred);
     }
+    // Proactive display-mode match: the container already carries the authoritative frame rate and
+    // coded size, so unlike live TV / recordings this needs no decoded frame and no stability gate.
+    // CloseCurrentEntry() has drained the pipeline, so any modeset lands in an idle window rather
+    // than mid-picture. Computed here, requested below once the codecs are known to have opened.
+    StreamModeRequest modeRequest{};
+    if (const auto &videoInfo = nextSource->VideoInfo();
+        videoInfo.codedWidth > 0 && videoInfo.codedHeight > 0 && videoInfo.fpsNum > 0 && videoInfo.fpsDen > 0) {
+        // Field rate for interlaced content: the VPP deinterlacer emits 2 frames per coded frame,
+        // which is what makes 1080i25 correctly ask for 50 Hz rather than 25.
+        const int64_t rateMilliHz =
+            (static_cast<int64_t>(videoInfo.fpsNum) * 1000 * (videoInfo.streamInterlaced ? 2 : 1)) / videoInfo.fpsDen;
+        if (rateMilliHz > 0) {
+            modeRequest = {.height = static_cast<uint32_t>(videoInfo.codedHeight),
+                           .rateMilliHz = static_cast<uint32_t>(rateMilliHz),
+                           .width = static_cast<uint32_t>(videoInfo.codedWidth)};
+        }
+    }
     if (!vaapiDev->OpenForMediaPlayer(nextSource->VideoInfo(), nextSource->AudioInfo())) {
         vaapiDev->ClearForMediaPlayer();
         return false;
+    }
+    // Only once the entry is known to be playable: the codec-open failure path above restores
+    // nothing, so requesting first would strand the panel on an unplayable entry's rate. Still
+    // ahead of every submitted frame, so the switch lands before playback, not a second into it.
+    if (modeRequest.IsValid()) {
+        vaapiDev->EvaluateDisplayMode(modeRequest, PlaybackSource::MediaPlayer, /*immediate=*/true);
     }
     // Publish + per-entry resets under the lock: readers see either the old source or the fully
     // initialized new one, never a half-open state.
@@ -1345,6 +1406,13 @@ auto cVaapiPlayer::Activate(bool On) -> void {
             subtitles->Shutdown(); // stop subtitle thread + free overlay while display is still attached
         }
         CloseCurrentEntry();
+        // Mode restore lives in ~cVaapiPlayer, not here: VDR reaches Activate(false) only through
+        // ~cPlayer, where the dynamic type has already decayed to the base and this override is
+        // never dispatched. Kept as a belt-and-braces no-op for the (currently unreachable)
+        // cDevice::AttachPlayer detach path -- ResetDisplayModeToDefault is idempotent.
+        if (auto *vaapiDev = FindPrimaryVaapiDevice(); vaapiDev != nullptr) {
+            vaapiDev->ResetDisplayModeToDefault();
+        }
         state.store(State::Stopped, std::memory_order_release);
     }
 }

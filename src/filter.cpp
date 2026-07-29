@@ -51,6 +51,20 @@ extern "C" {
 #pragma GCC diagnostic pop
 
 // ============================================================================
+// === CONSTANTS ===
+// ============================================================================
+
+namespace {
+constexpr uint64_t FILTER_RATE_MATCH_TOLERANCE_PPM =
+    2000; ///< 0.2%: source and display rates closer than this count as matched, so no fps re-timing
+          ///< filter is emitted. Sized to swallow the 1000-ppm NTSC pull-down gap (59.94 vs 60) --
+          ///< the one case where an exact comparison would insert a filter that duplicates a frame
+          ///< every ~1000 for no benefit. The residual drift is far below one frame per minute and
+          ///< the A/V sync controller corrects it; it must stay well under the smallest genuine
+          ///< cadence step (50 vs 60 Hz = 200000 ppm) so real mismatches still get the filter.
+} // namespace
+
+// ============================================================================
 // === FRAME CLASSIFICATION HELPERS ===
 // ============================================================================
 
@@ -192,6 +206,7 @@ auto cVideoFilterChain::FailBuild() noexcept -> bool {
     filterGraph_.reset();
     hasFpsFilter_.store(false, std::memory_order_relaxed);
     outputFrameDurationMs_ = 20;
+    naturalOutputRateMilliHz_.store(0, std::memory_order_relaxed);
     return false;
 }
 
@@ -264,19 +279,27 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         wantCrop = cropOffX > 0U || cropOffY > 0U;
     }
 
-    const uint64_t darNum = static_cast<uint64_t>(croppedW) * static_cast<uint64_t>(sarNum);
-    const uint64_t darDen = static_cast<uint64_t>(croppedH) * static_cast<uint64_t>(sarDen);
+    // Source display aspect, divided by the scanout pixel aspect: the result is the shape the
+    // picture must have in RASTER pixels to look right on the panel, so the fit below is the plain
+    // square-pixel one. On an anamorphic CEA timing (720x576 flagged 16:9) the two differ by 42%,
+    // and fitting without the divide letterboxes a 16:9 source into 720x405 that the TV stretches
+    // back to full width -- ~30% short vertically with black bars. par is 1:1 on every other mode,
+    // where this collapses to the source DAR exactly.
+    const uint64_t parNum = params.outputParNum > 0 ? params.outputParNum : 1;
+    const uint64_t parDen = params.outputParDen > 0 ? params.outputParDen : 1;
+    const uint64_t fitNum = static_cast<uint64_t>(croppedW) * static_cast<uint64_t>(sarNum) * parDen;
+    const uint64_t fitDen = static_cast<uint64_t>(croppedH) * static_cast<uint64_t>(sarDen) * parNum;
 
     uint32_t filterWidth = dstWidth;
     uint32_t filterHeight = dstHeight;
 
-    // Integer cross-multiply avoids FP rounding: compare darNum/darDen vs dstWidth/dstHeight.
-    if (darNum * dstHeight > darDen * static_cast<uint64_t>(dstWidth)) {
+    // Integer cross-multiply avoids FP rounding: compare fitNum/fitDen vs dstWidth/dstHeight.
+    if (fitNum * dstHeight > fitDen * static_cast<uint64_t>(dstWidth)) {
         filterWidth = dstWidth; // source wider -> letterbox
-        filterHeight = static_cast<uint32_t>(static_cast<uint64_t>(dstWidth) * darDen / darNum);
-    } else if (darNum * dstHeight < darDen * static_cast<uint64_t>(dstWidth)) {
+        filterHeight = static_cast<uint32_t>(static_cast<uint64_t>(dstWidth) * fitDen / fitNum);
+    } else if (fitNum * dstHeight < fitDen * static_cast<uint64_t>(dstWidth)) {
         filterHeight = dstHeight; // source narrower -> pillarbox
-        filterWidth = static_cast<uint32_t>(static_cast<uint64_t>(dstHeight) * darNum / darDen);
+        filterWidth = static_cast<uint32_t>(static_cast<uint64_t>(dstHeight) * fitNum / fitDen);
     }
 
     // NV12/P010 chroma is 4:2:0 (2x2-subsampled); odd dimensions produce artifacts.
@@ -298,6 +321,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filterHeight = evenAtLeastTwo(dstHeight);
     }
 
+    // Compare against the cropped dimensions: those are what scale_vaapi actually receives.
+    const bool needsResize = (filterWidth != croppedW || filterHeight != croppedH);
+    // Upscale specifically, not merely "resized": magnifying is the only case where the VPP itself
+    // softens edges, and that softening is what the SD sharpen level below exists to undo.
+    const bool upscales = (filterWidth > croppedW || filterHeight > croppedH);
+
     // UHD: GPU already saturated by 4K decode/scale; skip denoise/sharpen to avoid stutter.
     // MPEG-2 SD: DCT-block and analog-tape artifacts warrant heavier processing.
     // H.264/H.265 HD: lighter touch preserves encoder-intended detail.
@@ -306,16 +335,20 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     if (!isUhd) {
         if (params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-            denoiseLevel = 12;   // 576i->1080 upscale magnifies DCT blocking; higher smears motion
-            sharpnessLevel = 26; // restores upscale-softened edges without ringing on titles
+            // Denoise regardless of the scale factor: the blocking is in the source and gets
+            // magnified either way -- by us when we upscale, by the TV's scaler when we hand it a
+            // native 576p raster. Higher smears motion.
+            denoiseLevel = 12;
+            // Sharpen only when WE magnify. Resolution matching can now put an SD stream out 1:1 on
+            // a 576p/480p mode, where the VPP softens nothing and the TV's own scaler applies its
+            // own edge enhancement downstream -- pre-sharpening would stack on top of that and
+            // halate titles. 26 restores upscale-softened edges without ringing.
+            sharpnessLevel = upscales ? 26 : 0;
         } else {
             denoiseLevel = 4;    // 1080i is near-native; just tame ringing at bitrate-starved edges
             sharpnessLevel = 20; // mild -- stronger values halate bright HD content
         }
     }
-
-    // Compare against the cropped dimensions: those are what scale_vaapi actually receives.
-    const bool needsResize = (filterWidth != croppedW || filterHeight != croppedH);
 
     // HDR path: P010 (10-bit packed) preserves bit depth through VPP; NV12 would clip to 8-bit.
     // scaleColorArgs is appended after ':' (resize) or after '=' (no-resize); no leading separator.
@@ -353,7 +386,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         ((swDeintRequested && isInterlaced) || swDenoiseRequested || swSharpenRequested || swScaleRequested);
 
     // VBR DVB streams (and some cable muxes) omit framerate; 50/1 is the DVB-S/T baseline (= 25i).
-    const int fpsNum = params.fpsNum > 0 ? params.fpsNum : 50;
+    // Note the fallback is already a FIELD rate, so for an interlaced stream the fieldRateFactor
+    // below doubles it again -- harmless for the fps-filter decision (which then always inserts
+    // fps=display and pins the real output rate) but NOT a number the display-mode matcher may
+    // act on. fpsDeclared gates that; see naturalOutputRateMilliHz_ below.
+    const bool fpsDeclared = params.fpsNum > 0;
+    const int fpsNum = fpsDeclared ? params.fpsNum : 50;
     const int fpsDen = params.fpsDen > 0 ? params.fpsDen : 1;
 
     // rate=field doubles interlaced pairs (25i -> 50p); auto=1/deint=interlaced pass progressive frames
@@ -368,7 +406,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     const int64_t outputRateNum = static_cast<int64_t>(fpsNum) * fieldRateFactor;
     const int64_t outputRateDen = std::max<int64_t>(fpsDen, 1);
     const int naturalOutputFps = static_cast<int>((outputRateNum + (outputRateDen / 2)) / outputRateDen);
-    const int displayFps = static_cast<int>(params.outputRefreshHz);
+    // Exact pre-fps-filter output rate in millihertz, for both the rate comparison below and the
+    // stream format the decoder publishes to the display-mode matcher.
+    const auto naturalOutputMilliHz =
+        static_cast<uint32_t>(((outputRateNum * 1000) + (outputRateDen / 2)) / outputRateDen);
+    const uint32_t displayMilliHz = params.outputRefreshMilliHz;
+    const int displayFps = static_cast<int>((displayMilliHz + 500U) / 1000U);
     // Insert fps=display whenever the post-deinterlace output rate differs from the display rate.
     // The fps filter paces the decoder at source rate by buffering its output to the target rate;
     // without it, the decoder thread is paced by SubmitFrame's vsync backpressure (= display rate)
@@ -381,8 +424,18 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // visual cadence the display would produce anyway -- but the producer-side pacing is what makes
     // the decoder consume source at its actual rate. Adding it on audio-clocked paths is safe (and
     // eliminates "catch-up cycling sustained" log spam from the routine source>display drop work).
-    const int64_t displayRateInSourceDen = static_cast<int64_t>(displayFps) * outputRateDen;
-    const bool ratesDiffer = outputRateNum > 0 && displayFps > 0 && outputRateNum != displayRateInSourceDen;
+    //
+    // Compared with a tolerance rather than for equality: with display-mode matching enabled the
+    // output can sit on a genuine 59.94 Hz (or 23.976 Hz) mode, and an exact test would call that a
+    // mismatch against a 59.94 fps source and insert a pointless fps=60 that duplicates a frame
+    // every ~1000. Within the tolerance the residual drift is well under a frame per minute and the
+    // A/V sync controller absorbs it -- strictly better than resampling the cadence.
+    const uint64_t rateDeltaMilliHz = naturalOutputMilliHz > displayMilliHz
+                                          ? naturalOutputMilliHz - displayMilliHz
+                                          : static_cast<uint64_t>(displayMilliHz) - naturalOutputMilliHz;
+    const bool ratesDiffer =
+        naturalOutputMilliHz > 0 && displayMilliHz > 0 &&
+        rateDeltaMilliHz * 1000000ULL > static_cast<uint64_t>(displayMilliHz) * FILTER_RATE_MATCH_TOLERANCE_PPM;
     // Trick/still never get the fps filter (minimal chain), so their output stays at the natural rate.
     const bool insertFpsFilter = !minimalChain && ratesDiffer;
     const int outputFps = insertFpsFilter ? displayFps : naturalOutputFps;
@@ -741,6 +794,12 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // decision).
     hasFpsFilter_.store(insertFpsFilter, std::memory_order_relaxed);
     outputFrameDurationMs_ = outputFps > 0 ? std::max(1, 1000 / outputFps) : 20; // 20 ms = 50 fps fallback
+    // Published only when the stream actually declared a frame rate. A guess must never reach the
+    // display-mode matcher: the 50/1 fallback is a field rate, so an interlaced stream without VUI
+    // timing would report 100 Hz and could drive the CRTC to a 100 Hz mode -- above the operator's
+    // refresh cap, since the matcher deliberately exempts the k==1 multiple from it. Zero makes
+    // the decoder skip the notification and StreamModeRequest::IsValid() keep the matcher inert.
+    naturalOutputRateMilliHz_.store(fpsDeclared ? naturalOutputMilliHz : 0, std::memory_order_relaxed);
 
     if (compactLog) {
         if (wantCrop) {
@@ -755,8 +814,19 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         // chain is byte-for-byte identical, so every switch surfaces its settings.
         const char *cadenceTag = "";
         if (insertFpsFilter) {
-            if (outputRateNum < displayRateInSourceDen) {
-                cadenceTag = (displayRateInSourceDen % outputRateNum) == 0 ? ", duplicated" : ", uneven cadence";
+            if (naturalOutputMilliHz < displayMilliHz) {
+                // "duplicated" only when the display rate is a whole multiple of the source rate
+                // (every frame shown the same number of times); anything else beats out a 3:2-style
+                // uneven pattern. Compared with the same tolerance as the match test above so a
+                // 23.976-into-59.94 pull-down is not mislabelled over a rounding remainder.
+                const uint64_t multiple =
+                    (static_cast<uint64_t>(displayMilliHz) + (naturalOutputMilliHz / 2)) / naturalOutputMilliHz;
+                const uint64_t ideal = multiple * naturalOutputMilliHz;
+                const uint64_t deviation = ideal > displayMilliHz ? ideal - displayMilliHz : displayMilliHz - ideal;
+                const bool wholeMultiple =
+                    multiple >= 1 &&
+                    deviation * 1000000ULL <= static_cast<uint64_t>(displayMilliHz) * FILTER_RATE_MATCH_TOLERANCE_PPM;
+                cadenceTag = wholeMultiple ? ", duplicated" : ", uneven cadence";
             } else {
                 cadenceTag = ", decimated";
             }
@@ -802,6 +872,7 @@ auto cVideoFilterChain::Reset() noexcept -> void {
     bufferSinkCtx_ = nullptr;
     hasFpsFilter_.store(false, std::memory_order_relaxed);
     outputFrameDurationMs_ = 20;
+    naturalOutputRateMilliHz_.store(0, std::memory_order_relaxed);
     // Keep the old graph alive in previousFilterGraph_: destroying it immediately causes
     // -EIO on iHD because the VPP output surfaces are still DMA-BUF mapped by the display
     // thread. The saved graph (and its hw_frames_ctx) is released when a later Reset()

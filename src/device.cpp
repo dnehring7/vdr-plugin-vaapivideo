@@ -43,6 +43,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -107,6 +108,8 @@ extern "C" {
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
+namespace {
+
 // AUDIO_QUEUE_HIGHWATER paces dvbplayer/PES replay (PlayAudio/Poll); AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER
 // paces the single-cursor mediaplayer demux. MEDIAPLAYER_MAX_LOOKAHEAD_90K is the coarser PTS-distance
 // brake (so a TS mux interleave offset can't over-fill the decoder jitterBuf after a seek).
@@ -148,6 +151,27 @@ constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 /// frame can't fit a corroborating pair in 2 KB.
 constexpr size_t AUDIO_DETECT_WINDOW = 2048;
 
+// --- Runtime display-mode switching (stability / rate-limit / matcher tolerances) ---
+constexpr uint64_t DISPLAY_MODE_STABLE_MS =
+    1500; ///< How long a reactively observed format must hold before it may drive a modeset.
+          ///< Live-TV formats churn faster than this while the tuner settles, so only the one the
+          ///< viewer actually landed on gets through.
+constexpr uint64_t DISPLAY_MODE_MIN_INTERVAL_MS =
+    3000; ///< Minimum gap between two applied changes. Each modeset costs an HDMI link retrain
+          ///< (~0.5-1 s of black), so back-to-back switches must be impossible even if the
+          ///< stability gate is somehow satisfied twice in a row.
+constexpr uint64_t DISPLAY_MODE_IDLE_RESTORE_MS =
+    5000; ///< No stream format published for this long after a stop: hand the output back to the
+          ///< default. Playback can end into a source that never decodes anything (radio,
+          ///< scrambled, no free tuner), where nothing else would move the mode off the one the
+          ///< previous stream installed.
+constexpr uint32_t DISPLAY_MODE_EXACT_TOLERANCE_PPM =
+    200; ///< Tier-A rate tolerance (0.02%): rounding noise only. Keeps 59.94 and 60 distinct.
+constexpr uint32_t DISPLAY_MODE_LOOSE_TOLERANCE_PPM =
+    5000; ///< Tier-B rate tolerance (0.5%): only consulted when tier A finds nothing. Lets 59.94
+          ///< content land on a 60 Hz-only panel and 23.976 on a 24 Hz-only panel.
+constexpr uint32_t DISPLAY_MODE_MAX_RATE_MULTIPLE = 8; ///< Highest k considered in the k*source refresh search.
+
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
 // to VDR's KBD. DETA: yield to tty1 so the user lands on getty. Needs the
@@ -160,8 +184,6 @@ constexpr size_t AUDIO_DETECT_WINDOW = 2048;
 constexpr int VT_SWITCH_TIMEOUT_MS = 1500; ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
                                            ///< that refuse to release would otherwise block startup forever
                                            ///< and look like a 60 s "plugin hang" until the watchdog fires.
-
-namespace {
 
 std::atomic<bool> capWarned{false}, noVtHinted{false};
 
@@ -677,8 +699,10 @@ cVaapiDevice::~cVaapiDevice() noexcept {
     return HardwareReady() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
 }
 
+namespace {
 constexpr uint64_t DEVICE_CLEAR_LOG_COOLDOWN_MS =
     1000; ///< Min spacing between Clear() diagnostic logs; collapses a scrub/seek Clear() burst to ~1 line/s.
+} // namespace
 
 auto cVaapiDevice::Clear() -> void {
     // Diagnostic: log thread + inter-call delta to diagnose unexpected Clear() bursts.
@@ -690,6 +714,10 @@ auto cVaapiDevice::Clear() -> void {
     // burst). Log isolated Clear()s in full immediately (the gate is open after a quiet gap); during a
     // burst, emit one line per DEVICE_CLEAR_LOG_COOLDOWN_MS carrying the coalesced count so the burst
     // stays diagnosable (thread + magnitude) without 80 near-identical lines.
+    // Stream boundary: drop any format still ageing in the display-mode stability gate before it
+    // matures against a stream that has already gone away.
+    InvalidateDisplayModeCandidate();
+
     const auto nowMs = cTimeMs::Now();
     const uint64_t prevMs = lastClearMs.exchange(nowMs, std::memory_order_relaxed);
     clearsSinceLog.fetch_add(1, std::memory_order_relaxed);
@@ -827,27 +855,56 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
     // Gate the display-touching tiers on HardwareReady() (the acquire paired with AttachHardware()'s
     // SVDRP-thread publish): a skin repaint here must not race a half-built display. Until ready, use
     // the config tier.
+    //
+    // Keying the cache on the mode generation is the whole OSD-resize hookup for runtime mode
+    // switching: VDR polls cOsdProvider::UpdateOsdSize() once per second, which lands here, sees the
+    // new size, recomputes Setup.OSDWidth/Height plus the font sizes and bumps osdState -- which
+    // makes open menus redisplay, destroying the old cVaapiOsd for one sized to the new mode.
+    //
+    // PixelAspect is VDR's PIXEL aspect hint ("a circle drawn 100x100 shows up as a circle"), not
+    // the shape of the screen -- cDevice's own implementation returns 1.0. It is 1.0 for every
+    // square-pixel mode and only interesting on the anamorphic SD timings. Nothing in VDR core
+    // reads it back; it lands in Setup.OSDAspect for skins to use.
     if (HardwareReady() && display) [[likely]] {
-        if (osdWidth > 0 && osdHeight > 0) [[likely]] {
+        // Size and pixel aspect live in separate atomics, so bracket both with the mode generation
+        // and retry if it moved -- otherwise a mode change landing mid-read pairs a new size with
+        // the previous aspect and the mismatch is CACHED. Cannot spin: a second iteration needs a
+        // whole modeset to land inside it.
+        uint64_t modeGeneration = display->GetModeGeneration();
+        uint32_t outputWidth = 0;
+        uint32_t outputHeight = 0;
+        double pixelAspect = 1.0;
+        for (bool coherent = false; !coherent;) {
+            display->GetOutputGeometry(outputWidth, outputHeight);
+            const AspectRatio par = display->GetOutputPixelAspect();
+            pixelAspect = par.den > 0 ? static_cast<double>(par.num) / static_cast<double>(par.den) : 1.0;
+            const uint64_t recheck = display->GetModeGeneration();
+            coherent = (recheck == modeGeneration);
+            modeGeneration = recheck;
+        }
+
+        if (osdWidth > 0 && osdHeight > 0 && osdModeGeneration == modeGeneration) [[likely]] {
             Width = osdWidth;
             Height = osdHeight;
-            PixelAspect = display->GetAspectRatio();
+            PixelAspect = pixelAspect;
             return;
         }
         if (display->IsInitialized()) {
-            osdWidth = static_cast<int>(display->GetOutputWidth());
-            osdHeight = static_cast<int>(display->GetOutputHeight());
+            osdWidth = static_cast<int>(outputWidth);
+            osdHeight = static_cast<int>(outputHeight);
+            osdModeGeneration = modeGeneration;
             Width = osdWidth;
             Height = osdHeight;
-            PixelAspect = display->GetAspectRatio();
-            dsyslog("vaapivideo/device: OSD size cached: %dx%d aspect=%.3f", Width, Height, PixelAspect);
+            PixelAspect = pixelAspect;
+            dsyslog("vaapivideo/device: OSD size %dx%d pixel-aspect=%.3f screen-aspect=%.3f", Width, Height,
+                    PixelAspect, display->GetAspectRatio());
             return;
         }
     }
 
     Width = static_cast<int>(vaapiConfig.display.GetWidth());
     Height = static_cast<int>(vaapiConfig.display.GetHeight());
-    PixelAspect = static_cast<double>(Width) / Height;
+    PixelAspect = 1.0; // pre-init fallback: --resolution names a square-pixel raster
 }
 
 [[nodiscard]] auto cVaapiDevice::GetSTC() -> int64_t {
@@ -1118,22 +1175,22 @@ constexpr int GRAB_MAX_HEIGHT = 4320;
 
 [[nodiscard]] auto cVaapiDevice::GrabImage(int &Size, bool Jpeg, int Quality, int SizeX, int SizeY) -> uchar * {
     if (!HardwareReady() || !display) [[unlikely]] {
-        esyslog("vaapivideo/device: GrabImage - device not ready");
+        esyslog("vaapivideo/device: GrabImage -- device not ready");
         return nullptr;
     }
 
     // Reject oversize requests up front, before the (expensive) surface grab and HDR tonemap --
     // see GRAB_MAX_WIDTH/GRAB_MAX_HEIGHT for why VDR core does not bound these itself.
     if (SizeX > GRAB_MAX_WIDTH || SizeY > GRAB_MAX_HEIGHT) [[unlikely]] {
-        esyslog("vaapivideo/device: GrabImage - requested size %dx%d exceeds limit %dx%d", SizeX, SizeY, GRAB_MAX_WIDTH,
-                GRAB_MAX_HEIGHT);
+        esyslog("vaapivideo/device: GrabImage -- requested size %dx%d exceeds limit %dx%d", SizeX, SizeY,
+                GRAB_MAX_WIDTH, GRAB_MAX_HEIGHT);
         return nullptr;
     }
 
     // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010).
     auto srcFrame = display->GrabDisplayedFrame();
     if (!srcFrame) [[unlikely]] {
-        esyslog("vaapivideo/device: GrabImage - no displayed frame yet");
+        esyslog("vaapivideo/device: GrabImage -- no displayed frame yet");
         return nullptr;
     }
 
@@ -1188,7 +1245,16 @@ constexpr int GRAB_MAX_HEIGHT = 4320;
     }
 
     // 4. Encode. SizeX/SizeY <= 0 = native display resolution (upper bounds enforced at entry).
-    const int outW = (SizeX > 0) ? SizeX : rgb24->width;
+    // "Native" means what the viewer sees, not the raster: on an anamorphic SD mode the scanout is
+    // 720x576 but the panel shows it as 16:9, so an unscaled grab would arrive squashed in the
+    // browser (the live plugin renders these). Undo the stretch by widening to square pixels. An
+    // explicit SizeX/SizeY still wins -- that is the caller stating exactly what it wants.
+    const AspectRatio grabPar = display->GetOutputPixelAspect();
+    const int squareWidth =
+        (grabPar.den > 0 && grabPar.num != grabPar.den)
+            ? static_cast<int>((static_cast<int64_t>(rgb24->width) * grabPar.num) / grabPar.den) & ~1
+            : rgb24->width;
+    const int outW = (SizeX > 0) ? SizeX : std::max(squareWidth, 2);
     const int outH = (SizeY > 0) ? SizeY : rgb24->height;
     const bool needScale = (outW != rgb24->width) || (outH != rgb24->height);
 
@@ -1823,6 +1889,10 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     const auto idx = static_cast<unsigned>(PlayMode);
     dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
 
+    // Stream boundary, same reason as in Clear(): a candidate armed for the outgoing stream must
+    // not mature against the incoming one.
+    InvalidateDisplayModeCandidate();
+
     // External-player handover (vdr-mpv): suspend hardware so it can grab DRM/VAAPI/ALSA.
     // SuspendHardware (not Detach) -- cMpvControl is live, cControl::Shutdown would double-free.
     // Arm externActive only on actual suspend; --detached startup uses MakePrimaryDevice's
@@ -1892,6 +1962,10 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // old content's stop. Manual zoom is a per-content choice -- drop it on every change.
             ResetZoom();
             Clear();
+            // Playback ended (or a zap started). Arm the deferred mode restore -- if something
+            // decodes within the window this is disarmed again, so an ordinary zap never bounces
+            // the mode; if nothing does, the output comes back off the previous stream's mode.
+            ScheduleIdleModeRestore();
             // User opt-in: paint black during channel-switch gap instead of holding the
             // previous channel's last frame until the new one decodes its first frame.
             if (vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed)) {
@@ -2013,6 +2087,11 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     trickAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     trickSpeed.store(Speed, std::memory_order_release);
 
+    // Both display-mode entry points bail while trickSpeed != 0, so a candidate armed just before
+    // this would sit untouched for the whole (arbitrarily long) trick session and then be applied
+    // on the first tick after it ends -- possibly against different content entirely.
+    InvalidateDisplayModeCandidate();
+
     if (decoder) [[likely]] {
         decoder->SetTrickSpeed(Speed, Forward, isFast);
     }
@@ -2034,7 +2113,7 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     // Opens hardware using arguments latched by Initialize(). Used after detached startup
     // and after a Detach() -> SVDRP ATTA cycle.
     if (drmPath.empty()) [[unlikely]] {
-        esyslog("vaapivideo/device: cannot attach - Initialize() has not run yet");
+        esyslog("vaapivideo/device: cannot attach -- Initialize() has not run yet");
         return false;
     }
     isyslog("vaapivideo/device: attaching to hardware (DRM=%s audio=%s connector=%s)", drmPath.c_str(),
@@ -2126,6 +2205,20 @@ auto cVaapiDevice::SuspendHardware() -> void {
     lastHandledAudioPid = 0;
     osdWidth = 0;
     osdHeight = 0;
+    osdModeGeneration = 0;
+
+    // Drop the mode inventory: the next attach re-enumerates against the topology as it is then
+    // (the sink may have moved), and the debounce state must not carry a pre-detach timestamp.
+    {
+        const cMutexLock lock(&displayModeMutex);
+        connectorModes.clear();
+        modeCandidates.clear();
+        defaultMode = {};
+        ClearModeCandidateLocked();
+        modeIdleRestoreDueMs.store(0, std::memory_order_release);
+        lastModeChangeMs = 0;
+        lastRequest = {};
+    }
 
     // Drop an auto-detected connector so the next attach re-selects against the current topology
     // (sticky auto-latching would hard-fail a re-attach if the sink moved). A -c connector stays pinned.
@@ -2158,18 +2251,389 @@ auto cVaapiDevice::SuspendHardware() -> void {
     if (deferred) {
         // Stay in state 0: hardware opens on first primary-device promotion after startup,
         // or on explicit SVDRP ATTA.
-        isyslog("vaapivideo/device: starting detached - DRM '%s', audio '%s', connector '%s' "
+        isyslog("vaapivideo/device: starting detached -- DRM '%s', audio '%s', connector '%s' "
                 "(hardware init deferred until attach)",
                 drmPath.c_str(), audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
         return true;
     }
 
-    dsyslog("vaapivideo/device: initializing - DRM '%s', audio '%s', connector '%s'", drmPath.c_str(),
+    dsyslog("vaapivideo/device: initializing -- DRM '%s', audio '%s', connector '%s'", drmPath.c_str(),
             audioDevice.c_str(), connectorName.empty() ? "auto" : connectorName.c_str());
     return AttachHardware();
 }
 
 auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.store(true, std::memory_order_release); }
+
+// ============================================================================
+// === DISPLAY MODE SWITCHING ===
+// ============================================================================
+
+[[nodiscard]] auto cVaapiDevice::CurrentPlaybackSource() const noexcept -> PlaybackSource {
+    // mediaPlayerAudioActive spans an open mediaplayer entry; liveMode is latched from
+    // Transferring() on the first video PES. Anything else is cDvbPlayer replay.
+    if (mediaPlayerAudioActive.load(std::memory_order_acquire)) {
+        return PlaybackSource::MediaPlayer;
+    }
+    return liveMode.load(std::memory_order_relaxed) ? PlaybackSource::LiveTv : PlaybackSource::Replay;
+}
+
+[[nodiscard]] auto cVaapiDevice::ActiveRefreshMilliHz() const noexcept -> uint32_t {
+    if (HardwareReady() && display && display->IsInitialized()) [[likely]] {
+        return display->GetOutputRefreshMilliHz();
+    }
+    return vaapiConfig.display.GetRefreshRate() * 1000U;
+}
+
+namespace {
+
+/// True when the operator has enabled mode switching for @p source.
+[[nodiscard]] auto ModeSwitchEnabledFor(PlaybackSource source) noexcept -> bool {
+    switch (source) {
+        case PlaybackSource::LiveTv:
+            return vaapiConfig.modeSwitchLiveTv.load(std::memory_order_relaxed);
+        case PlaybackSource::Replay:
+            return vaapiConfig.modeSwitchReplay.load(std::memory_order_relaxed);
+        case PlaybackSource::MediaPlayer:
+            return vaapiConfig.modeSwitchMediaplayer.load(std::memory_order_relaxed);
+    }
+    return false;
+}
+
+/// Snapshot the live policy. Taken once per evaluation so a setup-menu edit landing mid-decision
+/// cannot mix old and new settings.
+[[nodiscard]] auto SnapshotModePolicy(const drmModeModeInfo &defaultMode) noexcept -> DisplayModePolicy {
+    return {.defaultHeight = defaultMode.vdisplay,
+            .defaultRefreshMilliHz = ModeRefreshMilliHz(defaultMode),
+            .defaultWidth = defaultMode.hdisplay,
+            .matchRefresh = vaapiConfig.matchRefreshRate.load(std::memory_order_relaxed),
+            .matchResolution = vaapiConfig.matchResolution.load(std::memory_order_relaxed),
+            .maxRefreshMilliHz = MaxRefreshModeMilliHz(vaapiConfig.maxRefreshRate.load(std::memory_order_relaxed)),
+            .minHeight = MinResolutionModeHeight(vaapiConfig.minResolution.load(std::memory_order_relaxed))};
+}
+
+/// Two modes are "the same output" iff size and exact rate agree; drmModeModeInfo also carries
+/// timing detail that is irrelevant to whether a modeset is worth its HDMI relink.
+[[nodiscard]] auto SameOutputMode(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
+    return a.hdisplay == b.hdisplay && a.vdisplay == b.vdisplay && ModeRefreshMilliHz(a) == ModeRefreshMilliHz(b);
+}
+
+} // namespace
+
+auto cVaapiDevice::ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs) -> void {
+    modeCandidate = request;
+    modeCandidateSinceMs = nowMs;
+    // Publish a non-zero due time last so PollPendingDisplayMode()'s lock-free probe never sees an
+    // armed window before the payload behind it. (+1 guards the theoretical nowMs==0 tick.)
+    modeCandidateDueMs.store(nowMs + DISPLAY_MODE_STABLE_MS + 1, std::memory_order_release);
+}
+
+auto cVaapiDevice::ClearModeCandidateLocked() -> void {
+    modeCandidateDueMs.store(0, std::memory_order_release);
+    modeCandidate = {};
+    modeCandidateSinceMs = 0;
+}
+
+auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, PlaybackSource source, uint64_t nowMs)
+    -> void {
+    // Caller holds displayModeMutex. Runs the matcher and stages the winner; the stability gate
+    // and the scope/policy gates are the caller's business.
+
+    // Rate limit: each change costs an HDMI link retrain, so back-to-back switches must be
+    // impossible even when a playlist advances through short entries. Deliberately returns with
+    // the candidate STILL ARMED -- PollPendingDisplayMode() re-enters once the interval expires,
+    // so a throttled switch is deferred rather than dropped.
+    if (lastModeChangeMs != 0 && nowMs - lastModeChangeMs < DISPLAY_MODE_MIN_INTERVAL_MS) {
+        return;
+    }
+
+    const auto match = SelectDisplayMode(modeCandidates, request, SnapshotModePolicy(defaultMode));
+    // Disarm before the verdict is acted on: a matcher that found nothing for this inventory will
+    // find nothing every time, so leaving the candidate armed would re-run it (and re-allocate its
+    // reason string) on every single decode-loop tick for the rest of the session.
+    ClearModeCandidateLocked();
+    if (match.index < 0) {
+        return;
+    }
+    const auto &winner = connectorModes.at(modeCandidates.at(static_cast<size_t>(match.index)).index);
+    if (SameOutputMode(winner, display->GetActiveMode())) {
+        // The common case once settled -- and what closes the rebuild -> publish -> evaluate loop,
+        // since the rebuilt filter graph republishes the very format that produced this mode.
+        return;
+    }
+
+    // Carries the stream too: without it the log cannot say whether the chosen resolution tracked
+    // the source or was clamped by the configured minimum.
+    isyslog("vaapivideo/device: display mode switch (%s): stream %ux%u@%.3fHz -> %s", PlaybackSourceName(source),
+            request.width, request.height, static_cast<double>(request.rateMilliHz) / 1000.0, match.reason.c_str());
+    display->RequestDisplayMode(winner);
+    lastModeChangeMs = nowMs;
+}
+
+auto cVaapiDevice::RestoreDefaultModeLocked(uint64_t nowMs) -> void {
+    // Caller holds displayModeMutex. Used whenever mode switching is not in charge of the current
+    // source: without it a mode installed by a *different* source stays on the CRTC forever (stop
+    // a 24p recording with live-TV switching off and live TV would run at 24 Hz for the session).
+    ClearModeCandidateLocked();
+    modeIdleRestoreDueMs.store(0, std::memory_order_release);
+    if (defaultMode.hdisplay == 0) {
+        return;
+    }
+    if (SameOutputMode(defaultMode, display->GetActiveMode())) {
+        return; // the overwhelmingly common case: nothing ever moved the mode
+    }
+    // No rate limit here, unlike ApplyDisplayModePolicy: this path is edge-driven with nothing left
+    // armed to retry it, so throttling it would silently drop the restore and strand the output on
+    // another source's mode. Returning to the default is idempotent and cannot oscillate.
+    isyslog("vaapivideo/device: restoring default display mode %ux%u@%.3fHz", defaultMode.hdisplay,
+            defaultMode.vdisplay, static_cast<double>(ModeRefreshMilliHz(defaultMode)) / 1000.0);
+    display->RequestDisplayMode(defaultMode);
+    lastModeChangeMs = nowMs;
+}
+
+auto cVaapiDevice::EvaluateDisplayMode(const StreamModeRequest &request, PlaybackSource source, bool immediate)
+    -> void {
+    if (!HardwareReady() || !display) {
+        return;
+    }
+    // Disarmed ahead of every other gate: a publish means something is decoding, which is exactly
+    // what the idle watchdog waits to rule out -- and a stream that cannot be matched, or one being
+    // scrubbed, is still decoding. SetPlayMode(pmNone) arms it, and a zap emits pmNone and then
+    // decodes, so this is what keeps an ordinary zap from bouncing the mode.
+    modeIdleRestoreDueMs.store(0, std::memory_order_release);
+    // Trick play paces frames off-cadence and is transient: a modeset would cost a second of black
+    // mid-scrub for a rate that reverts the moment it ends.
+    if (trickSpeed.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+
+    const cMutexLock lock(&displayModeMutex);
+    // A connector whose timings are all interlaced or all off-aspect leaves the candidates empty;
+    // the matcher can never satisfy anything, so there is nothing to remember or arm.
+    if (modeCandidates.empty()) {
+        return;
+    }
+    // Remembered even when the switches are off, so flipping one on in the setup menu can act on
+    // the stream already playing (see ReevaluateDisplayMode).
+    lastRequest = request;
+    lastRequestSource = source;
+
+    const uint64_t nowMs = cTimeMs::Now();
+    const auto policy = SnapshotModePolicy(defaultMode);
+    // No usable format (an unmatchable rate is published as 0 rather than guessed), source switch
+    // off, or neither policy enabled: all three mean this stream cannot drive the mode, so hand the
+    // output back to the default rather than leaving it on whatever a PREVIOUS stream installed.
+    // Done on the first filter build so the transition lands in the same window as any other
+    // switch. A no-op in the default configuration, where the mode never moved.
+    if (!request.IsValid() || !ModeSwitchEnabledFor(source) || (!policy.matchRefresh && !policy.matchResolution)) {
+        RestoreDefaultModeLocked(nowMs);
+        return;
+    }
+
+    if (immediate) {
+        ClearModeCandidateLocked();
+        ApplyDisplayModePolicy(request, source, nowMs);
+        return;
+    }
+
+    // Stability gate: live-TV formats churn while the tuner settles, so only a format that held
+    // long enough to be the one the viewer landed on may drive a modeset. Armed here, matured by
+    // PollPendingDisplayMode() -- the reactive publish fires once per filter-graph build, so a
+    // second identical notification would never arrive on its own.
+    if (modeCandidateSinceMs == 0 || !(modeCandidate == request)) {
+        ArmModeCandidateLocked(request, nowMs);
+        return;
+    }
+    if (nowMs - modeCandidateSinceMs < DISPLAY_MODE_STABLE_MS) {
+        return;
+    }
+    ApplyDisplayModePolicy(request, source, nowMs);
+}
+
+auto cVaapiDevice::PollPendingDisplayMode() -> void {
+    // Driven by the decode loop's per-iteration tick (which also runs on the ~100 ms idle ticks),
+    // so an armed candidate matures on wall-clock time instead of waiting for a second publish that
+    // a steady stream never produces.
+    //
+    // Lock-free fast path first: with nothing armed -- the steady state -- this must cost two
+    // loads, not a mutex acquisition.
+    const uint64_t candidateDueMs = modeCandidateDueMs.load(std::memory_order_acquire);
+    const uint64_t idleDueMs = modeIdleRestoreDueMs.load(std::memory_order_acquire);
+    if (candidateDueMs == 0 && idleDueMs == 0) {
+        return;
+    }
+    const uint64_t probeMs = cTimeMs::Now();
+    const bool candidateDue = candidateDueMs != 0 && probeMs >= candidateDueMs;
+    const bool idleDue = idleDueMs != 0 && probeMs >= idleDueMs;
+    if (!candidateDue && !idleDue) {
+        return;
+    }
+    if (!HardwareReady() || !display) {
+        return;
+    }
+    if (trickSpeed.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+
+    const cMutexLock lock(&displayModeMutex);
+    if (modeCandidates.empty()) {
+        return;
+    }
+    const uint64_t nowMs = cTimeMs::Now();
+
+    // Re-check under the lock: another thread may have disarmed or re-armed since the probe.
+    if (modeCandidateSinceMs != 0 && modeCandidate.IsValid() &&
+        nowMs - modeCandidateSinceMs >= DISPLAY_MODE_STABLE_MS) {
+        // Re-check the gates: the operator may have changed a setting while the candidate aged.
+        const auto policy = SnapshotModePolicy(defaultMode);
+        if (!ModeSwitchEnabledFor(lastRequestSource) || (!policy.matchRefresh && !policy.matchResolution)) {
+            RestoreDefaultModeLocked(nowMs);
+            return;
+        }
+        ApplyDisplayModePolicy(modeCandidate, lastRequestSource, nowMs);
+        return;
+    }
+
+    // Idle watchdog: nothing has published a format for a while, i.e. playback stopped without
+    // anything decoding afterwards -- hand the mode back so the VDR menu does not sit at a film
+    // rate for the session. The DEADLINE is re-read under the lock, not just its non-zero-ness:
+    // judging a re-arm that landed between the probe and the lock (stop, then an immediate zap)
+    // against the pre-lock snapshot restored the default ~5 s early.
+    const uint64_t idleDueNowMs = modeIdleRestoreDueMs.load(std::memory_order_acquire);
+    if (idleDueNowMs != 0 && nowMs >= idleDueNowMs && modeCandidateSinceMs == 0) {
+        // The stream that installed the mode is gone, so its format must not be resurrected by a
+        // later setup-menu confirm (ReevaluateDisplayMode replays lastRequest).
+        lastRequest = {};
+        RestoreDefaultModeLocked(nowMs);
+    }
+}
+
+auto cVaapiDevice::NotifyStreamFormat(const StreamModeRequest &request) -> void {
+    EvaluateDisplayMode(request, CurrentPlaybackSource(), /*immediate=*/false);
+}
+
+auto cVaapiDevice::InvalidateDisplayModeCandidate() -> void {
+    // Cheap lock-free guard: the candidate is armed for at most ~1.5 s at a time, so on the vast
+    // majority of Clear()/SetPlayMode() calls there is nothing to drop.
+    if (modeCandidateDueMs.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    const cMutexLock lock(&displayModeMutex);
+    ClearModeCandidateLocked();
+}
+
+auto cVaapiDevice::ScheduleIdleModeRestore() -> void {
+    // Deferred rather than restoring now: VDR emits pmNone immediately before pmAudioVideo on an
+    // ordinary zap, so restoring here would bounce the mode twice per zap. Anything that starts
+    // decoding disarms it (EvaluateDisplayMode, ahead of every other gate), leaving this to fire
+    // only when playback really ended into something that decodes nothing.
+    if (!HardwareReady() || !display) {
+        return;
+    }
+    // Armed unconditionally, not only when off the default: GetActiveMode() names the last mode the
+    // display thread finished PROGRAMMING, so a stop landing inside an in-flight switch would see
+    // the outgoing mode and leave the incoming one unwatched. A spurious arm costs one no-op poll --
+    // RestoreDefaultModeLocked() early-outs when the mode really is the default.
+    modeIdleRestoreDueMs.store(cTimeMs::Now() + DISPLAY_MODE_IDLE_RESTORE_MS, std::memory_order_release);
+}
+
+auto cVaapiDevice::ReevaluateDisplayMode() -> void {
+    StreamModeRequest request;
+    PlaybackSource source{};
+    {
+        const cMutexLock lock(&displayModeMutex);
+        request = lastRequest;
+        source = lastRequestSource;
+        ClearModeCandidateLocked();
+        lastModeChangeMs = 0; // an explicit operator action must not be swallowed by the rate limit
+    }
+    if (request.IsValid()) {
+        EvaluateDisplayMode(request, source, /*immediate=*/true);
+    } else {
+        ResetDisplayModeToDefault();
+    }
+}
+
+auto cVaapiDevice::ResetDisplayModeToDefault() -> void {
+    if (!HardwareReady() || !display) {
+        return;
+    }
+    const cMutexLock lock(&displayModeMutex);
+    if (defaultMode.hdisplay == 0) {
+        return;
+    }
+    ClearModeCandidateLocked();
+    modeIdleRestoreDueMs.store(0, std::memory_order_release); // the request below is the restore
+    lastRequest = {};
+    lastModeChangeMs = 0; // an explicit stop must not be swallowed by the rate limit
+    // Deliberately NOT gated on GetActiveMode(): that names the last mode the display thread
+    // finished programming, so a stop landing inside an in-flight switch would see the old mode and
+    // strand the output on the new one. RequestDisplayMode is idempotent, so requesting
+    // unconditionally is free and overrides a still-queued request.
+    // Worded apart from RestoreDefaultModeLocked()'s line: that one is the automatic policy edge,
+    // this one an explicit external reset (setup change, player teardown, SVDRP).
+    dsyslog("vaapivideo/device: display mode reset -- requesting default %ux%u@%.3fHz", defaultMode.hdisplay,
+            defaultMode.vdisplay, static_cast<double>(ModeRefreshMilliHz(defaultMode)) / 1000.0);
+    display->RequestDisplayMode(defaultMode);
+}
+
+namespace {
+
+/// " [anamorphic 64:45]" for a candidate whose raster is not square-pixel, empty otherwise. Tagged
+/// because it is what lets a 1.25:1 720x576 raster pass an aspect gate anchored on a 16:9 panel --
+/// otherwise the inventory looks wrong. Shared by the attach dump and the SVDRP MODE report.
+[[nodiscard]] auto AnamorphicNote(std::span<const drmModeModeInfo> modes, const DisplayModeCandidate &candidate)
+    -> std::string {
+    if (candidate.index >= modes.size()) [[unlikely]] {
+        return {};
+    }
+    const AspectRatio par = ModePixelAspectRatio(*std::next(modes.begin(), candidate.index));
+    if (par.num == par.den) {
+        return {};
+    }
+    return std::format(" [anamorphic {}:{}]", par.num, par.den);
+}
+
+} // namespace
+
+[[nodiscard]] auto cVaapiDevice::DisplayModeReport() const -> std::string {
+    if (!HardwareReady() || !display) {
+        return "display not attached\n";
+    }
+    const auto programmedMode = display->GetActiveMode();
+    // Whole report under displayModeMutex: runs on the SVDRP thread, where an attach or a
+    // DETA-driven suspend would otherwise reallocate the inventory mid-iteration.
+    const cMutexLock lock(&displayModeMutex);
+
+    std::string out = std::format(
+        "Active:  {}x{}@{:.3f}Hz\nDefault: {}x{}@{:.3f}Hz\n", programmedMode.hdisplay, programmedMode.vdisplay,
+        static_cast<double>(ModeRefreshMilliHz(programmedMode)) / 1000.0, defaultMode.hdisplay, defaultMode.vdisplay,
+        static_cast<double>(ModeRefreshMilliHz(defaultMode)) / 1000.0);
+
+    if (lastRequest.IsValid()) {
+        const auto match = SelectDisplayMode(modeCandidates, lastRequest, SnapshotModePolicy(defaultMode));
+        out += std::format("Stream:  {}x{}@{:.3f}Hz ({}, switching {})\nDecision: {}\n", lastRequest.width,
+                           lastRequest.height, static_cast<double>(lastRequest.rateMilliHz) / 1000.0,
+                           PlaybackSourceName(lastRequestSource),
+                           ModeSwitchEnabledFor(lastRequestSource) ? "enabled" : "disabled", match.reason);
+    } else if (lastRequest.width > 0) {
+        // Spelled out rather than reported as "none", which would read as nothing playing at all:
+        // a stream IS playing, the matcher is just inert because guessing its rate could drive the
+        // CRTC somewhere bogus.
+        out += std::format("Stream:  {}x{}, no declared frame rate -- not matchable\n", lastRequest.width,
+                           lastRequest.height);
+    } else {
+        out += "Stream:  none\n";
+    }
+
+    out += std::format("Modes ({} usable of {}):\n", modeCandidates.size(), connectorModes.size());
+    for (const auto &candidate : modeCandidates) {
+        out += std::format("  {}x{}@{:.3f}Hz{}{}\n", candidate.width, candidate.height,
+                           static_cast<double>(candidate.refreshMilliHz) / 1000.0,
+                           candidate.preferred ? " (preferred)" : "",
+                           AnamorphicNote({connectorModes.data(), connectorModes.size()}, candidate));
+    }
+    return out;
+}
 
 // ============================================================================
 // === MEDIAPLAYER FEED SURFACE ===
@@ -2205,8 +2669,9 @@ auto cVaapiDevice::MarkStartupComplete() noexcept -> void { startupComplete.stor
     }
     videoCodecId.store(video.codecId, std::memory_order_relaxed);
 
-    // Audio failure is non-fatal: some containers omit the audio sample rate until a frame decodes
-    // (raw-ADTS AAC in TS), which must not block an otherwise-fine HDR video. Degrade to video-only.
+    // Audio failure is non-fatal: a codec FFmpeg cannot open must not block an otherwise-fine HDR
+    // video. Degrade to video-only. (A missing container sample rate -- raw-ADTS AAC in TS -- no
+    // longer lands here: PopulateAudioInfo defaults it to the nominal 48 kHz the live path uses.)
     bool audioOpened = false;
     if (audio.codecId != AV_CODEC_ID_NONE) {
         if (audioProcessor->OpenCodecWithInfo(audio)) {
@@ -2481,7 +2946,18 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Drive the encrypted-channel watchdog off the decode loop's idle tick: a fully scrambled channel
     // delivers no PES to PlayAudio/PlayVideo, but the decode thread still wakes ~every 100 ms with an
     // empty queue. Set before Initialize() starts that thread. CheckEncryptionTimeout no-ops unless armed.
-    decoder->SetLoopTickCallback([this]() -> void { CheckEncryptionTimeout(); });
+    decoder->SetLoopTickCallback([this]() -> void {
+        CheckEncryptionTimeout();
+        // Same tick drives the display-mode stability gate: the reactive publish below fires once
+        // per filter-graph build, so a candidate needs a wall-clock nudge to ever mature.
+        PollPendingDisplayMode();
+    });
+    // Reactive display-mode matching for live TV and recordings: neither path knows the frame rate
+    // before FFmpeg has parsed the VUI, so the chain reports it after each build. Also set before
+    // Initialize(); a no-op unless the operator enabled a scope switch.
+    decoder->SetStreamFormatCallback([this](uint32_t width, uint32_t height, uint32_t rateMilliHz) -> void {
+        NotifyStreamFormat({.height = height, .rateMilliHz = rateMilliHz, .width = width});
+    });
     if (!decoder->Initialize()) [[unlikely]] {
         esyslog("vaapivideo/device: decoder initialization failed");
         decoder.reset();
@@ -2500,11 +2976,11 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // before any skin repaint triggers the lazy-init path.
     osdWidth = static_cast<int>(display->GetOutputWidth());
     osdHeight = static_cast<int>(display->GetOutputHeight());
-    dsyslog("vaapivideo/device: pre-cached OSD size %dx%d", osdWidth, osdHeight);
+    dsyslog("vaapivideo/device: OSD size %dx%d (pre-cached)", osdWidth, osdHeight);
 
     initState.store(2, std::memory_order_release);
     ResetZoom(); // Fresh hardware (plugin start or SVDRP ATTA) always begins at Off.
-    isyslog("vaapivideo/device: attached - DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
+    isyslog("vaapivideo/device: attached -- DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 
     // Startup splash: cover the console immediately with a black frame and a centered title.
     // Safe here -- display is ready and the decoder is codec-less/idle, and SubmitBlackFrame
@@ -2615,7 +3091,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
 
     drmFd = open(drmPath.c_str(), O_RDWR | O_CLOEXEC);
     if (drmFd < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: failed to open '%s' - %s", drmPath.c_str(), std::strerror(errno));
+        esyslog("vaapivideo/device: failed to open '%s' -- %s", drmPath.c_str(), std::strerror(errno));
         return false;
     }
     dsyslog("vaapivideo/device: opened DRM fd=%d", drmFd);
@@ -2652,7 +3128,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     AVBufferRef *hwDevice = nullptr;
     const int ret = av_hwdevice_ctx_create(&hwDevice, AV_HWDEVICE_TYPE_VAAPI, renderNode.c_str(), nullptr, 0);
     if (ret < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: av_hwdevice_ctx_create failed - %s", AvErr(ret).data());
+        esyslog("vaapivideo/device: av_hwdevice_ctx_create failed -- %s", AvErr(ret).data());
         esyslog("vaapivideo/device: test with: vainfo --display drm --device %s", renderNode.c_str());
         close(drmFd);
         drmFd = -1;
@@ -2714,6 +3190,265 @@ auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
     lastReplayAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
 }
 
+// ============================================================================
+// === DISPLAY MODE MATCHING ===
+// ============================================================================
+
+namespace {
+
+/// Relative difference between two rates, in parts per million. Used instead of a percentage so
+/// the exact tier (200 ppm) can stay tight enough to keep 59.94 and 60 apart.
+[[nodiscard]] auto RateErrorPpm(uint32_t actualMilliHz, uint32_t targetMilliHz) noexcept -> uint32_t {
+    if (targetMilliHz == 0) [[unlikely]] {
+        return UINT32_MAX;
+    }
+    const uint64_t delta =
+        actualMilliHz > targetMilliHz ? actualMilliHz - targetMilliHz : targetMilliHz - actualMilliHz;
+    return static_cast<uint32_t>(std::min<uint64_t>(delta * 1000000ULL / targetMilliHz, UINT32_MAX));
+}
+
+/// Resolution stage: the (width, height) the output should run at.
+///
+/// Smallest candidate size that still covers the stream's coded frame, so the picture maps 1:1 and
+/// the sink does its own upscaling; never below policy.minHeight, which doubles as the "pin the
+/// resolution" control when set to the panel's native height. A stream larger than anything the
+/// panel offers falls back to the largest size (VPP downscales, as it does today).
+[[nodiscard]] auto SelectTargetResolution(std::span<const DisplayModeCandidate> candidates,
+                                          const StreamModeRequest &request, const DisplayModePolicy &policy)
+    -> std::pair<uint32_t, uint32_t> {
+    const std::pair<uint32_t, uint32_t> fallback{policy.defaultWidth, policy.defaultHeight};
+    if (!policy.matchResolution) {
+        return fallback;
+    }
+
+    bool haveFit = false;
+    std::pair<uint32_t, uint32_t> best{};
+    std::pair<uint32_t, uint32_t> largest{};
+    uint64_t bestArea = 0;
+    uint64_t largestArea = 0;
+    for (const auto &candidate : candidates) {
+        if (candidate.height < policy.minHeight) {
+            continue;
+        }
+        const uint64_t area = static_cast<uint64_t>(candidate.width) * candidate.height;
+        if (area > largestArea) {
+            largestArea = area;
+            largest = {candidate.width, candidate.height};
+        }
+        if (candidate.width < request.width || candidate.height < request.height) {
+            continue;
+        }
+        if (!haveFit || area < bestArea) {
+            haveFit = true;
+            bestArea = area;
+            best = {candidate.width, candidate.height};
+        }
+    }
+
+    if (haveFit) {
+        return best;
+    }
+    if (largestArea > 0) {
+        return largest; // stream exceeds the panel: run native, let the VPP downscale
+    }
+    return fallback; // minHeight excluded everything
+}
+
+/// Refresh stage, restricted to candidates already at the target resolution.
+///
+/// Two tiers over k = 1..DISPLAY_MODE_MAX_RATE_MULTIPLE. Tier A absorbs rounding only, so 59.94
+/// and 60 stay distinct and a genuine 59.94 mode wins when the panel has both. Tier B is the
+/// 0.5% net that lets 59.94 content settle on a 60-Hz-only panel. Within a tier the HIGHEST k at
+/// or below the cap wins -- that is what turns 25p into 50 Hz and 29.97 into 59.94 -- while k==1
+/// is always in play so a source faster than the cap is never forced down.
+[[nodiscard]] auto SelectTargetRefresh(std::span<const DisplayModeCandidate> candidates, uint32_t targetWidth,
+                                       uint32_t targetHeight, const StreamModeRequest &request,
+                                       const DisplayModePolicy &policy) -> DisplayModeMatch {
+    const auto atTargetSize = [&](const DisplayModeCandidate &candidate) noexcept -> bool {
+        return candidate.width == targetWidth && candidate.height == targetHeight;
+    };
+    // Winners are tracked as pointers into the span and only converted to an index at the very end;
+    // that keeps every access a dereference of something already known to be in range.
+    const auto indexOf = [&](const DisplayModeCandidate *candidate) noexcept -> int {
+        return static_cast<int>(candidate - candidates.data());
+    };
+    // One shape for every decision string: "<mode picked> (<why>)". The caller prefixes the stream it
+    // was picked for, so the reason must never restate the source -- SVDRP MODE prints the stream on
+    // its own line right above the decision, and the syslog line does the same inline.
+    const auto describe = [](std::string_view why, const DisplayModeCandidate &candidate) -> std::string {
+        return std::format("{}x{}@{:.3f}Hz ({})", candidate.width, candidate.height,
+                           static_cast<double>(candidate.refreshMilliHz) / 1000.0, why);
+    };
+
+    // Fallback used both when matching is off and when no multiple fits: prefer the mode the
+    // operator configured, otherwise the fastest one within the cap, otherwise PREFERRED/first.
+    const auto pickFallback = [&](std::string_view why) -> DisplayModeMatch {
+        const DisplayModeCandidate *exactDefault = nullptr;
+        const DisplayModeCandidate *fastestCapped = nullptr;
+        const DisplayModeCandidate *preferred = nullptr;
+        const DisplayModeCandidate *anyMode = nullptr;
+        for (const auto &candidate : candidates) {
+            if (!atTargetSize(candidate)) {
+                continue;
+            }
+            if (anyMode == nullptr) {
+                anyMode = &candidate;
+            }
+            if (preferred == nullptr && candidate.preferred) {
+                preferred = &candidate;
+            }
+            if (exactDefault == nullptr && RateErrorPpm(candidate.refreshMilliHz, policy.defaultRefreshMilliHz) <=
+                                               DISPLAY_MODE_EXACT_TOLERANCE_PPM) {
+                exactDefault = &candidate;
+            }
+            if (candidate.refreshMilliHz <= policy.maxRefreshMilliHz &&
+                (fastestCapped == nullptr || candidate.refreshMilliHz > fastestCapped->refreshMilliHz)) {
+                fastestCapped = &candidate;
+            }
+        }
+        for (const auto *candidate : {exactDefault, fastestCapped, preferred, anyMode}) {
+            if (candidate != nullptr) {
+                return {.index = indexOf(candidate), .reason = describe(why, *candidate)};
+            }
+        }
+        return {.index = -1, .reason = std::format("no mode at {}x{} ({})", targetWidth, targetHeight, why)};
+    };
+
+    if (!policy.matchRefresh) {
+        return pickFallback("refresh matching off");
+    }
+    if (request.rateMilliHz == 0) [[unlikely]] {
+        return pickFallback("source rate unknown");
+    }
+
+    for (const uint32_t tolerancePpm : {DISPLAY_MODE_EXACT_TOLERANCE_PPM, DISPLAY_MODE_LOOSE_TOLERANCE_PPM}) {
+        const DisplayModeCandidate *best = nullptr;
+        uint32_t bestK = 0;
+        uint32_t bestErrorPpm = UINT32_MAX;
+        for (uint32_t k = 1; k <= DISPLAY_MODE_MAX_RATE_MULTIPLE; ++k) {
+            const uint64_t target = static_cast<uint64_t>(request.rateMilliHz) * k;
+            if (target > UINT32_MAX) {
+                break;
+            }
+            // k==1 reproduces the source rate exactly, so it stays eligible even above the cap --
+            // capping it would leave a 120 fps source with no honest option at all.
+            if (k > 1 && target > policy.maxRefreshMilliHz) {
+                break;
+            }
+            for (const auto &candidate : candidates) {
+                if (!atTargetSize(candidate)) {
+                    continue;
+                }
+                const uint32_t errorPpm = RateErrorPpm(candidate.refreshMilliHz, static_cast<uint32_t>(target));
+                if (errorPpm > tolerancePpm) {
+                    continue;
+                }
+                // Higher k wins first (ascending loop order lets a later k overwrite an earlier
+                // one), then the closest rate, then the faster mode on a dead heat.
+                const bool better =
+                    best == nullptr || k > bestK || (k == bestK && errorPpm < bestErrorPpm) ||
+                    (k == bestK && errorPpm == bestErrorPpm && candidate.refreshMilliHz > best->refreshMilliHz);
+                if (better) {
+                    best = &candidate;
+                    bestK = k;
+                    bestErrorPpm = errorPpm;
+                }
+            }
+        }
+        if (best != nullptr) {
+            return {.index = indexOf(best),
+                    .reason = describe(std::format("{} x{}, {} ppm",
+                                                   tolerancePpm == DISPLAY_MODE_EXACT_TOLERANCE_PPM ? "exact" : "near",
+                                                   bestK, bestErrorPpm),
+                                       *best)};
+        }
+    }
+
+    return pickFallback(std::format("no multiple of {:.3f}Hz available", //
+                                    static_cast<double>(request.rateMilliHz) / 1000.0));
+}
+
+} // namespace
+
+[[nodiscard]] auto BuildModeCandidates(std::span<const drmModeModeInfo> modes, const drmModeModeInfo &defaultMode)
+    -> std::vector<DisplayModeCandidate> {
+    std::vector<DisplayModeCandidate> candidates;
+    candidates.reserve(modes.size());
+
+    // Aspect gate: keep only timings shaped like the mode the operator/EDID settled on, so a legacy
+    // 4:3 entry can never be picked and stretch the picture. Compared on the PICTURE aspect, not
+    // hdisplay/vdisplay -- a raw pixel-ratio test rejects every anamorphic SD mode on a 16:9 panel,
+    // which silently reduced the 576p "Minimum resolution" setting to a duplicate of 720p.
+    const double referenceAspect = (defaultMode.hdisplay > 0 && defaultMode.vdisplay > 0)
+                                       ? ModePictureAspect(defaultMode)
+                                       : DISPLAY_DEFAULT_ASPECT_RATIO;
+    constexpr double kAspectTolerance = 0.02;
+
+    uint16_t index = 0;
+    for (const auto &mode : modes) {
+        const uint16_t modeIndex = index++;
+        if (mode.hdisplay == 0 || mode.vdisplay == 0) {
+            continue;
+        }
+        // Interlaced output is unusable here: the VPP always emits progressive frames and the
+        // scanout path has no field interleaving, so an interlaced mode would show half the lines.
+        if ((mode.flags & DRM_MODE_FLAG_INTERLACE) != 0) {
+            continue;
+        }
+        const uint32_t rateMilliHz = ModeRefreshMilliHz(mode);
+        if (rateMilliHz == 0) {
+            continue;
+        }
+        if (std::abs(ModePictureAspect(mode) - referenceAspect) > referenceAspect * kAspectTolerance) {
+            continue;
+        }
+        candidates.push_back({.height = mode.vdisplay,
+                              .refreshMilliHz = rateMilliHz,
+                              .preferred = (mode.type & DRM_MODE_TYPE_PREFERRED) != 0,
+                              .index = modeIndex,
+                              .width = mode.hdisplay});
+    }
+
+    // Second pass: drop the CEA pixel-repetition rasters (1440x576, 2880x576 -- 720x576 with every
+    // pixel sent two or four times). Same picture, 2x/4x the pixel clock, so picking one would make
+    // the VPP upscale horizontally for no added detail.
+    //
+    // Redundant means: another candidate shares its height, refresh rate and EXACT picture aspect
+    // at an integer fraction of its width. The exact-aspect key is what keeps genuinely distinct
+    // near-16:9 timings apart -- 1360x768 and 1366x768 match on height and rate but differ in
+    // picture aspect and are not multiples, so both survive.
+    const auto aspectOf = [modes](const DisplayModeCandidate &candidate) noexcept -> AspectRatio {
+        return ModePictureAspectRatio(*std::next(modes.begin(), candidate.index));
+    };
+    std::vector<DisplayModeCandidate> distinct;
+    distinct.reserve(candidates.size());
+    // Writes a separate vector: an erase-in-place pass would let the predicate see moved-from ones.
+    for (const auto &candidate : candidates) {
+        const AspectRatio aspect = aspectOf(candidate);
+        const bool repeats = std::ranges::any_of(candidates, [&](const DisplayModeCandidate &base) -> bool {
+            if (base.height != candidate.height || base.refreshMilliHz != candidate.refreshMilliHz ||
+                base.width >= candidate.width || (candidate.width % base.width) != 0) {
+                return false;
+            }
+            const AspectRatio baseAspect = aspectOf(base);
+            return baseAspect.num == aspect.num && baseAspect.den == aspect.den;
+        });
+        if (!repeats) {
+            distinct.push_back(candidate);
+        }
+    }
+    return distinct;
+}
+
+[[nodiscard]] auto SelectDisplayMode(std::span<const DisplayModeCandidate> candidates, const StreamModeRequest &request,
+                                     const DisplayModePolicy &policy) -> DisplayModeMatch {
+    if (candidates.empty()) [[unlikely]] {
+        return {.index = -1, .reason = "no usable connector modes"};
+    }
+    const auto [targetWidth, targetHeight] = SelectTargetResolution(candidates, request, policy);
+    return SelectTargetRefresh(candidates, targetWidth, targetHeight, request, policy);
+}
+
 // SelectDrmConnector() helper: validate one connector and, when it carries the wanted mode, latch the
 // chosen mode + CRTC + connector into the device. Pulled out of the two connector loops so the same
 // logic serves the fast cached pass and the slow full-probe pass. Mode priority: exact (w,h,rate) match
@@ -2740,14 +3475,33 @@ auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
         return false;
     }
 
-    bool modeFound = false;
+    // Match --resolution within its integer-Hz bucket, nearest true rate first. A connector
+    // routinely exposes 59.94 AND 60.000 at the same size and drm_mode_vrefresh() rounds BOTH to
+    // 60, so comparing that field latched whichever came first in EDID order -- "@60" could
+    // silently settle on 59.94. The loose tolerance IS the bucket (0.5%, wide enough for 59.94 and
+    // 23.976 to reach their integer neighbours); ties go to a PREFERRED timing.
+    const drmModeModeInfo *bestMode = nullptr;
+    uint32_t bestErrorPpm = 0;
     for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
         const auto &mode = connector->modes[modeIdx];
-        if (mode.hdisplay == targetWidth && mode.vdisplay == targetHeight && mode.vrefresh == targetRate) {
-            activeMode = mode;
-            modeFound = true;
-            break;
+        if (mode.hdisplay != targetWidth || mode.vdisplay != targetHeight) {
+            continue;
         }
+        const uint32_t errorPpm = RateErrorPpm(ModeRefreshMilliHz(mode), targetRate * 1000U);
+        if (errorPpm > DISPLAY_MODE_LOOSE_TOLERANCE_PPM) {
+            continue;
+        }
+        const bool preferred = (mode.type & DRM_MODE_TYPE_PREFERRED) != 0;
+        const bool bestPreferred = bestMode != nullptr && (bestMode->type & DRM_MODE_TYPE_PREFERRED) != 0;
+        if (bestMode == nullptr || errorPpm < bestErrorPpm ||
+            (errorPpm == bestErrorPpm && preferred && !bestPreferred)) {
+            bestMode = &mode;
+            bestErrorPpm = errorPpm;
+        }
+    }
+    bool modeFound = bestMode != nullptr;
+    if (modeFound) {
+        activeMode = *bestMode;
     }
     if (!modeFound) {
         if (!allowModeFallback) {
@@ -2794,8 +3548,32 @@ auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
     if (connectorName.empty()) {
         connectorName = name;
     }
-    isyslog("vaapivideo/device: display %ux%u@%uHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
-            activeMode.vdisplay, activeMode.vrefresh, name.c_str(), connectorId, crtcId);
+
+    // Retain the mode list for runtime switching. This is the only place it is ever read: the
+    // connector object is freed by the caller, and re-querying it later means a fresh DDC probe
+    // (100-500 ms per port, seconds on a CEC-standby sink). defaultMode is the fallback the
+    // matcher returns to and the mode ResetDisplayModeToDefault() restores.
+    // Under displayModeMutex: SVDRP MODE (DisplayModeReport) iterates these from its own thread,
+    // and an attach racing that iteration would reallocate the vectors under it.
+    {
+        const cMutexLock lock(&displayModeMutex);
+        defaultMode = activeMode;
+        connectorModes.assign(connector->modes, connector->modes + connector->count_modes);
+        modeCandidates = BuildModeCandidates(connectorModes, defaultMode);
+    }
+
+    isyslog("vaapivideo/device: display %ux%u@%.3fHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
+            activeMode.vdisplay, static_cast<double>(ModeRefreshMilliHz(activeMode)) / 1000.0, name.c_str(),
+            connectorId, crtcId);
+    // Inventory dump: the primary field diagnostic for mode matching, and the only record of what
+    // the aspect/interlace filter threw away.
+    dsyslog("vaapivideo/device: %zu connector modes, %zu usable for mode matching", connectorModes.size(),
+            modeCandidates.size());
+    for (const auto &candidate : modeCandidates) {
+        dsyslog("vaapivideo/device:   mode %ux%u@%.3fHz%s%s", candidate.width, candidate.height,
+                static_cast<double>(candidate.refreshMilliHz) / 1000.0, candidate.preferred ? " (preferred)" : "",
+                AnamorphicNote({connectorModes.data(), connectorModes.size()}, candidate).c_str());
+    }
     return true;
 }
 
@@ -2805,6 +3583,13 @@ auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
         esyslog("vaapivideo/device: failed to enable DRM atomic capability");
         return false;
     }
+    // Must precede the drmModeGetConnector() calls below: without it the kernel masks
+    // DRM_MODE_FLAG_PIC_AR_* out of every mode, leaving the anamorphic CEA SD timings
+    // indistinguishable from square-pixel 1.25:1 rasters -- the aspect gate would drop them and the
+    // VPP would mis-fit them. ATOMIC already implies this cap in every kernel to date; asking
+    // explicitly keeps the dependency visible. Best-effort: a refusal just falls back to pixel
+    // ratios.
+    (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ASPECT_RATIO, 1);
 
     std::unique_ptr<drmModeRes, FreeDrmResources> resources{drmModeGetResources(drmFd)};
     if (!resources) [[unlikely]] {

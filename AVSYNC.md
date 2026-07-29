@@ -1,5 +1,26 @@
 # A/V Synchronization
 
+Developer documentation for the plugin's A/V sync design: the clock model,
+threading, buffering, correction regimes, and their diagnostics. For
+user-facing setup and configuration see [README.md](README.md); the only
+operator knobs are the two latency values described under
+[Steady-state offset](#steady-state-offset).
+
+Contents:
+
+1. [Problem](#problem) — why correction is needed at all
+2. [Architecture](#architecture) — data flow and the three invariants
+3. [Decode / present decouple](#decode--present-decouple) — the two decoder threads
+4. [Filter pipeline](#filter-pipeline) — the FFmpeg graph both domains build
+5. [Per-frame sync](#per-frame-sync-syncandsubmitframe) — delta measurement and EMA smoothing
+6. [Correction regimes](#correction-regimes) — soft corridor, hard transients, catch-up
+7. [Sync bypass](#sync-bypass) — when frames are submitted unpaced
+8. [Jitter buffer](#jitter-buffer-unified-drain) — the present-thread drain
+9. [Display prerender](#display-prerender) — the per-VSync cushion and underrun detection
+10. [Lifecycle](#lifecycle) — what each event resets
+11. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
+12. [Constants](#constants) — every tunable, with purpose and unit
+
 ## Problem
 
 A DVB stream encodes audio and video against one 90 kHz program clock (PCR).
@@ -363,6 +384,15 @@ holds pre-Clear-stale frames, their deeply negative `rawDelta` would bias the EM
 seed and trip soft-behind on the next frame. The warmup catch-up drains them
 silently before they reach the accumulator.
 
+## Sync bypass
+
+The sync gate is bypassed (frame submitted unpaced) in:
+
+- Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
+- Freerun window after `Clear()`, trick exit, or `NotifyAudioChange()`.
+- Radio mode / NOPTS frame (no audio processor or no PTS to align on).
+- Audio not yet running (`GetClock()` is NOPTS until the first `WritePcmToAlsa()`).
+
 ## Jitter buffer (unified drain)
 
 The video drain is unified across live and replay and runs on the **present
@@ -469,11 +499,20 @@ gate's release rate.
 
 ### Audio packet queue (`aq`)
 
-`aq` is the FIFO between `Decode()` and the audio thread. The thread decodes and
-writes PCM as fast as packets arrive, so `aq` drains almost instantly and `aq = 0`
-is healthy. A persistently non-zero `aq` means the audio decoder is falling behind
-real time (CPU contention, ALSA write stall). The real audio cushion is the ALSA
-ring, not this queue.
+`aq` is the FIFO between `Decode()` and the audio thread. Its healthy depth
+depends on the input path:
+
+- **Live / PES replay** — packets arrive at real time and the thread decodes and
+  writes them immediately, so `aq` drains almost instantly and sits at **0**. A
+  persistently non-zero `aq` here means the audio decoder is falling behind real
+  time (CPU contention, ALSA write stall).
+- **Mediaplayer** — the single-cursor demux reads the file far faster than real
+  time until the audio feed gate stops it, and the audio thread blocks in the
+  ALSA write once the ring is full, so `aq` sits **pegged at
+  `AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER` (32) by design** — that is the pre-read
+  lead working, not a decoder falling behind.
+
+Either way the real audio cushion is the ALSA ring, not this queue.
 
 ## Display prerender
 
@@ -543,15 +582,6 @@ Without it, every `Clear()` would log a spurious underrun while the filter graph
 rebuilds and the audio clock anchors. `DISPLAY_WARMUP_ACTIVE_WINDOW_MS` exists only to arm this
 grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_IDLE_MAX_MS`).
 
-## Sync bypass
-
-The sync gate is bypassed (frame submitted unpaced) in:
-
-- Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
-- Freerun window after `Clear()`, trick exit, or `NotifyAudioChange()`.
-- Radio mode / NOPTS frame (no audio processor or no PTS to align on).
-- Audio not yet running (`GetClock()` is NOPTS until the first `WritePcmToAlsa()`).
-
 ## Lifecycle
 
 | Event                            | EMA               | Cooldown  | Jitter buffer |
@@ -605,7 +635,7 @@ sync d=+15.2ms avg=+15.1ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
 | `lat`  | Active `SyncLatency90k` (1-frame tail + active operator knob) |
 | `buf`  | `jitterBuf` depth in frames at log emission |
 | `aq`   | Audio packet queue depth |
-| `miss` | Drain gaps > 2 × output frame period since last log (upstream starvation; deliberate sync sleeps and trick-play holds are explicitly excluded via `sleptInLastSubmit`) |
+| `miss` | Drain gaps > 2 × output frame period since last log (upstream starvation; deliberate sync sleeps and trick-play holds are excluded via `sleptInLastSubmit`, and the first `DECODER_DRAIN_MISS_GRACE_MS` (3 s) after a flush are excluded as transition cost — filter rebuild, mode-switch HDMI retrain, audio re-anchor) |
 | `drop` | Frames dropped (video behind) since last log — soft-behind, hard-behind, catch-up, stale-jitter, and pending-drop bursts combined |
 | `skip` | Render delays (video ahead) since last log — soft sleep + hard-ahead combined |
 
@@ -615,7 +645,10 @@ Periodic interval `LOG_INTERVAL_MS = 2 s`.
 
 **Healthy steady state:** `avg` inside `±CORRIDOR`, `d ≈ avg`,
 `miss = drop = skip = 0`. `buf` depth varies by mode (live: ALSA-cushion-driven;
-replay cold start: ~40–60; replay post-`Clear()`: ~0).
+replay cold start: ~40–60; replay post-`Clear()`: ~0; mediaplayer: near the
+reserve cap). `aq` is 0 on the live/PES path and pegged at the mediaplayer
+highwater (32) during file replay — see
+[Audio packet queue](#audio-packet-queue-aq).
 
 Each soft / hard event also emits a per-event `dsyslog` line naming the cause
 (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead replay`,
@@ -652,11 +685,13 @@ relative to video, per `config.h`).
 
 Every constant below is file-scope — in [src/config.h](src/config.h),
 [src/audio.h](src/audio.h), [src/audio.cpp](src/audio.cpp),
-[src/mediaplayer.h](src/mediaplayer.h), [src/decoder.h](src/decoder.h),
+[src/mediaplayer.cpp](src/mediaplayer.cpp), [src/decoder.h](src/decoder.h),
 [src/decoder.cpp](src/decoder.cpp), [src/device.cpp](src/device.cpp), or
-[src/display.cpp](src/display.cpp) — and each carries a `///<` comment with
+[src/display.cpp](src/display.cpp) — shared constants as `inline constexpr` in
+a header, single-user constants as `constexpr` in the consuming `.cpp`'s
+anonymous namespace — and each carries a `///<` comment with
 purpose and unit. Within each file they are grouped by sub-function under
-`// --- label ---` rulers; the groups below mirror that layout.
+`// --- label ---` rulers; the groups below follow the same organization.
 
 Naming conventions:
 
@@ -683,7 +718,7 @@ Naming conventions:
 | `CONFIG_AUDIO_LATENCY_MIN_MS` | −200  | Lower clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
 | `CONFIG_AUDIO_LATENCY_MAX_MS` | 200   | Upper clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
 
-**Mediaplayer feed pacing** (mediaplayer.h, device.cpp)
+**Mediaplayer feed pacing** (mediaplayer.cpp, device.cpp)
 
 | Constant                                    | Value  | Purpose |
 | ------------------------------------------- | ------ | ------- |
@@ -734,6 +769,7 @@ Naming conventions:
 | ----------------------------- | ----- | ------- |
 | `DECODER_DRAIN_FUTURE_MAX_MS` | 3000  | Future-head discontinuity guard: drop heads > 3 s ahead; smaller offsets hold (still frame) until due |
 | `DECODER_NO_CLOCK_HOLD_MS`    | 1500  | Walltime the drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before no-clock freerun (covers the mux-interleave seek offset) |
+| `DECODER_DRAIN_MISS_GRACE_MS` | 3000  | Post-flush grace before drain gaps count toward `miss` — transition cost (filter rebuild, HDMI retrain, audio re-anchor), not starvation; mirrors `DISPLAY_WARMUP_GRACE_MS` |
 
 **Trick-play pacing** (decoder.h, decoder.cpp)
 
@@ -741,13 +777,15 @@ Naming conventions:
 | ----------------------------------- | ----- | ------- |
 | `DECODER_TRICK_QUEUE_DEPTH`         | 1     | Handoff reserve depth during trick play (Poll() throttles the producer; overflow drops incoming) |
 | `DECODER_TRICK_HOLD_MS`             | 20    | Base per-frame hold (~one field period @ 50 Hz). Slow **forward** scales it by the slowdown factor (capped at `DECODER_TRICK_SLOW_HOLD_MAX_MS`); fast trick keeps the base hold and scales the frame-skip multiplier; slow **reverse** uses the BASE/STEP/MAX holds below |
+| `DECODER_TRICK_PTS_HOLD_MIN_MS`     | 10    | Floor on any PTS-derived trick hold — a near-zero PTS step would compute a zero hold and free-run |
+| `DECODER_TRICK_PTS_HOLD_MAX_MS`     | 2000  | Ceiling on the PTS-derived trick hold — a PTS discontinuity (recording join, PCR break) can measure minutes per step |
 | `DECODER_TRICK_SLOW_HOLD_MAX_MS`    | 200   | Cap on the slow-forward per-frame hold (≥ 5 fps) |
 | `VDR_SLOW_REVERSE_SPEED_MULT`       | 12    | VDR `dvbplayer.c` SPEED_MULT; divided back out in `SetTrickSpeed` to recover the slow-reverse slowdown level |
 | `DECODER_SLOW_REVERSE_HOLD_BASE_MS` | 260   | Slow-reverse per-frame hold floor (reverse steps a fixed ~0.4 s of content per frame) |
 | `DECODER_SLOW_REVERSE_HOLD_STEP_MS` | 70    | Added to the slow-reverse hold per slowdown unit |
 | `DECODER_SLOW_REVERSE_HOLD_MAX_MS`  | 700   | Cap on the slow-reverse hold |
 
-**Display prerender & underrun tracking** (config.h, display.cpp)
+**Display prerender & underrun tracking** (display.cpp)
 
 | Constant                             | Value | Purpose |
 | ------------------------------------ | ----- | ------- |

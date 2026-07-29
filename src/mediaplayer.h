@@ -57,34 +57,8 @@
 class cVaapiDevice;
 class cSubtitleConverter;
 
-// ============================================================================
-// === CONSTANTS ===
-// ============================================================================
-
-/// Demux thread back-off when the device queues are full or input stalls.
-inline constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
-
-/// Real-time pacing brake: max AUDIO lookahead (90 kHz ticks) of the latest pushed audio PTS over the
-/// audio master clock before the demux throttles. libavformat reads files far faster than wall-clock, so
-/// without it the decoder queue + jitterBuf overrun their caps. Keyed off the audio tail only
-/// (latestAudioPts90k); the resulting video depth (audio_tail + per-file mux offset) is bounded instead by
-/// DECODER_RESERVE_HARD_CAP, where the excess lead waits COMPRESSED in the packetQueue. 1.5 s (not 1 s) so
-/// the budget still reaches the ~1.3 s reserve cap when interlaced content deinterlaces to 50 fps.
-inline constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 135000;
-// MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES (the pre-anchor video-depth gate) lives in device.cpp, its only
-// user, derived from DECODER_RESERVE_HARD_CAP so it stays coupled to the buffer it protects.
-
-/// Default seek deltas applied by the key bindings (milliseconds).
-inline constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
-inline constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
-
-/// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof): at EOF the decode queue (~4 s) and decoded
-/// reserve (~1.3 s) still hold unseen frames, so immediate teardown cuts playback seconds short (worst on
-/// video-only clips, where no audio clock throttles the demuxer). Flush that tail at real-time pace first.
-///   - TIMEOUT_MS: backstop so a wedged pipeline can't hang shutdown (covers the ~5 s queue+reserve tail).
-///   - STALL_MS: bail when depth stops shrinking; must exceed one frame interval.
-inline constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
-inline constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
+// The MEDIAPLAYER_* pacing/seek/EOF-drain constants live in mediaplayer.cpp, their only user
+// (MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES, the pre-anchor video-depth gate, in device.cpp likewise).
 
 // ============================================================================
 // === PLAYLIST HELPERS ===

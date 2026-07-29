@@ -8,6 +8,10 @@
 #ifndef VDR_VAAPIVIDEO_COMMON_H
 #define VDR_VAAPIVIDEO_COMMON_H
 
+// config.h is a leaf (it includes nothing of ours), so this stays acyclic. Needed for the display
+// defaults the DRM helpers below fall back to, which must keep a single definition.
+#include "config.h"
+
 // ============================================================================
 // === SYSTEM HEADERS ===
 // ============================================================================
@@ -25,6 +29,7 @@
 #include <cstring>
 #include <format>
 #include <memory>
+#include <numeric>
 #include <queue>
 #include <span>
 #include <string>
@@ -104,7 +109,7 @@ extern "C" {
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.7.4";
+inline constexpr const char *PLUGIN_VERSION = "1.8.0";
 
 // ============================================================================
 // === CONSTANTS ===
@@ -148,6 +153,102 @@ struct HdrStreamInfo {
             return "HLG";
     }
     return "?";
+}
+
+// ============================================================================
+// === DRM/KMS UTILITIES ===
+// ============================================================================
+
+/// Exact refresh rate of a KMS mode, in millihertz; 0 for a degenerate mode.
+///
+/// drmModeModeInfo::vrefresh is rounded to whole Hz, so 59.94 and 60 (and 23.976 and 24) are
+/// indistinguishable there -- fatal for cadence matching, where the wrong one costs a duplicated
+/// frame every ~1000. Mirrors the kernel's drm_mode_vrefresh() so the rounded value always agrees
+/// with what the driver reports.
+[[nodiscard]] inline auto ModeRefreshMilliHz(const drmModeModeInfo &mode) noexcept -> uint32_t {
+    if (mode.htotal == 0 || mode.vtotal == 0 || mode.clock == 0) [[unlikely]] {
+        return 0;
+    }
+    // Interlaced modes are quoted at their FIELD rate; doublescan and vscan divide it.
+    uint64_t num = static_cast<uint64_t>(mode.clock) * 1000000ULL;
+    if ((mode.flags & DRM_MODE_FLAG_INTERLACE) != 0) {
+        num *= 2;
+    }
+    uint64_t den = static_cast<uint64_t>(mode.htotal) * static_cast<uint64_t>(mode.vtotal);
+    if ((mode.flags & DRM_MODE_FLAG_DBLSCAN) != 0) {
+        den *= 2;
+    }
+    if (mode.vscan > 1) {
+        den *= mode.vscan;
+    }
+    return static_cast<uint32_t>((num + (den / 2)) / den); // round to nearest
+}
+
+/// An exact width:height ratio. Rational rather than a double so the VPP fit can cross-multiply in
+/// integers (see cVideoFilterChain::Build).
+struct AspectRatio {
+    uint32_t den{1};
+    uint32_t num{1};
+};
+
+/// Picture aspect a KMS mode is meant to be shown at, as an exact ratio.
+///
+/// Not hdisplay/vdisplay: the CEA SD timings (720x576, 720x480) are anamorphic and exist in both a
+/// 4:3 and a 16:9 variant differing only in the picture-aspect flag. Falls back to the pixel ratio
+/// for VESA/GTF timings, which are square-pixel by construction.
+///
+/// The flag survives drm_mode_getconnector() only once DRM_CLIENT_CAP_ATOMIC (or
+/// DRM_CLIENT_CAP_ASPECT_RATIO) is taken on the fd. It also round-trips into our mode blob, which
+/// is what makes the driver emit the CEA VIC / AVI-InfoFrame aspect that tells the TV to stretch
+/// an anamorphic raster back out.
+[[nodiscard]] inline auto ModePictureAspectRatio(const drmModeModeInfo &mode) noexcept -> AspectRatio {
+    switch (mode.flags & DRM_MODE_FLAG_PIC_AR_MASK) {
+        case DRM_MODE_FLAG_PIC_AR_4_3:
+            return {.den = 3, .num = 4};
+        case DRM_MODE_FLAG_PIC_AR_16_9:
+            return {.den = 9, .num = 16};
+        case DRM_MODE_FLAG_PIC_AR_64_27:
+            return {.den = 27, .num = 64};
+        case DRM_MODE_FLAG_PIC_AR_256_135:
+            return {.den = 135, .num = 256};
+        default:
+            break;
+    }
+    if (mode.hdisplay == 0 || mode.vdisplay == 0) [[unlikely]] {
+        return {.den = 1, .num = 1};
+    }
+    return {.den = mode.vdisplay, .num = mode.hdisplay};
+}
+
+/// Double form of ModePictureAspectRatio(), for logging and the aspect gate's tolerance compare.
+[[nodiscard]] inline auto ModePictureAspect(const drmModeModeInfo &mode) noexcept -> double {
+    const AspectRatio aspect = ModePictureAspectRatio(mode);
+    if (aspect.den == 0) [[unlikely]] {
+        return DISPLAY_DEFAULT_ASPECT_RATIO;
+    }
+    return static_cast<double>(aspect.num) / static_cast<double>(aspect.den);
+}
+
+/// Pixel aspect of a mode's scanout raster: how much wider than tall one framebuffer pixel lands on
+/// the panel. 1:1 on every square-pixel timing, 64:45 on a 720x576 flagged 16:9, 32:27 on a 720x480.
+///
+/// KMS scanout is 1:1 -- there is no plane scaler in the path -- so the VPP-fitted framebuffer is
+/// the only place the anamorphic stretch can be compensated. Get it wrong and a 16:9 source is
+/// letterboxed into a 1.25:1 raster the TV then stretches back out: ~30% short vertically.
+[[nodiscard]] inline auto ModePixelAspectRatio(const drmModeModeInfo &mode) noexcept -> AspectRatio {
+    const AspectRatio picture = ModePictureAspectRatio(mode);
+    if (mode.hdisplay == 0 || mode.vdisplay == 0 || picture.num == 0 || picture.den == 0) [[unlikely]] {
+        return {.den = 1, .num = 1};
+    }
+    // par = picture / (hdisplay/vdisplay). Reduced so the filter's cross-multiply stays far from
+    // overflow and an equality test against 1:1 is exact.
+    uint32_t num = picture.num * mode.vdisplay;
+    uint32_t den = picture.den * mode.hdisplay;
+    if (const uint32_t divisor = std::gcd(num, den); divisor > 1) {
+        num /= divisor;
+        den /= divisor;
+    }
+    return {.den = den, .num = num};
 }
 
 // ============================================================================
