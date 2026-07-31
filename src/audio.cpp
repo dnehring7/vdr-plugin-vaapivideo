@@ -1703,8 +1703,12 @@ auto cAudioProcessor::OpenDecoder() -> void {
     // the source layout is irrelevant at open (the IEC61937 carrier is always 2ch) -- omit it.
     const bool passthroughOpen = alsaPassthroughActive.load(std::memory_order_relaxed);
     const int openChannels = ctx->ch_layout.nb_channels;
-    const std::string channelLabel =
-        openChannels > 0 ? std::format(" {}ch", openChannels) : (passthroughOpen ? "" : " ?ch");
+    std::string channelLabel;
+    if (openChannels > 0) {
+        channelLabel = std::format(" {}ch", openChannels);
+    } else if (!passthroughOpen) {
+        channelLabel = " ?ch";
+    }
     isyslog("vaapivideo/audio: opened %s @ %dHz%s (%s)", codec->name, ctx->sample_rate, channelLabel.c_str(),
             passthroughOpen ? "passthrough" : "PCM");
 }

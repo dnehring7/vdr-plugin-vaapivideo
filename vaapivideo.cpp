@@ -53,6 +53,7 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/channels.h>
+#include <vdr/config.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
 #include <vdr/keys.h>
@@ -296,6 +297,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         PassthroughModeName(PassthroughMode::Off),
     };
     static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
+    static_assert(kPassthroughModeCount == CONFIG_PASSTHROUGH_MODE_COUNT, "menu labels out of sync with enum");
 
     // Same pattern as kPassthroughModeLabels; rooted in PcmChannelModeName().
     static constexpr std::array kPcmChannelModeLabels{
@@ -304,6 +306,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         PcmChannelModeName(PcmChannelMode::Multichannel),
     };
     static constexpr int kPcmChannelModeCount = static_cast<int>(kPcmChannelModeLabels.size());
+    static_assert(kPcmChannelModeCount == CONFIG_PCM_CHANNEL_MODE_COUNT, "menu labels out of sync with enum");
 
     // Same pattern as kPassthroughModeLabels; rooted in HdrModeName().
     static constexpr std::array kHdrModeLabels{
@@ -312,6 +315,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         HdrModeName(HdrMode::Off),
     };
     static constexpr int kHdrModeCount = static_cast<int>(kHdrModeLabels.size());
+    static_assert(kHdrModeCount == CONFIG_HDR_MODE_COUNT, "menu labels out of sync with enum");
 
     // Post-processing straight-item labels, derived from the *ModeName() functions in config.h so the
     // menu and the log summary share one source (same pattern as kPassthroughModeLabels). Order matches
@@ -322,6 +326,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         DeinterlaceModeName(DeinterlaceMode::SwBwdif), DeinterlaceModeName(DeinterlaceMode::SwW3fdif),
     };
     static constexpr int kDeinterlaceCount = static_cast<int>(kDeinterlaceLabels.size());
+    static_assert(kDeinterlaceCount == CONFIG_DEINTERLACE_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kDenoiseLabels{
         DenoiseModeName(DenoiseMode::Auto),
         DenoiseModeName(DenoiseMode::Off),
@@ -329,6 +334,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         DenoiseModeName(DenoiseMode::SwEnhanced),
     };
     static constexpr int kDenoiseCount = static_cast<int>(kDenoiseLabels.size());
+    static_assert(kDenoiseCount == CONFIG_DENOISE_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kSharpenLabels{
         SharpenModeName(SharpenMode::Auto),
         SharpenModeName(SharpenMode::Off),
@@ -336,6 +342,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SharpenModeName(SharpenMode::SwMedium),
     };
     static constexpr int kSharpenCount = static_cast<int>(kSharpenLabels.size());
+    static_assert(kSharpenCount == CONFIG_SHARPEN_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kScaleLabels{
         ScaleModeName(ScaleMode::Auto),
         ScaleModeName(ScaleMode::HwFast),
@@ -343,6 +350,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         ScaleModeName(ScaleMode::SwFast),
     };
     static constexpr int kScaleCount = static_cast<int>(kScaleLabels.size());
+    static_assert(kScaleCount == CONFIG_SCALE_MODE_COUNT, "menu labels out of sync with enum");
 
     // Display-mode straight-item labels; same enum/setup.conf/menu single-source pattern.
     static constexpr std::array kMinResolutionLabels{
@@ -352,12 +360,14 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         MinResolutionModeName(MinResolutionMode::P2160),
     };
     static constexpr int kMinResolutionCount = static_cast<int>(kMinResolutionLabels.size());
+    static_assert(kMinResolutionCount == CONFIG_MIN_RESOLUTION_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kMaxRefreshLabels{
         MaxRefreshModeName(MaxRefreshMode::Hz50),      MaxRefreshModeName(MaxRefreshMode::Hz60),
         MaxRefreshModeName(MaxRefreshMode::Hz100),     MaxRefreshModeName(MaxRefreshMode::Hz120),
         MaxRefreshModeName(MaxRefreshMode::Unlimited),
     };
     static constexpr int kMaxRefreshCount = static_cast<int>(kMaxRefreshLabels.size());
+    static_assert(kMaxRefreshCount == CONFIG_MAX_REFRESH_MODE_COUNT, "menu labels out of sync with enum");
 
     // Scratch copies of the vaapiConfig fields of the same name, edited in place by the menu items
     // above and committed only in Store() -- so leaving the page with Back discards everything.
@@ -718,6 +728,21 @@ auto cVaapiVideoPlugin::SetupParse(const char *Name, const char *Value) -> bool 
 
 auto cVaapiVideoPlugin::Start() -> bool {
     isyslog("vaapivideo: starting VAAPI Video Plugin v%s", PLUGIN_VERSION);
+
+    // Rewrite the setup.conf lines SetupParse() had to reject; without this a corrupted value is
+    // permanent (see SetupRepair). Deferred to here because SetupStore() mutates the list
+    // cSetup::Load() is still walking; saved right away because VDR skips its shutdown save on
+    // exit code 2.
+    if (!vaapiConfig.setupRepairs.empty()) [[unlikely]] {
+        for (const auto &repair : vaapiConfig.setupRepairs) {
+            SetupStore(repair.key.c_str(), repair.value);
+        }
+        isyslog("vaapivideo: rewrote %zu unusable setup.conf value(s)", vaapiConfig.setupRepairs.size());
+        vaapiConfig.setupRepairs.clear();
+        if (!Setup.Save()) [[unlikely]] {
+            esyslog("vaapivideo: cannot save repaired setup.conf");
+        }
+    }
 
     if (!vaapiDevice) [[unlikely]] {
         esyslog("vaapivideo: device not created -- cannot start");

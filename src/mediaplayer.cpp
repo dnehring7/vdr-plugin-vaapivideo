@@ -1318,9 +1318,12 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         videoInfo.codedWidth > 0 && videoInfo.codedHeight > 0 && videoInfo.fpsNum > 0 && videoInfo.fpsDen > 0) {
         // Field rate for interlaced content: the VPP deinterlacer emits 2 frames per coded frame,
         // which is what makes 1080i25 correctly ask for 50 Hz rather than 25.
-        const int64_t rateMilliHz =
-            (static_cast<int64_t>(videoInfo.fpsNum) * 1000 * (videoInfo.streamInterlaced ? 2 : 1)) / videoInfo.fpsDen;
-        if (rateMilliHz > 0) {
+        // Same halves-up rounding as the filter chain: the post-build republish must land on the
+        // identical millihertz or the stability gate treats it as a second, distinct format. The
+        // upper bound guards the cast -- a malformed container can report an absurd r_frame_rate.
+        const int64_t rateNum = static_cast<int64_t>(videoInfo.fpsNum) * 1000 * (videoInfo.streamInterlaced ? 2 : 1);
+        const int64_t rateMilliHz = (rateNum + (videoInfo.fpsDen / 2)) / videoInfo.fpsDen;
+        if (rateMilliHz > 0 && rateMilliHz <= UINT32_MAX) {
             modeRequest = {.height = static_cast<uint32_t>(videoInfo.codedHeight),
                            .rateMilliHz = static_cast<uint32_t>(rateMilliHz),
                            .width = static_cast<uint32_t>(videoInfo.codedWidth)};
@@ -2126,7 +2129,7 @@ cVaapiControl::cVaapiControl(cVaapiPlayer *typedPlayer) : cControl(typedPlayer),
             cStatus::MsgReplaying(this, title.c_str(), title.c_str(), true);
         }
     }
-    isyslog("vaapivideo/mediaplayer: control launched");
+    dsyslog("vaapivideo/mediaplayer: control launched");
 }
 
 cVaapiControl::~cVaapiControl() noexcept {
@@ -2141,7 +2144,7 @@ cVaapiControl::~cVaapiControl() noexcept {
     // vdr/dvbplayer.c). The unique_ptr owns/deletes; cControl does not.
     cControl::player = nullptr;
     player.reset();
-    isyslog("vaapivideo/mediaplayer: control destroyed");
+    dsyslog("vaapivideo/mediaplayer: control destroyed");
 }
 
 auto cVaapiControl::Hide() -> void { HideReplayBar(); }

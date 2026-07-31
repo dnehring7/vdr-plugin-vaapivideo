@@ -2340,9 +2340,11 @@ auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, Play
 
     // Rate limit: each change costs an HDMI link retrain, so back-to-back switches must be
     // impossible even when a playlist advances through short entries. Deliberately returns with
-    // the candidate STILL ARMED -- PollPendingDisplayMode() re-enters once the interval expires,
-    // so a throttled switch is deferred rather than dropped.
+    // the candidate STILL ARMED -- PollPendingDisplayMode() re-enters at the cooldown boundary the
+    // due time is pushed to, so a throttled switch is deferred rather than dropped. Leaving the
+    // due time in the past would instead have the poll take this mutex on every decode tick.
     if (lastModeChangeMs != 0 && nowMs - lastModeChangeMs < DISPLAY_MODE_MIN_INTERVAL_MS) {
+        modeCandidateDueMs.store(lastModeChangeMs + DISPLAY_MODE_MIN_INTERVAL_MS, std::memory_order_release);
         return;
     }
 
@@ -3420,10 +3422,22 @@ namespace {
     const auto aspectOf = [modes](const DisplayModeCandidate &candidate) noexcept -> AspectRatio {
         return ModePictureAspectRatio(*std::next(modes.begin(), candidate.index));
     };
+    // The default mode is exempt: it is the resolution the matcher falls back to whenever
+    // resolution matching is off or finds no fit, so dropping it (--resolution 1440x576 names a
+    // repeated raster) would leave the refresh stage without a candidate at the target size.
+    const uint32_t defaultRateMilliHz = ModeRefreshMilliHz(defaultMode);
+    const auto isDefaultMode = [&](const DisplayModeCandidate &candidate) noexcept -> bool {
+        return candidate.width == defaultMode.hdisplay && candidate.height == defaultMode.vdisplay &&
+               candidate.refreshMilliHz == defaultRateMilliHz;
+    };
     std::vector<DisplayModeCandidate> distinct;
     distinct.reserve(candidates.size());
     // Writes a separate vector: an erase-in-place pass would let the predicate see moved-from ones.
     for (const auto &candidate : candidates) {
+        if (isDefaultMode(candidate)) {
+            distinct.push_back(candidate);
+            continue;
+        }
         const AspectRatio aspect = aspectOf(candidate);
         const bool repeats = std::ranges::any_of(candidates, [&](const DisplayModeCandidate &base) -> bool {
             if (base.height != candidate.height || base.refreshMilliHz != candidate.refreshMilliHz ||

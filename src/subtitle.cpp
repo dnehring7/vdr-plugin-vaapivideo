@@ -452,7 +452,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // avcodec_decode_subtitle2 takes a const AVPacket* (FFmpeg 7+), so the caller's packet is safe.
     const int ret = avcodec_decode_subtitle2(codecCtx_.get(), &sub, &gotSub, packet);
     if (ret < 0) {
-        esyslog("vaapivideo/subtitle: decode: %s", AvErr(ret).data());
+        dsyslog("vaapivideo/subtitle: decode failed: %s", AvErr(ret).data());
         return;
     }
     if (gotSub == 0) {

@@ -109,7 +109,7 @@ extern "C" {
 
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.8.0";
+inline constexpr const char *PLUGIN_VERSION = "1.8.1";
 
 // ============================================================================
 // === CONSTANTS ===

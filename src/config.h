@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // ============================================================================
 // === CONSTANTS ===
@@ -61,6 +62,9 @@ enum class PassthroughMode : uint8_t {
     Off = 2,  ///< Never passthrough; always decode to PCM
 };
 
+inline constexpr int CONFIG_PASSTHROUGH_MODE_COUNT =
+    static_cast<int>(PassthroughMode::Off) + 1; ///< Derived from the last enumerator so it cannot drift
+
 /// Lowercase wire-format label for a PassthroughMode. Single source of truth shared by
 /// config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
 [[nodiscard]] constexpr auto PassthroughModeName(PassthroughMode mode) noexcept -> const char * {
@@ -88,7 +92,8 @@ enum class PcmChannelMode : uint8_t {
     Multichannel = 2, ///< Force native multichannel; when no ELD is readable, trust the stream's layout
 };
 
-inline constexpr int CONFIG_PCM_CHANNEL_MODE_COUNT = 3; ///< Number of PcmChannelMode values
+inline constexpr int CONFIG_PCM_CHANNEL_MODE_COUNT =
+    static_cast<int>(PcmChannelMode::Multichannel) + 1; ///< Derived from the last enumerator so it cannot drift
 
 /// Lowercase wire-format label for a PcmChannelMode. Single source of truth shared by config.cpp
 /// (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels); same pattern as PassthroughModeName.
@@ -115,6 +120,9 @@ enum class HdrMode : uint8_t {
     On = 1,   ///< Force HDR output when the stream is HDR; skip the sink-capability gate
     Off = 2,  ///< Never passthrough; always use the existing SDR BT.709 output path
 };
+
+inline constexpr int CONFIG_HDR_MODE_COUNT =
+    static_cast<int>(HdrMode::Off) + 1; ///< Derived from the last enumerator so it cannot drift
 
 /// Lowercase wire-format label for an HdrMode. Single source of truth shared by
 /// config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
@@ -148,7 +156,8 @@ enum class VppDeintMode : uint8_t {
     Bob = 3,               ///< line doubling -- lowest cost
 };
 
-inline constexpr int CONFIG_VPP_DEINT_MODE_COUNT = 4; ///< Number of VppDeintMode values; bounds the clamp loop
+inline constexpr int CONFIG_VPP_DEINT_MODE_COUNT =
+    static_cast<int>(VppDeintMode::Bob) + 1; ///< Derived from the last enumerator; bounds the clamp loop
 
 /// Bare ffmpeg "deinterlace_vaapi=mode=" argument token for a VppDeintMode (MUST stay a bare token --
 /// it is concatenated into the filter string). Single source shared by filter.cpp (clamp + emit) and
@@ -186,7 +195,8 @@ enum class DeinterlaceMode : uint8_t {
     SwW3fdif = 5,         ///< Software w3fdif -> forces SW block
 };
 
-inline constexpr int CONFIG_DEINTERLACE_MODE_COUNT = 6; ///< Number of DeinterlaceMode values
+inline constexpr int CONFIG_DEINTERLACE_MODE_COUNT =
+    static_cast<int>(DeinterlaceMode::SwW3fdif) + 1; ///< Derived from the last enumerator so it cannot drift
 
 /// Human label for a DeinterlaceMode -- single source for the setup menu AND the log summary.
 [[nodiscard]] constexpr auto DeinterlaceModeName(DeinterlaceMode mode) noexcept -> const char * {
@@ -217,7 +227,8 @@ enum class DenoiseMode : uint8_t {
     SwEnhanced = 3, ///< Software hqdn3d (strong) -> forces SW block
 };
 
-inline constexpr int CONFIG_DENOISE_MODE_COUNT = 4; ///< Number of DenoiseMode values
+inline constexpr int CONFIG_DENOISE_MODE_COUNT =
+    static_cast<int>(DenoiseMode::SwEnhanced) + 1; ///< Derived from the last enumerator so it cannot drift
 
 [[nodiscard]] constexpr auto DenoiseModeName(DenoiseMode mode) noexcept -> const char * {
     switch (mode) {
@@ -241,7 +252,8 @@ enum class SharpenMode : uint8_t {
     SwMedium = 3, ///< Software unsharp (medium) -> forces SW block
 };
 
-inline constexpr int CONFIG_SHARPEN_MODE_COUNT = 4; ///< Number of SharpenMode values
+inline constexpr int CONFIG_SHARPEN_MODE_COUNT =
+    static_cast<int>(SharpenMode::SwMedium) + 1; ///< Derived from the last enumerator so it cannot drift
 
 [[nodiscard]] constexpr auto SharpenModeName(SharpenMode mode) noexcept -> const char * {
     switch (mode) {
@@ -266,7 +278,8 @@ enum class ScaleMode : uint8_t {
     SwFast = 3,    ///< swscale bilinear -> forces SW block
 };
 
-inline constexpr int CONFIG_SCALE_MODE_COUNT = 4; ///< Number of ScaleMode values
+inline constexpr int CONFIG_SCALE_MODE_COUNT =
+    static_cast<int>(ScaleMode::SwFast) + 1; ///< Derived from the last enumerator so it cannot drift
 
 [[nodiscard]] constexpr auto ScaleModeName(ScaleMode mode) noexcept -> const char * {
     switch (mode) {
@@ -301,7 +314,8 @@ enum class MinResolutionMode : uint8_t {
     P2160 = 3, ///< 2160p -- UHD only (pins the resolution on a UHD panel)
 };
 
-inline constexpr int CONFIG_MIN_RESOLUTION_MODE_COUNT = 4; ///< Number of MinResolutionMode values
+inline constexpr int CONFIG_MIN_RESOLUTION_MODE_COUNT =
+    static_cast<int>(MinResolutionMode::P2160) + 1; ///< Derived from the last enumerator so it cannot drift
 
 /// Human label for a MinResolutionMode -- single source for the setup menu AND the log summary.
 [[nodiscard]] constexpr auto MinResolutionModeName(MinResolutionMode mode) noexcept -> const char * {
@@ -346,7 +360,8 @@ enum class MaxRefreshMode : uint8_t {
     Unlimited = 4, ///< No cap -- every frequency the connector offers is a candidate
 };
 
-inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT = 5; ///< Number of MaxRefreshMode values
+inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT =
+    static_cast<int>(MaxRefreshMode::Unlimited) + 1; ///< Derived from the last enumerator so it cannot drift
 
 /// Human label for a MaxRefreshMode -- single source for the setup menu AND the log summary.
 [[nodiscard]] constexpr auto MaxRefreshModeName(MaxRefreshMode mode) noexcept -> const char * {
@@ -411,6 +426,20 @@ struct MediaBookmark {
 [[nodiscard]] auto LoadBookmark() -> MediaBookmark;
 
 // ============================================================================
+// === SETUP.CONF REPAIR ===
+// ============================================================================
+
+/// A setup.conf entry whose stored value was unusable, paired with the fallback that replaced it.
+/// VDR keeps -- and re-saves -- every line SetupParse() rejects, so a corrupted value outlives
+/// restarts and even hand-edits (the shutdown save overwrites them). Repairing from inside
+/// SetupParse() is not an option: SetupStore() mutates the list cSetup::Load() is walking, so
+/// cVaapiVideoPlugin::Start() flushes this queue instead.
+struct SetupRepair {
+    std::string key; ///< Plugin-relative setup.conf key, i.e. without the "vaapivideo." prefix
+    int value{};     ///< Fallback the parser kept; what the rewritten line must carry
+};
+
+// ============================================================================
 // === PLUGIN CONFIGURATION ===
 // ============================================================================
 
@@ -440,8 +469,10 @@ struct VaapiConfig {
     std::atomic<int> passthroughLatency{0}; ///< A/V offset (ms, signed) for IEC61937 passthrough; + delays audio
     std::atomic<PassthroughMode> passthroughMode{PassthroughMode::Auto}; ///< Re-read on every codec change
     std::atomic<PcmChannelMode> pcmChannelMode{
-        PcmChannelMode::Auto};      ///< Decoded-PCM channel policy; re-read per decoded frame (decode-driven)
-    std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
+        PcmChannelMode::Auto};             ///< Decoded-PCM channel policy; re-read per decoded frame (decode-driven)
+    std::atomic<int> pcmLatency{0};        ///< A/V offset (ms, signed) for PCM decode path; + delays audio
+    std::vector<SetupRepair> setupRepairs; ///< Queued by SetupParse(), flushed by cVaapiVideoPlugin::Start();
+                                           ///< startup-only and single-threaded, hence unlocked
     std::atomic<int> zoomActive{
         0}; ///< Runtime cycle stop (0=Off, 1..ZOOM_PRESET_COUNT=level); transient, never persisted
     // A zoom level is a zoom-in factor in tenths-of-% (344 = +34.4%, the picture enlarged 1.344x);
@@ -453,7 +484,8 @@ struct VaapiConfig {
 
     [[nodiscard]] auto GetSummary() const -> std::string; ///< One-line human-readable snapshot for logging
     [[nodiscard]] auto SetupParse(const char *name, const char *value)
-        -> bool; ///< Called by VDR for each key in setup.conf; returns true when the key is recognized
+        -> bool; ///< Called by VDR per setup.conf key; true = the key is ours. An unusable value keeps the
+                 ///< default and queues a setupRepairs entry rather than failing the key
 };
 
 // ============================================================================

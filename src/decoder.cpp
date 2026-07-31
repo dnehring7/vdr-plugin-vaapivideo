@@ -309,7 +309,7 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
     if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
         parserCtx.reset(av_parser_init(currentCodecId));
         if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-            esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+            esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
         }
     } else if (currentCodecId == AV_CODEC_ID_NONE) {
         parserCtx.reset();
@@ -828,7 +828,7 @@ namespace {
 
     const AVCodec *decoder = avcodec_find_decoder(info.codecId);
     if (!decoder) [[unlikely]] {
-        esyslog("vaapivideo/decoder: codec %d not found", static_cast<int>(info.codecId));
+        esyslog("vaapivideo/decoder: codec %s not found", avcodec_get_name(info.codecId));
         return false;
     }
 
@@ -1019,7 +1019,7 @@ namespace {
                               (info.codecId == AV_CODEC_ID_AV1 && info.codedHeight >= 1080) ||
                               (info.codecId == AV_CODEC_ID_HEVC && info.codedHeight >= 2160);
         if (tooHeavy) {
-            esyslog("vaapivideo/decoder: warning: %s software decode at %dx%d may not sustain real-time on this "
+            isyslog("vaapivideo/decoder: warning: %s software decode at %dx%d may not sustain real-time on this "
                     "hardware; expect dropped frames if catch-up cycling appears in the log",
                     decoder->name, info.codedWidth, info.codedHeight);
         }
@@ -1159,7 +1159,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
                 if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-                    esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+                    esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
                 }
             }
         } else if (generationBoundary && display && filterChain.IsBuilt()) {
@@ -1297,7 +1297,7 @@ auto cVaapiDecoder::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDecoder::Action() -> void {
-    dsyslog("vaapivideo/decoder: thread started");
+    dsyslog("vaapivideo/decoder: decode thread started");
 
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
     int trickEmptyDecodes{0};        ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
@@ -1539,7 +1539,7 @@ auto cVaapiDecoder::Action() -> void {
 // ============================================================================
 
 auto cVaapiDecoder::PresentAction() -> void {
-    dsyslog("vaapivideo/present: thread started");
+    dsyslog("vaapivideo/decoder: presentation thread started");
 
     uint64_t noClockBlockedSinceMs{0}; ///< Walltime of the first no-clock hold; 0 = not holding.
     uint64_t lastDrainMs{0};
@@ -2377,7 +2377,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
                 parserCtx.reset(av_parser_init(currentCodecId));
                 if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-                    esyslog("vaapivideo/decoder: parser re-init failed for codec %d", static_cast<int>(currentCodecId));
+                    esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
                 }
             }
         } else if (display && filterChain.IsBuilt()) {
