@@ -1216,7 +1216,7 @@ auto cVaapiMediaSource::Flush() -> void {
 // ============================================================================
 
 cVaapiPlayer::cVaapiPlayer(std::string uri, std::vector<PlaylistEntry> entries, int startMs)
-    : cPlayer(pmAudioVideo), cThread("vaapi mediaplayer demux"), originUri(std::move(uri)), startPositionMs(startMs),
+    : cPlayer(pmAudioVideo), cThread("vaapivideo/mediaplayer"), originUri(std::move(uri)), startPositionMs(startMs),
       playlist(std::move(entries)) {
     if (playlist.empty()) {
         esyslog("vaapivideo/mediaplayer: cVaapiPlayer constructed with empty playlist");

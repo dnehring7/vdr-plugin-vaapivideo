@@ -49,15 +49,15 @@
 // === VIDEO FILTER CHAIN ===
 // ============================================================================
 
-// VAAPI post-processing filter graph with keep-alive reset.
-//
-// Lifecycle: Build() on the first decoded frame -> SendFrame/ReceiveFrame in a loop ->
-// Reset() on format change or stream end (keeps old graph alive) -> Build() again.
-// Destructor releases both the active and keep-alive graphs.
-//
-// Thread safety: not thread-safe. The decoder thread owns the instance and must
-// hold the codec mutex (and VA driver mutex) around Build() and Reset(), matching
-// the pre-refactor InitFilterGraph / ResetFilterGraph call sites.
+/// VAAPI post-processing filter graph with keep-alive reset.
+///
+/// Lifecycle: Build() on the first decoded frame -> SendFrame/ReceiveFrame in a loop ->
+/// Reset() on format change or stream end (keeps old graph alive) -> Build() again.
+/// Destructor releases both the active and keep-alive graphs.
+///
+/// Thread safety: not thread-safe. The decoder thread owns the instance and must
+/// hold the codec mutex (and VA driver mutex) around Build() and Reset(), matching
+/// the pre-refactor InitFilterGraph / ResetFilterGraph call sites.
 class cVideoFilterChain {
   public:
     cVideoFilterChain() = default;
@@ -172,7 +172,7 @@ class cVideoFilterChain {
     /// in-flight VPP surfaces PRIME-exportable -- routing through Reset() would clobber it).
     [[nodiscard]] auto FailBuild() noexcept -> bool;
 
-    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> filterGraph_;
+    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> filterGraph_; ///< Active graph; null until the first Build()
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
         previousFilterGraph_;          ///< keep-alive: released after display maps its surfaces
     AVFilterContext *bufferSrcCtx_{};  ///< owned by filterGraph_; raw pointer valid only while filterGraph_ is live

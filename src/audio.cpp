@@ -702,8 +702,6 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
 // ============================================================================
 
 auto cAudioProcessor::Action() -> void {
-    dsyslog("vaapivideo/audio: processing thread started");
-
     while (!stopping.load(std::memory_order_acquire)) {
         std::unique_ptr<AVPacket, FreeAVPacket> packet;
         bool passthrough = false;

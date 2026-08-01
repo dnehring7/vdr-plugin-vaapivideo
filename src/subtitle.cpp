@@ -366,7 +366,7 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
 
 // Start the pacing thread up front: it must already be running when the user enables a track, so the
 // first cue is timed against the clock immediately. It idles cheaply (50 ms tick) until cues arrive.
-cSubtitleConverter::cSubtitleConverter(cVaapiDevice *device) : cThread("vaapi subtitle"), device_(device) {
+cSubtitleConverter::cSubtitleConverter(cVaapiDevice *device) : cThread("vaapivideo/subtitle"), device_(device) {
     hasExited_.store(false, std::memory_order_release);
     if (!Start()) {
         // Keep the latch consistent so Shutdown() doesn't wait on / warn about a thread that never ran.

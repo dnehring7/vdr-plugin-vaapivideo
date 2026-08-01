@@ -47,11 +47,11 @@ class cBitmap;
 
 /// Threaded subtitle converter: decodes text (SubRip/ASS/mov_text) and DVB bitmap cues and paces them
 /// onto the OSD. One instance per player. Thread safety: the public API (Open/Close/Convert/Reset/Shutdown)
-/// is demux-thread only and Action() is the sole owner of the cOsd -- see the @file block above for rationale.
+/// is demux-thread only and Action() is the sole owner of the cOsd -- see the file header for rationale.
 class cSubtitleConverter final : public cThread {
   public:
     /// A rendered line plus its color. Public only so the file-local markup parser in subtitle.cpp can
-    /// populate it. Color is per-line because broadcaster SRT/ASS can switch <font color> mid-cue.
+    /// populate it. Color is per-line because broadcaster SRT/ASS can switch `<font color>` mid-cue.
     struct Line {
         std::string text;       ///< line text, markup already stripped
         uint32_t rgb{0xFFFFFF}; ///< 0xRRGGBB foreground, honored only when hasColor (else Setup's white)
@@ -62,6 +62,7 @@ class cSubtitleConverter final : public cThread {
     // === SPECIAL MEMBERS ===
     // ========================================================================
     // Non-copyable/movable: owns a thread + an OSD, neither of which can be duplicated or relocated.
+    /// Starts the pacing thread immediately (see the note above the definition); @p device is borrowed.
     explicit cSubtitleConverter(cVaapiDevice *device);
     ~cSubtitleConverter() noexcept override;
     cSubtitleConverter(const cSubtitleConverter &) = delete;
@@ -134,14 +135,14 @@ class cSubtitleConverter final : public cThread {
     cVaapiDevice *device_; ///< borrowed (player outlives us): clock + OSD-size source
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> codecCtx_; ///< decoder; demux-thread only, hence unlocked
     cOsd *osd_{};                                                  ///< live OSD; Action-thread only, hence unlocked
-    // Geometry of the live OSD: a same-shape successor cue reuses it (clear + redraw) instead of
-    // realloc'ing the dumb buffer + KMS framebuffer. Action-thread only, valid only while osd_ != nullptr.
-    // osdLeft_ is 0 for text bands (full-width, centered text); bitmap cues place the OSD at the scaled
-    // region bounding box, so reuse must match the left edge too.
-    int osdLeft_{};
-    int osdTop_{};
-    int osdAreaWidth_{};
-    int osdAreaHeight_{};
+    /// Geometry of the live OSD: a same-shape successor cue reuses it (clear + redraw) instead of
+    /// realloc'ing the dumb buffer + KMS framebuffer. Action-thread only, valid only while osd_ != nullptr.
+    /// osdLeft_ is 0 for text bands (full-width, centered text); bitmap cues place the OSD at the scaled
+    /// region bounding box, so reuse must match the left edge too.
+    int osdLeft_{};             ///< Left edge of the live OSD (px)
+    int osdTop_{};              ///< Top edge of the live OSD (px)
+    int osdAreaWidth_{};        ///< Width of the live OSD (px)
+    int osdAreaHeight_{};       ///< Height of the live OSD (px)
     uint64_t shownCueSerial_{}; ///< Cue::serial on screen now (0 = nothing); dedups redraws. Action-thread only.
     uint64_t nextCueSerial_{1}; ///< next serial to hand out; demux-thread only. 0 is reserved for "nothing shown".
 

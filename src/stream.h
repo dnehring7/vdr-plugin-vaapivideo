@@ -85,12 +85,13 @@ struct AudioStreamInfo {
 /// row in VIDEO_BACKEND_TABLE wins; rows must be ordered most-specific first.
 /// Adding a codec: one row here + one case in ProbeGpuCaps.
 struct VideoBackendCap {
-    AVCodecID codecId;
-    int profile; ///< AV_PROFILE_UNKNOWN = match-all
-    BitDepth bitDepth;
-    bool GpuCaps::*flag;
+    AVCodecID codecId;   ///< Codec this row answers for
+    int profile;         ///< AV_PROFILE_UNKNOWN = match-all
+    BitDepth bitDepth;   ///< Bit depth this row answers for (8-bit and 10-bit are probed separately)
+    bool GpuCaps::*flag; ///< Member of GpuCaps that ProbeGpuCaps() sets when the driver advertises this combination
 };
 
+/// Codec/profile/depth -> GpuCaps flag lookup, most-specific row first (see VideoBackendCap).
 inline constexpr std::array<VideoBackendCap, 11> VIDEO_BACKEND_TABLE{{
     {.codecId = AV_CODEC_ID_MPEG2VIDEO,
      .profile = AV_PROFILE_UNKNOWN,

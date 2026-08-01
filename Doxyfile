@@ -6,11 +6,20 @@ PROJECT_NAME           = "VDR VAAPI Video Plugin"
 PROJECT_BRIEF          = "Zero-copy VAAPI decode, DRM atomic modesetting, ALSA IEC61937 passthrough"
 OUTPUT_DIRECTORY       = docs
 
-INPUT                  = README.md vaapivideo.cpp src/
+INPUT                  = README.md AVSYNC.md vaapivideo.cpp src/
 RECURSIVE              = YES
 USE_MDFILE_AS_MAINPAGE = README.md
 
-EXTRACT_ALL            = YES
+# The .md files are read on GitHub too, so their [text](#heading) links must keep working there:
+# generate GitHub-style heading anchors instead of Doxygen's own, rather than littering the
+# headings with {#label} markers that GitHub would render verbatim.
+MARKDOWN_ID_STYLE      = GITHUB
+
+# EXTRACT_ALL would publish undocumented entities silently AND disable WARN_IF_UNDOCUMENTED, so a
+# missing brief would never be noticed. Off, every entity is documented, and the next one that is not
+# fails the build.
+EXTRACT_ALL            = NO
+WARN_IF_UNDOCUMENTED   = YES
 EXTRACT_PRIVATE        = YES
 EXTRACT_STATIC         = YES
 
@@ -19,3 +28,8 @@ ALIASES                = "R=R"
 
 GENERATE_LATEX         = NO
 SHOW_INCLUDE_FILES     = NO
+
+# Progress chatter off so `make docs` shows warnings and nothing else, and a warning fails the
+# target -- same contract as the -Werror build. Docs are still written; the exit code is the signal.
+QUIET                  = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS

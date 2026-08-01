@@ -30,16 +30,15 @@ struct VaapiContext;
 // === CONSTANTS ===
 // ============================================================================
 
-inline constexpr size_t DECODER_TRICK_QUEUE_DEPTH =
-    1;                                           ///< Depth-1: Poll() throttles the producer; overflow drops incoming.
+/// Depth-1: Poll() throttles the producer; overflow drops incoming.
+inline constexpr size_t DECODER_TRICK_QUEUE_DEPTH = 1;
 inline constexpr int DECODER_TRICK_HOLD_MS = 20; ///< Base hold per frame for slow trick (~= one field period @ 50 Hz).
-inline constexpr size_t DECODER_RESERVE_HARD_CAP =
-    64; ///< Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps total): the decode
-        ///< thread backpressures when the published total reaches it (or handoffQueue alone does), and each
-        ///< stage also drop-oldest-trims past it as a runaway guard. Caps GPU surface retention (~64 4K NV12
-        ///< surfaces ~= 0.8 GB GTT) while still dwarfing the <40 ms VPP variance and the 8-slot display
-        ///< prerender. In decoder.h (not the .cpp) so the mediaplayer's backpressure gate can be statically
-        ///< checked against it (see device.cpp).
+/// Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps total): the decode thread backpressures
+/// when the published total reaches it (or handoffQueue alone does), and each stage also drop-oldest-trims past it as a
+/// runaway guard. Caps GPU surface retention (~64 4K NV12 surfaces ~= 0.8 GB GTT) while still dwarfing the <40 ms VPP
+/// variance and the 8-slot display prerender. In decoder.h (not the .cpp) so the mediaplayer's backpressure gate can be
+/// statically checked against it (see device.cpp).
+inline constexpr size_t DECODER_RESERVE_HARD_CAP = 64;
 
 // ============================================================================
 // === STRUCTURES ===
@@ -51,8 +50,9 @@ struct VaapiFrame {
     VaapiFrame() = default;
     ~VaapiFrame() noexcept;
     VaapiFrame(const VaapiFrame &) = delete;
-    VaapiFrame(VaapiFrame &&other) noexcept;
+    VaapiFrame(VaapiFrame &&other) noexcept; ///< Steals the AVFrame and DRM handles; @p other is left empty
     auto operator=(const VaapiFrame &) -> VaapiFrame & = delete;
+    /// Releases our own handles first, then steals @p other's.
     auto operator=(VaapiFrame &&other) noexcept -> VaapiFrame &;
 
     // ========================================================================
@@ -76,6 +76,7 @@ struct VaapiFrame {
 /// on its own cThread. All cross-thread state uses atomics or one of the two mutexes.
 class cVaapiDecoder : public cThread {
   public:
+    /// Both pointers are borrowed and must outlive the decoder; neither thread is started until Initialize().
     cVaapiDecoder(cVaapiDisplay *display, VaapiContext *vaapiCtx);
     ~cVaapiDecoder() noexcept override;
     cVaapiDecoder(const cVaapiDecoder &) = delete;
@@ -169,12 +170,13 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === PRESENTATION THREAD ===
     // ========================================================================
-    // The drain + A/V-sync controller runs on its OWN thread so a slow 4K VPP step on the decode
-    // thread never stalls frame presentation: the presenter drains the decoded reserve at the
-    // audio-synced cadence while the decode thread is still filtering the next frame. cThread runs
-    // exactly one Action() per instance, so the second loop needs a second cThread instance.
+    /// The drain + A/V-sync controller runs on its OWN thread so a slow 4K VPP step on the decode
+    /// thread never stalls frame presentation: the presenter drains the decoded reserve at the
+    /// audio-synced cadence while the decode thread is still filtering the next frame. cThread runs
+    /// exactly one Action() per instance, so the second loop needs a second cThread instance.
     class cPresenter : public cThread {
       public:
+        /// @p owner must outlive the thread; cVaapiDecoder::Shutdown() joins before tearing down members.
         explicit cPresenter(cVaapiDecoder *owner) noexcept : cThread("vaapivideo/present"), owner_(owner) {}
         ~cPresenter() noexcept override = default;
         cPresenter(const cPresenter &) = delete;
@@ -187,6 +189,7 @@ class cVaapiDecoder : public cThread {
         } ///< Public join wrapper (cThread::Cancel is protected).
 
       protected:
+        /// The loop lives in cVaapiDecoder::PresentAction(), next to the state it drives.
         auto Action() -> void override { owner_->PresentAction(); }
 
       private:
@@ -308,8 +311,8 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === REFERENCES ===
     // ========================================================================
-    std::atomic<cAudioProcessor *> audioProcessor{
-        nullptr};                           ///< A/V sync master clock. Written by main thread, read by decode thread.
+    /// A/V sync master clock. Written by main thread, read by decode thread.
+    std::atomic<cAudioProcessor *> audioProcessor{nullptr};
     cVaapiDisplay *display;                 ///< Receives completed VaapiFrames via SubmitFrame().
     VaapiContext *vaapiContext;             ///< Shared VAAPI hw_device_ctx and GpuCaps.
     std::function<void()> loopTickCallback; ///< Per-iteration device hook; set before Initialize(), then read-only.
@@ -326,14 +329,14 @@ class cVaapiDecoder : public cThread {
     bool forceCodecReopen{};                    ///< Set by RequestCodecReopen(); cleared by OpenCodecWithInfo().
     bool streamInterlaced{false};               ///< Positive sequence-level hint; forces deinterlace at graph build.
     // Container HDR hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED on the PES path.
-    AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};
-    AVColorTransferCharacteristic hintColorTransfer{AVCOL_TRC_UNSPECIFIED};
-    AVColorSpace hintColorSpace{AVCOL_SPC_UNSPECIFIED};
-    AVColorRange hintColorRange{AVCOL_RANGE_UNSPECIFIED};
-    bool hintHasMasteringDisplay{false};
-    AVMasteringDisplayMetadata hintMasteringDisplay{};
-    bool hintHasContentLight{false};
-    AVContentLightMetadata hintContentLight{};
+    AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};             ///< Container colour primaries
+    AVColorTransferCharacteristic hintColorTransfer{AVCOL_TRC_UNSPECIFIED}; ///< Container transfer function
+    AVColorSpace hintColorSpace{AVCOL_SPC_UNSPECIFIED};                     ///< Container matrix coefficients
+    AVColorRange hintColorRange{AVCOL_RANGE_UNSPECIFIED};                   ///< Container range (tv/pc)
+    bool hintHasMasteringDisplay{false};               ///< Whether hintMasteringDisplay carries a payload
+    AVMasteringDisplayMetadata hintMasteringDisplay{}; ///< HDR10 mastering display volume, valid per the flag above
+    bool hintHasContentLight{false};                   ///< Whether hintContentLight carries a payload
+    AVContentLightMetadata hintContentLight{};         ///< HDR10 MaxCLL/MaxFALL, valid per the flag above
     std::unique_ptr<AVFrame, FreeAVFrame>
         decodedFrame;              ///< Staging for avcodec_receive_frame(); unref'd each iteration.
     cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi -> optional denoise/sharpness).
@@ -365,8 +368,8 @@ class cVaapiDecoder : public cThread {
     std::atomic<uint64_t> codecOpenTimeMs; ///< cTimeMs::Now() at last OpenCodecWithInfo(); used by starvation tiers.
     std::atomic<size_t> packetsSinceOpen;  ///< avcodec_send_packet calls since last open; starvation counters.
     std::atomic<size_t> keyPacketsSinceOpen; ///< Subset with AV_PKT_FLAG_KEY; distinguishes silent feed vs HW stall.
-    std::atomic<int64_t> lastPts{
-        AV_NOPTS_VALUE};                   ///< Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
+    /// Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
+    std::atomic<int64_t> lastPts{AV_NOPTS_VALUE};
     std::atomic<uint64_t> clearEpoch{0};   ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
     uint64_t presentEpoch{0};              ///< Presentation thread only. Snapshot of clearEpoch at each present-loop
                                            ///< iteration; gates submit (SubmitIfCurrent), PublishLastPts, and the
@@ -381,10 +384,9 @@ class cVaapiDecoder : public cThread {
     std::atomic<int> trickSpeed;           ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
     std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
                                              ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
-    std::atomic<bool> filterCompactRebuildPending{
-        false}; ///< Set by FlushForSeek to request a one-line "filter rebuilt" diagnostic on the
-                ///< next InitFilterGraph call instead of the full 3-line graph init dump.
-                ///< Consumed (exchanged to false) by the decode-thread filter-build path.
+    /// Set by FlushForSeek to request a one-line "filter rebuilt" diagnostic on the next InitFilterGraph call instead
+    /// of the full 3-line graph init dump. Consumed (exchanged to false) by the decode-thread filter-build path.
+    std::atomic<bool> filterCompactRebuildPending{false};
 
     // ========================================================================
     // === TRICK MODE ===
@@ -392,14 +394,14 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> deferredTrickExitPending; ///< Play() without TrickSpeed(0); resolved on the present thread once
                                                 ///< the cancellation grace expires (queue-independent, so FF can't hang
                                                 ///< waiting for a keyframe that never arrives).
-    std::atomic<uint64_t> deferredTrickExitDueMs{
-        0};                                  ///< cTimeMs::Now() deadline after which the deferred exit resolves.
+    /// cTimeMs::Now() deadline after which the deferred exit resolves.
+    std::atomic<uint64_t> deferredTrickExitDueMs{0};
     std::atomic<bool> isTrickFastForward;    ///< FF mode: only keyframes enqueued; first field of each pair dropped.
     std::atomic<bool> isTrickReverse;        ///< REW: GOPs arrive backward; skip frames with rising PTS within a GOP.
     std::atomic<uint64_t> nextTrickFrameDue; ///< cTimeMs::Now() deadline for next submission; enforces pacing.
     std::atomic<int64_t> prevTrickPts{AV_NOPTS_VALUE}; ///< Source PTS of previous trick frame; detects field pairs.
-    std::atomic<uint64_t> trickHoldMs{
-        DECODER_TRICK_HOLD_MS};            ///< Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS.
+    /// Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS.
+    std::atomic<uint64_t> trickHoldMs{DECODER_TRICK_HOLD_MS};
     std::atomic<uint64_t> trickMultiplier; ///< Fast-mode PTS-derived hold divisor (2/4/8x). 0 = slow mode.
 
     // ========================================================================
@@ -407,19 +409,18 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // Default 1 so the very first frame after construction is submitted immediately.
     // Without it the due-gate holds until the audio clock is anchored and the screen stays black.
-    std::atomic<int> freerunFrames{
-        1}; ///< Bypass A/V sync for N frames. Set by Clear() / trick-exit / NotifyAudioChange().
-    std::atomic<int> jitterFlushRequest{
-        0}; ///< Deferred Clear() / FlushForSeek() request consumed by the PRESENTATION thread (single consumer,
-            ///< one exchange(0) per present iteration):
-            ///<   0 = no flush pending,
-            ///<   1 = plain Clear()  -- drop seek-hint, content boundary,
-            ///<   2 = FlushForSeek() -- preserve seek-hint across the flush.
-            ///< The preserve policy is encoded *in* the request so back-to-back FlushForSeek /
-            ///< Clear() can't cross-pollinate (a stale flush observed by the present thread always
-            ///< carries its originator's policy, never a later issuer's). Last writer wins, which
-            ///< is correct: Clear() after FlushForSeek dropping the hint = content boundary win;
-            ///< FlushForSeek after FlushForSeek = coalesced preserve.
+    /// Bypass A/V sync for N frames. Set by Clear() / trick-exit / NotifyAudioChange().
+    std::atomic<int> freerunFrames{1};
+    /// Deferred Clear() / FlushForSeek() request consumed by the PRESENTATION thread (single consumer, one
+    /// exchange(0) per present iteration):
+    ///   - 0 = no flush pending
+    ///   - 1 = plain Clear() -- drop seek-hint, content boundary
+    ///   - 2 = FlushForSeek() -- preserve seek-hint across the flush
+    /// The preserve policy is encoded *in* the request so back-to-back FlushForSeek / Clear() can't cross-pollinate
+    /// (a stale flush observed by the present thread always carries its originator's policy, never a later issuer's).
+    /// Last writer wins, which is correct: Clear() after FlushForSeek dropping the hint = content boundary win;
+    /// FlushForSeek after FlushForSeek = coalesced preserve.
+    std::atomic<int> jitterFlushRequest{0};
     std::atomic<size_t> publishedDecodedReserveSize{0}; ///< Cross-thread snapshot of the total decoded reserve
                                                         ///< (jitterBuf.size() + handoffQueue.size()) for backpressure.
                                                         ///< Written by the PRESENT thread once per present iteration,
@@ -443,22 +444,18 @@ class cVaapiDecoder : public cThread {
     int64_t emaResidual90k{};         ///< Integer EMA remainder: carries sub-sample rounding so the filter converges
                                       ///< exactly to the mean rather than stalling when |diff| < EMA_SAMPLES ticks.
     bool smoothedDeltaValid{false};   ///< True after warmup completes. Gates soft-corridor and catch-up (sustained).
-    int64_t seekHintDelta90k{
-        AV_NOPTS_VALUE}; ///< One-shot fast-start hint: last converged smoothedDelta carried across
-                         ///< a FlushForSeek. Used as the catch-up exit target AND as the EMA seed
-                         ///< on the first valid post-seek sample, so playback resumes at the
-                         ///< steady-state offset within milliseconds instead of waiting out the
-                         ///< 50-sample warmup. Consumed (set back to AV_NOPTS_VALUE) once the EMA
-                         ///< is seeded so subsequent controller resets warm up from real samples
-                         ///< rather than re-applying the same stale value. Presentation thread only.
-    int64_t stableDelta90k{
-        AV_NOPTS_VALUE};              ///< Pre-correction snapshot of smoothedDelta taken at each hard-/soft-ahead
-                                      ///< trigger, just before the post-sleep `smoothedDelta -= extraMs` feedback.
-                                      ///< Represents the long-term GPU-vs-audio offset that the EMA had converged
-                                      ///< to before the in-flight correction perturbed it. Used as the seek-hint
-                                      ///< source so the captured hint survives a FlushForSeek that lands inside
-                                      ///< the post-correction recovery window. AV_NOPTS_VALUE until the first
-                                      ///< trigger fires; cleared by ResetSmoothedDelta. Presentation thread only.
+    /// One-shot fast-start hint: last converged smoothedDelta carried across a FlushForSeek. Used as the catch-up exit
+    /// target AND as the EMA seed on the first valid post-seek sample, so playback resumes at the steady-state offset
+    /// within milliseconds instead of waiting out the 50-sample warmup. Consumed (set back to AV_NOPTS_VALUE) once the
+    /// EMA is seeded so subsequent controller resets warm up from real samples rather than re-applying the same stale
+    /// value. Presentation thread only.
+    int64_t seekHintDelta90k{AV_NOPTS_VALUE};
+    /// Pre-correction snapshot of smoothedDelta taken at each hard-/soft-ahead trigger, just before the post-sleep
+    /// `smoothedDelta -= extraMs` feedback. Represents the long-term GPU-vs-audio offset that the EMA had converged to
+    /// before the in-flight correction perturbed it. Used as the seek-hint source so the captured hint survives a
+    /// FlushForSeek that lands inside the post-correction recovery window. AV_NOPTS_VALUE until the first trigger
+    /// fires; cleared by ResetSmoothedDelta. Presentation thread only.
+    int64_t stableDelta90k{AV_NOPTS_VALUE};
     uint64_t stableDeltaCapturedMs{}; ///< cTimeMs::Now() of the most recent stableDelta90k capture. Paired with
                                       ///< DECODER_SYNC_HINT_MAX_AGE_MS so an old snapshot from a single past
                                       ///< correction cannot dominate seeks long after the pipeline has settled at
@@ -509,8 +506,8 @@ class cVaapiDecoder : public cThread {
     // Declared LAST so it is destroyed FIRST: the presenter thread (whose PresentAction body touches
     // handoffMutex/handoffQueue/jitterBuf and the controller scalars above) must be torn down before
     // those members. The dtor->Shutdown() join is the primary guarantee; this ordering is defense-in-depth.
-    cPresenter presenter{
-        this}; ///< Presentation (drain + A/V-sync) thread; started/stopped alongside the decode thread.
+    /// Presentation (drain + A/V-sync) thread; started/stopped alongside the decode thread.
+    cPresenter presenter{this};
 };
 
 #endif // VDR_VAAPIVIDEO_DECODER_H

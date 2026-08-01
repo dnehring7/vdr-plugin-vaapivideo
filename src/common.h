@@ -107,9 +107,10 @@ extern "C" {
 // === PLUGIN METADATA ===
 // ============================================================================
 
+/// Shown by "vdr -h" and in VDR's plugin list.
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.8.1";
+inline constexpr const char *PLUGIN_VERSION = "1.8.1";   ///< Reported to VDR; "make dist" greps this line.
 
 // ============================================================================
 // === CONSTANTS ===
@@ -187,8 +188,8 @@ struct HdrStreamInfo {
 /// An exact width:height ratio. Rational rather than a double so the VPP fit can cross-multiply in
 /// integers (see cVideoFilterChain::Build).
 struct AspectRatio {
-    uint32_t den{1};
-    uint32_t num{1};
+    uint32_t den{1}; ///< Height side of the ratio
+    uint32_t num{1}; ///< Width side of the ratio
 };
 
 /// Picture aspect a KMS mode is meant to be shown at, as an exact ratio.
@@ -283,24 +284,29 @@ struct AspectRatio {
 // ============================================================================
 
 // --- FFmpeg Deleters ---
+// These free functions take a double pointer and null it, hence the address-of below (av_parser_close excepted).
 
 /// Deleter for AVBufferRef (av_buffer_unref)
 struct FreeAVBufferRef {
+    /// Drops one reference; the buffer dies with the last one.
     auto operator()(AVBufferRef *ref) const noexcept -> void { av_buffer_unref(&ref); }
 };
 
 /// Deleter for AVCodecContext (avcodec_free_context)
 struct FreeAVCodecContext {
+    /// Closes the codec before freeing the context.
     auto operator()(AVCodecContext *ctx) const noexcept -> void { avcodec_free_context(&ctx); }
 };
 
 /// Deleter for AVCodecParserContext (av_parser_close)
 struct FreeAVCodecParserContext {
+    /// The exception: av_parser_close() takes the pointer itself.
     auto operator()(AVCodecParserContext *ctx) const noexcept -> void { av_parser_close(ctx); }
 };
 
 /// Deleter for AVFilterGraph (avfilter_graph_free)
 struct FreeAVFilterGraph {
+    /// Frees the graph and every filter in it.
     auto operator()(AVFilterGraph *graph) const noexcept -> void { avfilter_graph_free(&graph); }
 };
 
@@ -308,48 +314,58 @@ struct FreeAVFilterGraph {
 /// for the libavformat-based mediaplayer path. avformat_close_input is the canonical pairing for
 /// avformat_open_input; it nulls the local pointer too, hence the address-of.
 struct FreeAVFormatContext {
+    /// Closes the input before freeing the context.
     auto operator()(AVFormatContext *ctx) const noexcept -> void { avformat_close_input(&ctx); }
 };
 
 /// Deleter for AVFrame (av_frame_free)
 struct FreeAVFrame {
+    /// Unreferences the frame's buffers, then frees it.
     auto operator()(AVFrame *frame) const noexcept -> void { av_frame_free(&frame); }
 };
 
 /// Deleter for AVPacket (av_packet_free)
 struct FreeAVPacket {
+    /// Unreferences the payload, then frees the packet.
     auto operator()(AVPacket *pkt) const noexcept -> void { av_packet_free(&pkt); }
 };
 
 // --- DRM Deleters ---
+// Unlike FFmpeg's, these take the pointer itself -- drmFreeDevice() being the one exception.
 
 /// Deleter for drmModeConnector (drmModeFreeConnector)
 struct FreeDrmConnector {
+    /// Also frees its mode and property arrays -- anything pointing into them dangles.
     auto operator()(drmModeConnector *conn) const noexcept -> void { drmModeFreeConnector(conn); }
 };
 
 /// Deleter for drmDevice (drmFreeDevice)
 struct FreeDrmDevice {
+    /// The exception: takes a double pointer.
     auto operator()(drmDevice *dev) const noexcept -> void { drmFreeDevice(&dev); }
 };
 
 /// Deleter for drmModeObjectProperties (drmModeFreeObjectProperties)
 struct FreeDrmObjectProperties {
+    /// Frees the id/value arrays from drmModeObjectGetProperties().
     auto operator()(drmModeObjectProperties *props) const noexcept -> void { drmModeFreeObjectProperties(props); }
 };
 
 /// Deleter for drmModePlaneRes (drmModeFreePlaneResources)
 struct FreeDrmPlaneResources {
+    /// Frees the plane id list from drmModeGetPlaneResources().
     auto operator()(drmModePlaneRes *res) const noexcept -> void { drmModeFreePlaneResources(res); }
 };
 
 /// Deleter for drmModePropertyRes (drmModeFreeProperty)
 struct FreeDrmProperty {
+    /// Frees one property descriptor, including its enum-name table.
     auto operator()(drmModePropertyRes *prop) const noexcept -> void { drmModeFreeProperty(prop); }
 };
 
 /// Deleter for drmModeRes (drmModeFreeResources)
 struct FreeDrmResources {
+    /// Frees the connector/encoder/CRTC id lists from drmModeGetResources().
     auto operator()(drmModeRes *res) const noexcept -> void { drmModeFreeResources(res); }
 };
 

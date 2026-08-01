@@ -29,7 +29,6 @@
 #include <xf86drm.h>
 
 // C++ Standard Library
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -53,7 +52,6 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/channels.h>
-#include <vdr/config.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
 #include <vdr/keys.h>
@@ -75,33 +73,25 @@ namespace {
 class cMenuSetupVaapi : public cMenuSetupPage {
   public:
     cMenuSetupVaapi()
+        // No clamping: cMenuEditIntItem's ctor (base of every cMenuEditStraItem here) clamps *value
+        // into range before first use, so even a corrupt atomic cannot index past a label array.
         : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
-          // Clamp so cMenuEditStraItem never indexes past its label array.
-          editDeinterlaceMode(std::clamp(static_cast<int>(vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed)),
-                                         0, kDeinterlaceCount - 1)),
-          editDenoiseMode(std::clamp(static_cast<int>(vaapiConfig.denoiseMode.load(std::memory_order_relaxed)), 0,
-                                     kDenoiseCount - 1)),
-          editHdrMode(
-              std::clamp(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed)), 0, kHdrModeCount - 1)),
+          editDeinterlaceMode(static_cast<int>(vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed))),
+          editDenoiseMode(static_cast<int>(vaapiConfig.denoiseMode.load(std::memory_order_relaxed))),
+          editHdrMode(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed))),
           editMatchRefreshRate(vaapiConfig.matchRefreshRate.load(std::memory_order_relaxed) ? 1 : 0),
           editMatchResolution(vaapiConfig.matchResolution.load(std::memory_order_relaxed) ? 1 : 0),
-          editMaxRefreshRate(std::clamp(static_cast<int>(vaapiConfig.maxRefreshRate.load(std::memory_order_relaxed)), 0,
-                                        kMaxRefreshCount - 1)),
-          editMinResolution(std::clamp(static_cast<int>(vaapiConfig.minResolution.load(std::memory_order_relaxed)), 0,
-                                       kMinResolutionCount - 1)),
+          editMaxRefreshRate(static_cast<int>(vaapiConfig.maxRefreshRate.load(std::memory_order_relaxed))),
+          editMinResolution(static_cast<int>(vaapiConfig.minResolution.load(std::memory_order_relaxed))),
           editModeSwitchLiveTv(vaapiConfig.modeSwitchLiveTv.load(std::memory_order_relaxed) ? 1 : 0),
           editModeSwitchMediaplayer(vaapiConfig.modeSwitchMediaplayer.load(std::memory_order_relaxed) ? 1 : 0),
           editModeSwitchReplay(vaapiConfig.modeSwitchReplay.load(std::memory_order_relaxed) ? 1 : 0),
           editPassthroughLatency(vaapiConfig.passthroughLatency.load(std::memory_order_relaxed)),
-          editPassthroughMode(std::clamp(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
-                                         0, kPassthroughModeCount - 1)),
-          editPcmChannelMode(std::clamp(static_cast<int>(vaapiConfig.pcmChannelMode.load(std::memory_order_relaxed)), 0,
-                                        kPcmChannelModeCount - 1)),
+          editPassthroughMode(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed))),
+          editPcmChannelMode(static_cast<int>(vaapiConfig.pcmChannelMode.load(std::memory_order_relaxed))),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
-          editScaleMode(
-              std::clamp(static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed)), 0, kScaleCount - 1)),
-          editSharpenMode(std::clamp(static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed)), 0,
-                                     kSharpenCount - 1)) {
+          editScaleMode(static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed))),
+          editSharpenMode(static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed))) {
         SetSection(tr("VAAPI Video"));
         for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
             editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
@@ -729,21 +719,6 @@ auto cVaapiVideoPlugin::SetupParse(const char *Name, const char *Value) -> bool 
 auto cVaapiVideoPlugin::Start() -> bool {
     isyslog("vaapivideo: starting VAAPI Video Plugin v%s", PLUGIN_VERSION);
 
-    // Rewrite the setup.conf lines SetupParse() had to reject; without this a corrupted value is
-    // permanent (see SetupRepair). Deferred to here because SetupStore() mutates the list
-    // cSetup::Load() is still walking; saved right away because VDR skips its shutdown save on
-    // exit code 2.
-    if (!vaapiConfig.setupRepairs.empty()) [[unlikely]] {
-        for (const auto &repair : vaapiConfig.setupRepairs) {
-            SetupStore(repair.key.c_str(), repair.value);
-        }
-        isyslog("vaapivideo: rewrote %zu unusable setup.conf value(s)", vaapiConfig.setupRepairs.size());
-        vaapiConfig.setupRepairs.clear();
-        if (!Setup.Save()) [[unlikely]] {
-            esyslog("vaapivideo: cannot save repaired setup.conf");
-        }
-    }
-
     if (!vaapiDevice) [[unlikely]] {
         esyslog("vaapivideo: device not created -- cannot start");
         return false;
@@ -987,4 +962,5 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
 
 } // namespace
 
+/// VDR entry point: expands to the exported factory the plugin loader calls (see PLUGINS.html).
 VDRPLUGINCREATOR(cVaapiVideoPlugin);

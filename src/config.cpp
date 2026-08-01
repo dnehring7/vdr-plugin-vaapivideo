@@ -7,8 +7,10 @@
 
 #include "config.h"
 
+// POSIX
+#include <strings.h>
+
 // C++ Standard Library
-#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <cstdint>
@@ -18,7 +20,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <vector>
 
 // VDR
 #pragma GCC diagnostic push
@@ -181,36 +182,15 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 
 namespace {
 
-/// The queued repair for @p key, or nullptr. setup.conf can carry a key twice, so neither
-/// queuing nor refreshing may assume it is new.
-[[nodiscard]] auto FindRepair(const char *key, std::vector<SetupRepair> &repairs) -> SetupRepair * {
-    const auto it = std::ranges::find(repairs, key, &SetupRepair::key);
-    return it == repairs.end() ? nullptr : &*it;
+/// Don't promise "the default": the target may already hold an earlier duplicate that parsed. The
+/// line stays on disk until that key is stored again, and with duplicates SetupStore() drops only
+/// the first of them, so more than one save cycle can be needed.
+auto RejectValue(const char *key, const char *value, std::string_view why) -> void {
+    esyslog("vaapivideo/config: %s value '%s' %.*s -- keeping the current value", key, value,
+            static_cast<int>(why.size()), why.data());
 }
 
-/// Shared failure path: log, keep @p fallback, queue the line for a rewrite -- VDR re-saves
-/// rejected lines verbatim (see SetupRepair). One entry per key; the rewrite replaces one line.
-auto RejectValue(const char *key, const char *value, std::string_view why, int fallback,
-                 std::vector<SetupRepair> &repairs) -> void {
-    esyslog("vaapivideo/config: %s value '%s' %.*s -- keeping %d and rewriting setup.conf", key, value,
-            static_cast<int>(why.size()), why.data(), fallback);
-    if (auto *queued = FindRepair(key, repairs); queued != nullptr) {
-        queued->value = fallback;
-    } else {
-        repairs.push_back({.key = key, .value = fallback});
-    }
-}
-
-/// A clean line for @p key: retarget any repair queued by an earlier rejected duplicate, or the
-/// rewrite would undo the good line that won. Never queues -- a key that parsed needs no repair.
-auto AcceptValue(const char *key, int accepted, std::vector<SetupRepair> &repairs) -> void {
-    if (auto *queued = FindRepair(key, repairs); queued != nullptr) [[unlikely]] {
-        queued->value = accepted;
-    }
-}
-
-/// from_chars over the WHOLE string -- stopping at the first bad character would accept "50x" as
-/// 50. nullopt on garbage; shared by every numeric parser below.
+/// from_chars over the WHOLE string -- stopping at the first bad character would accept "50x" as 50.
 [[nodiscard]] auto ParseWholeInt(const char *value) -> std::optional<int> {
     int parsed{};
     const auto *end = value + std::strlen(value);
@@ -221,69 +201,56 @@ auto AcceptValue(const char *key, int accepted, std::vector<SetupRepair> &repair
     return parsed;
 }
 
-/// Parse an integer into @p target after range-checking [@p min, @p max]. Relaxed store: every
-/// consumer re-reads on its own cadence (audio latency per packet, zoom per filter rebuild).
-auto ParseBoundedIntValue(const char *key, const char *value, std::atomic<int> &target, int min, int max,
-                          std::vector<SetupRepair> &repairs) -> void {
-    const int fallback = target.load(std::memory_order_relaxed);
+/// Relaxed store: every consumer re-reads on its own cadence (audio latency per packet, zoom per
+/// filter rebuild).
+auto ParseBoundedIntValue(const char *key, const char *value, std::atomic<int> &target, int min, int max) -> void {
     const auto parsed = ParseWholeInt(value);
     if (!parsed) [[unlikely]] {
-        RejectValue(key, value, "is not a number", fallback, repairs);
+        RejectValue(key, value, "is not a number");
         return;
     }
     if (*parsed < min || *parsed > max) [[unlikely]] {
-        RejectValue(key, value, std::format("is outside [{},{}]", min, max), fallback, repairs);
+        RejectValue(key, value, std::format("is outside [{},{}]", min, max));
         return;
     }
     target.store(*parsed, std::memory_order_relaxed);
-    AcceptValue(key, *parsed, repairs);
 }
 
-/// Parse VDR's canonical 0/1 boolean encoding into @p target. Relaxed store, matching the other
-/// parsers.
-auto ParseBoolValue(const char *key, const char *value, std::atomic<bool> &target, std::vector<SetupRepair> &repairs)
-    -> void {
+/// Only VDR's canonical 0/1 encoding: anything else is a corrupt line, not an implicit false.
+auto ParseBoolValue(const char *key, const char *value, std::atomic<bool> &target) -> void {
     const std::string_view v{value};
     if (v != "0" && v != "1") [[unlikely]] {
-        RejectValue(key, value, "is not 0 or 1", target.load(std::memory_order_relaxed) ? 1 : 0, repairs);
+        RejectValue(key, value, "is not 0 or 1");
         return;
     }
-    const bool parsed = v == "1";
-    target.store(parsed, std::memory_order_relaxed);
-    AcceptValue(key, parsed ? 1 : 0, repairs);
+    target.store(v == "1", std::memory_order_relaxed);
 }
 
-/// Parse a non-negative integer (e.g. a bookmark position in ms) into @p target. Plain int, not
-/// atomic: the bookmark is only touched at startup (here) and via the serialized accessors in
-/// mediaplayer.cpp.
-auto ParseNonNegativeIntValue(const char *key, const char *value, int &target, std::vector<SetupRepair> &repairs)
-    -> void {
+/// Plain int, not atomic: the bookmark position is touched only here at startup and through the
+/// serialized accessors in mediaplayer.cpp.
+auto ParseNonNegativeIntValue(const char *key, const char *value, int &target) -> void {
     const auto parsed = ParseWholeInt(value);
     if (!parsed || *parsed < 0) [[unlikely]] {
-        RejectValue(key, value, "is not a non-negative number", target, repairs);
+        RejectValue(key, value, "is not a non-negative number");
         return;
     }
     target = *parsed;
-    AcceptValue(key, *parsed, repairs);
 }
 
-/// Parse a contiguous-from-zero enum index (written by cMenuEditStraItem) into @p target after
-/// bounds-checking against @p count. Relaxed store, matching the other parsers.
+/// Enum indices are contiguous from zero -- that is what cMenuEditStraItem writes -- so @p count
+/// alone bounds them.
 template <typename EnumT>
-auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &target, int count,
-                    std::vector<SetupRepair> &repairs) -> void {
-    const int fallback = static_cast<int>(target.load(std::memory_order_relaxed));
+auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &target, int count) -> void {
     const auto parsed = ParseWholeInt(value);
     if (!parsed) [[unlikely]] {
-        RejectValue(key, value, "is not a number", fallback, repairs);
+        RejectValue(key, value, "is not a number");
         return;
     }
     if (*parsed < 0 || *parsed >= count) [[unlikely]] {
-        RejectValue(key, value, std::format("is outside [0,{}]", count - 1), fallback, repairs);
+        RejectValue(key, value, std::format("is outside [0,{}]", count - 1));
         return;
     }
     target.store(static_cast<EnumT>(*parsed), std::memory_order_relaxed);
-    AcceptValue(key, *parsed, repairs);
 }
 
 } // namespace
@@ -293,101 +260,96 @@ auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &targ
         return false;
     }
 
-    // Every branch returns true: VDR asks "is this key yours?", not "was the value any good". A bad
-    // value keeps the default and queues a repair, because a rejected line lives forever (SetupRepair).
-    //
-    // Key strings must stay in sync with the SetupStore() calls in vaapivideo.cpp -- VDR
-    // round-trips these verbatim through setup.conf, so a typo silently drops the setting.
-    const std::string_view key{name};
-    if (key == "PcmLatency") {
-        ParseBoundedIntValue("PcmLatency", value, pcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS,
-                             setupRepairs);
+    // Matched with strcasecmp like the PLUGINS.html reference implementation, and because VDR's own
+    // lookup (cSetupLine::Compare) is: exact matching here would ignore a hand-edited
+    // "vaapivideo.maxrefreshrate" that Store() then happily updates. Key spellings must track the
+    // SetupStore() calls in vaapivideo.cpp -- a typo drops the setting silently.
+    if (strcasecmp(name, "PcmLatency") == 0) {
+        ParseBoundedIntValue("PcmLatency", value, pcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS);
         return true;
     }
-    if (key == "PassthroughLatency") {
+    if (strcasecmp(name, "PassthroughLatency") == 0) {
         ParseBoundedIntValue("PassthroughLatency", value, passthroughLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
-                             CONFIG_AUDIO_LATENCY_MAX_MS, setupRepairs);
+                             CONFIG_AUDIO_LATENCY_MAX_MS);
         return true;
     }
-    if (key == "PassthroughMode") {
-        ParseEnumValue("PassthroughMode", value, passthroughMode, CONFIG_PASSTHROUGH_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "PassthroughMode") == 0) {
+        ParseEnumValue("PassthroughMode", value, passthroughMode, CONFIG_PASSTHROUGH_MODE_COUNT);
         return true;
     }
-    if (key == "HdrMode") {
-        ParseEnumValue("HdrMode", value, hdrMode, CONFIG_HDR_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "HdrMode") == 0) {
+        ParseEnumValue("HdrMode", value, hdrMode, CONFIG_HDR_MODE_COUNT);
         return true;
     }
-    if (key == "PcmChannelMode") {
-        ParseEnumValue("PcmChannelMode", value, pcmChannelMode, CONFIG_PCM_CHANNEL_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "PcmChannelMode") == 0) {
+        ParseEnumValue("PcmChannelMode", value, pcmChannelMode, CONFIG_PCM_CHANNEL_MODE_COUNT);
         return true;
     }
-    if (key == "ClearOnChannelSwitch") {
-        ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch, setupRepairs);
+    if (strcasecmp(name, "ClearOnChannelSwitch") == 0) {
+        ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);
         return true;
     }
-    if (key == "BookmarkUri") {
+    if (strcasecmp(name, "BookmarkUri") == 0) {
         bookmark.uri = value; // free-form path/URL; validated at use (browser open / StartPlayback)
         return true;
     }
-    if (key == "BookmarkPositionMs") {
-        ParseNonNegativeIntValue("BookmarkPositionMs", value, bookmark.positionMs, setupRepairs);
+    if (strcasecmp(name, "BookmarkPositionMs") == 0) {
+        ParseNonNegativeIntValue("BookmarkPositionMs", value, bookmark.positionMs);
         return true;
     }
-    if (key == "DeinterlaceMode") {
-        ParseEnumValue("DeinterlaceMode", value, deinterlaceMode, CONFIG_DEINTERLACE_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "DeinterlaceMode") == 0) {
+        ParseEnumValue("DeinterlaceMode", value, deinterlaceMode, CONFIG_DEINTERLACE_MODE_COUNT);
         return true;
     }
-    if (key == "DenoiseMode") {
-        ParseEnumValue("DenoiseMode", value, denoiseMode, CONFIG_DENOISE_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "DenoiseMode") == 0) {
+        ParseEnumValue("DenoiseMode", value, denoiseMode, CONFIG_DENOISE_MODE_COUNT);
         return true;
     }
-    if (key == "SharpenMode") {
-        ParseEnumValue("SharpenMode", value, sharpenMode, CONFIG_SHARPEN_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "SharpenMode") == 0) {
+        ParseEnumValue("SharpenMode", value, sharpenMode, CONFIG_SHARPEN_MODE_COUNT);
         return true;
     }
-    if (key == "ScaleMode") {
-        ParseEnumValue("ScaleMode", value, scaleMode, CONFIG_SCALE_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "ScaleMode") == 0) {
+        ParseEnumValue("ScaleMode", value, scaleMode, CONFIG_SCALE_MODE_COUNT);
         return true;
     }
-    // Display mode switching. Both match policies and all three scope switches default to off,
-    // so a setup.conf written before this feature existed keeps the legacy fixed-mode behaviour.
-    if (key == "MatchRefreshRate") {
-        ParseBoolValue("MatchRefreshRate", value, matchRefreshRate, setupRepairs);
+    // Display mode switching: both match policies and all three scopes default to off, so a
+    // setup.conf predating the feature keeps the legacy fixed-mode behaviour.
+    if (strcasecmp(name, "MatchRefreshRate") == 0) {
+        ParseBoolValue("MatchRefreshRate", value, matchRefreshRate);
         return true;
     }
-    if (key == "MatchResolution") {
-        ParseBoolValue("MatchResolution", value, matchResolution, setupRepairs);
+    if (strcasecmp(name, "MatchResolution") == 0) {
+        ParseBoolValue("MatchResolution", value, matchResolution);
         return true;
     }
-    if (key == "MinResolution") {
-        ParseEnumValue("MinResolution", value, minResolution, CONFIG_MIN_RESOLUTION_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "MinResolution") == 0) {
+        ParseEnumValue("MinResolution", value, minResolution, CONFIG_MIN_RESOLUTION_MODE_COUNT);
         return true;
     }
-    if (key == "MaxRefreshRate") {
-        ParseEnumValue("MaxRefreshRate", value, maxRefreshRate, CONFIG_MAX_REFRESH_MODE_COUNT, setupRepairs);
+    if (strcasecmp(name, "MaxRefreshRate") == 0) {
+        ParseEnumValue("MaxRefreshRate", value, maxRefreshRate, CONFIG_MAX_REFRESH_MODE_COUNT);
         return true;
     }
-    if (key == "ModeSwitchLiveTv") {
-        ParseBoolValue("ModeSwitchLiveTv", value, modeSwitchLiveTv, setupRepairs);
+    if (strcasecmp(name, "ModeSwitchLiveTv") == 0) {
+        ParseBoolValue("ModeSwitchLiveTv", value, modeSwitchLiveTv);
         return true;
     }
-    if (key == "ModeSwitchMediaplayer") {
-        ParseBoolValue("ModeSwitchMediaplayer", value, modeSwitchMediaplayer, setupRepairs);
+    if (strcasecmp(name, "ModeSwitchMediaplayer") == 0) {
+        ParseBoolValue("ModeSwitchMediaplayer", value, modeSwitchMediaplayer);
         return true;
     }
-    if (key == "ModeSwitchReplay") {
-        ParseBoolValue("ModeSwitchReplay", value, modeSwitchReplay, setupRepairs);
+    if (strcasecmp(name, "ModeSwitchReplay") == 0) {
+        ParseBoolValue("ModeSwitchReplay", value, modeSwitchReplay);
         return true;
     }
-    // Per-preset zoom level (tenths-of-% zoom-in factor), keys Zoom1..Zoom<N> as written by the
-    // SetupStore() loop in vaapivideo.cpp. The active cycle stop (zoomActive) is intentionally NOT
-    // parsed/stored: zoom is transient and must reset to Off on every restart.
+    // Keys Zoom1..Zoom<N>, written by the SetupStore() loop in vaapivideo.cpp. zoomActive is
+    // deliberately not persisted: zoom is transient and must reset to Off on every restart.
     static_assert(CONFIG_ZOOM_PRESET_COUNT <= 9, "key decode below reads a single preset digit");
-    if (key.size() == 5 && key.starts_with("Zoom")) {
-        const int preset = key.back() - '1';
+    if (strncasecmp(name, "Zoom", 4) == 0 && name[4] != '\0' && name[5] == '\0') {
+        const int preset = name[4] - '1';
         if (preset >= 0 && preset < CONFIG_ZOOM_PRESET_COUNT) {
-            ParseBoundedIntValue(name, value, zoomLevel[preset], CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX,
-                                 setupRepairs);
+            ParseBoundedIntValue(name, value, zoomLevel[preset], CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX);
             return true;
         }
     }

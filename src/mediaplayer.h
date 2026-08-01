@@ -67,11 +67,11 @@ class cSubtitleConverter;
 /// One playlist row. @c uri is the absolute path (or URL); @c title is the
 /// display label (defaults to the basename of @c uri).
 struct PlaylistEntry {
-    std::string uri;
-    std::string title;
+    std::string uri;   ///< Absolute path or URL to open
+    std::string title; ///< Display label; defaults to the basename of @c uri
 };
 
-/// Parse an m3u / m3u8 file. Honors @c #EXTINF:duration,title rows; falls back
+/// Parse an m3u / m3u8 file. Honors `#EXTINF:duration,title` rows; falls back
 /// to the basename when no title is given. Relative paths are resolved against
 /// the playlist's parent directory. Comment / empty lines are skipped.
 /// Returns an empty vector on read error.
@@ -165,18 +165,25 @@ class cVaapiMediaSource final : public IMediaSource {
     [[nodiscard]] auto IoInterrupted() const noexcept
         -> bool; ///< True if a blocking libavformat I/O should bail (shutdown via stopFlag, or a
                  ///< pending seek/next via interruptFlag). Polled by the interrupt_callback.
+    /// True once a stream is routed; audio-less video (and vice versa) is legal, so both are checked.
     [[nodiscard]] auto HasAudio() const noexcept -> bool { return audioStreamIndex >= 0; }
-    [[nodiscard]] auto HasVideo() const noexcept -> bool { return videoStreamIndex >= 0; }
+    [[nodiscard]] auto HasVideo() const noexcept -> bool { return videoStreamIndex >= 0; } ///< @see HasAudio()
+    /// All audio streams found at Open(); the index doubles as the cDisplayTracks menu index.
     [[nodiscard]] auto AudioTracks() const noexcept -> const std::vector<AudioTrackDesc> & { return audioTracks; }
+    /// Number of AudioTracks(); 0 for video-only input.
     [[nodiscard]] auto AudioTrackCount() const noexcept -> int { return static_cast<int>(audioTracks.size()); }
+    /// Index into AudioTracks() of the stream being decoded; -1 before the first ApplyCurrentAudioTrack().
     [[nodiscard]] auto CurrentAudioTrack() const noexcept -> int { return currentAudioTrack; }
     /// Repoint the active audio stream (demux state only -- never the device/codec/seek). False on a
     /// bad index. Caller serializes via sourceMutex once the source is published.
     [[nodiscard]] auto SelectAudioTrack(int trackIdx) -> bool;
+    /// Selectable subtitle streams (text + DVB bitmap only); the index doubles as the chooser menu index.
     [[nodiscard]] auto SubtitleTracks() const noexcept -> const std::vector<SubtitleTrackDesc> & {
         return subtitleTracks;
     }
+    /// Number of SubtitleTracks(); 0 when the input carries none we can render.
     [[nodiscard]] auto SubtitleTrackCount() const noexcept -> int { return static_cast<int>(subtitleTracks.size()); }
+    /// Index into SubtitleTracks() of the routed stream; -1 = subtitles off (the default).
     [[nodiscard]] auto CurrentSubtitleTrack() const noexcept -> int { return currentSubtitleTrack; }
     /// Repoint (or disable, idx < 0) the active subtitle stream -- demux routing only; the converter
     /// owns decode/render. False on an out-of-range index. Caller serializes via sourceMutex.
@@ -184,11 +191,14 @@ class cVaapiMediaSource final : public IMediaSource {
     [[nodiscard]] auto VideoFps() const noexcept -> double {
         return videoFps;
     } ///< Container-reported avg_frame_rate; 0.0 if unknown.
+    /// Coded (width, height) of the video stream in px; {0, 0} for audio-only input.
     [[nodiscard]] auto VideoCodedSize() const noexcept -> std::pair<int, int> {
         return {videoInfo.codedWidth, videoInfo.codedHeight};
     }
 
   private:
+    /// One pass over formatCtx->streams after Open(): fills the track tables, picks the initial
+    /// streams, snapshots what the cached getters serve.
     auto PopulateStreamInfo() -> void;
     /// Fill @p info (codec / rate / forced-stereo / extradata) for one audio AVStream into @p storage.
     static auto PopulateAudioInfo(const AVStream *stream, AudioStreamInfo &info, std::vector<uint8_t> &storage) -> void;
@@ -204,31 +214,31 @@ class cVaapiMediaSource final : public IMediaSource {
     /// timeline, so before audio/video has seeded the origin they rebase to NOPTS and drop.
     [[nodiscard]] auto Rebase90k(int64_t ts, AVRational tb, bool seedOrigin = true) noexcept -> int64_t;
 
-    std::unique_ptr<AVFormatContext, FreeAVFormatContext> formatCtx;
+    std::unique_ptr<AVFormatContext, FreeAVFormatContext> formatCtx; ///< Open input; null until Open() succeeds
     std::atomic<bool> *stopFlag{nullptr};      ///< Non-owning; shutdown signal polled by the interrupt_callback.
     std::atomic<bool> *interruptFlag{nullptr}; ///< Non-owning; seek/next signal polled by the interrupt_callback.
-    int videoStreamIndex{-1};
-    int audioStreamIndex{-1};
-    AVRational videoTimeBase{.num = 1, .den = 90000};
-    AVRational audioTimeBase{.num = 1, .den = 90000};
-    int64_t ptsOrigin90k{AV_NOPTS_VALUE};          ///< First-packet PTS in 90 kHz (or formatCtx->start_time
-                                                   ///< when known); subtracted from every emitted PTS so the
-                                                   ///< replay bar and Seek() math share a zero-based timeline.
-    int64_t discardAudioBefore90k{AV_NOPTS_VALUE}; ///< Post-seek guard: armed to the seek target, drops
-                                                   ///< audio packets earlier than that so the master
-                                                   ///< clock anchors at the requested timeline (and not
-                                                   ///< at the earlier video keyframe libavformat lands on).
-    VideoStreamInfo videoInfo;
-    AudioStreamInfo audioInfo; ///< Mirror of audioTracks[currentAudioTrack].info (the decoding stream)
-    std::vector<uint8_t> videoExtradataStorage;
-    std::vector<AudioTrackDesc> audioTracks;       ///< All audio streams; index == cDisplayTracks menu index
-    int currentAudioTrack{-1};                     ///< Index into audioTracks of the decoding stream (-1 = none)
+    int videoStreamIndex{-1};                  ///< formatCtx->streams index of the video stream; -1 = none
+    int audioStreamIndex{-1};                  ///< formatCtx->streams index of the decoding audio stream
+    AVRational videoTimeBase{.num = 1, .den = 90000}; ///< Video stream time base (drives Rebase90k)
+    AVRational audioTimeBase{.num = 1, .den = 90000}; ///< Audio stream time base (drives Rebase90k)
+    int64_t ptsOrigin90k{AV_NOPTS_VALUE};             ///< First-packet PTS in 90 kHz (or formatCtx->start_time
+                                                      ///< when known); subtracted from every emitted PTS so the
+                                                      ///< replay bar and Seek() math share a zero-based timeline.
+    int64_t discardAudioBefore90k{AV_NOPTS_VALUE};    ///< Post-seek guard: armed to the seek target, drops
+                                                      ///< audio packets earlier than that so the master
+                                                      ///< clock anchors at the requested timeline (and not
+                                                      ///< at the earlier video keyframe libavformat lands on).
+    VideoStreamInfo videoInfo;                  ///< Video decoder descriptor; .extradata aliases videoExtradataStorage
+    AudioStreamInfo audioInfo;                  ///< Mirror of audioTracks[currentAudioTrack].info (the decoding stream)
+    std::vector<uint8_t> videoExtradataStorage; ///< Owns the bytes videoInfo.extradata points at
+    std::vector<AudioTrackDesc> audioTracks;    ///< All audio streams; index == cDisplayTracks menu index
+    int currentAudioTrack{-1};                  ///< Index into audioTracks of the decoding stream (-1 = none)
     std::vector<SubtitleTrackDesc> subtitleTracks; ///< All selectable subtitle streams; index == chooser menu index
     int currentSubtitleTrack{-1};                  ///< Index into subtitleTracks of the routed stream (-1 = off)
     int subtitleStreamIndex{-1};                   ///< Mirror of subtitleTracks[currentSubtitleTrack].avStreamIndex
     AVRational subtitleTimeBase{.num = 1, .den = 90000}; ///< Mirror of the routed subtitle stream's time base
-    double videoFps{0.0}; ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
-    bool eofReached{false};
+    double videoFps{0.0};   ///< Snapshot of avg_frame_rate at Open(); 0.0 if not advertised.
+    bool eofReached{false}; ///< Latched when av_read_frame() returns AVERROR_EOF; cleared by Seek()/Flush()
 };
 
 // ============================================================================
@@ -258,10 +268,13 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === PUBLIC API (called from cVaapiControl on the VDR main thread) ===
     // ========================================================================
+    /// Parks the demux thread and freezes the device, so the audio master clock stops rather than drifting on.
     auto SetPaused(bool paused) -> void;
+    /// Mirrors the last SetPaused(); safe from any thread.
     [[nodiscard]] auto IsPaused() const noexcept -> bool { return paused.load(std::memory_order_acquire); }
     auto Seek(int64_t deltaMs) -> void; ///< Relative seek; deltaMs may be negative
     auto Next() -> void;                ///< Skip to next playlist entry, if any
+    /// Display title of the entry playing now (playlist label, else the basename).
     [[nodiscard]] auto Title() const -> std::string;
     /// Snapshot the resume bookmark. A position is captured only for a single seekable local file
     /// still playing; playlists, streams, EOF and failed opens yield position 0 (URI only). Lock-free
@@ -277,8 +290,13 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === cPlayer overrides (public) ===
     // ========================================================================
+    /// cPlayer hook for the replay bar: always forward at normal speed (no trick modes here).
     [[nodiscard]] auto GetReplayMode(bool &Play, bool &Forward, int &Speed) -> bool override;
+    /// Position and length in MILLISECONDS, not cPlayer's frame unit -- cVaapiControl, the only
+    /// caller, formats them directly. Served from cached atomics so it never blocks behind the
+    /// demux thread. @p SnapToIFrame is ignored.
     [[nodiscard]] auto GetIndex(int &Current, int &Total, bool SnapToIFrame = false) -> bool override;
+    /// Cached container fps, else cPlayer's default (25) -- skins divide by it for the frame counter.
     [[nodiscard]] auto FramesPerSecond() -> double override;
     [[nodiscard]] auto InfoText() const -> std::string; ///< Multi-line file metadata for cControl::GetInfo().
     /// cPlayer hook for the Audio-button track menu (VDR main thread). Maps Type to a descriptor index
@@ -297,10 +315,14 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === cThread overrides ===
     // ========================================================================
+    /// Demux loop: read -> rebase PTS -> push to the device, with pause/seek/next serviced between packets.
     auto Action() -> void override;
 
   private:
+    /// Construct the source for playlist[currentIndex], register its tracks, cache the metadata.
+    /// False when it cannot be opened -- the caller then advances or finishes.
     [[nodiscard]] auto OpenCurrentEntry() -> bool;
+    /// Tear the current entry down and clear the cached metadata. Idempotent.
     auto CloseCurrentEntry() noexcept -> void;
     /// Seek the just-opened first entry to the one-shot resume position before the demux thread starts.
     /// Consumes startPositionMs (playlist advancement unaffected); skipped for live / at-or-past-end.
@@ -313,6 +335,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// most recently submitted packet is. Returns AV_NOPTS_VALUE when either side is unanchored
     /// (startup, post-seek, no device) -- callers must skip the comparison in that case.
     [[nodiscard]] auto Lookahead90k(const cVaapiDevice *vaapiDev) const noexcept -> int64_t;
+    /// Demux-thread half of Seek(): resolves the delta against the current position, then SeekToMs().
     auto PerformSeek(int64_t deltaMs) -> void;
     /// Absolute seek + re-anchor; assumes sourceMutex held. Shared by PerformSeek and the track
     /// switch's re-anchor (which Seek() would skip as a delta==0 no-op).
@@ -334,19 +357,20 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// stop / pause / seek / next during the wait, or if the pipeline stalls. Demux thread only;
     /// called before AdvancePlaylist() tears the entry down. See MEDIAPLAYER_EOF_DRAIN_* .
     auto DrainTailAtEof() -> void;
+    /// Move to the next playlist entry, or finish when the list is exhausted.
     auto AdvancePlaylist() -> void;
 
     const std::string originUri; ///< What the user selected (file / .m3u path / URL); the bookmark identity
     int startPositionMs{0};      ///< First-entry resume position; consumed once in Activate(true) before Start()
-    std::vector<PlaylistEntry> playlist;
-    std::atomic<size_t> currentIndex{0};
+    std::vector<PlaylistEntry> playlist; ///< One entry for a single file/URL; expanded rows for an .m3u
+    std::atomic<size_t> currentIndex{0}; ///< Index into playlist of the entry playing now
 
-    std::unique_ptr<cVaapiMediaSource> source;
+    std::unique_ptr<cVaapiMediaSource> source;     ///< Current entry's demuxer; swapped under sourceMutex
     std::unique_ptr<cSubtitleConverter> subtitles; ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
-    std::atomic<State> state{State::Running};
-    std::atomic<bool> paused{false};
-    std::atomic<bool> seekPending{false};
-    std::atomic<int64_t> seekDeltaMs{0};
+    std::atomic<State> state{State::Running};      ///< Lifecycle state; Eof/Stopped are what IsFinished() reports
+    std::atomic<bool> paused{false};               ///< Mirrors SetPaused(); the demux loop parks while set
+    std::atomic<bool> seekPending{false};          ///< Set by Seek(), consumed by Action() before the next read
+    std::atomic<int64_t> seekDeltaMs{0};           ///< Relative seek staged with seekPending (ms, may be negative)
     /// Per-track-type switch coordination. A Set*Track() call (VDR thread) stages a request here;
     /// the demux Action() services it before the pause branch so a frozen player still switches.
     struct TrackSwitchState {
@@ -355,20 +379,18 @@ class cVaapiPlayer final : public cPlayer, public cThread {
         std::atomic<int> menuIndex{-1};   ///< Index last selected; lets Set*Track() no-op redundant re-selections.
         std::atomic<int> trackCount{0};   ///< Registered track count; range check in Set*Track().
     };
-    TrackSwitchState audioSwitch;    ///< Audio-track switch request (menuIndex = index currently decoding).
-    TrackSwitchState subtitleSwitch; ///< Subtitle-track switch request (menuIndex = last requested, -1 = off).
-    std::atomic<bool> nextRequested{false};
-    std::atomic<bool> stopping{false};
-    std::atomic<bool> ioInterrupt{false}; ///< Set by Seek()/Next() (and shutdown) to break a blocking
-                                          ///< av_read_frame()/av_seek_frame() on a slow network URL so the
-                                          ///< command is serviced promptly instead of after the I/O timeout.
-                                          ///< Polled via cVaapiMediaSource::IoInterrupted(); cleared in ReadPacket.
-    std::atomic<int64_t> latestAudioPts90k{
-        AV_NOPTS_VALUE};                      ///< Max AUDIO packet PTS submitted (90 kHz); drives the
-                                              ///< lookahead-vs-audio-clock throttle in Action(). Audio
-                                              ///< only: keying off the max of both streams lets a TS's
-                                              ///< video-leads-audio mux PTS offset inflate the lookahead
-                                              ///< and starve the audio queue. AV_NOPTS_VALUE for video-only.
+    TrackSwitchState audioSwitch;           ///< Audio-track switch request (menuIndex = index currently decoding).
+    TrackSwitchState subtitleSwitch;        ///< Subtitle-track switch request (menuIndex = last requested, -1 = off).
+    std::atomic<bool> nextRequested{false}; ///< Set by Next(), consumed by Action() to advance the playlist
+    std::atomic<bool> stopping{false};      ///< Shutdown signal; also breaks blocking libavformat I/O
+    std::atomic<bool> ioInterrupt{false};   ///< Set by Seek()/Next() (and shutdown) to break a blocking
+                                            ///< av_read_frame()/av_seek_frame() on a slow network URL so the
+                                            ///< command is serviced promptly instead of after the I/O timeout.
+                                            ///< Polled via cVaapiMediaSource::IoInterrupted(); cleared in ReadPacket.
+    /// Max AUDIO packet PTS submitted (90 kHz); drives the lookahead-vs-audio-clock throttle in Action(). Audio only:
+    /// keying off the max of both streams lets a TS's video-leads-audio mux PTS offset inflate the lookahead and starve
+    /// the audio queue. AV_NOPTS_VALUE for video-only.
+    std::atomic<int64_t> latestAudioPts90k{AV_NOPTS_VALUE};
     std::atomic<int> pendingSeekTargetMs{-1}; ///< Most recent seek target (ms). Used by CurrentPositionMs() as a
                                               ///< fallback while GetSTC() is still NOPTS in the ~50 ms window between
                                               ///< Clear() and the first decoded frame at the new position. Without
@@ -383,7 +405,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
 
     mutable cMutex sourceMutex; ///< Guards source-pointer swaps across Action() and command methods
     cCondVar pauseCondition;    ///< Wakes Action() out of pause loop
-    mutable cMutex pauseMutex;
+    mutable cMutex pauseMutex;  ///< Pairs with pauseCondition; never held across a demux read
 };
 
 // ============================================================================
@@ -398,6 +420,8 @@ class cVaapiPlayer final : public cPlayer, public cThread {
 /// osEnd or after Stop() (kBlue / kBack / kStop).
 class cVaapiControl final : public cControl {
   public:
+    /// Constructs the player it owns; @p startPositionMs is the one-shot resume offset. Go through
+    /// cControl::Launch(), not this directly.
     cVaapiControl(std::string originUri, std::vector<PlaylistEntry> entries, int startPositionMs)
         : cVaapiControl(new cVaapiPlayer(std::move(originUri), std::move(entries), startPositionMs)) {}
     ~cVaapiControl() noexcept override;
@@ -406,8 +430,11 @@ class cVaapiControl final : public cControl {
     auto operator=(const cVaapiControl &) -> cVaapiControl & = delete;
     auto operator=(cVaapiControl &&) noexcept -> cVaapiControl & = delete;
 
+    /// cControl hook: drop the replay bar so a menu can take the shared OSD plane.
     auto Hide() -> void override;
+    /// cControl hook: play/pause, seek, next, info and stop; returns osEnd once playback is finished.
     [[nodiscard]] auto ProcessKey(eKeys Key) -> eOSState override;
+    /// cControl hook: the title VDR shows while this control is active.
     [[nodiscard]] auto GetHeader() -> cString override;
     [[nodiscard]] auto GetInfo() -> cOsdObject * override; ///< File metadata dialog shown via kInfo.
 
@@ -416,18 +443,18 @@ class cVaapiControl final : public cControl {
     /// (upcast) and to @c player as cVaapiPlayer*. Avoids a static_cast downcast off
     /// cControl::player just to re-acquire the type we already had.
     explicit cVaapiControl(cVaapiPlayer *typedPlayer);
-    auto ShowReplayBar() -> void;
-    auto HideReplayBar() -> void;
-    auto RefreshReplayBar() -> void;
+    auto ShowReplayBar() -> void;    ///< Create the skin replay display and arm its auto-hide timeout
+    auto HideReplayBar() -> void;    ///< Destroy the replay display; idempotent
+    auto RefreshReplayBar() -> void; ///< Repaint position/duration; rate-limited via lastBarRefresh
     /// Handle a seek key: log, dispatch the relative seek, and pop up the replay bar so the
     /// user gets immediate visual feedback. @p label is the key name for the log line.
     [[nodiscard]] auto HandleSeekKey(const char *label, int deltaMs) -> eOSState;
 
     std::unique_ptr<cVaapiPlayer> player; ///< Sole owner. cControl::player is VDR's borrowed alias of the same pointer.
-    cSkinDisplayReplay *displayReplay{nullptr};
-    cTimeMs barTimeout;
-    cTimeMs lastBarRefresh;
-    bool barVisible{false};
+    cSkinDisplayReplay *displayReplay{nullptr}; ///< Skin replay display; owned while barVisible
+    cTimeMs barTimeout;                         ///< Auto-hide deadline for the replay bar
+    cTimeMs lastBarRefresh;                     ///< Rate limit for RefreshReplayBar()
+    bool barVisible{false};                     ///< Whether the replay bar is currently on screen
 };
 
 // ============================================================================
@@ -447,24 +474,30 @@ class cVaapiFileBrowser final : public cOsdMenu {
     auto operator=(const cVaapiFileBrowser &) -> cVaapiFileBrowser & = delete;
     auto operator=(cVaapiFileBrowser &&) noexcept -> cVaapiFileBrowser & = delete;
 
+    /// cOsdMenu hook: kOk enters a directory or starts playback, kBack pops to the parent.
     [[nodiscard]] auto ProcessKey(eKeys Key) -> eOSState override;
 
   private:
+    /// What a row stands for; also the sort key (parent, then directories, then files/playlists).
     enum class EntryKind : uint8_t { Parent, Directory, File, Playlist };
+    /// One row of the listing.
     struct BrowserEntry {
-        EntryKind kind;
+        EntryKind kind;         ///< Row type; decides the icon prefix and what kOk does
         std::string name;       ///< Display name (basename only)
         std::uintmax_t size{0}; ///< File size in bytes; 0 / unused for Parent and Directory
     };
 
+    /// Read @p dir, rebuild @c entries (directories first, then media files) and repaint the menu.
     auto LoadDirectory(const std::string &dir) -> void;
     /// Move the cursor to the entry whose basename matches @p name and redraw; false if none match.
     [[nodiscard]] auto SelectEntryByName(std::string_view name) -> bool;
+    /// Entry under the cursor, or nullptr for an empty listing.
     [[nodiscard]] auto SelectedEntry() const -> const BrowserEntry *;
+    /// Absolute path of @p entry, i.e. currentDir joined with its name.
     [[nodiscard]] auto BuildFullPath(const BrowserEntry &entry) const -> std::string;
 
-    std::string currentDir;
-    std::vector<BrowserEntry> entries;
+    std::string currentDir;            ///< Directory being listed; the base for BuildFullPath()
+    std::vector<BrowserEntry> entries; ///< Rows in display order; index matches the cOsdMenu item index
 };
 
 #endif // VDR_VAAPIVIDEO_MEDIAPLAYER_H

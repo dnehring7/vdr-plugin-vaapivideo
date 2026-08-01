@@ -273,9 +273,12 @@ auto cVaapiDisplay::DrmFramebuffer::operator=(DrmFramebuffer &&other) noexcept -
 // ============================================================================
 
 cVaapiDisplay::cVaapiDisplay()
-    // Only page_flip_handler (v1) is wired; other slots are null so libdrm doesn't dispatch
-    // to stale pointers on unexpected event types (vblank, sequence, page_flip2).
-    : eventContext{.version = DRM_EVENT_CONTEXT_VERSION,
+    // Without a description cThread logs no start/end line, skips prctl(PR_SET_NAME), and its
+    // "thread won't end" error names nothing.
+    : cThread("vaapivideo/display"),
+      // Only page_flip_handler (v1) is wired; other slots are null so libdrm doesn't dispatch
+      // to stale pointers on unexpected event types (vblank, sequence, page_flip2).
+      eventContext{.version = DRM_EVENT_CONTEXT_VERSION,
                    .vblank_handler = nullptr,
                    .page_flip_handler = OnPageFlipEvent,
                    .page_flip_handler2 = nullptr,
@@ -766,10 +769,6 @@ auto cVaapiDisplay::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDisplay::Action() -> void {
-    // No thread id: VDR already prefixes every line with the tid, and the sibling threads
-    // (present, decoder, audio) log this same bare phrase.
-    dsyslog("vaapivideo/display: thread started");
-
     // Queue-underrun tracker: wall-clock duration of consecutive empty VSyncs during active
     // playback; warmup grace suppresses spurious counts after Clear/cold-start while the
     // filter graph + audio anchor. Durations are wall-clock deltas, never vsyncCount * nominal
@@ -1606,9 +1605,11 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
             isyslog("vaapivideo/display: OSD plane %u type=%s zpos=%s", osdPlaneId, GetPlaneTypeName(props.type),
                     props.zpos ? "yes" : "no");
         }
+        // The *Found flags say the enum value was located, not what it is; the per-plane probe
+        // lines above print the values, and shorter names made the two lines look contradictory.
         dsyslog("vaapivideo/display: plane %u props: fbId=%u crtcId=%u srcX/Y/W/H=%u/%u/%u/%u "
-                "crtcX/Y/W/H=%u/%u/%u/%u zpos=%u blend=%u colorEncoding=%u(bt709=%d,bt2020=%d) "
-                "colorRange=%u(limited=%d) supportsP010=%d",
+                "crtcX/Y/W/H=%u/%u/%u/%u zpos=%u blend=%u colorEncoding=%u(bt709Found=%d,bt2020Found=%d) "
+                "colorRange=%u(limitedFound=%d) supportsP010=%d",
                 planeId, props.fbId, props.crtcId, props.srcX, props.srcY, props.srcW, props.srcH, props.crtcX,
                 props.crtcY, props.crtcW, props.crtcH, props.zpos, props.pixelBlendMode, props.colorEncoding,
                 props.colorEncodingValid ? 1 : 0, props.colorEncodingBt2020Valid ? 1 : 0, props.colorRange,

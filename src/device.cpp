@@ -278,8 +278,6 @@ DrmDevices::~DrmDevices() noexcept {
 [[nodiscard]] auto DrmDevices::end() -> std::vector<drmDevicePtr>::iterator { return deviceList.end(); }
 
 [[nodiscard]] auto DrmDevices::Enumerate() -> bool {
-    dsyslog("vaapivideo/device: enumerating DRM devices");
-
     // drmFreeDevices walks libdrm's per-entry refs; must be called before reuse.
     if (!deviceList.empty()) {
         drmFreeDevices(deviceList.data(), static_cast<int>(deviceList.size()));
@@ -3370,6 +3368,16 @@ namespace {
                                     static_cast<double>(request.rateMilliHz) / 1000.0));
 }
 
+/// Timing identity, stricter than SameOutputMode(): a CEA and a DMT 1080p60 look alike but are
+/// different rasters. All programmed fields -- equal totals can still split into a different
+/// porch/sync -- but not type/name/vrefresh, which are metadata or derived.
+[[nodiscard]] auto SameRaster(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
+    return a.clock == b.clock && a.hdisplay == b.hdisplay && a.hsync_start == b.hsync_start &&
+           a.hsync_end == b.hsync_end && a.htotal == b.htotal && a.hskew == b.hskew && a.vdisplay == b.vdisplay &&
+           a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end && a.vtotal == b.vtotal && a.vscan == b.vscan &&
+           a.flags == b.flags;
+}
+
 } // namespace
 
 [[nodiscard]] auto BuildModeCandidates(std::span<const drmModeModeInfo> modes, const drmModeModeInfo &defaultMode)
@@ -3411,7 +3419,33 @@ namespace {
                               .width = mode.hdisplay});
     }
 
-    // Second pass: drop the CEA pixel-repetition rasters (1440x576, 2880x576 -- 720x576 with every
+    // Second pass: one candidate per distinct output. A connector routinely lists 1920x1080@60
+    // twice (CEA and DMT rasters for the same picture), and keeping both lets the matcher install
+    // the default mode's twin -- which SameOutputMode() calls "already there", so
+    // RestoreDefaultModeLocked() never puts the sink back on its own timing. Keep the default
+    // raster, else a PREFERRED one, else the first listed.
+    const auto rankOf = [modes, &defaultMode](const DisplayModeCandidate &candidate) noexcept -> int {
+        if (SameRaster(*std::next(modes.begin(), candidate.index), defaultMode)) {
+            return 2;
+        }
+        return candidate.preferred ? 1 : 0;
+    };
+    std::vector<DisplayModeCandidate> unique;
+    unique.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+        const auto twin = std::ranges::find_if(unique, [&candidate](const DisplayModeCandidate &kept) noexcept -> bool {
+            return kept.width == candidate.width && kept.height == candidate.height &&
+                   kept.refreshMilliHz == candidate.refreshMilliHz;
+        });
+        if (twin == unique.end()) {
+            unique.push_back(candidate);
+        } else if (rankOf(candidate) > rankOf(*twin)) {
+            *twin = candidate;
+        }
+    }
+    candidates = std::move(unique);
+
+    // Third pass: drop the CEA pixel-repetition rasters (1440x576, 2880x576 -- 720x576 with every
     // pixel sent two or four times). Same picture, 2x/4x the pixel clock, so picking one would make
     // the VPP upscale horizontally for no added detail.
     //

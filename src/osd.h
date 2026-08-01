@@ -55,6 +55,7 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     // === SPECIAL MEMBERS ===
     // ========================================================================
+    /// Registers itself with VDR as the OSD provider; @p display is borrowed and must outlive it.
     explicit cVaapiOsdProvider(cVaapiDisplay *display);
     ~cVaapiOsdProvider() noexcept override;
     cVaapiOsdProvider(const cVaapiOsdProvider &) = delete;
@@ -77,6 +78,8 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     // === VDR INTERFACE ===
     // ========================================================================
+    /// Returns a cVaapiOsd with its dumb buffer already allocated; on any failure a no-op
+    /// cVaapiDummyOsd, never nullptr (VDR would dereference it).
     [[nodiscard]] auto CreateOsd(int left, int top, uint level) -> cOsd * override;
     [[nodiscard]] auto ProvidesTrueColor() -> bool override { return true; } ///< Enables RenderPixmaps() fast path
 
@@ -86,6 +89,7 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
+    /// Borrowed display; the provider does not own it.
     [[nodiscard]] auto GetDisplay() const noexcept -> cVaapiDisplay *;
     auto HideOsd(uint32_t fbId) -> void;          ///< Clears OSD plane only if fbId is the currently scanned-out FB
     auto UpdateOsd(cVaapiOsd &osd) const -> void; ///< Push FB id + geometry to display for the next atomic commit
@@ -111,6 +115,8 @@ class cVaapiOsd : public cOsd {
     // ========================================================================
     // === SPECIAL MEMBERS ===
     // ========================================================================
+    /// Geometry and the borrowed fd only: the buffer follows in Allocate(), because a constructor
+    /// cannot report the allocation failing.
     cVaapiOsd(int posX, int posY, uint lvl, int fd, int fbWidth, int fbHeight, cVaapiOsdProvider *provider);
     ~cVaapiOsd() noexcept override;
     cVaapiOsd(const cVaapiOsd &) = delete;
@@ -121,6 +127,8 @@ class cVaapiOsd : public cOsd {
     // ========================================================================
     // === VDR INTERFACE ===
     // ========================================================================
+    /// Accepts any area config -- the TrueColor pipeline converts palette/depth upstream; only
+    /// cOsd's structural validation (count, overlap, dimensions) can reject.
     [[nodiscard]] auto CanHandleAreas(const tArea *areas, int numAreas) -> eOsdError override;
     auto Flush() -> void override; ///< Write dirty pixmaps/bitmaps into the dumb buffer, then signal display
 
@@ -131,11 +139,12 @@ class cVaapiOsd : public cOsd {
     // === INTERNAL METHODS ===
     // ========================================================================
     [[nodiscard]] auto Allocate() -> bool; ///< Must be called once after construction (CreateOsd does this)
+    /// GEM create -> mmap -> drmModeAddFB2; on any failure it unwinds what it made and returns false.
     [[nodiscard]] auto CreateDumbBuffer(uint32_t fbWidth, uint32_t fbHeight) -> bool;
     auto DestroyDumbBuffer() -> void; ///< Idempotent: munmap -> drmModeRmFB -> destroy GEM (reverse alloc order)
-    [[nodiscard]] auto GetFramebufferId() const noexcept -> uint32_t;
-    [[nodiscard]] auto Height() const noexcept -> int;
-    [[nodiscard]] auto Width() const noexcept -> int;
+    [[nodiscard]] auto GetFramebufferId() const noexcept -> uint32_t; ///< KMS FB id; 0 until Allocate() succeeds
+    [[nodiscard]] auto Height() const noexcept -> int;                ///< Dumb-buffer height (px)
+    [[nodiscard]] auto Width() const noexcept -> int;                 ///< Dumb-buffer width (px)
 
     // ========================================================================
     // === STATE ===

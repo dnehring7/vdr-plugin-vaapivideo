@@ -36,7 +36,8 @@ class AtomicRequest {
     ~AtomicRequest() noexcept;
     AtomicRequest(const AtomicRequest &) = delete;
     auto operator=(const AtomicRequest &) -> AtomicRequest & = delete;
-    AtomicRequest(AtomicRequest &&other) noexcept;
+    AtomicRequest(AtomicRequest &&other) noexcept; ///< Steals the request handle; @p other is left with none
+    /// Destroys our own request first, then steals @p other's.
     auto operator=(AtomicRequest &&other) noexcept -> AtomicRequest &;
 
     // ========================================================================
@@ -44,8 +45,9 @@ class AtomicRequest {
     // ========================================================================
     auto AddProperty(uint32_t objId, uint32_t propId, uint64_t value)
         -> void; ///< Append (objId, propId, value); silently skips propId==0 (optional property absent on this driver)
-    [[nodiscard]] auto Count() const noexcept -> int;
+    [[nodiscard]] auto Count() const noexcept -> int;   ///< Number of staged triples; 0 means the commit is a no-op
     [[nodiscard]] auto Failed() const noexcept -> bool; ///< True if any requested property could not be staged
+    /// Borrowed libdrm handle for drmModeAtomicCommit(); valid only while this object lives.
     [[nodiscard]] auto Handle() const noexcept -> drmModeAtomicReq *;
 
   private:
@@ -147,10 +149,12 @@ class cVaapiDisplay : public cThread {
         const uint64_t packed = outputPixelAspect.load(std::memory_order_acquire);
         return {.den = static_cast<uint32_t>(packed & 0xFFFFFFFFULL), .num = static_cast<uint32_t>(packed >> 32)};
     }
+    /// Borrowed DRM fd; the display owns it, so callers must not close it.
     [[nodiscard]] auto GetDrmFd() const noexcept -> int { return drmFd; }
     /// Snapshot the most recently displayed VAAPI surface as a host-side AVFrame (NV12 or P010).
     /// Returns nullptr if no frame has been displayed yet or the GPU download fails. Used by GrabImage.
     [[nodiscard]] auto GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame>;
+    /// Active scanout height (px); use GetOutputGeometry() when both dimensions must agree.
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t;
     /// Both dimensions from ONE load of the packed atomic. Calling GetOutputWidth() and
     /// GetOutputHeight() separately is two loads, which a mode change landing between them turns
@@ -164,6 +168,7 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputRefreshMilliHz() const noexcept -> uint32_t {
         return outputRefreshMilliHz.load(std::memory_order_acquire);
     }
+    /// Active scanout width (px); see GetOutputHeight().
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t;
     /// Snapshot of the mode currently programmed on the CRTC. Used by the device to skip a
     /// request that would be a no-op. Display-thread state, so this takes modeRequestMutex.
@@ -191,6 +196,7 @@ class cVaapiDisplay : public cThread {
     /// Set up planes, cache DRM property IDs, program the initial display mode, start the thread.
     [[nodiscard]] auto Initialize(int fileDescriptor, AVBufferRef *hwDevice, uint32_t crtcIdentifier,
                                   uint32_t connectorIdentifier, const drmModeModeInfo &displayMode) -> bool;
+    /// True once Initialize() has planes, properties and the display thread up.
     [[nodiscard]] auto IsInitialized() const noexcept -> bool;
     /// Hide the OSD plane only if fbId is the currently committed FB (avoids a spurious hide
     /// when another overlay has already replaced it).
@@ -261,10 +267,12 @@ class cVaapiDisplay : public cThread {
         ~DrmFramebuffer() noexcept;
         DrmFramebuffer(const DrmFramebuffer &) = delete;
         auto operator=(const DrmFramebuffer &) -> DrmFramebuffer & = delete;
-        DrmFramebuffer(DrmFramebuffer &&other) noexcept;
+        DrmFramebuffer(DrmFramebuffer &&other) noexcept; ///< Steals fb/GEM ownership; @p other is left invalid
+        /// Releases our own fb in destructor order first, then steals @p other's.
         auto operator=(DrmFramebuffer &&other) noexcept -> DrmFramebuffer &;
 
         // === API ===
+        /// True once the FB is registered with KMS, i.e. safe to reference from a commit.
         [[nodiscard]] auto IsValid() const noexcept -> bool { return fbId != 0; }
 
         // === DATA ===
@@ -427,16 +435,16 @@ class cVaapiDisplay : public cThread {
                                 ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
     mutable cMutex vaDriverMutex; ///< Serializes VA-driver calls: MapVaapiFrame (display) vs VPP pull (decoder).
                                   ///< iHD VEBOX is not re-entrant when shared with filter execution.
-    std::atomic<bool> isClearing{
-        false}; ///< Set during stream switch; gates new frame imports in Action() and SubmitFrame()
+    /// Set during stream switch; gates new frame imports in Action() and SubmitFrame()
+    std::atomic<bool> isClearing{false};
     std::atomic<bool> isFlipPending{false};      ///< True between commit and page-flip event; Action() waits on this
     std::atomic<uint64_t> flipPendingSinceMs{0}; ///< cTimeMs::Now() when isFlipPending was set; 0 = not pending.
                                                  ///< Action() force-clears the flag if no event arrives within a
                                                  ///< few vblanks (kernel can swallow events on first plane attach).
     std::atomic<bool> ready{false};              ///< True after Initialize() succeeds; cleared first in Shutdown()
     std::atomic<bool> stopping{false}; ///< Tells Action() to exit; set after isClearing to avoid import/exit race
-    std::atomic<bool> trickActive{
-        false}; ///< Decoder is in trick play (slow-paced commits expected); suppresses underrun log
+    /// Decoder is in trick play (slow-paced commits expected); suppresses underrun log
+    std::atomic<bool> trickActive{false};
     std::atomic<bool> syncSleeping{false}; ///< Decoder is inside a sync-correction sleep (hard-ahead / soft-ahead);
                                            ///< suppresses underrun log so an intentional sleep doesn't fire it.
     std::atomic<bool> devicePaused{false}; ///< Mirrors cVaapiDevice::Freeze()/Play(). Suppresses the underrun log
@@ -478,31 +486,30 @@ class cVaapiDisplay : public cThread {
         pendingFrames; ///< Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
     std::atomic<size_t> pendingDepth{0}; ///< Lock-free mirror of pendingFrames.size(); updated under bufferMutex
                                          ///< on every push/pop/clear, polled by the decoder via PendingDepth().
-    std::atomic<uint32_t> outputRefreshMilliHz{DISPLAY_DEFAULT_REFRESH_RATE *
-                                               1000}; ///< Active refresh rate in millihertz, derived from the mode
-                                                      ///< timings; falls back to 50000 when the mode reports no clock
-    uint32_t videoPlaneId{};                          ///< DRM plane object ID for the video primary plane
-    DrmPlaneProps videoProps{};                       ///< Cached atomic prop IDs for the video plane
-    cRect targetVideoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH),
-                          static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Requested rect (next VPP build target).
-    cRect videoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH),
-                    static_cast<int>(DISPLAY_DEFAULT_HEIGHT)}; ///< Active scanout rect; matches current fb 1:1.
-                                                               ///< Advances to targetVideoRect once a matching fb
-                                                               ///< arrives, so old frames keep painting during rebuild.
-    mutable cMutex videoRectMutex;                             ///< Guards targetVideoRect and videoRect.
+    /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
+    /// reports no clock.
+    std::atomic<uint32_t> outputRefreshMilliHz{DISPLAY_DEFAULT_REFRESH_RATE * 1000};
+    uint32_t videoPlaneId{};    ///< DRM plane object ID for the video primary plane
+    DrmPlaneProps videoProps{}; ///< Cached atomic prop IDs for the video plane
+    /// Requested rect (next VPP build target).
+    cRect targetVideoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH), static_cast<int>(DISPLAY_DEFAULT_HEIGHT)};
+    /// Active scanout rect; matches the current fb 1:1. Advances to targetVideoRect once a matching fb arrives,
+    /// so old frames keep painting during a rebuild.
+    cRect videoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH), static_cast<int>(DISPLAY_DEFAULT_HEIGHT)};
+    mutable cMutex videoRectMutex; ///< Guards targetVideoRect and videoRect.
 
     // Last-committed plane property caches. Sentinel ~0 forces a write on the first commit after
     // Initialize; cache advances only on commit success so failed commits retry next frame.
-    uint32_t lastCommittedOsdFbId{}; ///< OSD fbId in scanout after last successful commit; 0 = none.
-    uint64_t lastOsdPixelBlendMode{~uint64_t{0}};
-    uint64_t lastVideoColorEncoding{~uint64_t{0}};
-    uint64_t lastVideoColorRange{~uint64_t{0}};
-    uint64_t lastVideoSrcW{~uint64_t{0}};
-    uint64_t lastVideoSrcH{~uint64_t{0}};
-    uint64_t lastVideoCrtcX{~uint64_t{0}};
-    uint64_t lastVideoCrtcY{~uint64_t{0}};
-    uint64_t lastVideoCrtcW{~uint64_t{0}};
-    uint64_t lastVideoCrtcH{~uint64_t{0}};
+    uint32_t lastCommittedOsdFbId{};               ///< OSD fbId in scanout after last successful commit; 0 = none.
+    uint64_t lastOsdPixelBlendMode{~uint64_t{0}};  ///< OSD plane pixel blend mode last committed
+    uint64_t lastVideoColorEncoding{~uint64_t{0}}; ///< Video plane COLOR_ENCODING last committed
+    uint64_t lastVideoColorRange{~uint64_t{0}};    ///< Video plane COLOR_RANGE last committed
+    uint64_t lastVideoSrcW{~uint64_t{0}};          ///< Video plane SRC_W last committed (16.16 fixed point)
+    uint64_t lastVideoSrcH{~uint64_t{0}};          ///< Video plane SRC_H last committed (16.16 fixed point)
+    uint64_t lastVideoCrtcX{~uint64_t{0}};         ///< Video plane CRTC_X last committed (px)
+    uint64_t lastVideoCrtcY{~uint64_t{0}};         ///< Video plane CRTC_Y last committed (px)
+    uint64_t lastVideoCrtcW{~uint64_t{0}};         ///< Video plane CRTC_W last committed (px)
+    uint64_t lastVideoCrtcH{~uint64_t{0}};         ///< Video plane CRTC_H last committed (px)
 
     // ========================================================================
     // === HDR STATE ===

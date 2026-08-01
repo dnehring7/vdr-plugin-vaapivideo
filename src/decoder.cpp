@@ -1297,8 +1297,6 @@ auto cVaapiDecoder::Shutdown() -> void {
 // ============================================================================
 
 auto cVaapiDecoder::Action() -> void {
-    dsyslog("vaapivideo/decoder: decode thread started");
-
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
     int trickEmptyDecodes{0};        ///< Consecutive reverse-trick packets that yielded no frame; arms force-drain.
     cTimeMs jitterOverflowLogGate;   ///< Rate-limits the per-iter "handoff overflow" syslog spam.
@@ -1539,8 +1537,6 @@ auto cVaapiDecoder::Action() -> void {
 // ============================================================================
 
 auto cVaapiDecoder::PresentAction() -> void {
-    dsyslog("vaapivideo/decoder: presentation thread started");
-
     uint64_t noClockBlockedSinceMs{0}; ///< Walltime of the first no-clock hold; 0 = not holding.
     uint64_t lastDrainMs{0};
     uint64_t missGraceUntilMs{0};    ///< Drain-miss suppression deadline; armed by each consumed flush.

@@ -56,9 +56,8 @@ static_assert(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER < AUDIO_QUEUE_CAPACITY,
 // === STRUCTURES ===
 // ============================================================================
 
-// AudioStreamInfo (stream.h) is the single source of truth for stream identity
-// and format parameters, shared by the PES path and future mediaplayer path.
-// AudioStreamParams is a local alias kept for call-site readability in audio.cpp.
+/// Alias for AudioStreamInfo (stream.h), which is the single source of truth for stream identity and format
+/// parameters across the PES and mediaplayer paths. Kept only for call-site readability in audio.cpp.
 using AudioStreamParams = AudioStreamInfo;
 
 // ============================================================================
@@ -295,8 +294,8 @@ class cAudioProcessor : public cThread {
     bool sinkCapsCached{false}; ///< True when sinkCaps was probed for sinkCapsDevice
     std::string sinkCapsDevice; ///< Device name for which sinkCaps was last probed; invalidated on device change
     std::atomic<bool> sinkElded{false}; ///< Lock-free mirror of sinkCaps.elded for ChooseOutputChannels()
-    std::atomic<unsigned> sinkMaxPcmChannels{
-        2}; ///< Lock-free mirror of sinkCaps.pcmMaxChannels for ChooseOutputChannels()
+    /// Lock-free mirror of sinkCaps.pcmMaxChannels for ChooseOutputChannels()
+    std::atomic<unsigned> sinkMaxPcmChannels{2};
 
     // ========================================================================
     // === STREAM ===
@@ -321,8 +320,8 @@ class cAudioProcessor : public cThread {
                                                 ///< the producer (EnqueuePacket, on the mediaplayer demux cursor) never
                                                 ///< blocks behind the audio thread's mutex-held blocking ALSA write.
                                                 ///< Lock order: mutex -> queueMutex (never the reverse).
-    std::atomic<bool> stopping{
-        false};                   ///< Signals Action() to exit; also set on fatal ALSA error to mark processor unusable
+    /// Signals Action() to exit; also set on fatal ALSA error to mark processor unusable
+    std::atomic<bool> stopping{false};
     std::atomic<int> volume{255}; ///< Volume applied in WriteToAlsa(); 255 = unity, 0 = mute (zero-filled output on
                                   ///< both PCM and passthrough), intermediate values scale PCM samples only
 

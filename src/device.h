@@ -63,7 +63,9 @@ struct StreamModeRequest {
                             ///< 1080i25 arrives here as 50000, which is why 25i naturally lands on 50 Hz
     uint32_t width{};       ///< Coded frame width (px)
 
+    /// Field-wise equality; the stability gate uses it to recognise an unchanged request.
     [[nodiscard]] auto operator==(const StreamModeRequest &other) const noexcept -> bool = default;
+    /// False while any field is still unknown, i.e. before the filter chain has published a format.
     [[nodiscard]] auto IsValid() const noexcept -> bool { return width > 0 && height > 0 && rateMilliHz > 0; }
 };
 
@@ -237,7 +239,7 @@ class cVaapiDevice : public cDevice {
     auto Detach() -> bool;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume.
                            ///< Returns true iff VDR's VT was yielded so fbcon owns the text console; false
                            ///< means the hardware IS released but fbcon did not reclaim the display (user
-                           ///< needs to press Alt+F<n>, or add CAP_SYS_TTY_CONFIG to the systemd drop-in --
+                           ///< needs to press `Alt+F<n>`, or add CAP_SYS_TTY_CONFIG to the systemd drop-in --
                            ///< see README)
     [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
                                   std::string_view connectorNameFilter = {}, bool deferred = false)
@@ -462,14 +464,14 @@ class cVaapiDevice : public cDevice {
                                        ///< reached from the decode thread, the player thread and the main thread
     StreamModeRequest modeCandidate{}; ///< Format currently accumulating toward the stability gate
     uint64_t modeCandidateSinceMs{};   ///< When modeCandidate was first observed (0 = none pending)
-    std::atomic<uint64_t> modeCandidateDueMs{
-        0}; ///< Lock-free mirror of modeCandidateSinceMs + DISPLAY_MODE_STABLE_MS; 0 = nothing armed.
-            ///< PollPendingDisplayMode() runs on every decode-loop iteration, so the (overwhelmingly
-            ///< common) no-candidate case must not cost a mutex acquisition.
-    std::atomic<uint64_t> modeIdleRestoreDueMs{
-        0}; ///< Wall clock at which an idle output on a non-default mode is handed back to defaultMode;
-            ///< 0 = disarmed. Covers playback ending into a source that decodes nothing (radio,
-            ///< scrambled, no free tuner), where no format is ever published to drive the restore.
+    /// Lock-free mirror of modeCandidateSinceMs + DISPLAY_MODE_STABLE_MS; 0 = nothing armed. PollPendingDisplayMode()
+    /// runs on every decode-loop iteration, so the (overwhelmingly common) no-candidate case must not cost a mutex
+    /// acquisition.
+    std::atomic<uint64_t> modeCandidateDueMs{0};
+    /// Wall clock at which an idle output on a non-default mode is handed back to defaultMode; 0 = disarmed. Covers
+    /// playback ending into a source that decodes nothing (radio, scrambled, no free tuner), where no format is ever
+    /// published to drive the restore.
+    std::atomic<uint64_t> modeIdleRestoreDueMs{0};
     uint64_t lastModeChangeMs{};     ///< Wall clock of the last applied change; enforces the minimum interval
     StreamModeRequest lastRequest{}; ///< Most recently published format; replayed by ReevaluateDisplayMode()
     PlaybackSource lastRequestSource{PlaybackSource::LiveTv};     ///< Source that published lastRequest
@@ -487,35 +489,32 @@ class cVaapiDevice : public cDevice {
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
     std::atomic<bool> paused;                 ///< True while frozen via Freeze()
-    std::atomic<AVCodecID> previousAudioCodec{
-        AV_CODEC_ID_NONE}; ///< Last confirmed audio codec; survives Clear() so a
-                           ///< same-codec re-detect after a scrub seek logs nothing
+    /// Last confirmed audio codec; survives Clear() so a same-codec re-detect after a scrub seek logs nothing
+    std::atomic<AVCodecID> previousAudioCodec{AV_CODEC_ID_NONE};
     std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE}; ///< Previous channel's video codec (stale guard)
     bool inStillPicture{false};                                  ///< Re-entry guard for cDevice::StillPicture
     std::atomic<bool> radioBlackPending{false};                  ///< Awaiting radio-only channel detection
     cTimeMs radioBlackTimer;                                     ///< Radio-mode detection timeout
     std::atomic<bool> radioSplashActive{false};                  ///< A refreshable radio (no-video) splash is on screen
-    std::atomic<uint32_t> radioSplashEventId{
-        0}; ///< EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
+    /// EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
+    std::atomic<uint32_t> radioSplashEventId{0};
 
     cTimeMs radioSplashPoll; ///< Next EPG re-check; touched only on the PlayAudio thread
-    std::atomic<uint64_t> encryptedDeadlineMs{
-        0}; ///< Encrypted-notice watchdog, armed on pmAudioVideo/pmAudioOnly: grace deadline on the
-            ///< cTimeMs::Now() clock; 0 = disarmed. Deliberately ONE word: the decoder tick thread
-            ///< outlives play modes, so it disarms/claims via CAS against the deadline it observed --
-            ///< a concurrent re-arm stores a strictly-future value an expired observation never
-            ///< matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
-    std::atomic<int64_t> lastReplayAudioPts{
-        AV_NOPTS_VALUE}; ///< PTS of the last replay PES fed to the decoder, 90 kHz. At EOF cDvbPlayer re-pushes
-                         ///< the last PES; decoding the repeats keeps the DAC clock alive, so radio replay never
-                         ///< hits VDR's StuckAtEof. Dropping an exact PTS repeat lets the clock stall instead.
-                         ///< Reset via ResetReplayAudioEofBaseline() on every replay-audio timeline break.
-    std::atomic<int64_t> trickAudioPts{
-        AV_NOPTS_VALUE};         ///< PTS of the last step PlayTrickAudio() let through, 90 kHz; AV_NOPTS_VALUE = none.
-                                 ///< Serves as both the audio-only replay's trick STC (read only while trickSpeed != 0)
-                                 ///< and the pacing hold's previous-step reference. Reset by Clear() and TrickSpeed().
-    std::atomic<int> trickSpeed; ///< VDR trick speed; 0 = normal
-    VaapiContext vaapi{};        ///< Shared VAAPI context
+    /// Encrypted-notice watchdog, armed on pmAudioVideo/pmAudioOnly: grace deadline on the cTimeMs::Now() clock; 0 =
+    /// disarmed. Deliberately ONE word: the decoder tick thread outlives play modes, so it disarms/claims via CAS
+    /// against the deadline it observed -- a concurrent re-arm stores a strictly-future value an expired observation
+    /// never matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
+    std::atomic<uint64_t> encryptedDeadlineMs{0};
+    /// PTS of the last replay PES fed to the decoder, 90 kHz. At EOF cDvbPlayer re-pushes the last PES; decoding the
+    /// repeats keeps the DAC clock alive, so radio replay never hits VDR's StuckAtEof. Dropping an exact PTS repeat
+    /// lets the clock stall instead. Reset via ResetReplayAudioEofBaseline() on every replay-audio timeline break.
+    std::atomic<int64_t> lastReplayAudioPts{AV_NOPTS_VALUE};
+    /// PTS of the last step PlayTrickAudio() let through, 90 kHz; AV_NOPTS_VALUE = none. Serves as both the audio-only
+    /// replay's trick STC (read only while trickSpeed != 0) and the pacing hold's previous-step reference. Reset by
+    /// Clear() and TrickSpeed().
+    std::atomic<int64_t> trickAudioPts{AV_NOPTS_VALUE};
+    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};                                         ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
     std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
