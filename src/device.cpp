@@ -3043,6 +3043,9 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
 
     const auto pid = static_cast<uint16_t>(track ? track->id : 0);
 
+    // ttNone is exempt from the dedup so the ambiguous-dolby fallback above always resets. pid==0 is
+    // not: EnsureAudioTrack(Force=true) selects an id-less ttAudioFirst slot (vdr/device.c), so it is
+    // a real track state to dedup against, not a "no track yet" sentinel to bail on.
     if (type != ttNone && type == lastHandledAudioTrack && pid == lastHandledAudioPid) {
         return; // PMT churn / duplicate hook: VDR fires this repeatedly per channel switch.
     }

@@ -1084,22 +1084,19 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         display->SetTrickActive(true);
     }
 
-    // VDR skips DeviceClear() on trick entry. FF/REW/slow-reverse are non-contiguous streams,
-    // so stale partial NALs would corrupt the parser. Slow-forward stays contiguous; no flush.
-    const bool needsFlush = (speed > 0) && (fast || !forward);
-    dsyslog("vaapivideo/decoder: SetTrickSpeed speed=%d forward=%d fast=%d needsFlush=%d", speed, forward, fast,
-            needsFlush);
-
-    // Decide the new pacing + whether this transition is a generation boundary BEFORE taking the
-    // locks, so the publish below is a tight sequence under codecMutex->parserMutex. A generation
-    // boundary is entry/exit (0<->N) or an FF<->REW direction flip; an in-mode speed change is not.
-    const int previousSpeed = trickSpeed.load(std::memory_order_acquire);
+    // Derived purely from the arguments, so it needs no view of the old state.
     const bool newFastForward = forward && fast;
     const bool newReverse = !forward;
-    const bool oldFastForward = isTrickFastForward.load(std::memory_order_relaxed);
-    const bool oldReverse = isTrickReverse.load(std::memory_order_relaxed);
-    const bool generationBoundary = (previousSpeed == 0) != (speed == 0) ||
-                                    (speed != 0 && (oldFastForward != newFastForward || oldReverse != newReverse));
+
+    // Snapshotted under codecMutex->parserMutex below, NOT here: ResolvePendingTrickExit() publishes
+    // this same tuple under those locks and only stores trickSpeed last, so a lock-free read can pair
+    // a pre-exit speed with post-exit flags. Acquire does not help -- it orders the loads but makes no
+    // group of them atomic. A torn snapshot misjudges generationBoundary and picks the wrong
+    // flush/filter path, exactly on the REW->PLAY->REW handoff that arms the deferred exit.
+    int previousSpeed = 0;
+    bool generationBoundary = false;
+    bool needsFlush = false;
+    bool pacingChanged = false;
 
     // Compute this transition's pacing. Fast (FF/REW): PTS-derived hold via trickMultiplier (set below).
     // Slow forward and slow reverse use DIFFERENT hold models -- see each branch.
@@ -1130,11 +1127,35 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         }
         newHoldMs = DECODER_TRICK_HOLD_MS;
     }
+
     {
         // codecMutex + parserMutex: same atomicity guarantee as Clear() during the flush path
         // (codec flush + parser recreate must not race a concurrent EnqueueData parse).
         const cMutexLock decodeLock(&codecMutex);
         const cMutexLock parseLock(&parserMutex);
+
+        // A generation boundary is entry/exit (0<->N) or an FF<->REW direction flip; an in-mode speed
+        // change is not. pacingChanged additionally covers fast<->slow REW, which keeps both speed and
+        // direction and swaps only the hold model -- it gates the trace, since pmNone/StillPicture call
+        // SetTrickSpeed(0) unconditionally and an ungated line would claim a change per zap and per
+        // mark-jump.
+        previousSpeed = trickSpeed.load(std::memory_order_acquire);
+        const bool oldFastForward = isTrickFastForward.load(std::memory_order_relaxed);
+        const bool oldReverse = isTrickReverse.load(std::memory_order_relaxed);
+        const uint64_t oldMultiplier = trickMultiplier.load(std::memory_order_relaxed);
+        const uint64_t oldHoldMs = trickHoldMs.load(std::memory_order_relaxed);
+        generationBoundary = (previousSpeed == 0) != (speed == 0) ||
+                             (speed != 0 && (oldFastForward != newFastForward || oldReverse != newReverse));
+        pacingChanged =
+            speed != previousSpeed || generationBoundary || newMultiplier != oldMultiplier || newHoldMs != oldHoldMs;
+
+        // VDR skips DeviceClear() on trick entry, and the FF/REW/slow-reverse feeds are non-contiguous,
+        // so stale partial NALs from the PREVIOUS generation would corrupt the parser: flush on the
+        // boundary into those modes. An in-mode speed change keeps the feed structure (FF stays
+        // keyframe-only, REW keeps its backward GOP stepping) -- flushing there dropped the buffered
+        // trick frames and rebuilt an identical filter graph on every speed press, a visible stutter
+        // for zero benefit.
+        needsFlush = generationBoundary && (speed > 0) && (fast || !forward);
 
         if (needsFlush) {
             DrainQueue();
@@ -1201,6 +1222,13 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         }
 
         trickSpeed.store(speed, std::memory_order_release);
+    }
+
+    // Outside the locks: dsyslog does I/O and both mutexes gate the decode path.
+    if (pacingChanged) {
+        dsyslog("vaapivideo/decoder: SetTrickSpeed %d -> %d forward=%d fast=%d needsFlush=%d mult=%llu hold=%llums",
+                previousSpeed, speed, forward, fast, needsFlush, static_cast<unsigned long long>(newMultiplier),
+                static_cast<unsigned long long>(newHoldMs));
     }
 
     // speed==0 path: clear the display's trick flag once pacing state is fully published.
@@ -2326,7 +2354,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // expires WITHOUT waiting for a frame to reach SyncAndSubmitFrame -- in FF the keyframe gate can
     // starve the present thread of frames, so a frame-driven exit could hang indefinitely. Called
     // every present iteration (loop top, queue-independent) and again from SyncAndSubmitFrame as a
-    // frame arrives; the exchange below makes the two callers race to a single winner.
+    // frame arrives; the lock-held exchange below makes the two callers race to a single winner.
     if (!deferredTrickExitPending.load(std::memory_order_acquire)) {
         return false;
     }
@@ -2334,18 +2362,23 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     if (dueMs != 0 && cTimeMs::Now() < dueMs) {
         return false; // cancellation grace not yet expired -- a racing SetTrickSpeed() may supersede.
     }
-    if (!deferredTrickExitPending.exchange(false, std::memory_order_acq_rel)) {
-        return false; // the other caller resolved it first this iteration.
-    }
-    deferredTrickExitDueMs.store(0, std::memory_order_relaxed);
 
     {
         // codecMutex -> parserMutex: same atomicity as SetTrickSpeed(), so the codec flush, parser
         // recreate, clearEpoch bump, and trickSpeed publication never race a concurrent EnqueueData().
         const cMutexLock decodeLock(&codecMutex);
         const cMutexLock parseLock(&parserMutex);
+
+        // Claim under the locks, not before: SetTrickSpeed() publishes new trick state under this same
+        // pair, so a pre-lock claim could win the exchange, lose the lock race to an incoming
+        // SetTrickSpeed(N), and then tear that freshly published mode straight back down to normal
+        // play. Serialized, whichever side takes the locks first wins coherently.
+        if (!deferredTrickExitPending.exchange(false, std::memory_order_acq_rel)) {
+            return false; // superseded by SetTrickSpeed(), or the other caller resolved it first.
+        }
+        deferredTrickExitDueMs.store(0, std::memory_order_relaxed);
         if (trickSpeed.load(std::memory_order_acquire) == 0) {
-            return false; // a SetTrickSpeed(0) won the race and already normalized; nothing to do.
+            return false; // pending was armed while already normal (defensive); nothing to tear down.
         }
 
         // FF/REW are non-contiguous (keyframe-only / backward GOPs): flush codec+parser so stale partial

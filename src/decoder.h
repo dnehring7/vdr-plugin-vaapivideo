@@ -323,8 +323,8 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === FFMPEG STATE ===
     // ========================================================================
-    std::unique_ptr<AVCodecContext, FreeAVCodecContext>
-        codecCtx;                               ///< Active decoder context (HW or SW). Null before OpenCodec().
+    /// Active decoder context (HW or SW). Null before OpenCodec().
+    std::unique_ptr<AVCodecContext, FreeAVCodecContext> codecCtx;
     AVCodecID currentCodecId{AV_CODEC_ID_NONE}; ///< Codec ID currently open; used for reuse check and parser recreate.
     bool forceCodecReopen{};                    ///< Set by RequestCodecReopen(); cleared by OpenCodecWithInfo().
     bool streamInterlaced{false};               ///< Positive sequence-level hint; forces deinterlace at graph build.
@@ -337,13 +337,13 @@ class cVaapiDecoder : public cThread {
     AVMasteringDisplayMetadata hintMasteringDisplay{}; ///< HDR10 mastering display volume, valid per the flag above
     bool hintHasContentLight{false};                   ///< Whether hintContentLight carries a payload
     AVContentLightMetadata hintContentLight{};         ///< HDR10 MaxCLL/MaxFALL, valid per the flag above
-    std::unique_ptr<AVFrame, FreeAVFrame>
-        decodedFrame;              ///< Staging for avcodec_receive_frame(); unref'd each iteration.
+    /// Staging for avcodec_receive_frame(); unref'd each iteration.
+    std::unique_ptr<AVFrame, FreeAVFrame> decodedFrame;
     cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi -> optional denoise/sharpness).
-    std::unique_ptr<AVFrame, FreeAVFrame>
-        filteredFrame; ///< Staging for filterChain.ReceiveFrame(); unref'd each iteration.
-    std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext>
-        parserCtx; ///< Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.
+    /// Staging for filterChain.ReceiveFrame(); unref'd each iteration.
+    std::unique_ptr<AVFrame, FreeAVFrame> filteredFrame;
+    /// Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.
+    std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx;
     bool trickAwaitSecondField{false}; ///< FF keyframe filter: keep the PAFF I-frame's 2nd field (parserMutex).
 
     // ========================================================================
@@ -352,22 +352,22 @@ class cVaapiDecoder : public cThread {
     std::queue<AVPacket *> packetQueue; ///< FIFO of parsed packets awaiting HW decode. Owned by packetMutex.
     cTimeMs lastTrickDropWarn;          ///< Rate-limits the trick-enqueue drop log. Held under packetMutex.
     size_t trickDropsSinceWarn{0};      ///< Drops accumulated since the last emitted trick-drop log line.
-    std::atomic<bool> stopping; ///< Shutdown signal. Set by Shutdown(); read by encode thread and enqueue paths.
+    std::atomic<bool> stopping{false}; ///< Shutdown signal. Set by Shutdown(); read by encode thread and enqueue paths.
 
     // ========================================================================
     // === PLAYBACK STATE ===
     // ========================================================================
-    std::atomic<bool> codecDrainPending;   ///< Decode thread drains codec (NULL packet) then clears this.
-    std::atomic<bool> stillPictureMode;    ///< Selects spatial-only (bob) deinterlace; cleared after drain.
-    std::atomic<bool> hasExited{true};     ///< False only while Action() (decode) is running; checked by Shutdown().
-    std::atomic<bool> presentExited{true}; ///< False only while PresentAction() is running; checked by Shutdown().
-    std::atomic<bool> hasLoggedFirstFrame; ///< One-time first-frame info log guard; reset only in OpenCodecWithInfo().
-    std::atomic<bool> starvationWarned;    ///< One-time "no frame 3 s after open" warning; reset per codec open.
-    std::atomic<bool>
-        starvationWarnedSustained;         ///< One-time "still no frame 15 s after open" warning; reset per codec open.
-    std::atomic<uint64_t> codecOpenTimeMs; ///< cTimeMs::Now() at last OpenCodecWithInfo(); used by starvation tiers.
-    std::atomic<size_t> packetsSinceOpen;  ///< avcodec_send_packet calls since last open; starvation counters.
-    std::atomic<size_t> keyPacketsSinceOpen; ///< Subset with AV_PKT_FLAG_KEY; distinguishes silent feed vs HW stall.
+    std::atomic<bool> codecDrainPending{false};   ///< Decode thread drains codec (NULL packet) then clears this.
+    std::atomic<bool> stillPictureMode{false};    ///< Selects spatial-only (bob) deinterlace; cleared after drain.
+    std::atomic<bool> hasExited{true};            ///< False only while Action() (decode) runs; checked by Shutdown().
+    std::atomic<bool> presentExited{true};        ///< False only while PresentAction() runs; checked by Shutdown().
+    std::atomic<bool> hasLoggedFirstFrame{false}; ///< One-time first-frame log guard; reset in OpenCodecWithInfo().
+    std::atomic<bool> starvationWarned{false};    ///< One-time "no frame 3 s after open" warning; reset per open.
+    /// One-time "still no frame 15 s after open" warning; reset per codec open.
+    std::atomic<bool> starvationWarnedSustained{false};
+    std::atomic<uint64_t> codecOpenTimeMs{0};   ///< cTimeMs::Now() at last OpenCodecWithInfo(); starvation tiers.
+    std::atomic<size_t> packetsSinceOpen{0};    ///< avcodec_send_packet calls since last open; starvation counters.
+    std::atomic<size_t> keyPacketsSinceOpen{0}; ///< Subset with AV_PKT_FLAG_KEY; silent feed vs HW stall.
     /// Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
     std::atomic<int64_t> lastPts{AV_NOPTS_VALUE};
     std::atomic<uint64_t> clearEpoch{0};   ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
@@ -376,12 +376,12 @@ class cVaapiDecoder : public cThread {
                                            ///< drain-loop stale-frame discard. The decode thread needs no iteration
                                            ///< epoch of its own: it stamps producedEpoch from clearEpoch while holding
                                            ///< codecMutex for the producing decode/drain operation.
-    std::atomic<bool> liveMode;            ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
+    std::atomic<bool> liveMode{false};     ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
     std::atomic<bool> devicePaused{false}; ///< Mirrors cVaapiDevice::Freeze()/Play(). When true the drain loop holds
                                            ///< (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift
                                            ///< while ALSA is dropped and the audio master clock is genuinely frozen.
     std::atomic<bool> ready{false};        ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
-    std::atomic<int> trickSpeed;           ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
+    std::atomic<int> trickSpeed{0};        ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
     std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
                                              ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
     /// Set by FlushForSeek to request a one-line "filter rebuilt" diagnostic on the next InitFilterGraph call instead
@@ -391,18 +391,19 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === TRICK MODE ===
     // ========================================================================
-    std::atomic<bool> deferredTrickExitPending; ///< Play() without TrickSpeed(0); resolved on the present thread once
-                                                ///< the cancellation grace expires (queue-independent, so FF can't hang
-                                                ///< waiting for a keyframe that never arrives).
+    std::atomic<bool> deferredTrickExitPending{false}; ///< Play() without TrickSpeed(0); resolved on the present thread
+                                                       ///< once the cancellation grace expires (queue-independent, so
+                                                       ///< FF can't hang waiting for a keyframe that never arrives).
     /// cTimeMs::Now() deadline after which the deferred exit resolves.
     std::atomic<uint64_t> deferredTrickExitDueMs{0};
-    std::atomic<bool> isTrickFastForward;    ///< FF mode: only keyframes enqueued; first field of each pair dropped.
-    std::atomic<bool> isTrickReverse;        ///< REW: GOPs arrive backward; skip frames with rising PTS within a GOP.
-    std::atomic<uint64_t> nextTrickFrameDue; ///< cTimeMs::Now() deadline for next submission; enforces pacing.
+    std::atomic<bool> isTrickFastForward{false}; ///< FF mode: only keyframes enqueued; first field of a pair dropped.
+    std::atomic<bool> isTrickReverse{false};     ///< REW: GOPs arrive backward; skip frames with rising PTS in a GOP.
+    std::atomic<uint64_t> nextTrickFrameDue{0};  ///< cTimeMs::Now() deadline for next submission; enforces pacing.
     std::atomic<int64_t> prevTrickPts{AV_NOPTS_VALUE}; ///< Source PTS of previous trick frame; detects field pairs.
-    /// Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS.
-    std::atomic<uint64_t> trickHoldMs{DECODER_TRICK_HOLD_MS};
-    std::atomic<uint64_t> trickMultiplier; ///< Fast-mode PTS-derived hold divisor (2/4/8x). 0 = slow mode.
+    /// Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS. Zero-init to match the normal-play
+    /// state both trick-exit paths publish, so a SetTrickSpeed(0) no-op is not mistaken for a change.
+    std::atomic<uint64_t> trickHoldMs{0};
+    std::atomic<uint64_t> trickMultiplier{0}; ///< Fast-mode PTS-derived hold divisor (2/4/8x). 0 = slow mode.
 
     // ========================================================================
     // === A/V SYNC ===
@@ -425,7 +426,7 @@ class cVaapiDecoder : public cThread {
                                                         ///< (jitterBuf.size() + handoffQueue.size()) for backpressure.
                                                         ///< Written by the PRESENT thread once per present iteration,
                                                         ///< read by the mediaplayer demux thread.
-    std::atomic<bool> syncLogPending;                   ///< Force sync log on next frame regardless of timer.
+    std::atomic<bool> syncLogPending{false};            ///< Force sync log on next frame regardless of timer.
     cTimeMs nextSyncLog;              ///< Presentation thread only. Deadline for the periodic sync-stats dsyslog.
     int drainMissCount{};             ///< Drain gaps > 2xframeDur since last sync log = upstream starvation.
                                       ///< Excludes controller-driven pacing (trick, sync sleep, still-frame hold).
@@ -489,13 +490,13 @@ class cVaapiDecoder : public cThread {
     // ========================================================================
     // === JITTER BUFFER ===
     // ========================================================================
-    std::deque<std::unique_ptr<VaapiFrame>>
-        handoffQueue; ///< Decode->present handoff. Producer: decode thread (push under handoffMutex). Consumer:
-                      ///< present thread (splice under handoffMutex). FIFO; bounded by DECODER_RESERVE_HARD_CAP
-                      ///< with producer backpressure via handoffNotFull.
-    std::deque<std::unique_ptr<VaapiFrame>>
-        jitterBuf;                              ///< Decoded frames pending display. Presentation thread only (spliced
-                                                ///< from handoffQueue each present iteration); see AVSYNC.md.
+    /// Decode->present handoff. Producer: decode thread (push under handoffMutex). Consumer: present thread
+    /// (splice under handoffMutex). FIFO; bounded by DECODER_RESERVE_HARD_CAP with producer backpressure
+    /// via handoffNotFull.
+    std::deque<std::unique_ptr<VaapiFrame>> handoffQueue;
+    /// Decoded frames pending display. Presentation thread only (spliced from handoffQueue each present
+    /// iteration); see AVSYNC.md.
+    std::deque<std::unique_ptr<VaapiFrame>> jitterBuf;
     std::atomic<int> outputFrameDurationMs{20}; ///< Field/frame duration ms. Written by the decode thread after the
                                                 ///< filter graph is (re)built; read by the present-thread sync math and
                                                 ///< the decode-thread PTS stamping. Standalone scalar: relaxed both

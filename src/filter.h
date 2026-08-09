@@ -97,8 +97,8 @@ class cVideoFilterChain {
         bool hasDenoise{false};           ///< denoise_vaapi is available on this device
         bool hasSharpness{false};         ///< sharpness_vaapi is available on this device
         std::string_view deinterlaceMode; ///< Best advertised mode "motion_adaptive"/"bob"/...; empty = skip HW deint
-        unsigned
-            deinterlaceModeMask{}; ///< Bit (1u<<VppDeintMode) per driver-supported mode; bounds ClampDeinterlaceMode
+        /// Bit (1u<<VppDeintMode) per driver-supported mode; bounds ClampDeinterlaceMode
+        unsigned deinterlaceModeMask{};
 
         // --- Post-processing policies (resolved from config by caller) ---
         DeinterlaceMode userDeint{DeinterlaceMode::Auto}; ///< Deinterlacer selection (GPU clamp vs. SW block)
@@ -173,8 +173,8 @@ class cVideoFilterChain {
     [[nodiscard]] auto FailBuild() noexcept -> bool;
 
     std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> filterGraph_; ///< Active graph; null until the first Build()
-    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph>
-        previousFilterGraph_;          ///< keep-alive: released after display maps its surfaces
+    /// keep-alive: released after display maps its surfaces
+    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> previousFilterGraph_;
     AVFilterContext *bufferSrcCtx_{};  ///< owned by filterGraph_; raw pointer valid only while filterGraph_ is live
     AVFilterContext *bufferSinkCtx_{}; ///< owned by filterGraph_; same lifetime constraint
     int outputFrameDurationMs_{20};    ///< 20 = 50 fps fallback; updated by Build()

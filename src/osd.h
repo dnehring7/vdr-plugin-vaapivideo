@@ -97,10 +97,10 @@ class cVaapiOsdProvider : public cOsdProvider {
     // ========================================================================
     // === STATE ===
     // ========================================================================
-    std::atomic<cVaapiDisplay *> display_; ///< Borrowed; nulled on Detach -- never outlives the device.
-                                           ///< Atomic: SVDRP thread writes via Attach/Detach, VDR main thread
-                                           ///< reads from CreateOsd/Flush/destructor. Lifetime is guaranteed
-                                           ///< separately (display outlives the provider while attached).
+    std::atomic<cVaapiDisplay *> display_{nullptr}; ///< Borrowed; nulled on Detach -- never outlives the device.
+                                                    ///< Atomic: SVDRP thread writes via Attach/Detach, VDR main thread
+                                                    ///< reads from CreateOsd/Flush/destructor. Lifetime is guaranteed
+                                                    ///< separately (display outlives the provider while attached).
     std::shared_ptr<cVaapiOsdProviderState> state_{std::make_shared<cVaapiOsdProviderState>()};
     ///< Shared with every cVaapiOsd it creates; keeps mutex + list alive past provider destruction
 };
@@ -155,8 +155,8 @@ class cVaapiOsd : public cOsd {
     uint32_t height_{};        ///< FB height = screen height - Top() (not the visible pixmap height)
     size_t mappedSize_{};      ///< Byte length of the mmap region (driver-aligned, >= stride*height)
     uint8_t *pixels_{};        ///< mmap'd ARGB8888 scanout memory; nullptr = released or not yet allocated
-    std::atomic<cVaapiOsdProvider *> provider_; ///< Borrowed; nulled by ~cVaapiOsdProvider if it dies first --
-                                                ///< read/written only under providerState_->mutex
+    std::atomic<cVaapiOsdProvider *> provider_{nullptr}; ///< Borrowed; nulled by ~cVaapiOsdProvider if it dies first --
+                                                         ///< read/written only under providerState_->mutex
     std::shared_ptr<cVaapiOsdProviderState> providerState_; ///< Keeps mutex + OSD list alive past provider death
     uint32_t stride_{}; ///< Row pitch in bytes from DRM_IOCTL_MODE_CREATE_DUMB; may exceed width*4
     uint32_t width_{};  ///< FB width = screen width - Left()

@@ -445,11 +445,11 @@ class cVaapiDevice : public cDevice {
     std::unique_ptr<cVaapiDisplay> display;                ///< DRM page-flip display manager
     int drmFd{-1};                                         ///< DRM primary node fd
     std::string drmPath;                                   ///< DRM primary device path
-    std::atomic<int> initState;                            ///< 0=detached, 1=pending, 2=ready
+    std::atomic<int> initState{0};                         ///< 0=detached, 1=pending, 2=ready
     std::atomic<bool> externActive{false};                 ///< True between SetPlayMode(pmExtern) and the next
                                                            ///< SetPlayMode call; gates the resume-Attach path.
     std::atomic<bool> startupComplete{false};              ///< Gates deferred-attach against --detached
-    std::atomic<bool> liveMode;                            ///< True in Transfer Mode (live TV)
+    std::atomic<bool> liveMode{false};                     ///< True in Transfer Mode (live TV)
     std::atomic<bool> mediaPlayerAudioActive{false};       ///< Gates HandleAudioTrackChange off while the
                                                            ///< mediaplayer owns audio (track switches go via
                                                            ///< cVaapiPlayer::SetAudioTrack, not the live-TV reset)
@@ -476,7 +476,7 @@ class cVaapiDevice : public cDevice {
     StreamModeRequest lastRequest{}; ///< Most recently published format; replayed by ReevaluateDisplayMode()
     PlaybackSource lastRequestSource{PlaybackSource::LiveTv};     ///< Source that published lastRequest
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
-    std::atomic<int> audioCodecCandidateCount;                    ///< Confirmation count for audioCodecCandidate
+    std::atomic<int> audioCodecCandidateCount{0};                 ///< Confirmation count for audioCodecCandidate
     std::vector<uint8_t> audioDetectBuffer;   ///< AAC-LATM fallback window for DetectAudioCodec() (see
                                               ///< AUDIO_DETECT_WINDOW). Owned solely by the PlayAudio feed thread;
                                               ///< the reset paths never touch it (see audioDetectGen).
@@ -488,7 +488,7 @@ class cVaapiDevice : public cDevice {
     std::atomic<uint64_t> lastClearMs{0};     ///< Last Clear() timestamp (diagnostic)
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
-    std::atomic<bool> paused;                 ///< True while frozen via Freeze()
+    std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
     /// Last confirmed audio codec; survives Clear() so a same-codec re-detect after a scrub seek logs nothing
     std::atomic<AVCodecID> previousAudioCodec{AV_CODEC_ID_NONE};
     std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE}; ///< Previous channel's video codec (stale guard)
@@ -513,10 +513,10 @@ class cVaapiDevice : public cDevice {
     /// replay's trick STC (read only while trickSpeed != 0) and the pacing hold's previous-step reference. Reset by
     /// Clear() and TrickSpeed().
     std::atomic<int64_t> trickAudioPts{AV_NOPTS_VALUE};
-    std::atomic<int> trickSpeed;                                  ///< VDR trick speed; 0 = normal
+    std::atomic<int> trickSpeed{0};                               ///< VDR trick speed; 0 = normal
     VaapiContext vaapi{};                                         ///< Shared VAAPI context
     std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
-    std::atomic<int> videoCodecCandidateCount;                    ///< Confirmation count for videoCodecCandidate
+    std::atomic<int> videoCodecCandidateCount{0};                 ///< Confirmation count for videoCodecCandidate
     std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
 };
 

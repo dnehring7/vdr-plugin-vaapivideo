@@ -482,8 +482,8 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> geometryChanged{false}; ///< Set by ChangeDisplayMode; consumed once by the decoder via
                                               ///< TakeGeometryChange() to trigger a VPP rebuild for the new size.
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
-    std::deque<std::unique_ptr<VaapiFrame>>
-        pendingFrames; ///< Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
+    /// Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
+    std::deque<std::unique_ptr<VaapiFrame>> pendingFrames;
     std::atomic<size_t> pendingDepth{0}; ///< Lock-free mirror of pendingFrames.size(); updated under bufferMutex
                                          ///< on every push/pop/clear, polled by the decoder via PendingDepth().
     /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
