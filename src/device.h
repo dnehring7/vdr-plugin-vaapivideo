@@ -387,6 +387,11 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto CurrentChannelIsEncrypted() const
         -> bool; ///< True iff the current channel carries a CA id; lets the radio path defer encrypted channels to the
                  ///< encrypted watchdog instead of painting a (silent) radio splash over them.
+    auto CheckRadioSplash()
+        -> void; ///< Decoder-tick half of radio detection: resolves radio-vs-encrypted and refreshes the splash.
+                 ///< PlayAudio() only raises radioCheckPending -- it runs on the receiver thread under
+                 ///< cDevice::mutexReceiver, where taking the Channels lock inverts against
+                 ///< GetDevice()->Priority() (mutexReceiver under the Channels lock).
     auto HandleAudioTrackChange(const char *reason, bool enteringDolby)
         -> void; ///< Log + re-detect audio on track change. @p enteringDolby works around VDR firing the hook
                  ///< BEFORE assigning currentAudioTrack from SetDigitalAudioDevice(true).
@@ -495,11 +500,13 @@ class cVaapiDevice : public cDevice {
     bool inStillPicture{false};                                  ///< Re-entry guard for cDevice::StillPicture
     std::atomic<bool> radioBlackPending{false};                  ///< Awaiting radio-only channel detection
     cTimeMs radioBlackTimer;                                     ///< Radio-mode detection timeout
-    std::atomic<bool> radioSplashActive{false};                  ///< A refreshable radio (no-video) splash is on screen
+    std::atomic<bool> radioCheckPending{
+        false}; ///< PlayAudio saw no video after the grace; CheckRadioSplash resolves it
+    std::atomic<bool> radioSplashActive{false}; ///< A refreshable radio (no-video) splash is on screen
     /// EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
     std::atomic<uint32_t> radioSplashEventId{0};
 
-    cTimeMs radioSplashPoll; ///< Next EPG re-check; touched only on the PlayAudio thread
+    cTimeMs radioSplashPoll; ///< Next EPG re-check; touched only on the decoder tick thread (CheckRadioSplash)
     /// Encrypted-notice watchdog, armed on pmAudioVideo/pmAudioOnly: grace deadline on the cTimeMs::Now() clock; 0 =
     /// disarmed. Deliberately ONE word: the decoder tick thread outlives play modes, so it disarms/claims via CAS
     /// against the deadline it observed -- a concurrent re-arm stores a strictly-future value an expired observation

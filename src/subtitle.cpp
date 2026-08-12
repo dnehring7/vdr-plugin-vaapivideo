@@ -867,8 +867,26 @@ auto cSubtitleConverter::ShowBitmapCue(const Cue &cue) -> bool {
 }
 
 auto cSubtitleConverter::HideCue() -> void {
-    delete osd_; // cVaapiOsd dtor hides the plane and frees its buffer safely
-    osd_ = nullptr;
+    if (osd_ != nullptr) {
+        // Unlink from cOsd's global list before destruction: a concurrent ~cOsd in another
+        // thread (skin OSD teardown in the VDR main loop) may otherwise virtual-call
+        // SetActive() on this half-destroyed OSD. cOsd::Delete()/Deregister() are core
+        // patches, so the checks must stay dependent (lambda template parameter) -- a
+        // non-dependent requires on a missing member is a hard error, not false, and
+        // would break the build against an unpatched VDR.
+        const auto deleteOsdCompat = []<typename TOsd>(TOsd *&osd) -> void {
+            if constexpr (requires { TOsd::Delete(osd); }) {
+                TOsd::Delete(osd); // deregisters, deletes, and nulls in one step
+            } else {
+                if constexpr (requires { osd->Deregister(); }) {
+                    osd->Deregister();
+                }
+                delete osd; // cVaapiOsd dtor hides the plane and frees its buffer safely
+                osd = nullptr;
+            }
+        };
+        deleteOsdCompat(osd_);
+    }
     osdLeft_ = 0;
     osdTop_ = 0;
     osdAreaWidth_ = 0;

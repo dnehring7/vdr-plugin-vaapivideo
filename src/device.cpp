@@ -127,9 +127,9 @@ constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = (DECODER_RESERVE_HA
 static_assert(MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES < DECODER_RESERVE_HARD_CAP,
               "mediaplayer backpressure must engage below the reserve cap");
 
-/// How often PlayAudio re-checks the present EPG event while a radio splash is on screen. Program
-/// boundaries land on minute scales, so a couple of seconds is responsive without taxing the
-/// Schedules read-lock on the audio thread.
+/// How often the decoder tick re-checks the present EPG event while a radio splash is on screen.
+/// Program boundaries land on minute scales, so a couple of seconds is responsive without taxing
+/// the Schedules read-lock on the decoder thread.
 constexpr int RADIO_SPLASH_POLL_MS = 2000;
 
 /// radioSplashEventId cache sentinels. DVB event ids are 16-bit, so top-of-range uint32 values can
@@ -428,7 +428,7 @@ auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
 }
 
 auto cVaapiDevice::RefreshRadioSplash(bool force) -> void {
-    // force=true clears stale scanout on radio entry (main thread); the poll (audio thread) repaints
+    // force=true clears stale scanout on radio entry (main thread); the decoder-tick poll repaints
     // only when the cached key changes. Cross-thread state rides the atomics; SubmitBlackFrame is
     // serialized internally via vaDriverMutex.
     uint32_t presentEventId = 0;
@@ -484,6 +484,32 @@ auto cVaapiDevice::CheckEncryptionTimeout() -> void {
     }
 }
 
+auto cVaapiDevice::CheckRadioSplash() -> void {
+    // Decoder-thread half of the radio detection (see PlayAudio for why the split exists).
+    if (radioCheckPending.exchange(false, std::memory_order_acq_rel)) [[unlikely]] {
+        if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
+            // An encrypted channel with no video is owned by the encrypted watchdog (which shows the
+            // "encrypted" notice); painting a silent radio splash here would race and flicker with it.
+            if (CurrentChannelIsEncrypted()) {
+                dsyslog("vaapivideo/device: no video on encrypted channel -- deferring to encrypted watchdog");
+            } else {
+                isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
+                RefreshRadioSplash(/*force=*/true);
+                radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+            }
+        }
+    }
+    // Radio splash refresh: while a no-video splash is up, re-render when the present EPG event
+    // changes so the on-screen "now playing" stays current. Throttled and confined to this decoder
+    // tick thread (radioSplashPoll is not shared). The videoCodecId gate drops out of radio mode
+    // the moment a channel starts sending video -- the decoder then owns the scanout.
+    if (radioSplashActive.load(std::memory_order_relaxed) &&
+        videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && radioSplashPoll.TimedOut()) [[unlikely]] {
+        radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+        RefreshRadioSplash(/*force=*/false);
+    }
+}
+
 auto cVaapiDevice::ShowEncryptedScreen() -> void {
     // "encrypted/undecodable" means the CAM cannot descramble this channel at all. ANY decoding
     // elementary stream -- video OR audio -- proves it IS descrambling (a DVB service scrambles under
@@ -532,6 +558,7 @@ auto cVaapiDevice::ResetNoVideoMonitors() noexcept -> void {
     // Single funnel for tearing down both no-video screens (radio splash + encrypted notice) on every
     // lifecycle boundary, so no path forgets a field. DIRTY makes the next radio entry repaint.
     radioBlackPending.store(false, std::memory_order_relaxed);
+    radioCheckPending.store(false, std::memory_order_relaxed);
     radioSplashActive.store(false, std::memory_order_relaxed);
     radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
     // Plain store, not CAS: a lifecycle boundary means disarm WHATEVER is armed, by design.
@@ -1543,31 +1570,17 @@ auto cVaapiDevice::Play() -> void {
         }
     }
 
-    // Radio detection: 3 s grace set by SetPlayMode(pmAudioVideo) with no video arriving;
-    // paint black to clear the previous channel's residual scanout picture.
-    if (radioBlackPending.load(std::memory_order_relaxed) && radioBlackTimer.TimedOut()) [[unlikely]] {
+    // Radio detection: 3 s grace set by SetPlayMode(pmAudioVideo) with no video arriving. Only
+    // raise the flag here: resolving radio-vs-encrypted takes the Channels lock, and this receiver
+    // thread runs under cDevice::mutexReceiver -- a state lock here inverts against
+    // GetDevice() -> Priority(), which takes mutexReceiver under the Channels lock. The decoder
+    // tick (CheckRadioSplash) does the locked work. Acquire pairs with SetPlayMode's release so
+    // radioBlackTimer's deadline is visible here.
+    if (radioBlackPending.load(std::memory_order_acquire) && radioBlackTimer.TimedOut()) [[unlikely]] {
         radioBlackPending.store(false, std::memory_order_relaxed);
         if (videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE) {
-            // An encrypted channel with no video is owned by the encrypted watchdog (which shows the
-            // "encrypted" notice); painting a silent radio splash here would race and flicker with it.
-            if (CurrentChannelIsEncrypted()) {
-                dsyslog("vaapivideo/device: no video on encrypted channel -- deferring to encrypted watchdog");
-            } else {
-                isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
-                RefreshRadioSplash(/*force=*/true);
-                radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
-            }
+            radioCheckPending.store(true, std::memory_order_release);
         }
-    }
-
-    // Radio splash refresh: while a no-video splash is up, re-render when the present EPG event
-    // changes so the on-screen "now playing" stays current. Throttled and confined to this audio
-    // thread (radioSplashPoll is not shared). The videoCodecId gate drops out of radio mode the
-    // moment a channel starts sending video -- the decoder then owns the scanout.
-    if (radioSplashActive.load(std::memory_order_relaxed) &&
-        videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && radioSplashPoll.TimedOut()) [[unlikely]] {
-        radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
-        RefreshRadioSplash(/*force=*/false);
     }
 
     // End-of-replay flush: at EOF cDvbPlayer continuously re-pushes the last PES to drain the device
@@ -1973,14 +1986,14 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
         case pmAudioOnly:
         case pmAudioOnlyBlack:
             // Radio: paint channel name + present EPG title over black so DRM scanout doesn't hold
-            // the previous channel's picture; PlayAudio keeps it current as the program changes.
+            // the previous channel's picture; the decoder tick keeps it current as the program changes.
             ResetNoVideoMonitors(); // RefreshRadioSplash below re-arms radioSplashActive for this channel
             ResetZoom();            // Audio-only is still a content change; keep transient-zoom semantics.
             Clear();
             // Encrypted radio: arm the watchdog too, so a scrambled audio-only channel that never
             // decodes gets the "encrypted" notice instead of a silent radio splash.
             encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
-            // Poll deadline is left to the PlayAudio thread (which owns radioSplashPoll); its first
+            // Poll deadline is left to the decoder tick (which owns radioSplashPoll); its first
             // refresh after entry recomputes the same event and no-ops, then arms the 2 s cadence.
             RefreshRadioSplash(/*force=*/true);
             break;
@@ -1991,9 +2004,10 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             ResetNoVideoMonitors(); // a video stream is starting; re-armed below for the no-video grace
             ResetZoom(); // Before Clear(): belt-and-braces so a new stream starts at Off even if pmNone was skipped.
             Clear();
-            // Shared grace: if no video arrives, PlayAudio() paints black (radio channel).
+            // Shared grace: if no video arrives, PlayAudio() flags it and the decoder tick paints
+            // black (radio channel). Release publishes radioBlackTimer's deadline to that thread:
             radioBlackTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
-            radioBlackPending.store(true, std::memory_order_relaxed);
+            radioBlackPending.store(true, std::memory_order_release);
             // Same grace for the encrypted-channel notice: armed unconditionally, it self-cancels
             // when a codec opens and only paints if the channel turns out encrypted with a video PID.
             encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
@@ -2948,6 +2962,9 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // empty queue. Set before Initialize() starts that thread. CheckEncryptionTimeout no-ops unless armed.
     decoder->SetLoopTickCallback([this]() -> void {
         CheckEncryptionTimeout();
+        // Radio splash lives here too: PlayAudio must not take the Channels lock (receiver thread
+        // runs under cDevice::mutexReceiver), so it only raises a flag this tick consumes.
+        CheckRadioSplash();
         // Same tick drives the display-mode stability gate: the reactive publish below fires once
         // per filter-graph build, so a candidate needs a wall-clock nudge to ever mature.
         PollPendingDisplayMode();

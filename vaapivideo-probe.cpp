@@ -16,11 +16,14 @@
  *   VVC     (H.266 Main 10, 8-bit + 10-bit)         -- next-gen broadcast
  *
  * Each profile is tested against the exact surface format it requires
- * (YUV420 for 8-bit, YUV420_10 for 10-bit). VPP filters, HDR tone mapping,
- * and deinterlacing modes are also reported. Per connector, the sink EDID is
- * parsed for its advertised HDR10 (PQ) / HLG / BT.2020 / HDR10+ support and
+ * (YUV420 for 8-bit, YUV420_10 for 10-bit). VPP filters, HDR tone mapping
+ * (both HDR->SDR and the H2H path that re-masters HLG to HDR10), and
+ * deinterlacing modes are also reported. Per connector, the sink EDID is
+ * parsed for its advertised HDR10 (PQ) / HLG / BT.2020 / HDR10+ support,
  * Dolby Vision VSVDB -- the display half of the HDR decision (DV is reported
- * for information only; VAAPI cannot decode it).
+ * for information only; VAAPI cannot decode it) -- and the advertised VRR
+ * ranges (HDMI 2.1 game-VRR, AMD FreeSync, VESA range limits), alongside the
+ * kernel's vrr_capable / VRR_ENABLED properties.
  *
  * Usage:   ./vaapivideo-probe [/dev/dri/cardN]   (default: /dev/dri/card0)
  * Compile: g++ -std=c++20 $(pkg-config --cflags --libs libdrm libva-drm) -o vaapivideo-probe vaapivideo-probe.cpp
@@ -130,16 +133,6 @@ constexpr struct {
     {.type = VAProcFilterSkinToneEnhancement, .name = "Skin Tone Enhancement"},
     {.type = VAProcFilterTotalColorCorrection, .name = "Total Color Correction"},
     {.type = VAProcFilterHVSNoiseReduction, .name = "HVS Noise Reduction"},
-};
-
-// Directions relevant to a broadcast playback pipeline.
-// SDR->HDR is deliberately excluded: no broadcast source requires it.
-constexpr struct {
-    uint16_t flag;
-    const char *name;
-} kToneMappingFlags[] = {
-    {.flag = VA_TONE_MAPPING_HDR_TO_HDR, .name = "HDR->HDR"},
-    {.flag = VA_TONE_MAPPING_HDR_TO_SDR, .name = "HDR->SDR"},
 };
 
 // Listed highest-quality first so the first supported entry is the preferred choice.
@@ -367,33 +360,42 @@ struct DecodeSupport {
     return result;
 }
 
-// Returns true if the driver supports tone mapping in at least one direction the
-// plugin uses (HDR->HDR or HDR->SDR).  Does not print directly; the result is
-// surfaced through PrintColorConversions so the operator sees it alongside the
-// codec/surface context that makes it actionable.  The VPP filter list already
-// shows whether VAProcFilterHighDynamicRangeToneMapping is advertised at all.
-[[nodiscard]] auto HasHdrToneMapping(VADisplay display, VAContextID vppContext,
-                                            std::span<const VAProcFilterType> filters) -> bool {
+// Per-direction tone-mapping support for the directions a broadcast pipeline uses
+// (SDR->HDR is deliberately excluded: no broadcast source requires it).  Not printed
+// directly; the results are surfaced through PrintColorConversions so the operator
+// sees them alongside the codec/surface context that makes them actionable.  The VPP
+// filter list already shows whether VAProcFilterHighDynamicRangeToneMapping is
+// advertised at all.
+struct HdrToneMapCaps {
+    bool toHdr10{}; ///< VA_TONE_MAPPING_HDR_TO_HDR: HDR input (PQ or HLG) re-mastered to HDR10 output
+    bool toSdr{};   ///< VA_TONE_MAPPING_HDR_TO_SDR: HDR input rendered down to SDR
+};
+
+[[nodiscard]] auto ProbeHdrToneMapping(VADisplay display, VAContextID vppContext,
+                                       std::span<const VAProcFilterType> filters) -> HdrToneMapCaps {
+    HdrToneMapCaps result;
     if (std::ranges::find(filters, VAProcFilterHighDynamicRangeToneMapping) == filters.end()) {
-        return false;
+        return result;
     }
 
     VAProcFilterCapHighDynamicRange hdrCaps[VAProcHighDynamicRangeMetadataTypeCount];
     auto hdrCapCount = static_cast<unsigned int>(VAProcHighDynamicRangeMetadataTypeCount);
     if (vaQueryVideoProcFilterCaps(display, vppContext, VAProcFilterHighDynamicRangeToneMapping, hdrCaps,
                                    &hdrCapCount) != VA_STATUS_SUCCESS) {
-        return false;
+        return result;
     }
 
-    // Skip the None metadata row; require at least one direction the plugin uses.
-    constexpr uint16_t kUsableMask = VA_TONE_MAPPING_HDR_TO_HDR | VA_TONE_MAPPING_HDR_TO_SDR;
+    // Only HDR10-metadata rows count: both directions need the driver to understand
+    // ST 2086 / CTA-861.3 metadata (mastering data on the input for HDR->SDR, metadata
+    // attach on the output for HDR->HDR10).
     for (unsigned int i = 0; i < hdrCapCount; ++i) {
-        if (hdrCaps[i].metadata_type != VAProcHighDynamicRangeMetadataNone &&
-            (hdrCaps[i].caps_flag & kUsableMask) != 0) {
-            return true;
+        if (hdrCaps[i].metadata_type != VAProcHighDynamicRangeMetadataHDR10) {
+            continue;
         }
+        result.toHdr10 = result.toHdr10 || (hdrCaps[i].caps_flag & VA_TONE_MAPPING_HDR_TO_HDR) != 0;
+        result.toSdr = result.toSdr || (hdrCaps[i].caps_flag & VA_TONE_MAPPING_HDR_TO_SDR) != 0;
     }
-    return false;
+    return result;
 }
 
 auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
@@ -414,7 +416,7 @@ auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
     }
 }
 
-auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12, bool hasHdrToneMapping)
+auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12, const HdrToneMapCaps &toneMap)
     -> void {
     std::printf("\n--- Color Conversion Paths ---\n");
 
@@ -433,7 +435,10 @@ auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12,
     // HLG is backward-compatible with BT.709 -- display handles it without VPP TM.
     PrintCapability("HLG -> SDR    (no TM required)", any10Bit);
     // PQ/HDR10: requires VAProcFilterHighDynamicRangeToneMapping with HDR->SDR.
-    PrintCapability("PQ/HDR10 -> SDR     (tone map)", any10Bit && hasHdrToneMapping);
+    PrintCapability("PQ/HDR10 -> SDR     (tone map)", any10Bit && toneMap.toSdr);
+    // HLG for PQ-only sinks: VPP H2H re-masters ARIB STD-B67 input to ST 2084 output
+    // with HDR10 metadata attached. Both sides ride P010 (decode surface in, HDR out).
+    PrintCapability("HLG -> HDR10    (H2H tone map)", any10Bit && hasP010 && toneMap.toHdr10);
 }
 
 } // namespace
@@ -781,7 +786,9 @@ struct PropEntry {
 }
 
 // What the sink advertises in its EDID CTA-861 blocks -- the display half of the HDR decision (the
-// plugin's auto gate needs PQ + BT.2020 Y'CbCr). Mirrors src/display.cpp plus luminance/HDR10+/DV.
+// plugin's auto gate needs PQ + BT.2020 Y'CbCr). Mirrors src/display.cpp plus luminance, the
+// dynamic-HDR systems DVB broadcasts use (HDR10+, SL-HDR, Dolby Vision), and the HDMI 2.1
+// game-VRR range from the HDMI Forum VSDB.
 struct SinkHdrCaps {
     bool eotfSdr{};        ///< HDR Static Metadata EOTF bit 0 (traditional gamma SDR)
     bool eotfHdrGamma{};   ///< EOTF bit 1 (traditional gamma HDR)
@@ -789,8 +796,20 @@ struct SinkHdrCaps {
     bool hlg{};            ///< EOTF bit 3 (ARIB STD-B67 / HLG)
     bool bt2020Ycc{};      ///< Colorimetry bit 6 (BT.2020 Y'CbCr)
     bool bt2020Rgb{};      ///< Colorimetry bit 7 (BT.2020 RGB)
-    bool hdr10Plus{};      ///< HDR Dynamic Metadata block advertises SMPTE ST 2094-40
+    bool hdr10Plus{};      ///< HDR Dynamic Metadata type 4 (SMPTE ST 2094-40)
+    bool dynMetaType1{};   ///< HDR Dynamic Metadata type 1 (SMPTE ST 2094-10; Dolby Vision / SL-HDR2 carrier)
+    bool slHdr1{};         ///< HDR Dynamic Metadata type 2, bit 4: SL-HDR1 (ETSI TS 103 433-1)
+    bool slHdr2{};         ///< HDR Dynamic Metadata type 2, bit 5: SL-HDR2 (ETSI TS 103 433-2)
+    bool slHdr3{};         ///< HDR Dynamic Metadata type 2, bit 6: SL-HDR3 (ETSI TS 103 433-3)
     bool dolbyVision{};    ///< Vendor-Specific Video Data Block carries the Dolby OUI (00-D0-46)
+    uint8_t dvBlockVer{};  ///< Dolby VSVDB layout version 0..2 -- a block format, not the DV generation
+    uint8_t vrrMin{};      ///< HF-VSDB VRRmin in Hz; 0 = HDMI game-VRR not advertised
+    uint16_t vrrMax{};     ///< HF-VSDB VRRmax in Hz (10-bit field)
+    uint8_t fsMin{};       ///< AMD FreeSync VSDB minimum refresh in Hz; 0 = block absent
+    uint8_t fsMax{};       ///< AMD FreeSync VSDB maximum refresh in Hz
+    uint16_t rangeMinHz{}; ///< Base-block range-limits descriptor min vertical rate (offset applied)
+    uint16_t rangeMaxHz{}; ///< Base-block range-limits descriptor max vertical rate (offset applied)
+    bool continuousFreq{}; ///< Base-block feature bit 0: display supports continuous frequencies
     bool hasLuminance{};   ///< The HDR Static Metadata block carried the optional luminance bytes
     uint8_t maxLumaCode{}; ///< Desired content max luminance (CTA code; nits = 50 * 2^(code/32))
 };
@@ -803,7 +822,8 @@ constexpr size_t EDID_CHECKSUM_OFFSET = 127;
 [[nodiscard]] auto LuminanceCodeToNits(uint8_t code) -> double { return 50.0 * std::pow(2.0, code / 32.0); }
 
 /// Parse one 128-byte CTA-861 extension block (tag 0x02). OR results into @p caps so multiple
-/// extension blocks accumulate. Mirrors src/display.cpp ParseCtaExtension plus DV/HDR10+/luminance.
+/// extension blocks accumulate. Mirrors src/display.cpp ParseCtaExtension plus the dynamic-HDR
+/// blocks and luminance.
 auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -> void {
     // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
     if (ext.size() < 4 || ext[0] != 0x02) {
@@ -819,7 +839,11 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
         const uint8_t header = ext[offset];
         const uint8_t blockTag = header >> 5;
         const uint8_t payloadLen = header & 0x1F;
-        if (offset + 1 + payloadLen > dataBlockEnd) {
+        // Bound payloads by the checksum byte, not the DTD offset: some real panels declare a DTD
+        // offset that lands inside the last data block (seen on an AUO eDP panel whose AMD FreeSync
+        // VSDB overruns it by 3 bytes; amdgpu byte-scans around the same bug, edid-decode is equally
+        // lenient). Headers still stop at the DTD offset via the loop condition.
+        if (offset + 1 + payloadLen > EDID_CHECKSUM_OFFSET) {
             break;
         }
         const std::span<const uint8_t> payload = ext.subspan(offset + 1, payloadLen);
@@ -838,24 +862,82 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
                 caps.bt2020Ycc = caps.bt2020Ycc || (payload[1] & (1U << 6)) != 0;
                 caps.bt2020Rgb = caps.bt2020Rgb || (payload[1] & (1U << 7)) != 0;
             } else if (extTag == 0x07 && payload.size() >= 3) { // HDR Dynamic Metadata (sec.7.5.14)
-                // Walk the (length, type-LSB, type-MSB, ...) sub-blocks; type 0x0004 = SMPTE ST 2094-40 (HDR10+).
+                // Sub-blocks are (length, type-LSB, type-MSB, data...). Type 1 = SMPTE ST 2094-10,
+                // type 2 = ETSI TS 103 433 (SL-HDR), type 4 = SMPTE ST 2094-40 (HDR10+).
                 size_t p = 1;
-                while (p + 1 < payload.size()) {
+                while (p + 2 < payload.size()) {
                     const uint8_t subLen = payload[p];
                     if (subLen == 0 || p + 1 + subLen > payload.size()) {
                         break;
                     }
                     const uint16_t type =
                         static_cast<uint16_t>(payload[p + 1]) | (static_cast<uint16_t>(payload[p + 2]) << 8U);
+                    caps.dynMetaType1 = caps.dynMetaType1 || type == 0x0001;
                     caps.hdr10Plus = caps.hdr10Plus || type == 0x0004;
+                    if (type == 0x0002 && subLen > 2) {
+                        // First data byte: low nibble = sub-block version, bits 4/5/6 = SL-HDR1/2/3.
+                        // The flag bits only exist from version 1 on.
+                        const uint8_t flags = payload[p + 3];
+                        if ((flags & 0x0FU) >= 1) {
+                            caps.slHdr1 = caps.slHdr1 || (flags & (1U << 4)) != 0;
+                            caps.slHdr2 = caps.slHdr2 || (flags & (1U << 5)) != 0;
+                            caps.slHdr3 = caps.slHdr3 || (flags & (1U << 6)) != 0;
+                        }
+                    }
                     p += 1 + subLen;
                 }
             } else if (extTag == 0x01 && payload.size() >= 4) { // Vendor-Specific Video Data Block
                 // IEEE OUI stored LSB-first; Dolby = 00-D0-46 -> bytes 46 D0 00.
-                caps.dolbyVision = caps.dolbyVision || (payload[1] == 0x46 && payload[2] == 0xD0 && payload[3] == 0x00);
+                if (payload[1] == 0x46 && payload[2] == 0xD0 && payload[3] == 0x00) {
+                    caps.dolbyVision = true;
+                    if (payload.size() >= 5) { // first data byte: bits 7..5 = VSVDB layout version
+                        caps.dvBlockVer = static_cast<uint8_t>((payload[4] >> 5U) & 0x07U);
+                    }
+                }
+            }
+        } else if (blockTag == 3 && payload.size() >= 3) { // Vendor-Specific Data Block
+            if (payload[0] == 0xD8 && payload[1] == 0x5D && payload[2] == 0xC4 && payload.size() >= 10) {
+                // HDMI Forum VSDB (OUI C4-5D-D8 LSB-first), HDMI 2.1 game-VRR range:
+                // payload[8] bits 5:0 = VRRmin, bits 7:6 = VRRmax[9:8], payload[9] = VRRmax[7:0]
+                // (offsets validated against edid-decode). Both zero = VRR not supported.
+                caps.vrrMin = static_cast<uint8_t>(payload[8] & 0x3FU);
+                caps.vrrMax = static_cast<uint16_t>(((payload[8] & 0xC0U) << 2U) | payload[9]);
+            } else if (payload[0] == 0x1A && payload[1] == 0x00 && payload[2] == 0x00 &&
+                       payload.size() >= 7) {
+                // AMD FreeSync VSDB (OUI 00-00-1A LSB-first): payload[3] = version, payload[5]/[6] =
+                // min/max refresh in Hz -- how FreeSync TVs and DP/eDP panels advertise VRR
+                // (offsets validated against edid-decode on a live panel EDID).
+                caps.fsMin = payload[5];
+                caps.fsMax = payload[6];
             }
         }
         offset += 1 + payloadLen;
+    }
+    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+}
+
+/// Parse the EDID base block for the VRR-relevant bits: the continuous-frequency feature flag and
+/// the range-limits descriptor's vertical rate span (VESA EDID 1.4 sec.3.10.3.3). On DP/eDP these
+/// are exactly what the kernel folds into the connector's vrr_capable property.
+auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> void {
+    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- span is size-checked
+    if (base.size() < EDID_BLOCK_SIZE) {
+        return;
+    }
+    constexpr size_t kFeatureOffset = 24;      // feature support byte; bit 0 = continuous frequency
+    constexpr size_t kDescriptorStart = 54;    // four 18-byte descriptors at 54/72/90/108
+    constexpr size_t kDescriptorEnd = 126;
+    caps.continuousFreq = (base[kFeatureOffset] & 0x01U) != 0;
+    for (size_t off = kDescriptorStart; off + 18 <= kDescriptorEnd; off += 18) {
+        // Display descriptor (not a timing): bytes 0-2 zero, byte 3 = tag 0xFD (range limits).
+        if (base[off] != 0 || base[off + 1] != 0 || base[off + 2] != 0 || base[off + 3] != 0xFD) {
+            continue;
+        }
+        // Byte 4 offset flags: bit 0 = min vfreq +255, bit 1 = max vfreq +255; bytes 5/6 = min/max.
+        const uint8_t flags = base[off + 4];
+        caps.rangeMinHz = static_cast<uint16_t>(base[off + 5] + (((flags & 0x01U) != 0) ? 255U : 0U));
+        caps.rangeMaxHz = static_cast<uint16_t>(base[off + 6] + (((flags & 0x02U) != 0) ? 255U : 0U));
+        break;
     }
     // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
@@ -872,6 +954,7 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
         return false;
     }
     const std::span<const uint8_t> edid{static_cast<const uint8_t *>(blob->data), blob->length};
+    ParseBaseBlockForSink(edid.first(EDID_BLOCK_SIZE), caps);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bounded by the size check
     const size_t extCount = edid[EDID_EXTENSION_COUNT_OFFSET];
     for (size_t i = 0; i < extCount; ++i) {
@@ -896,12 +979,40 @@ auto PrintSinkHdrCaps(int fd, const std::vector<PropEntry> &props) -> void {
     std::printf("      HLG (ARIB STD-B67)      %s\n", yn(caps.hlg));
     std::printf("      BT.2020 Y'CbCr          %s\n", yn(caps.bt2020Ycc));
     std::printf("      HDR10+ (ST 2094-40)     %s\n", yn(caps.hdr10Plus));
+    std::printf("      SL-HDR1 (TS 103 433-1)  %s\n", yn(caps.slHdr1));
+    std::printf("      SL-HDR2 (TS 103 433-2)  %s\n", yn(caps.slHdr2));
+    std::printf("      SL-HDR3 (TS 103 433-3)  %s\n", yn(caps.slHdr3));
+    std::printf("      ST 2094-10 dyn. meta    %s\n", yn(caps.dynMetaType1));
     if (caps.hasLuminance) {
         std::printf("      desired max luminance   ~%.0f cd/m^2 (code %u)\n", LuminanceCodeToNits(caps.maxLumaCode),
                     caps.maxLumaCode);
     }
-    // DV is sink capability only.
-    std::printf("      Dolby Vision (sink)     %s\n", yn(caps.dolbyVision));
+    // DV is sink capability only. The version is the EDID block layout (0..2), not the Dolby Vision
+    // generation -- "Dolby Vision 2" has no published EDID signaling, so it cannot be detected here.
+    if (caps.dolbyVision) {
+        std::printf("      Dolby Vision (sink)     yes (VSVDB v%u)\n", caps.dvBlockVer);
+    } else {
+        std::printf("      Dolby Vision (sink)     no\n");
+    }
+    // VRR: sinks signal it three ways -- HDMI 2.1 game-VRR (HF-VSDB), AMD FreeSync (AMD VSDB;
+    // FreeSync TVs and DP/eDP panels), and the VESA range-limits descriptor combined with the
+    // continuous-frequency flag (what the kernel folds into vrr_capable on DP/eDP).
+    std::printf("    Sink VRR (EDID):\n");
+    const auto printRange = [](const char *label, unsigned int lo, unsigned int hi) -> void {
+        if (lo != 0 && hi != 0) {
+            std::printf("      %-24s%u-%u Hz\n", label, lo, hi);
+        } else {
+            std::printf("      %-24s(not advertised)\n", label);
+        }
+    };
+    printRange("HDMI 2.1 game-VRR", caps.vrrMin, caps.vrrMax);
+    printRange("AMD FreeSync", caps.fsMin, caps.fsMax);
+    if (caps.rangeMinHz != 0 && caps.rangeMaxHz != 0) {
+        std::printf("      %-24s%u-%u Hz (%s)\n", "VESA range limits", caps.rangeMinHz, caps.rangeMaxHz,
+                    caps.continuousFreq ? "continuous frequency" : "fixed modes only");
+    } else {
+        std::printf("      %-24s(no range descriptor)\n", "VESA range limits");
+    }
 }
 
 // The connector only carries its mode *list*; the mode actually scanning out lives on the
@@ -929,6 +1040,12 @@ auto PrintCurrentConnectorMode(int fd, const drmModeConnector *c) -> void {
         std::printf("    current mode:             (crtc %u active, no mode programmed)\n", crtcId);
     }
     drmModeFreeCrtc(crtc);
+    // Live VRR state on the CRTC actually scanning this connector out (only meaningful
+    // when the connector's vrr_capable says the sink+driver pair can do it at all).
+    const auto crtcProps = LoadObjectProps(fd, crtcId, DRM_MODE_OBJECT_CRTC);
+    if (const auto *p = FindProp(crtcProps, "VRR_ENABLED"); p != nullptr) {
+        std::printf("    VRR_ENABLED (crtc)        %s\n", p->value != 0 ? "on" : "off");
+    }
 }
 
 auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
@@ -959,6 +1076,13 @@ auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
         }
         if (const auto *p = FindProp(props, "Colorspace"); p != nullptr) {
             std::printf("    Colorspace (current)      %u\n", static_cast<uint32_t>(p->value));
+        }
+        // Kernel-side VRR verdict: the driver folds the sink's EDID signaling (HDMI HF-VSDB
+        // game-VRR, DP Adaptive-Sync range) and its own scanout support into this property.
+        if (const auto *p = FindProp(props, "vrr_capable"); p != nullptr) {
+            std::printf("    vrr_capable               %s\n", p->value != 0 ? "yes" : "no");
+        } else {
+            std::printf("    vrr_capable               no (property absent)\n");
         }
         PrintSinkHdrCaps(fd, props);
         drmModeFreeConnector(c);
@@ -1272,9 +1396,9 @@ auto main(int argc, char *argv[]) -> int {
         PrintCapability(filterName, std::ranges::find(filters, filterType) != filters.end());
     }
 
-    const bool hasHdrToneMapping = HasHdrToneMapping(vaDisplay, vppContext, filters);
+    const HdrToneMapCaps toneMap = ProbeHdrToneMapping(vaDisplay, vppContext, filters);
 
-    PrintColorConversions(decodeSupport, hasP010, hasNV12, hasHdrToneMapping);
+    PrintColorConversions(decodeSupport, hasP010, hasNV12, toneMap);
     ProbeDeinterlacing(vaDisplay, vppContext);
 
     vaDestroyContext(vaDisplay, vppContext);

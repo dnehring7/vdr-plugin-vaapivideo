@@ -207,8 +207,11 @@ If this line is missing, the plugin will not start — verify the driver
 (step 4) and the render-node permissions (step 3).
 
 For deeper diagnostics, a standalone probe tool reports decode profiles, VPP
-filters, surface formats, HDR tone mapping, and the sink's EDID HDR
-capabilities. It is built on demand:
+filters, surface formats, HDR tone mapping (including the HLG → HDR10 H2H
+path), variable refresh rate support (kernel `vrr_capable` / `VRR_ENABLED`
+plus the sink's advertised VRR ranges: HDMI 2.1 game-VRR, AMD FreeSync, and
+VESA range limits), and the sink's EDID HDR capabilities.
+It is built on demand:
 
     make probe
     ./vaapivideo-probe [/dev/dri/cardN]     # default: /dev/dri/card0
@@ -533,6 +536,19 @@ layer's cross-compatibility, which the plugin logs when the file opens:
 | 7          | HDR10                    | Base layer plays as HDR10           |
 | 4 / 5      | none                     | SDR fallback                        |
 
+### Dynamic HDR
+
+DVB broadcasts carry dynamic HDR as HDR10+, SL-HDR2, or Dolby Vision. None of
+them can be passed through: the kernel's `HDR_OUTPUT_METADATA` property carries
+only the static HDR10 metadata infoframe, so the plugin sends the PQ or HLG base
+layer and the sink applies its own tone mapping.
+
+`make probe` reports what the sink advertises for each system, read from the
+EDID CTA-861 HDR Dynamic Metadata block (HDR10+, SL-HDR1/2/3, ST 2094-10) and
+the Dolby vendor block. The Dolby line shows the vendor block's layout version
+(0–2), which is an EDID format revision — Dolby Vision 2 has no published EDID
+signaling and cannot be detected.
+
 
 ## SVDRP commands
 
@@ -712,6 +728,32 @@ the runtime environment variables. Run with verbose logging via
 The project enforces a strict modern-C++ style — trailing return types,
 `[[nodiscard]]`, RAII for every C-API resource, VDR threading primitives. The
 full rules are in `.github/copilot-instructions.md`.
+
+
+## Roadmap
+
+- **VRR presentation** — on displays with variable refresh rate (FreeSync /
+  VESA Adaptive-Sync), latch each frame at its PTS deadline instead of
+  switching display modes: the existing audio-master pacing goes straight to
+  the glass at the source's true cadence (e.g. 50 Hz PAL on a panel with no
+  fixed 50 Hz mode). `Match refresh rate` becomes a three-way choice —
+  off / mode switch / VRR preferred — falling back to mode switching when the
+  display has no usable VRR range.
+- **Mediaplayer trick play** — fast forward/rewind and slow motion for file
+  replay, alongside today's jump-style seeking. Fast modes step through
+  keyframes at increasing speeds (×2/×4/×8, `FastFwd`/`FastRew` keys with the
+  speed shown in the replay bar); slow motion paces full decode below real
+  time (audio muted), reusing the trick-speed machinery the live-TV path
+  already has. Rewind is keyframe-only by nature; exact speeds depend on the
+  file's keyframe interval.
+- **HLG → HDR10 (PQ) mapping** — for HDR panels that accept only the PQ EOTF
+  (common on laptop eDP), convert HLG streams to PQ and signal ST 2084 to the
+  sink. Uses the driver's VAAPI HDR tone-mapping filter
+  (`VAProcFilterHighDynamicRangeToneMapping`, HDR-to-HDR mode) when the GPU
+  exposes it; on drivers without it (Mesa `radeonsi`) falls back to a static
+  per-channel transfer-function swap in the CRTC gamma LUT at zero per-frame
+  cost. Includes accepting BT.2020-RGB-only sinks in the HDR gate, which
+  today fall back to SDR even for native HDR10.
 
 
 ## Credits

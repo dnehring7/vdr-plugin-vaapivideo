@@ -227,10 +227,13 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // lipsync re-anchors at the next valid write.
     //
     // Seqlock read of the (playbackPts, lastClockUpdateMs) pair: retry until two even sequence loads
-    // match. Both fences are load-bearing -- seq1's acquire stops the data loads from hoisting above
-    // it, and the acquire fence below stops them from sinking past seq2. Without that fence the
-    // compiler (even on x86) may move the relaxed loads after seq2, letting a torn snapshot pass the
-    // seq1==seq2 check and bias GetClock() by a full ALSA period. (Boehm's seqlock hazard.)
+    // match. Both barriers are load-bearing -- seq1's acquire stops the data loads from hoisting above
+    // it, and the data loads' own acquire stops seq2 from hoisting above them. Without the second
+    // barrier the compiler (even on x86) may move the data loads after seq2, letting a torn snapshot
+    // pass the seq1==seq2 check and bias GetClock() by a full ALSA period. (Boehm's seqlock hazard.)
+    // Acquire on the data loads rather than a std::atomic_thread_fence between them: TSAN does not
+    // instrument standalone fences (-Wtsan warns, and the sanitizer then reports false races here),
+    // while per-load acquire is both modelled by TSAN and free on x86.
     uint64_t lastMs = 0;
     int64_t pts = AV_NOPTS_VALUE;
     while (true) {
@@ -238,9 +241,8 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         if ((seq1 & 1U) != 0U) {
             continue; // writer mid-update
         }
-        lastMs = lastClockUpdateMs.load(std::memory_order_relaxed);
-        pts = playbackPts.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire); // orders the data loads before seq2
+        lastMs = lastClockUpdateMs.load(std::memory_order_acquire);
+        pts = playbackPts.load(std::memory_order_acquire);
 
         const uint32_t seq2 = clockSequence.load(std::memory_order_relaxed);
         if (seq1 == seq2) {

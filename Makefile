@@ -55,30 +55,46 @@ $(foreach lib,$(REQUIRED_LIBS),$(call check_lib,$(lib)))
 # Toolchain
 # ------------------------------------------------------------
 CXX ?= g++
-
-# C++ Compiler Flags
 CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 
-# Debugging Flags for AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer
-# (uncomment for development builds — mutually exclusive with ThreadSanitizer)
-#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
-#           -fsanitize=address,undefined,leak \
-#           -fsanitize-address-use-after-scope \
-#           -fstack-protector-strong \
-#           -ftrivial-auto-var-init=zero
-# Runtime options (copy into shell before starting VDR):
-#   export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:symbolize=1:fast_unwind_on_malloc=0:strict_init_order=1:check_initialization_order=1:detect_stack_use_after_return=1"
-#   export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
-#   export LD_PRELOAD="/usr/lib64/libasan.so.8:/usr/lib64/libubsan.so.1"
+# ------------------------------------------------------------
+# Sanitizers — `make SANITIZE=thread` (or =address); empty = packaging build.
+# ------------------------------------------------------------
+# TSan and ASan cannot coexist in one process. The flags REPLACE VDR's cxxflags:
+# core's -O3/-flto would defeat -Og/-fno-lto (the dropped VDR defines are no-ops
+# on LP64, so no ABI skew).
+SANITIZE ?=
 
-# Debugging Flags for ThreadSanitizer
-# (uncomment for development builds — mutually exclusive with AddressSanitizer)
-#CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
-#           -fsanitize=thread \
-#           -ftrivial-auto-var-init=zero
-# Runtime options (copy into shell before starting VDR):
-#   export TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:detect_deadlocks=1:report_thread_leaks=1:history_size=7:symbolize=1"
-#   export LD_PRELOAD="/usr/lib64/libtsan.so.2"
+ifeq ($(SANITIZE),thread)
+CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+           -fsanitize=thread \
+           -ftrivial-auto-var-init=zero
+else ifeq ($(SANITIZE),address)
+CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+           -fsanitize=address,undefined,leak \
+           -fsanitize-address-use-after-scope \
+           -fstack-protector-strong \
+           -ftrivial-auto-var-init=zero
+else ifneq ($(SANITIZE),)
+$(error SANITIZE must be one of: thread, address, or empty)
+endif
+
+# TSan runtime setup:
+#   TSAN_OPTIONS="log_path=/var/tmp/vdr-tsan:log_exe_name=1:strip_path_prefix=/srv/vdr-packages:history_size=7:second_deadlock_stack=1:print_full_thread_history=1:malloc_context_size=10:memory_limit_mb=16384:exitcode=0:suppressions=/etc/vdr/tsan-suppressions.txt:print_suppressions=1"
+#   LD_PRELOAD="/usr/lib64/libtsan.so.2"  # only when the core is NOT TSan-built (stock vdr)
+#
+# - TSAN_OPTIONS + suppressions live in /etc/sysconfig/vdr; reports land in
+#   /var/tmp/vdr-tsan.vdr.<pid>. log_path is mandatory as daemon (stderr goes to
+#   /dev/null); exitcode=0 keeps systemd from restart-looping on a finding.
+# - Build VDR core with the same flags via Make.config in the core tree (never on
+#   make's command line -- that silences the core Makefile's own `CXXFLAGS +=`).
+#   The vdr binary then links libtsan itself. Without that, LD_PRELOAD the
+#   runtime: pulled in first by dlopen it cannot allocate its static TLS block.
+# - The suppressions file must exist, or libtsan aborts at startup.
+#
+# ASan run: LD_PRELOAD libasan/libubsan and e.g.
+#   ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:fast_unwind_on_malloc=0:detect_stack_use_after_return=1"
+#   UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
 
 # Development warnings: lenient by default (safe for packaging); enable with `make DEV_WARNINGS=1`.
 DEV_WARNINGS ?= 0
@@ -99,12 +115,17 @@ CXXFLAGS += -DPLUGIN_NAME_I18N='"$(PLUGIN)"'
 CXXFLAGS += -I$(VDRDIR)/include -I.
 CXXFLAGS += $(shell $(PKG_CONFIG) --cflags $(REQUIRED_LIBS))
 
-LDFLAGS := -shared -Wl,--no-as-needed
+ifeq ($(origin RPM_ARCH),undefined)
+LDFLAGS := $(filter-out %redhat-package-notes,$(LDFLAGS))
+endif
 
-# Debugging Flags for AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer
-#LDFLAGS += -fsanitize=address,undefined,leak
-# Debugging Flags for ThreadSanitizer
-#LDFLAGS += -fsanitize=thread
+# Derived from the final CXXFLAGS, not from SANITIZE, so compile and link can
+# never disagree (a sanitizer-built core also injects -fsanitize via vdr.pc's
+# cxxflags). Adds only the DT_NEEDED -- the runtime must already be in the
+# process (see the TSan setup notes above).
+LDFLAGS += $(filter -fsanitize=%,$(CXXFLAGS))
+
+SO_LDFLAGS = $(LDFLAGS) -shared -Wl,--no-as-needed
 
 LDLIBS = $(shell $(PKG_CONFIG) --libs $(REQUIRED_LIBS)) -pthread
 
@@ -136,25 +157,27 @@ HEADERS = $(wildcard src/*.h)
 all: $(SOFILE)
 
 $(SOFILE): $(OBJECTS)
-	$(CXX) $(LDFLAGS) $(OBJECTS) -o $@ $(LDLIBS)
+	$(CXX) $(SO_LDFLAGS) $(OBJECTS) -o $@ $(LDLIBS)
 
-%.o: %.cpp $(HEADERS)
+# Makefile in the prerequisites: a build-flag change (above all SANITIZE=) must invalidate
+# every object. Without it, flipping the sanitizer relinks stale uninstrumented objects into
+# the .so -- TSan then sees only part of the plugin, silently missing races in the untouched
+# translation units while reporting bogus ones where a happens-before edge went unobserved.
+%.o: %.cpp $(HEADERS) Makefile
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Standalone VAAPI capability prober. Links only libdrm + libva-drm — keep this
-# rule separate from the plugin build so the probe binary does not accrue the
-# plugin's full dependency closure (ffmpeg, alsa, ...).
+# Standalone VAAPI capability prober
 PROBE_BIN = vaapivideo-probe
 PROBE_SRC = vaapivideo-probe.cpp
 PROBE_PKGS = libdrm libva-drm
 
 probe: $(PROBE_BIN)
 
-$(PROBE_BIN): $(PROBE_SRC)
-	$(CXX) $(CXXFLAGS) $(shell $(PKG_CONFIG) --cflags $(PROBE_PKGS)) \
+$(PROBE_BIN): $(PROBE_SRC) Makefile
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(shell $(PKG_CONFIG) --cflags $(PROBE_PKGS)) \
 		$< $(shell $(PKG_CONFIG) --libs $(PROBE_PKGS)) -o $@
 
-.deps: $(SOURCES) $(HEADERS)
+.deps: $(SOURCES) $(HEADERS) Makefile
 	$(CXX) -MM $(CXXFLAGS) $(SOURCES) > $@
 
 # Include Dependencies (only for build targets, skip for clean/dist/docs/etc)
