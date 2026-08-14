@@ -187,6 +187,9 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto DeviceName() const
         -> cString override; ///< Descriptive name (DRM path + connector) for SVDRP PRIM/LSTD replies
     [[nodiscard]] auto DeviceType() const -> cString override; ///< Returns "VAAPI"
+#if APIVERSNUM >= 30014
+    [[nodiscard]] auto Drain() -> bool override; ///< EOS: true once all buffered A/V has played out; never blocks.
+#endif
     [[nodiscard]] auto Flush(int TimeoutMs = 0)
         -> bool override;           ///< Wait until packet queue drains; returns true when empty
     auto Freeze() -> void override; ///< Pause output: drain queue and stop audio
@@ -298,7 +301,8 @@ class cVaapiDevice : public cDevice {
     // Narrow, encapsulated entry points for the libavformat-based mediaplayer path
     // (see src/mediaplayer.{h,cpp}). The PES path remains the only writer through
     // PlayVideo/PlayAudio; these methods exist so the mediaplayer never touches the
-    // private decoder / audioProcessor pointers directly.
+    // private decoder / audioProcessor pointers directly. The EOS-drain pair
+    // (RequestEosDrain/PendingPlayoutDepth) is also what cDevice::Drain() runs on.
     [[nodiscard]] auto OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
         -> bool; ///< Opens video + audio codecs with full stream descriptors. Returns false iff either codec failed.
     [[nodiscard]] auto SubmitVideoPacket(const AVPacket *packet)
@@ -310,15 +314,13 @@ class cVaapiDevice : public cDevice {
                  ///< (HardwareReady()) or the queue is full.
     auto ClearForMediaPlayer()
         -> void; ///< Heavy flush: drops queues AND tears down the filter chain. Used at open/close of an entry.
-    auto RequestMediaPlayerEosDrain()
-        -> void; ///< Flush the codec reorder buffer + temporal-filter hold into the present reserve. Call only once
-                 ///< the decode queue is drained (MediaPlayerDecodeQueueDepth()): a mid-queue flush re-arms the
-                 ///< codec, leaving the remaining non-keyframe packets undecodable until the next I-frame.
-    [[nodiscard]] auto MediaPlayerDecodeQueueDepth() const noexcept
-        -> size_t; ///< Packets still waiting in the decode queue (0 when closed). Mediaplayer EOS-drain phase 1.
-    [[nodiscard]] auto MediaPlayerBufferedDepth() const noexcept
-        -> size_t; ///< Total un-presented work: decode queue + decoded reserve + audio pending work + pending codec
-                   ///< drain. Mediaplayer EOS-drain phase 2 waits for this to reach 0 before teardown.
+    auto RequestEosDrain()
+        -> void; ///< Flush the codec reorder buffer + temporal-filter hold into the present reserve. Safe with
+                 ///< packets still queued: the decode thread defers the flush until its queue has emptied.
+    [[nodiscard]] auto PendingPlayoutDepth() const noexcept
+        -> size_t; ///< Un-presented work: decode queue + decoded reserve + pending codec drain + display
+                   ///< backlog + unplayed audio tail. EOS drains wait for 0 -- only then has the final
+                   ///< PTS actually been played out.
     auto FlushForSeek()
         -> void; ///< Light flush: drops queues but keeps filter chain and swresample alive. Used at seek.
     [[nodiscard]] auto ReopenMediaPlayerAudio(const AudioStreamInfo &audio)
@@ -494,6 +496,10 @@ class cVaapiDevice : public cDevice {
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
     std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
+#if APIVERSNUM >= 30014
+    /// One RequestEosDrain() per Drain() cycle; Clear() and SetPlayMode() cancel and re-arm it (Drain() contract).
+    std::atomic<bool> eosDrainRequested{false};
+#endif
     /// Last confirmed audio codec; survives Clear() so a same-codec re-detect after a scrub seek logs nothing
     std::atomic<AVCodecID> previousAudioCodec{AV_CODEC_ID_NONE};
     std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE}; ///< Previous channel's video codec (stale guard)

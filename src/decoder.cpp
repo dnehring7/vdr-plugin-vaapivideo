@@ -1546,7 +1546,7 @@ auto cVaapiDecoder::Action() -> void {
                 }
             }
             // EOS-drain bridge: codecDrainPending is already cleared but the present thread only
-            // republishes the reserve total next iteration, so a mediaplayer drain poll in that gap
+            // republishes the reserve total next iteration, so an EOS-drain poll in that gap
             // could read a premature 0 and tear down before these final frames present. Bump the
             // count now (under handoffMutex, serialized with that store; transient over-count is safe).
             if (drainedCodecAtEof && retainedNewFrames > 0) {

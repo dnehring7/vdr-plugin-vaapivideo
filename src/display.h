@@ -227,6 +227,9 @@ class cVaapiDisplay : public cThread {
     /// Lock-free pendingFrames depth poll. Decoder uses depth==0 to decide whether to pre-submit
     /// one frame ahead of strict-due (avoids a VSync re-present from audio-clock vs VSync drift).
     [[nodiscard]] auto PendingDepth() const noexcept -> size_t { return pendingDepth.load(std::memory_order_acquire); }
+    /// True between commit and page-flip event: the committed buffer is not yet on screen.
+    /// EOS drains count it so the final frame cannot be cut before its flip.
+    [[nodiscard]] auto HasPendingFlip() const noexcept -> bool { return isFlipPending.load(std::memory_order_acquire); }
     /// Wall-clock ms of the most recent page-flip event; used by the decoder for VSync pacing.
     [[nodiscard]] auto GetLastVSyncTimeMs() const noexcept -> uint64_t {
         return lastVSyncTimeMs.load(std::memory_order_relaxed);

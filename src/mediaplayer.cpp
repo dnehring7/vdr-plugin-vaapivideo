@@ -1850,7 +1850,7 @@ auto cVaapiPlayer::DrainTailAtEof() -> void {
             if (depth == 0) {
                 return;
             }
-            // Reset on ANY decrease vs the previous reading, not a lifetime low: phase 2's codec drain
+            // Reset on ANY decrease vs the previous reading, not a lifetime low: the codec drain
             // can RAISE depth (tail flushed into the reserve), and a lifetime-min tracker would then
             // read the legitimate drain that follows as a stall and cut the tail early.
             if (depth < lastDepth) {
@@ -1865,15 +1865,10 @@ auto cVaapiPlayer::DrainTailAtEof() -> void {
         }
     };
 
-    // Phase 1: feed every queued packet into the codec first. A codec flush with packets still
-    // queued re-arms mid-stream, leaving the rest undecodable until the next I-frame (lost tail).
-    drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->MediaPlayerDecodeQueueDepth(); });
-    if (aborted()) {
-        return;
-    }
-    // Phase 2: flush the reorder tail into the reserve, then drain it to the screen at real-time pace.
-    vaapiDev->RequestMediaPlayerEosDrain();
-    drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->MediaPlayerBufferedDepth(); });
+    // Flush the reorder tail into the reserve (the decode thread defers that until its queue has
+    // emptied), then drain everything to the screen at real-time pace.
+    vaapiDev->RequestEosDrain();
+    drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->PendingPlayoutDepth(); });
 }
 
 auto cVaapiPlayer::AdvancePlaylist() -> void {

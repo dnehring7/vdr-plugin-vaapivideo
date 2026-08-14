@@ -108,7 +108,7 @@ class cAudioProcessor : public cThread {
     } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() is exact but
       ///< takes queueMutex; this mirror avoids even that short queue lock in hot display / status paths.
     [[nodiscard]] auto GetPendingWorkSize() const
-        -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The mediaplayer EOS drain needs this, not
+        -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The EOS drains need this, not
                    ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper around SetStreamParams() for simple codec+rate+channels changes

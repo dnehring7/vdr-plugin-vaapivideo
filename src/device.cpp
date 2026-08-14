@@ -764,6 +764,10 @@ auto cVaapiDevice::Clear() -> void {
 
     cDevice::Clear();
 
+#if APIVERSNUM >= 30014
+    eosDrainRequested.store(false, std::memory_order_relaxed); // a Clear() cancels an in-flight Drain()
+#endif
+
     // trickSpeed intentionally NOT reset: Clear() is a buffer flush, not a mode change.
     // VDR calls Clear() at the start of trick play; resetting here would cancel the mode.
 
@@ -818,6 +822,21 @@ auto cVaapiDevice::Clear() -> void {
 }
 
 [[nodiscard]] auto cVaapiDevice::DeviceType() const -> cString { return "VAAPI"; }
+
+#if APIVERSNUM >= 30014
+[[nodiscard]] auto cVaapiDevice::Drain() -> bool {
+    // Never waits: VDR polls this from cDvbPlayer's loop, which holds its thread lock meanwhile.
+    if (!decoder) [[unlikely]] {
+        return true;
+    }
+    // Once: a re-request would re-arm the pending-drain flag and hold the depth above 0 forever.
+    if (!eosDrainRequested.exchange(true, std::memory_order_relaxed)) {
+        RequestEosDrain();
+    }
+    // Zero once decode, display, and audio backlogs have played out: the final PTS is on the output.
+    return PendingPlayoutDepth() == 0;
+}
+#endif
 
 [[nodiscard]] auto cVaapiDevice::Flush(int TimeoutMs) -> bool {
     // Waits only on the decoder packet queue, not the audio queue. Audio drains under its
@@ -1583,16 +1602,19 @@ auto cVaapiDevice::Play() -> void {
         }
     }
 
+#if APIVERSNUM < 30014
     // End-of-replay flush: at EOF cDvbPlayer continuously re-pushes the last PES to drain the device
     // (vdr/dvbplayer.c). Decoding the repeats keeps the DAC clock advancing, so GetSTC() never stalls and
     // radio replay never hits VDR's StuckAtEof (no video PTS pins the STC). Drop the repeat -- the real tail
     // is already queued, ALSA drains, the clock ages stale, replay auto-stops. Audio PTS is strictly rising
     // in normal replay (trick play uses PlayTrickAudio), so an exact repeat is the EOF re-push, never a real
     // frame. Reset on every timeline break via ResetReplayAudioEofBaseline().
+    // From API 14 on Drain() does the draining -- no EOF re-push arrives to filter.
     if (!isLive && pes.pts != AV_NOPTS_VALUE && pes.pts == lastReplayAudioPts.load(std::memory_order_relaxed))
         [[unlikely]] {
         return Length;
     }
+#endif
 
     // Replay backpressure: cap queue to avoid tail-drops that create PTS gaps. Live: always accept.
     if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) [[unlikely]] {
@@ -1903,6 +1925,10 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     // Stream boundary, same reason as in Clear(): a candidate armed for the outgoing stream must
     // not mature against the incoming one.
     InvalidateDisplayModeCandidate();
+
+#if APIVERSNUM >= 30014
+    eosDrainRequested.store(false, std::memory_order_relaxed); // Drain() contract: SetPlayMode() cancels a drain
+#endif
 
     // External-player handover (vdr-mpv): suspend hardware so it can grab DRM/VAAPI/ALSA.
     // SuspendHardware (not Detach) -- cMpvControl is live, cControl::Shutdown would double-free.
@@ -2360,7 +2386,8 @@ auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, Play
         return;
     }
 
-    const auto match = SelectDisplayMode(modeCandidates, request, SnapshotModePolicy(defaultMode));
+    const auto match =
+        SelectDisplayMode({modeCandidates.data(), modeCandidates.size()}, request, SnapshotModePolicy(defaultMode));
     // Disarm before the verdict is acted on: a matcher that found nothing for this inventory will
     // find nothing every time, so leaving the candidate armed would re-run it (and re-allocate its
     // reason string) on every single decode-loop tick for the rest of the session.
@@ -2624,7 +2651,8 @@ namespace {
         static_cast<double>(ModeRefreshMilliHz(defaultMode)) / 1000.0);
 
     if (lastRequest.IsValid()) {
-        const auto match = SelectDisplayMode(modeCandidates, lastRequest, SnapshotModePolicy(defaultMode));
+        const auto match = SelectDisplayMode({modeCandidates.data(), modeCandidates.size()}, lastRequest,
+                                             SnapshotModePolicy(defaultMode));
         out += std::format("Stream:  {}x{}@{:.3f}Hz ({}, switching {})\nDecision: {}\n", lastRequest.width,
                            lastRequest.height, static_cast<double>(lastRequest.rateMilliHz) / 1000.0,
                            PlaybackSourceName(lastRequestSource),
@@ -2807,26 +2835,30 @@ auto cVaapiDevice::ClearForMediaPlayer() -> void {
     }
 }
 
-auto cVaapiDevice::RequestMediaPlayerEosDrain() -> void {
+auto cVaapiDevice::RequestEosDrain() -> void {
     if (decoder) [[likely]] {
         decoder->RequestCodecDrain();
     }
 }
 
-[[nodiscard]] auto cVaapiDevice::MediaPlayerDecodeQueueDepth() const noexcept -> size_t {
-    return decoder ? decoder->GetQueueSize() : 0;
-}
-
-[[nodiscard]] auto cVaapiDevice::MediaPlayerBufferedDepth() const noexcept -> size_t {
+[[nodiscard]] auto cVaapiDevice::PendingPlayoutDepth() const noexcept -> size_t {
     if (!decoder) {
         return 0;
     }
-    // decode queue + decoded reserve + audio pending work. The pending-drain flag bridges the gap
-    // between RequestMediaPlayerEosDrain() and the reorder tail landing in the reserve, so the
+    // decode queue + decoded reserve + display backlog + audio pending work. The pending-drain flag
+    // bridges the gap between RequestEosDrain() and the reorder tail landing in the reserve, so the
     // drain wait can't read a premature zero.
     size_t depth = decoder->GetQueueSize() + decoder->GetDecodedReserveSize();
     if (decoder->IsCodecDrainPending()) {
         ++depth;
+    }
+    if (display) {
+        // Frames leave the decoder reserve before they are on screen; without these terms the last
+        // frames of the tail would be cut at EOS (audio often ends before the final video flip).
+        depth += display->PendingDepth();
+        if (display->HasPendingFlip()) {
+            ++depth;
+        }
     }
     if (audioProcessor) {
         depth += audioProcessor->GetPendingWorkSize();
@@ -3627,7 +3659,7 @@ namespace {
         const cMutexLock lock(&displayModeMutex);
         defaultMode = activeMode;
         connectorModes.assign(connector->modes, connector->modes + connector->count_modes);
-        modeCandidates = BuildModeCandidates(connectorModes, defaultMode);
+        modeCandidates = BuildModeCandidates({connectorModes.data(), connectorModes.size()}, defaultMode);
     }
 
     isyslog("vaapivideo/device: display %ux%u@%.3fHz (%s, connector %u, CRTC %u)", activeMode.hdisplay,
