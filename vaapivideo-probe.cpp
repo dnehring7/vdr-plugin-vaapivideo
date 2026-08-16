@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file vaapivideo-probe.cpp
  * @brief Standalone VAAPI capability prober for vdr-plugin-vaapivideo.
@@ -902,8 +903,7 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
                 // (offsets validated against edid-decode). Both zero = VRR not supported.
                 caps.vrrMin = static_cast<uint8_t>(payload[8] & 0x3FU);
                 caps.vrrMax = static_cast<uint16_t>(((payload[8] & 0xC0U) << 2U) | payload[9]);
-            } else if (payload[0] == 0x1A && payload[1] == 0x00 && payload[2] == 0x00 &&
-                       payload.size() >= 7) {
+            } else if (payload[0] == 0x1A && payload[1] == 0x00 && payload[2] == 0x00 && payload.size() >= 7) {
                 // AMD FreeSync VSDB (OUI 00-00-1A LSB-first): payload[3] = version, payload[5]/[6] =
                 // min/max refresh in Hz -- how FreeSync TVs and DP/eDP panels advertise VRR
                 // (offsets validated against edid-decode on a live panel EDID).
@@ -924,8 +924,8 @@ auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> 
     if (base.size() < EDID_BLOCK_SIZE) {
         return;
     }
-    constexpr size_t kFeatureOffset = 24;      // feature support byte; bit 0 = continuous frequency
-    constexpr size_t kDescriptorStart = 54;    // four 18-byte descriptors at 54/72/90/108
+    constexpr size_t kFeatureOffset = 24;   // feature support byte; bit 0 = continuous frequency
+    constexpr size_t kDescriptorStart = 54; // four 18-byte descriptors at 54/72/90/108
     constexpr size_t kDescriptorEnd = 126;
     caps.continuousFreq = (base[kFeatureOffset] & 0x01U) != 0;
     for (size_t off = kDescriptorStart; off + 18 <= kDescriptorEnd; off += 18) {

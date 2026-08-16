@@ -58,7 +58,11 @@ struct VaapiFrame {
     // ========================================================================
     // === DATA ===
     // ========================================================================
-    AVFrame *avFrame{};          ///< Holds the VAAPI surface buffer ref; keep alive until DRM retires it.
+    AVFrame *avFrame{}; ///< Holds the VAAPI surface buffer ref; keep alive until DRM retires it.
+    /// Keeps the producing VPP graph alive while this surface is in flight (see FilterGraphToken);
+    /// null for unfiltered frames. Must be released after avFrame -- the dtor body frees avFrame
+    /// first, and moves hand both to cVaapiDisplay::DrmFramebuffer together.
+    FilterGraphToken graphToken;
     bool ownsFrame{true};        ///< False after a move; move-out nulls avFrame so dtor is a no-op.
     uint64_t producedEpoch{0};   ///< clearEpoch at production (decode thread); the presentation thread drops frames
                                  ///< older than the current clearEpoch, so pre-Clear material self-discards regardless
@@ -154,7 +158,7 @@ class cVaapiDecoder : public cThread {
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
     auto RequestFilterRebuild()
-        -> void; ///< Schedule filter graph rebuild on next decoded frame (e.g. after ScaleVideo dim change).
+        -> void; ///< Schedule a debounced filter graph rebuild (e.g. after a ScaleVideo dim change).
     auto RequestTrickExit() -> void; ///< Deferred Play()-without-TrickSpeed(0); cleared if SetTrickSpeed() follows.
     auto SetTrickSpeed(int speed, bool forward = true, bool fast = false)
         -> void;             ///< Configure trick-play pacing. speed=0 returns to normal. fast=true -> key-frames only.
@@ -209,6 +213,10 @@ class cVaapiDecoder : public cThread {
                  ///< observed by the decode thread always sees the matching policy (race-free).
     [[nodiscard]] auto CreateVaapiFrame(AVFrame *src) const
         -> std::unique_ptr<VaapiFrame>; ///< av_frame_clone() the filtered surface; extracts VASurfaceID from data[3].
+    [[nodiscard]] auto TakeFilterRebuild() noexcept
+        -> bool; ///< Consume a debounced RequestFilterRebuild(); true = rebuild now. Decode thread only.
+    auto ClearPendingFilterRebuild() noexcept
+        -> void; ///< Cancel a debounced rebuild that an explicit filter reset just subsumed.
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
     auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
@@ -225,7 +233,7 @@ class cVaapiDecoder : public cThread {
                           ///< Caller holds codecMutex.
     [[nodiscard]] auto InitFilterGraph(AVFrame *firstFrame, bool compactLog = false)
         -> bool; ///< Fill BuildParams and delegate to filterChain_.Build(). compactLog=true for
-                 ///< ScaleVideo-driven rebuilds (one-line dsyslog); false for first build / channel switch.
+                 ///< ScaleVideo-driven rebuilds (chain line only); false for first build / channel switch.
     [[nodiscard]] auto ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept
         -> bool; ///< True when stream + GPU (vppP010) + display (EDID) + user config all permit HDR passthrough.
     [[nodiscard]] auto SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame)
@@ -286,11 +294,14 @@ class cVaapiDecoder : public cThread {
     // === SYNCHRONIZATION ===
     // ========================================================================
     // Lock order: ALWAYS codecMutex -> parserMutex -> packetMutex. DrainQueue takes only packetMutex.
-    // handoffMutex is a strict LEAF: no thread ever acquires codecMutex/parserMutex/packetMutex/
-    // vaDriverMutex/display bufferMutex while holding it, and it is never held across
-    // display->SubmitFrame() or any cCondWait::SleepMs. (ClearInternal/SetTrickSpeed/etc. take it
-    // briefly only to Broadcast handoffCondition; that codecMutex->handoffMutex nesting is permitted
-    // precisely because handoffMutex has no outgoing edge to any other lock.)
+    // handoffMutex is a near-LEAF: no thread acquires codecMutex/parserMutex/packetMutex/display
+    // bufferMutex while holding it, and it is never held across display->SubmitFrame() or any
+    // cCondWait::SleepMs. Its single outgoing edge is handoffMutex -> vaDriverMutex: destroying a
+    // VaapiFrame under it may drop the last FilterGraphToken, whose deleter locks vaDriverMutex.
+    // Safe because vaDriverMutex has no path back to any decoder-side lock (it precedes only the
+    // display leaf mutexes -- see the display.cpp lock-order comment).
+    // (ClearInternal/SetTrickSpeed/etc. take handoffMutex briefly to Broadcast handoffCondition;
+    // that codecMutex->handoffMutex nesting relies on the above.)
     //
     // codecMutex and parserMutex are deliberately separate: the dvbplayer / receiver feeds the
     // parser via EnqueueData() while the decode thread is busy submitting work to VAAPI. Sharing
@@ -302,7 +313,8 @@ class cVaapiDecoder : public cThread {
     mutable cMutex parserMutex;  ///< Guards parser context (EnqueueData vs reopen/clear).
     mutable cMutex packetMutex;  ///< Guards packetQueue; also used as condvar futex.
     cCondVar packetCondition;    ///< Wakes the decode thread on enqueue or shutdown.
-    mutable cMutex handoffMutex; ///< Guards handoffQueue (decode producer -> present consumer). Strict leaf lock.
+    mutable cMutex handoffMutex; ///< Guards handoffQueue (decode producer -> present consumer). Near-leaf:
+                                 ///< dropping the last frame token under it may take vaDriverMutex (see above).
     cCondVar handoffCondition;   ///< Wakes the presentation thread: new handed-off batch, Clear()/FlushForSeek()/
                                  ///< SetTrickSpeed()/NotifyAudioChange()/SetDevicePaused(), or shutdown.
     cCondVar handoffNotFull;     ///< Wakes the decode thread when the presenter drains a full handoffQueue below the
@@ -382,9 +394,12 @@ class cVaapiDecoder : public cThread {
                                            ///< while ALSA is dropped and the audio master clock is genuinely frozen.
     std::atomic<bool> ready{false};        ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
     std::atomic<int> trickSpeed{0};        ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
-    std::atomic<bool> videoRectDirty{false}; ///< Triggers filterChain.Reset() on next frame; set by
-                                             ///< RequestFilterRebuild when ScaleVideo() changes the target dimensions.
-    /// Set by FlushForSeek to request a one-line "filter rebuilt" diagnostic on the next InitFilterGraph call instead
+    // Debounced rebuild request (ScaleVideo / zoom), written by RequestFilterRebuild(), consumed
+    // by TakeFilterRebuild() on the decode thread. Timestamps are published before the flag.
+    std::atomic<uint64_t> filterRebuildFirstRequestMs{0}; ///< Burst start; bounds the total deferral.
+    std::atomic<uint64_t> filterRebuildLastRequestMs{0};  ///< Most recent request; restarts the quiet window.
+    std::atomic<bool> filterRebuildPending{false};        ///< Set last; TakeFilterRebuild() consumes.
+    /// Set by FlushForSeek to request the compact chain-line-only diagnostic on the next InitFilterGraph call instead
     /// of the full 3-line graph init dump. Consumed (exchanged to false) by the decode-thread filter-build path.
     std::atomic<bool> filterCompactRebuildPending{false};
 

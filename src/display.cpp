@@ -10,7 +10,12 @@
  *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down.
  *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
  *
- * Lock order: importMutex -> vaDriverMutex (frame import); importMutex -> bufferMutex.
+ * Lock order: importMutex -> vaDriverMutex (frame import); importMutex -> bufferMutex ->
+ * vaDriverMutex (releasing a DrmFramebuffer / clearing pendingFrames can drop the last
+ * FilterGraphToken, whose deleter locks vaDriverMutex and nothing else). vaDriverMutex may
+ * precede only the leaf mutexes {videoRectMutex, osdMutex, hdrStateMutex} -- decoder rebuilds
+ * query geometry/HDR state under it -- and the leaves have no outgoing edges, so the lock
+ * graph stays acyclic.
  * PresentBuffer() may run under bufferMutex; its leaf locks
  * {videoRectMutex, osdMutex, hdrStateMutex} are never nested with each other.
  * DRM fd rule: the consumer thread is the ONLY drmHandleEvent dispatcher while Action()
@@ -216,8 +221,8 @@ auto AtomicRequest::AddProperty(uint32_t objId, uint32_t propId, uint64_t value)
 // ============================================================================
 
 cVaapiDisplay::DrmFramebuffer::DrmFramebuffer(DrmFramebuffer &&other) noexcept
-    : drmFd(other.drmFd), fbId(other.fbId), frame(other.frame), gemHandle(other.gemHandle), height(other.height),
-      modifier(other.modifier), width(other.width) {
+    : drmFd(other.drmFd), fbId(other.fbId), frame(other.frame), gemHandle(other.gemHandle),
+      graphToken(std::move(other.graphToken)), height(other.height), modifier(other.modifier), width(other.width) {
     other.drmFd = -1; // prevents double-release in moved-from destructor
     other.fbId = 0;
     other.gemHandle = 0;
@@ -228,7 +233,8 @@ cVaapiDisplay::DrmFramebuffer::~DrmFramebuffer() noexcept {
     // Release order matters: (1) AVFrame drops the VA surface ref that backs the DMA-BUF;
     // (2) drmModeRmFB tells the CRTC to stop scanning and releases the kernel DMA-BUF ref;
     // (3) DRM_IOCTL_GEM_CLOSE frees the imported BO. Reversing (1)/(2) causes the kernel to
-    // read freed GPU memory on the next scanout.
+    // read freed GPU memory on the next scanout. (4) graphToken with the members after this
+    // body: the VPP graph must outlive the surface it rendered into (see FilterGraphToken).
     if (frame) {
         av_frame_free(&frame);
     }
@@ -257,6 +263,7 @@ auto cVaapiDisplay::DrmFramebuffer::operator=(DrmFramebuffer &&other) noexcept -
         fbId = other.fbId;
         frame = other.frame;
         gemHandle = other.gemHandle;
+        graphToken = std::move(other.graphToken); // after our releases above: old token may free its graph
         height = other.height;
         modifier = other.modifier;
         width = other.width;
@@ -528,6 +535,10 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
 
     // Clone under bufferMutex so the displayed AVFrame's VA-surface ref stays alive past unlock;
     // hold the mutex only across the cheap ref bump, never across the GPU download below.
+    // The token rides along: the download syncs the surface through the producing VPP context, so
+    // a rebuild retiring that graph mid-grab must not free it (see FilterGraphToken). Declared
+    // before `source` so it is released after it.
+    FilterGraphToken sourceGraphToken;
     std::unique_ptr<AVFrame, FreeAVFrame> source;
     {
         const cMutexLock lock(&bufferMutex);
@@ -535,6 +546,7 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
             return nullptr;
         }
         source.reset(av_frame_clone(displayedBuffer.frame));
+        sourceGraphToken = displayedBuffer.graphToken;
     }
     if (!source) [[unlikely]] {
         return nullptr;
@@ -545,7 +557,7 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
         return nullptr;
     }
 
-    // Serialize with VPP: iHD's VEBOX deadlocks if download races with concurrent filter execution.
+    // Serialize against VPP: a download racing filter execution on one VADisplay hangs the driver.
     const cMutexLock vaLock(&vaDriverMutex);
     if (const int ret = av_hwframe_transfer_data(dest.get(), source.get(), 0); ret < 0) [[unlikely]] {
         esyslog("vaapivideo/display: grab transfer failed: %s", AvErr(ret).data());
@@ -584,9 +596,9 @@ auto cVaapiDisplay::SetOsd(const OsdOverlay &osd) -> void {
     }
 
     // Always mark dirty, even for an unchanged (fbId, geometry) pair. VDR may repaint
-    // into the same dumb buffer in-place; on Intel/AMD, FBC/PSR tile caches are only
-    // invalidated when the plane is touched by an atomic commit. Without this, stale
-    // compressed pixels remain on screen.
+    // into the same dumb buffer in-place, and display-compression caches (FBC/PSR) are only
+    // invalidated when the plane is touched by an atomic commit. Without this, stale compressed
+    // pixels remain on screen.
     currentOsd = osd;
     osdDirty = true;
     ++osdGeneration;
@@ -1066,8 +1078,8 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
         return false;
     }
 
-    // OSD-over-HDR EINVAL recovery (e.g. Intel N100 / Alder Lake-N): the OSD plane beside the 4K
-    // 10-bpc video plane forces a CDCLK bump that only a modeset can apply, so the NONBLOCK flip is
+    // OSD-over-HDR EINVAL recovery on bandwidth-limited GPUs: the OSD plane beside the 4K 10-bpc
+    // video plane forces a pixel-clock bump that only a modeset can apply, so the NONBLOCK flip is
     // rejected every frame. Retry the same req (drmModeAtomicCommit leaves it intact on failure)
     // under ALLOW_MODESET -- accepted even though parts without cdclk-squash may briefly retrain the
     // link at OSD show/hide, since otherwise the menu is unusable over HDR. Latch so later frames
@@ -2012,9 +2024,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     //   no intermediate copy is allocated. Without this every frame would be duplicated on
     //   the GPU heap.
     // vaDriverMutex: serializes VA-driver entry against the decoder thread's filter-graph
-    //   execution. The iHD driver's VEBOX path is not thread-safe when shared with VPP
-    //   filter execution on the same VADisplay (observed sporadic VA_STATUS_ERROR_OPERATION
-    //   _FAILED on iHD). The decoder takes the same lock around its filter push/pull.
+    //   execution -- driving one VADisplay from two threads at once fails sporadically with
+    //   VA_STATUS_ERROR_OPERATION_FAILED. The decoder takes the same lock around its push/pull.
     int ret = 0;
     {
         const cMutexLock vaLock(&vaDriverMutex);
@@ -2036,9 +2047,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
         reinterpret_cast<const AVDRMFrameDescriptor *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
             mappedFrame->data[0]);
     // The rest of this function assumes a single DMA-BUF object holding both NV12 layers
-    // (Y + UV at different offsets). On the iHD/Mesa stacks tested this is always the
-    // shape returned; on hypothetical drivers that split planes across multiple objects
-    // a per-object GEM import + multi-fd AddFB2 path would be required. Reject early so the
+    // (Y + UV at different offsets) -- the shape every stack tested returns. A driver that split
+    // planes across multiple objects would need a per-object GEM import + multi-fd AddFB2 path. Reject early so the
     // failure mode is "no scanout, log line" rather than "scanout reads from one object's
     // GEM handle plus another object's offset".
     if (!desc || desc->nb_objects == 0 || desc->nb_layers == 0 || desc->nb_objects != 1) [[unlikely]] {
@@ -2064,8 +2074,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     //
     // Pick the DRM fourcc from hw_frames_ctx->sw_format -- the VPP surface was explicitly
     // allocated with this layout, so it's the authoritative source. The PRIME descriptor's
-    // layer[0].format is NOT reliable: iHD 25.x has been observed to report a fourcc that
-    // KMS rejects in combination with the exported modifier, producing spurious AddFB2
+    // layer[0].format is NOT reliable: a driver can report a fourcc that KMS rejects in
+    // combination with the exported modifier (seen on iHD 25.x), producing spurious AddFB2
     // EINVAL on plain SDR NV12 scanout.
     uint32_t format = DRM_FORMAT_NV12;
     if (srcFrame->hw_frames_ctx) {
@@ -2127,7 +2137,9 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     // Move the AVFrame ownership into the DrmFramebuffer so the VA surface ref outlives
     // the scanout. Dropping it earlier would let the VA driver recycle the surface while
     // the kernel is still reading from the DMA-BUF -> green/garbled frames on the next flip.
+    // The token travels with it: this fb is now what keeps its VPP graph alive.
     fb.frame = vaapiFrame->avFrame;
+    fb.graphToken = std::move(vaapiFrame->graphToken);
     vaapiFrame->avFrame = nullptr;
     vaapiFrame->ownsFrame = false;
 

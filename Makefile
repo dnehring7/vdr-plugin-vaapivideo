@@ -58,7 +58,7 @@ CXX ?= g++
 CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 
 # ------------------------------------------------------------
-# Sanitizers — `make SANITIZE=thread` (or =address); empty = packaging build.
+# Sanitizers -- `make SANITIZE=thread` (or =address); empty = packaging build.
 # ------------------------------------------------------------
 # TSan and ASan cannot coexist in one process. The flags REPLACE VDR's cxxflags:
 # core's -O3/-flto would defeat -Og/-fno-lto (the dropped VDR defines are no-ops
@@ -103,11 +103,11 @@ CXXFLAGS += -pedantic-errors -Wall -Wextra
 CXXFLAGS += -Wformat=2 -Wconversion -Wsign-conversion -Wshadow -Werror -Wnull-dereference
 endif
 
-# libstdc++ debug mode — bounds checking on iterators, vectors, strings
+# libstdc++ debug mode -- bounds checking on iterators, vectors, strings
 # WARNING: changes ABI; VDR and all plugins must be recompiled with this flag
 #CXXFLAGS += -D_GLIBCXX_DEBUG -D_GLIBCXX_DEBUG_PEDANTIC
 
-# GCC static analyzer (slow — finds null-deref, use-after-free, double-free at compile time)
+# GCC static analyzer (slow -- finds null-deref, use-after-free, double-free at compile time)
 #CXXFLAGS += -fanalyzer
 
 CXXFLAGS += -std=c++20 -fPIC
@@ -152,7 +152,7 @@ SOFILE = libvdr-$(PLUGIN).so
 HEADERS = $(wildcard src/*.h)
 
 # Build Targets
-.PHONY: all clean install dist indent lint docs probe
+.PHONY: all clean install dist indent lint docs check-docs-defaults probe
 
 all: $(SOFILE)
 
@@ -181,7 +181,7 @@ $(PROBE_BIN): $(PROBE_SRC) Makefile
 	$(CXX) -MM $(CXXFLAGS) $(SOURCES) > $@
 
 # Include Dependencies (only for build targets, skip for clean/dist/docs/etc)
-ifeq ($(filter clean dist docs lint indent,$(MAKECMDGOALS)),)
+ifeq ($(filter clean dist docs check-docs-defaults lint indent,$(MAKECMDGOALS)),)
 -include .deps
 endif
 
@@ -211,7 +211,19 @@ dist: clean
 		vdr-plugin-$(PLUGIN)
 	@echo "Distribution package created as ../vdr-$(PLUGIN)-$(VERSION).tar.gz"
 
-docs:
+# A brace-init that clang-format wrapped (declaration + trailing ///< over ColumnLimit) makes
+# Doxygen drop the default value from the rendered declaration -- silently, no warning. Catch the
+# pattern "IDENT{" at EOL followed by a lone "value};": aggregates keep their comma or open "{{",
+# so only the wrapped-scalar case matches. Fix by moving the comment above the member as "///".
+check-docs-defaults:
+	@awk '/[[:alnum:]_]\{[[:space:]]*$$/ { decl = $$0; file = FILENAME; line = FNR; next } \
+	      decl != "" { if ($$0 ~ /^[[:space:]]*[^,{}]+\};/) { \
+	          printf "%s:%d: wrapped default value -- Doxygen drops it:\n  %s\n  %s\n", \
+	                 file, line, decl, $$0; rc = 1 } decl = "" } \
+	      END { exit rc }' $(SOURCES) $(HEADERS) $(PROBE_SRC) \
+	  || { echo "make docs: put the initializer on one line (see comment in Makefile)"; exit 1; }
+
+docs: check-docs-defaults
 	@command -v doxygen >/dev/null 2>&1 || { echo "doxygen not found"; exit 1; }
 	@doxygen && echo "Doxygen documentation written to docs/html/index.html"
 

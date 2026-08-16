@@ -506,8 +506,8 @@ class cVaapiDevice : public cDevice {
     bool inStillPicture{false};                                  ///< Re-entry guard for cDevice::StillPicture
     std::atomic<bool> radioBlackPending{false};                  ///< Awaiting radio-only channel detection
     cTimeMs radioBlackTimer;                                     ///< Radio-mode detection timeout
-    std::atomic<bool> radioCheckPending{
-        false}; ///< PlayAudio saw no video after the grace; CheckRadioSplash resolves it
+    /// PlayAudio saw no video after the grace; CheckRadioSplash resolves it
+    std::atomic<bool> radioCheckPending{false};
     std::atomic<bool> radioSplashActive{false}; ///< A refreshable radio (no-video) splash is on screen
     /// EPG id last queued into the radio splash; top-of-range sentinels = empty/dirty
     std::atomic<uint32_t> radioSplashEventId{0};

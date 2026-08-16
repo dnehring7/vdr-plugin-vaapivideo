@@ -148,9 +148,9 @@ time, that spike would surface as a dropped frame.
   `jitterBuf`, runs the due-gated drain, and calls `SyncAndSubmitFrame` at the
   audio-synced cadence — while the decode thread is already filtering ahead.
 
-They are joined by a bounded **blocking** handoff: `handoffMutex` (a strict leaf
-lock), with `handoffCondition` waking the present thread and `handoffNotFull`
-waking the decode thread. When the decoded reserve reaches `DECODER_RESERVE_HARD_CAP`
+They are joined by a bounded **blocking** handoff: `handoffMutex` (a near-leaf
+lock — see below), with `handoffCondition` waking the present thread and
+`handoffNotFull` waking the decode thread. When the decoded reserve reaches `DECODER_RESERVE_HARD_CAP`
 — the published total `jitterBuf + handoffQueue`, or `handoffQueue` alone — the
 decode thread *waits* rather than dropping, so the upstream packet queue (and
 through it VDR's flow control) stays authoritative — backpressure is never resolved
@@ -186,9 +186,12 @@ lock handshake. A single atomic `clearEpoch` is the generation counter:
   control changes are applied at the top of `PresentAction` via atomics
   (e.g. `jitterFlushRequest`), never by reaching into present-thread state.
 
-Lock order is `codecMutex → parserMutex → packetMutex`, with `handoffMutex` a
-strict leaf that nests no other lock — so the second thread adds no ordering
-edges. `jitterBuf` and the sync controller stay present-thread-private (no lock).
+Lock order is `codecMutex → parserMutex → packetMutex`. `handoffMutex` is a
+near-leaf: destroying a frame under it may drop the last `FilterGraphToken`,
+whose deleter locks the display's `vaDriverMutex` — its only outgoing edge, and
+safe because `vaDriverMutex` never leads back to a decoder-side lock (see the
+lock-order comments in decoder.h / display.cpp). `jitterBuf` and the sync
+controller stay present-thread-private (no lock).
 
 ## Filter pipeline
 
@@ -220,6 +223,25 @@ instead when a `sw-*` scale/sharpen pulls scaling into the SW segment).
 `fps` only duplicates or drops `AVFrame` references; it never reprocesses pixels.
 Placing it at the chain tail keeps scale/denoise/sharpen at one execution per
 *input* frame.
+
+### Graph lifetime and rebuild debounce
+
+A rebuilt graph is retired, not freed in place: every frame it produced carries
+a `FilterGraphToken` (a shared keep-alive on the graph), because iHD surfaces
+hold a raw back-pointer to the producing VPP context that `vaSyncSurface()`
+dereferences — freeing the graph while up to ~1.3 s of its frames (reserve +
+display prerender) are still queued is a driver use-after-free on the display
+thread's next PRIME export. The retired graph is freed, under the VA driver
+mutex, when the last frame referencing it leaves the pipeline.
+
+Rebuild *requests* (`ScaleVideo()` resize, zoom preset change) are debounced on
+the decode thread: the rebuild runs once the burst has been quiet for
+`DECODER_FILTER_REBUILD_DEBOUNCE_MS`, capped at
+`DECODER_FILTER_REBUILD_DEFER_MAX_MS` total deferral. A skin firing several
+resize calls per menu transition costs one rebuild instead of one per call;
+old-sized frames keep painting at the old scanout rect until the first
+new-sized fb arrives (`PresentBuffer` promotes `videoRect` then), so the
+deferral is invisible.
 
 ## Per-frame sync (`SyncAndSubmitFrame`)
 
@@ -735,6 +757,13 @@ Naming conventions:
 | `DECODER_QUEUE_CAPACITY`    | 200   | Video packet queue depth (~4 s @ 50 fps) |
 | `DECODER_SUBMIT_TIMEOUT_MS` | 100   | Present-side VSync backpressure budget inside `display->SubmitFrame()` |
 | `DECODER_RESERVE_HARD_CAP`  | 64    | Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps **total**); decode-side backpressure / present-side drop-oldest guard; also bounds 4K-surface GTT |
+
+**Filter rebuild debounce** (decoder.cpp)
+
+| Constant                              | Value | Purpose |
+| ------------------------------------- | ----- | ------- |
+| `DECODER_FILTER_REBUILD_DEBOUNCE_MS`  | 150   | Quiet window a ScaleVideo/zoom rebuild burst must clear before the VPP graph is rebuilt — a skin fires several resize calls per menu transition, and each rebuild retires a graph + surface pool |
+| `DECODER_FILTER_REBUILD_DEFER_MAX_MS` | 500   | Hard cap on the total deferral so a persistent caller cannot pin the pre-resize geometry |
 
 **Sync controller — corridor / EMA / cooldown** (decoder.cpp)
 

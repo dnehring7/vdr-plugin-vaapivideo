@@ -17,8 +17,10 @@
  * the clock halts with the demux loop.
  *
  * Invariants:
- *   1. sourceMutex MUST be released before calling Open/CloseCurrentEntry; cMutex is
- *      PTHREAD_MUTEX_ERRORCHECK (non-recursive). Action() defers playlist advancement.
+ *   1. sourceMutex MUST be released before calling Open/CloseCurrentEntry: they relock it
+ *      internally and would otherwise hold it across blocking container I/O (invariant 5).
+ *      Action() defers playlist advancement past its lock scope for the same reason.
+ *      (cMutex tolerates same-thread relock -- this is a hold-time rule, not a deadlock rule.)
  *   2. cVaapiControl owns the player (unique_ptr); cControl holds a borrowed alias.
  *      The dtor nulls the base before resetting (see ~cVaapiControl).
  *   3. cVaapiMediaSource emits a zero-based 90 kHz timeline so GetIndex/Seek math is
@@ -1600,8 +1602,8 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
 }
 
 auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
-    // sourceMutex is held by the caller (PerformSeek / PerformAudioSwitch). cMutex is
-    // non-recursive, so this must NOT re-lock.
+    // sourceMutex is held by the caller (PerformSeek / PerformAudioSwitch); not re-locked here
+    // so the hold stays visible at the call site (relock would be tolerated but obscures it).
     if (!source) {
         return;
     }
@@ -2003,8 +2005,8 @@ auto cVaapiPlayer::Action() -> void {
         }
 
         // -- read and dispatch one packet in demux order --------------------------
-        // AdvancePlaylist() re-locks sourceMutex via Close/OpenCurrentEntry; cMutex is
-        // non-recursive (PTHREAD_MUTEX_ERRORCHECK), so we defer it past the lock scope.
+        // AdvancePlaylist() re-locks sourceMutex via Close/OpenCurrentEntry and can block on
+        // container I/O, so defer it past the lock scope (invariant 1).
         bool didWork = false;
         bool advanceAfterUnlock = false;
         if (!packetPending) {

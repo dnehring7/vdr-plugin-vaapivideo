@@ -1,5 +1,6 @@
 #!/usr/bin/make -f
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 
 %:
 	dh $@ --with vdrplugin

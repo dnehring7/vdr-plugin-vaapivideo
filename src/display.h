@@ -11,6 +11,7 @@
 #include "caps.h"
 #include "common.h"
 #include "config.h"
+#include "filter.h" // FilterGraphToken (DrmFramebuffer keeps the producing VPP graph alive)
 
 #include <deque>
 
@@ -86,8 +87,10 @@ struct VideoPlacement {
 ///
 /// Thread safety: SubmitFrame(), SetOsd(), BeginStreamSwitch(), EndStreamSwitch() are
 /// safe from any thread. Initialize() and Shutdown() must be called from the same thread.
-/// Lock order: importMutex -> vaDriverMutex; importMutex -> bufferMutex; bufferMutex may
-/// precede videoRectMutex/osdMutex/hdrStateMutex, which are never nested with each other.
+/// Lock order: importMutex -> vaDriverMutex; importMutex -> bufferMutex -> vaDriverMutex
+/// (a framebuffer released under bufferMutex may free a retired VPP graph). bufferMutex and
+/// vaDriverMutex may precede the leaf mutexes videoRectMutex/osdMutex/hdrStateMutex, which
+/// are never nested with each other.
 /// See display.cpp.
 class cVaapiDisplay : public cThread {
   public:
@@ -182,7 +185,7 @@ class cVaapiDisplay : public cThread {
     /// and safe from any thread; a second request before the first is serviced replaces it.
     auto RequestDisplayMode(const drmModeModeInfo &mode) -> void;
     /// Consume the "output geometry changed" edge. The decoder calls this once per decode
-    /// iteration and rebuilds the VPP graph when it fires (same contract as videoRectDirty).
+    /// iteration and rebuilds the VPP graph when it fires (same contract as filterRebuildPending).
     [[nodiscard]] auto TakeGeometryChange() noexcept -> bool {
         return geometryChanged.exchange(false, std::memory_order_acq_rel);
     }
@@ -234,8 +237,8 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetLastVSyncTimeMs() const noexcept -> uint64_t {
         return lastVSyncTimeMs.load(std::memory_order_relaxed);
     }
-    /// Mutex serializing VA-driver calls between display (MapVaapiFrame) and decoder (VPP).
-    /// iHD's VEBOX path is not thread-safe when shared with concurrent filter execution.
+    /// Mutex serializing VA-driver calls between display (MapVaapiFrame) and decoder (VPP):
+    /// one VADisplay may not be driven from two threads at once.
     [[nodiscard]] auto GetVaDriverMutex() noexcept -> cMutex & { return vaDriverMutex; }
     /// True iff all KMS commit-path prerequisites for HDR are present: plane supports P010,
     /// COLOR_ENCODING has BT.2020 and BT.709 enums, connector exposes HDR_OUTPUT_METADATA,
@@ -264,7 +267,8 @@ class cVaapiDisplay : public cThread {
     // -------------------------------------------------------------------------
 
     /// Owns a KMS framebuffer backed by a VAAPI PRIME surface. Move-only.
-    /// Destructor release order: AVFrame -> FB -> GEM (reversing this is a kernel use-after-free).
+    /// Destructor release order: AVFrame -> FB -> GEM (reversing this is a kernel use-after-free),
+    /// then graphToken with the rest of the members (a VA-driver use-after-free if reversed).
     struct DrmFramebuffer {
         DrmFramebuffer() = default;
         ~DrmFramebuffer() noexcept;
@@ -283,9 +287,12 @@ class cVaapiDisplay : public cThread {
         uint32_t fbId{};      ///< KMS FB object ID; 0 = invalid/unregistered
         AVFrame *frame{};     ///< Owned AVFrame keeping the VA surface ref alive for KMS scanout
         uint32_t gemHandle{}; ///< GEM BO handle imported from the PRIME fd
-        uint32_t height{};    ///< Full surface height (may include codec padding beyond crop)
-        uint64_t modifier{};  ///< DRM format modifier (tiling/compression layout)
-        uint32_t width{};     ///< Full surface width (may include codec padding beyond crop)
+        /// Moved in from the VaapiFrame with `frame`: keeps the producing VPP graph alive while we
+        /// hold its surface (see FilterGraphToken). Released after `frame` (dtor body order).
+        FilterGraphToken graphToken;
+        uint32_t height{};   ///< Full surface height (may include codec padding beyond crop)
+        uint64_t modifier{}; ///< DRM format modifier (tiling/compression layout)
+        uint32_t width{};    ///< Full surface width (may include codec padding beyond crop)
     };
 
     // -------------------------------------------------------------------------
@@ -436,8 +443,11 @@ class cVaapiDisplay : public cThread {
     AVBufferRef *hwDeviceRef{};         ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
     mutable cMutex importMutex;         ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
                                 ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
-    mutable cMutex vaDriverMutex; ///< Serializes VA-driver calls: MapVaapiFrame (display) vs VPP pull (decoder).
-                                  ///< iHD VEBOX is not re-entrant when shared with filter execution.
+    /// Serializes VA-driver calls: MapVaapiFrame (display), VPP pull (decoder), retired-graph
+    /// teardown (FreeFilterGraphLocked, any thread) -- one VADisplay may not be driven from two
+    /// threads at once. Precedes only the leaf mutexes (see the class lock-order comment); the
+    /// token deleter takes it alone.
+    mutable cMutex vaDriverMutex;
     /// Set during stream switch; gates new frame imports in Action() and SubmitFrame()
     std::atomic<bool> isClearing{false};
     std::atomic<bool> isFlipPending{false};      ///< True between commit and page-flip event; Action() waits on this
@@ -527,8 +537,8 @@ class cVaapiDisplay : public cThread {
     HdrStreamInfo stagedHdrState{}; ///< HDR state staged by SetHdrOutputState(); consumed by MaybeAppendHdrOutputState
 
     // OSD-over-HDR commit policy (display-thread-only; see AtomicCommit). On bandwidth-limited GPUs
-    // (e.g. Intel N100) the OSD plane beside the 4K 10-bpc video plane forces a CDCLK-bump modeset;
-    // no static cap predicts it, so it's detected at runtime. Reset on mode change and Initialize().
+    // the OSD plane beside the 4K 10-bpc video plane forces a clock-bump modeset; no static cap
+    // predicts it, so it's detected at runtime. Reset on mode change and Initialize().
     bool osdHdrNeedsModeset{}; ///< OSD-over-HDR commits must use ALLOW_MODESET (CDCLK bump needed).
     bool osdHdrSuppressed{};   ///< Modeset fails too (bandwidth ceiling): block OSD enables under HDR.
 };

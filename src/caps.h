@@ -67,7 +67,7 @@ struct GpuCaps {
     bool vppSharpness{};            ///< VAProcFilterSharpening available
     std::string deinterlaceMode;    ///< Best VAProcDeinterlacing mode name for deinterlace_vaapi; "" = none
     unsigned deinterlaceModeMask{}; ///< Bit (1u<<VppDeintMode) set per supported mode; lets ClampDeinterlaceMode pick
-                                    ///< only modes the driver actually advertises (some iHD GPUs expose just one)
+                                    ///< only modes the driver actually advertises (a GPU may expose just one)
 
     // === DIAGNOSTICS ===
     std::string vendorName; ///< vaQueryVendorString output; logged at startup only
@@ -151,12 +151,12 @@ struct AudioSinkCaps {
 // ============================================================================
 
 /// Probe VAAPI decode profiles and VPP filter capabilities from @p renderNode.
-/// Opens a dedicated throwaway VADisplay -- reusing FFmpeg's VADisplay tickles
-/// an iHD 24.x bug where vaCreateContext fails intermittently after the first
-/// probe context is destroyed. Returns std::nullopt on hard failures (render
-/// node unreadable, vaInitialize error, VPP entrypoint missing); the caller
-/// must abort hardware attach. A returned struct with all hw* flags false is
-/// valid: VPP is operational but no codec was confirmed usable for HW decode.
+/// Opens a dedicated throwaway VADisplay -- probing on FFmpeg's has been seen to
+/// break every later vaCreateContext once the probe context is destroyed (iHD 24.x).
+/// Returns std::nullopt on hard failures (render node unreadable, vaInitialize error,
+/// VPP entrypoint missing); the caller must abort hardware attach. A returned struct
+/// with all hw* flags false is valid: VPP is operational but no codec was confirmed
+/// usable for HW decode.
 [[nodiscard]] auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps>;
 
 /// OR the sink HDR capability bits from a raw EDID blob into @p caps (sinkHdr10Pq, sinkHlg,

@@ -602,9 +602,9 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
         return false;
     }
 
-    // vaDriverMutex: hw_frames_ctx_init + get_buffer create/reserve a VAAPI surface, which
-    // races the display thread's av_hwframe_map and the decoder's VPP on the iHD driver (not
-    // thread-safe on a shared VADisplay). Serialize like MapVaapiFrame / the decoder paths do.
+    // vaDriverMutex: hw_frames_ctx_init + get_buffer create/reserve a VAAPI surface -- one
+    // VADisplay may not be driven from two threads at once, and both the display thread's map and
+    // the decoder's VPP run on this one. Serialize like MapVaapiFrame / the decoder paths do.
     {
         const cMutexLock vaLock(&display->GetVaDriverMutex());
         if (av_hwframe_ctx_init(framesRef.get()) < 0) [[unlikely]] {

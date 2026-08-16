@@ -20,7 +20,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 // FFmpeg
@@ -47,6 +46,7 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/remux.h>
+#include <vdr/thread.h>
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
@@ -144,7 +144,7 @@ namespace {
 
 /// Resolve the GPU deinterlacer for a requested VppDeintMode rank, choosing ONLY modes the driver
 /// advertises in @p supportedMask -- emitting an unadvertised mode makes VAAPI reject the whole graph
-/// (some iHD GPUs expose just motion_compensated). The VppDeintMode value is its rank (lower = better);
+/// (a GPU may expose just one mode). The VppDeintMode value is its rank (lower = better);
 /// rank 0 (MCDI) means "best advertised". See config.h.
 [[nodiscard]] auto ClampDeinterlaceMode(std::string_view gpuMode, int capRank, unsigned supportedMask)
     -> std::string_view {
@@ -200,10 +200,28 @@ inline constexpr const char *SW_SHARPEN_MEDIUM = "unsharp=5:5:0.5:5:5:0.0";
 
 } // namespace
 
+// ============================================================================
+// === FILTER GRAPH TOKEN ===
+// ============================================================================
+
+auto FreeFilterGraphLocked::operator()(AVFilterGraph *graph) const noexcept -> void {
+    // Why locked: teardown issues vaDestroyContext/vaDestroyConfig, and the last token can be
+    // dropped on any thread (see the struct doc). Null mutex = graph never touched a display.
+    if (vaDriverMutex == nullptr) [[unlikely]] {
+        avfilter_graph_free(&graph);
+        return;
+    }
+    const cMutexLock vaLock(vaDriverMutex);
+    avfilter_graph_free(&graph);
+}
+
+// ============================================================================
+// === BUILD ===
+// ============================================================================
+
 auto cVideoFilterChain::FailBuild() noexcept -> bool {
     bufferSrcCtx_ = nullptr;
     bufferSinkCtx_ = nullptr;
-    filterGraph_.reset();
     hasFpsFilter_.store(false, std::memory_order_relaxed);
     outputFrameDurationMs_ = 20;
     naturalOutputRateMilliHz_.store(0, std::memory_order_relaxed);
@@ -211,7 +229,7 @@ auto cVideoFilterChain::FailBuild() noexcept -> bool {
 }
 
 auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) -> bool {
-    if (filterGraph_) {
+    if (graph_) {
         return true;
     }
 
@@ -356,7 +374,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     std::string scaleColorArgs;
     if (params.hdrPassthrough) {
         // Pin colorimetry explicitly: scale_vaapi's "preserve input" default is driver-dependent
-        // and iHD has been observed to silently downgrade to BT.709 on some frame sizes.
+        // and has been seen to silently downgrade HDR output to BT.709.
         const char *transfer = (params.hdrInfo.kind == StreamHdrKind::Hlg) ? "arib-std-b67" : "smpte2084";
         scaleColorArgs = std::format(
             "format={}:out_color_matrix=bt2020nc:out_color_primaries=bt2020:out_color_transfer={}:out_range=tv", pixFmt,
@@ -549,10 +567,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filters.emplace_back(useSpatialDeinterlace ? "yadif=deint=interlaced" : SW_DEINT_BWDIF);
             } else if (useSpatialDeinterlace && hasHwDeinterlace) {
                 // Trick: bob spatial deinterlace at frame rate (1x); auto=1 leaves progressive frames
-                // untouched inside mixed streams. Clamp to an advertised mode -- some iHD GPUs expose
-                // only motion_compensated, and an unadvertised bob would fail the whole graph (no video
-                // in trick mode). The temporal fallback costs 1-2 frames of latency, which trick's
-                // continuous frame flow absorbs; rate=frame keeps the 1x cadence either way.
+                // untouched inside mixed streams. Clamp to an advertised mode -- a GPU may expose only
+                // one, and an unadvertised bob would fail the whole graph (no video in trick mode).
+                // The temporal fallback costs 1-2 frames of latency, which trick's continuous frame
+                // flow absorbs; rate=frame keeps the 1x cadence either way.
                 const std::string_view deintMode =
                     ClampDeinterlaceMode(VppDeintModeArg(VppDeintMode::Bob), static_cast<int>(VppDeintMode::Bob),
                                          params.deinterlaceModeMask);
@@ -628,8 +646,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filterChain += filter;
     }
 
-    filterGraph_.reset(avfilter_graph_alloc());
-    if (!filterGraph_) [[unlikely]] {
+    // Build()-local until fully configured: every failure path frees it on return, and graph_
+    // stays null so IsBuilt() never sees a half-built chain.
+    std::unique_ptr<AVFilterGraph, FreeAVFilterGraph> graph{avfilter_graph_alloc()};
+    if (!graph) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to allocate filter graph");
         return false;
     }
@@ -660,7 +680,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     // hw_frames_ctx must be attached to the buffer source before avfilter_init_str();
     // FFmpeg 7.x rejects initialization of a HW-format source without it.
-    bufferSrcCtx_ = avfilter_graph_alloc_filter(filterGraph_.get(), avfilter_get_by_name("buffer"), "in");
+    bufferSrcCtx_ = avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("buffer"), "in");
     if (!bufferSrcCtx_) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to allocate buffer source filter");
         return FailBuild();
@@ -701,7 +721,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     }
 
     ret = avfilter_graph_create_filter(&bufferSinkCtx_, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr,
-                                       filterGraph_.get());
+                                       graph.get());
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to create buffer sink: %s", AvErr(ret).data());
         return FailBuild();
@@ -713,7 +733,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // create and init. (HW decode doesn't strictly need hw_device_ctx on the VAAPI filters --
     // they pick it up from hw_frames_ctx via the link -- but setting it is harmless.)
     AVFilterGraphSegment *segment = nullptr;
-    ret = avfilter_graph_segment_parse(filterGraph_.get(), filterChain.c_str(), 0, &segment);
+    ret = avfilter_graph_segment_parse(graph.get(), filterChain.c_str(), 0, &segment);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to parse filter chain '%s': %s", filterChain.c_str(), AvErr(ret).data());
         return FailBuild();
@@ -729,8 +749,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Attach hw_device_ctx to every newly created filter (skip the externally allocated
     // buffer source/sink, which were already initialized above). Without this, hwupload's
     // init returns EINVAL and scale_vaapi/sharpness_vaapi fail at graph config time.
-    for (unsigned int i = 0; i < filterGraph_->nb_filters; ++i) {
-        AVFilterContext *filterCtx = filterGraph_->filters[i];
+    for (unsigned int i = 0; i < graph->nb_filters; ++i) {
+        AVFilterContext *filterCtx = graph->filters[i];
         if (filterCtx == bufferSrcCtx_ || filterCtx == bufferSinkCtx_) {
             continue;
         }
@@ -783,7 +803,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         return FailBuild();
     }
 
-    ret = avfilter_graph_config(filterGraph_.get(), nullptr);
+    ret = avfilter_graph_config(graph.get(), nullptr);
     if (ret < 0) [[unlikely]] {
         esyslog("vaapivideo/filter: failed to configure filter graph '%s': %s", filterChain.c_str(), AvErr(ret).data());
         return FailBuild();
@@ -801,17 +821,13 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // the decoder skip the notification and StreamModeRequest::IsValid() keep the matcher inert.
     naturalOutputRateMilliHz_.store(fpsDeclared ? naturalOutputMilliHz : 0, std::memory_order_relaxed);
 
-    if (compactLog) {
-        if (wantCrop) {
-            // Zoom-driven rebuild: show the crop so the active zoom is verifiable in the log.
-            dsyslog("vaapivideo/filter: rebuilt -> %ux%u (zoom crop=%u:%u:%u:%u)", filterWidth, filterHeight, croppedW,
-                    croppedH, cropOffX, cropOffY);
-        } else {
-            dsyslog("vaapivideo/filter: rebuilt -> %ux%u", filterWidth, filterHeight);
-        }
-    } else {
-        // Non-compact => Clear / channel switch (trick/zoom set compactLog). Log it even when the
-        // chain is byte-for-byte identical, so every switch surfaces its settings.
+    // Publish: from here the graph is owned jointly by the chain and by every frame it produces
+    // (via FilterGraphToken), so it survives Reset() for as long as any of them is in flight.
+    graph_ = std::shared_ptr<AVFilterGraph>(graph.release(), FreeFilterGraphLocked{params.vaDriverMutex});
+
+    if (!compactLog) {
+        // Non-compact => Clear / channel switch (trick/zoom/seek rebuilds set compactLog). Log it
+        // even when the chain is byte-for-byte identical, so every switch surfaces its settings.
         const char *cadenceTag = "";
         if (insertFpsFilter) {
             if (naturalOutputMilliHz < displayMilliHz) {
@@ -839,8 +855,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filterWidth, filterHeight, chainDeinterlaces ? ", deinterlaced" : "", cadenceTag, pixFmt,
                 params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
     }
-    // Always surface the actual chain so trick/still/zoom/seek rebuilds are verifiable in the log.
-    dsyslog("vaapivideo/filter: filter chain='%s'", filterChain.c_str());
+    // Always surface the actual chain -- on compact rebuilds this is the ONLY line. The output
+    // size is appended explicitly because a no-resize/no-crop chain emits a bare "scale_vaapi=..."
+    // element with no w=/h= args, so the chain string alone would not carry the geometry.
+    dsyslog("vaapivideo/filter: filter chain='%s' (out=%ux%u)", filterChain.c_str(), filterWidth, filterHeight);
 
     return true;
 }
@@ -850,7 +868,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 // ============================================================================
 
 auto cVideoFilterChain::SendFrame(AVFrame *frame) noexcept -> int {
-    if (!filterGraph_ || !bufferSrcCtx_) [[unlikely]] {
+    if (!graph_ || !bufferSrcCtx_) [[unlikely]] {
         return AVERROR(EINVAL);
     }
     // KEEP_REF: the filter graph makes its own ref; the decoder retains ownership of the
@@ -861,7 +879,7 @@ auto cVideoFilterChain::SendFrame(AVFrame *frame) noexcept -> int {
 }
 
 auto cVideoFilterChain::ReceiveFrame(AVFrame *out) noexcept -> int {
-    if (!filterGraph_ || !bufferSinkCtx_) [[unlikely]] {
+    if (!graph_ || !bufferSinkCtx_) [[unlikely]] {
         return AVERROR(EINVAL);
     }
     return av_buffersink_get_frame(bufferSinkCtx_, out);
@@ -873,13 +891,9 @@ auto cVideoFilterChain::Reset() noexcept -> void {
     hasFpsFilter_.store(false, std::memory_order_relaxed);
     outputFrameDurationMs_ = 20;
     naturalOutputRateMilliHz_.store(0, std::memory_order_relaxed);
-    // Keep the old graph alive in previousFilterGraph_: destroying it immediately causes
-    // -EIO on iHD because the VPP output surfaces are still DMA-BUF mapped by the display
-    // thread. The saved graph (and its hw_frames_ctx) is released when a later Reset()
-    // saves a successor graph here (or in the destructor). Build() deliberately never
-    // touches this slot: freeing it during the Reset->Build gap would hit the same race.
-    // Guard: a double-reset (Clear -> drain -> EOS) must not overwrite the saved graph with null.
-    if (filterGraph_) {
-        previousFilterGraph_ = std::move(filterGraph_);
-    }
+    // Drop only the chain's own reference: in-flight frames hold FilterGraphTokens, and destroying
+    // the graph under them is a driver use-after-free (see FilterGraphToken). With nothing in
+    // flight this IS the last reference and frees the graph right here -- the recursive
+    // vaDriverMutex re-entry is fine since every Reset() call site already holds it.
+    graph_.reset();
 }

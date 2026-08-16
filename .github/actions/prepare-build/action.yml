@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+#
 # Validate vX.Y.Z tag and export V (= tag without leading "v") to
 # $GITHUB_ENV/$GITHUB_OUTPUT. GPG handling is done by the standard
 # crazy-max/ghaction-import-gpg action in the workflow itself.

@@ -142,9 +142,8 @@ class ProbeVaDisplay {
 auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps> {
     GpuCaps caps{};
 
-    // Open a dedicated render fd for probing. Reusing FFmpeg's VADisplay tickles an
-    // iHD 24.x bug where vaCreateContext starts failing intermittently once the probe
-    // context is destroyed (likely a refcount issue in the driver's internal state).
+    // Probe on a throwaway fd, never FFmpeg's VADisplay: destroying the probe context there has
+    // been seen to break every later vaCreateContext on that display (iHD 24.x).
     const std::string renderPath{renderNode};
     const int renderFd = open(renderPath.c_str(), O_RDWR | O_CLOEXEC);
     if (renderFd < 0) [[unlikely]] {
@@ -202,9 +201,8 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
     }
     isyslog("vaapivideo/caps: VA-API driver -- %s", caps.vendorName.empty() ? "(unknown)" : caps.vendorName.c_str());
 
-    // Probe 8-bit and 10-bit independently per codec: a driver may list Main10 without
-    // Main (e.g. HEVC Main10-only on some iHD builds), so both bits need independent
-    // confirmation. Only broadcast codecs relevant to VDR are probed.
+    // Probe 8-bit and 10-bit independently per codec: a driver may list Main10 without Main, so
+    // neither bit implies the other. Only broadcast codecs relevant to VDR are probed.
     const int maxProfiles = vaMaxNumProfiles(vaDisplay);
     if (maxProfiles <= 0) [[unlikely]] {
         esyslog("vaapivideo/caps: vaMaxNumProfiles failed");
@@ -249,8 +247,8 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
                     }
                     break;
                 case VAProfileHEVCMain10:
-                    // Main10 decoders can handle 8-bit Main streams; probe both in case
-                    // the driver lists only Main10 (observed on some iHD configurations).
+                    // Main10 decoders handle 8-bit Main streams too; probe both, since a
+                    // driver may list only Main10.
                     if (!caps.hwHevc && HasVldDecode(vaDisplay, profile, VA_RT_FORMAT_YUV420)) {
                         caps.hwHevc = true;
                     }
@@ -314,7 +312,7 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
         return std::nullopt;
     }
 
-    // 64x64: iHD SIGSEGVs on zero-size dimensions; some VPP entrypoints reject
+    // 64x64: a zero-size probe can segfault the driver, and some VPP entrypoints reject
     // sub-macroblock sizes. NV12 is required: scale_vaapi outputs NV12 on the SDR
     // path and the DRM video plane consumes it -- no fallback exists if absent.
     if (!CanCreateSurfaceFourcc(vaDisplay, VA_RT_FORMAT_YUV420, VA_FOURCC_NV12)) [[unlikely]] {
@@ -385,7 +383,7 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
         const std::span<const VAProcFilterCapDeinterlacing> validDeintCaps{
             deintCaps.data(), std::min(static_cast<size_t>(numDeintCaps), deintCaps.size())};
         // Mask EVERY advertised mode, not just the best: ClampDeinterlaceMode needs to know which lower
-        // modes actually exist (some iHD GPUs advertise only motion_compensated). Descending quality
+        // modes actually exist (a GPU may advertise only one). Descending quality
         // order means the first hit is also the default best mode.
         for (const auto &[type, mode] : kDeintModes) {
             if (std::ranges::any_of(validDeintCaps, [type](const auto &c) -> bool { return c.type == type; })) {
