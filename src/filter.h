@@ -214,6 +214,10 @@ class cVideoFilterChain {
     /// Active graph; null until the first Build() and after every Reset(). Produced frames hold
     /// FilterGraphTokens on it, which is what keeps a retired graph's VA context alive.
     std::shared_ptr<AVFilterGraph> graph_;
+    /// Source args + chain + geometry of the last *logged* build. Compact rebuilds matching it
+    /// byte-for-byte skip the chain line (reverse trick rebuilds an identical graph once per
+    /// keyframe step). Deliberately survives Reset() -- it tracks the log, not the graph.
+    std::string lastChainLogKey_;
     AVFilterContext *bufferSrcCtx_{};       ///< owned by graph_; raw pointer valid only while graph_ is live
     AVFilterContext *bufferSinkCtx_{};      ///< owned by graph_; same lifetime constraint
     int outputFrameDurationMs_{20};         ///< 20 = 50 fps fallback; updated by Build()

@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // FFmpeg
@@ -672,8 +673,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         bufferSrcArgs += std::format(":range={}", static_cast<int>(firstFrame->color_range));
     }
 
-    // compactLog is the sole gate -- don't also dedup identical args, or a same-format channel
-    // switch (trick/zoom set compactLog) would never surface its settings.
+    // compactLog is the sole gate here -- no dedup on this line, or a same-format channel switch
+    // (always non-compact) would never surface its settings. Compact rebuilds are deduped at the
+    // chain line below instead.
     if (!compactLog) {
         dsyslog("vaapivideo/filter: buffer source args='%s'", bufferSrcArgs.c_str());
     }
@@ -855,10 +857,16 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filterWidth, filterHeight, chainDeinterlaces ? ", deinterlaced" : "", cadenceTag, pixFmt,
                 params.hdrPassthrough ? StreamHdrKindName(params.hdrInfo.kind) : "SDR");
     }
-    // Always surface the actual chain -- on compact rebuilds this is the ONLY line. The output
-    // size is appended explicitly because a no-resize/no-crop chain emits a bare "scale_vaapi=..."
-    // element with no w=/h= args, so the chain string alone would not carry the geometry.
-    dsyslog("vaapivideo/filter: filter chain='%s' (out=%ux%u)", filterChain.c_str(), filterWidth, filterHeight);
+    // On compact rebuilds this is the ONLY line, and a byte-identical repeat is skipped outright:
+    // trick reverse rebuilds the same graph once per keyframe step. Non-compact builds (Clear /
+    // channel switch) always log, so a same-format switch still surfaces its settings. The output
+    // size is appended because a no-resize/no-crop chain emits a bare "scale_vaapi=..." element
+    // with no w=/h= args.
+    std::string chainLogKey = std::format("{}|{}|{}x{}", bufferSrcArgs, filterChain, filterWidth, filterHeight);
+    if (!compactLog || chainLogKey != lastChainLogKey_) {
+        dsyslog("vaapivideo/filter: filter chain='%s' (out=%ux%u)", filterChain.c_str(), filterWidth, filterHeight);
+    }
+    lastChainLogKey_ = std::move(chainLogKey);
 
     return true;
 }

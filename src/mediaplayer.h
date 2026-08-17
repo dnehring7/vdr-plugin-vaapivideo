@@ -161,6 +161,12 @@ class cVaapiMediaSource final : public IMediaSource {
     auto Flush() -> void override; ///< avformat_flush (post-seek)
 
     [[nodiscard]] auto Seek(int64_t targetPts90k) -> bool; ///< av_seek_frame to nearest keyframe at/below target
+    /// Arm a one-shot window flagging video packets below @p before90k with AV_PKT_FLAG_DISCARD:
+    /// libavcodec decodes them (the H.264/HEVC reference chain needs the preroll) but drops the
+    /// output. Needed for slow-motion entry, where trick pacing presents EVERY decoded frame --
+    /// there is no clock gate to swallow the preroll, so it would replay in slow motion otherwise.
+    /// Disarmed by the first video packet at/after the target, or by the next Seek().
+    auto DiscardVideoPrerollBefore(int64_t before90k) noexcept -> void { discardVideoBefore90k = before90k; }
     [[nodiscard]] auto DurationMs() const noexcept -> int; ///< 0 when unknown (live streams)
     [[nodiscard]] auto IoInterrupted() const noexcept
         -> bool; ///< True if a blocking libavformat I/O should bail (shutdown via stopFlag, or a
@@ -228,6 +234,9 @@ class cVaapiMediaSource final : public IMediaSource {
                                                       ///< audio packets earlier than that so the master
                                                       ///< clock anchors at the requested timeline (and not
                                                       ///< at the earlier video keyframe libavformat lands on).
+    int64_t discardVideoBefore90k{AV_NOPTS_VALUE};    ///< Slow-motion entry guard: video below this gets
+                                                      ///< AV_PKT_FLAG_DISCARD (decoded for refs, never shown).
+                                                      ///< See DiscardVideoPrerollBefore().
     VideoStreamInfo videoInfo;                  ///< Video decoder descriptor; .extradata aliases videoExtradataStorage
     AudioStreamInfo audioInfo;                  ///< Mirror of audioTracks[currentAudioTrack].info (the decoding stream)
     std::vector<uint8_t> videoExtradataStorage; ///< Owns the bytes videoInfo.extradata points at
@@ -245,16 +254,27 @@ class cVaapiMediaSource final : public IMediaSource {
 // === PLAYER ===
 // ============================================================================
 
+/// Index of the normal-speed ('1') entry in the trick-speed notch table (vdr/dvbplayer.c
+/// Speeds[]; the table itself lives in mediaplayer.cpp). Here only for member initialization.
+inline constexpr int MEDIAPLAYER_TRICK_NORMAL_IDX = 4;
+
 /// VDR cPlayer + private demux cThread. Owns the cVaapiMediaSource and walks the
 /// playlist. Action() runs the packet pump: pull one video + one audio packet
 /// per iteration, submit to the device, throttle on IsMediaPlayerBackpressured().
 // NOLINTNEXTLINE(misc-multiple-inheritance) -- standard VDR pattern; cf. cDvbPlayer in VDR core.
 class cVaapiPlayer final : public cPlayer, public cThread {
   public:
-    /// Only the phases anyone observes (IsFinished / Action's EOF checks). Transient pause/seek
-    /// phases are NOT states -- they live in the dedicated `paused` / `seekPending` atomics; folding
-    /// them in here made two threads write one variable for values nobody read.
+    /// Only the phases anyone observes (IsFinished / Action's EOF checks). Transient pause/seek/
+    /// trick phases are NOT states -- they live in the dedicated `playMode` / `seekPending` atomics;
+    /// folding them in here made two threads write one variable for values nobody read.
     enum class State : uint8_t { Running, Eof, Stopped };
+
+    /// dvbplayer-style play phase (cf. ePlayModes in vdr/dvbplayer.c). The VDR main thread (key
+    /// handlers) is the primary writer; the demux thread writes only on auto-exit edges (reverse
+    /// play reaching the file start, EOF during a trick mode). Fast = keyframe stepping paced by
+    /// the decoder's trick hold; Slow = full decode paced below real time. Direction lives in the
+    /// separate `trickForward` flag, the speed notch in `trickSpeedIdx`.
+    enum class PlayMode : uint8_t { Play, Pause, Slow, Fast };
 
     /// @p uri is what the user selected (media file, .m3u path, or URL) -- the bookmark identity.
     /// @p startMs is the absolute resume position for the FIRST entry (0 = start).
@@ -268,10 +288,29 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === PUBLIC API (called from cVaapiControl on the VDR main thread) ===
     // ========================================================================
-    /// Parks the demux thread and freezes the device, so the audio master clock stops rather than drifting on.
-    auto SetPaused(bool paused) -> void;
-    /// Mirrors the last SetPaused(); safe from any thread.
-    [[nodiscard]] auto IsPaused() const noexcept -> bool { return paused.load(std::memory_order_acquire); }
+    /// Resume normal playback from pause or any trick mode (cf. cDvbPlayer::Play()); no-op while playing.
+    auto Play() -> void;
+    /// Toggle pause (cf. cDvbPlayer::Pause()): freezes from normal play (parks the demux thread and
+    /// halts the audio master clock), exits a trick mode into pause, resumes when already paused.
+    auto Pause() -> void;
+    /// One notch toward faster-forward (cf. cDvbPlayer::Forward()): from play -> fast forward, deeper
+    /// on repeat; from pause -> slow motion; winds an active backward mode down through normal.
+    auto Forward() -> void;
+    /// Mirror of Forward() toward backward playback (cf. cDvbPlayer::Backward()).
+    auto Backward() -> void;
+    /// Leave an active trick mode into normal play WITHOUT the Exit re-anchor; no-op otherwise.
+    /// For callers about to reposition anyway (jump seek, playlist advance, audio-track switch) --
+    /// their own seek/reopen re-anchors, so ExitTrick()'s staged seek would just double the flush.
+    auto LeaveTrickWithoutReanchor() -> void;
+    /// True while frozen (not during trick modes); safe from any thread.
+    [[nodiscard]] auto IsPaused() const noexcept -> bool {
+        return playMode.load(std::memory_order_acquire) == PlayMode::Pause;
+    }
+    /// True while a trick mode (fast or slow, either direction) is active; safe from any thread.
+    [[nodiscard]] auto IsTrickMode() const noexcept -> bool {
+        const PlayMode mode = playMode.load(std::memory_order_acquire);
+        return mode == PlayMode::Fast || mode == PlayMode::Slow;
+    }
     auto Seek(int64_t deltaMs) -> void; ///< Relative seek; deltaMs may be negative
     auto Next() -> void;                ///< Skip to next playlist entry, if any
     /// Display title of the entry playing now (playlist label, else the basename).
@@ -290,7 +329,8 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === cPlayer overrides (public) ===
     // ========================================================================
-    /// cPlayer hook for the replay bar: always forward at normal speed (no trick modes here).
+    /// cPlayer hook for the replay bar (cf. cDvbPlayer::GetReplayMode): Play/Forward/Speed from the
+    /// trick state, so skins render the usual "1>>".."3>>" / "<<1" / "1|>" / "<|1" mode symbols.
     [[nodiscard]] auto GetReplayMode(bool &Play, bool &Forward, int &Speed) -> bool override;
     /// Position and length in MILLISECONDS, not cPlayer's frame unit -- cVaapiControl, the only
     /// caller, formats them directly. Served from cached atomics so it never blocks behind the
@@ -337,9 +377,64 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     [[nodiscard]] auto Lookahead90k(const cVaapiDevice *vaapiDev) const noexcept -> int64_t;
     /// Demux-thread half of Seek(): resolves the delta against the current position, then SeekToMs().
     auto PerformSeek(int64_t deltaMs) -> void;
-    /// Absolute seek + re-anchor; assumes sourceMutex held. Shared by PerformSeek and the track
-    /// switch's re-anchor (which Seek() would skip as a delta==0 no-op).
-    auto SeekToMs(int64_t targetMs) -> void;
+    /// Absolute seek + re-anchor; assumes sourceMutex held. Shared by PerformSeek, the track
+    /// switch's re-anchor (which Seek() would skip as a delta==0 no-op), and trick transitions.
+    /// False when nothing was flushed (no source/device, or the container seek failed -- playback
+    /// then continues at the old position). Trick transitions MUST check it and fail closed;
+    /// jump/track-switch callers deliberately ignore it (continuing unmoved is the right fallback).
+    [[nodiscard]] auto SeekToMs(int64_t targetMs) -> bool;
+
+    // ========================================================================
+    // === TRICK PLAY (state machine on the VDR main thread; feed in Action) ===
+    // ========================================================================
+    /// One-shot feed-transition command for the demux thread, staged by the state machine and
+    /// consumed in Action() like seekPending. Enter* start a trick feed at the anchored position;
+    /// Exit re-anchors normal playback after leaving a trick. Slow-forward is its own command
+    /// (not derived from playMode in the consumer): the command is staged BEFORE playMode is
+    /// published, so the consumer must not depend on the mode store having landed.
+    enum class TrickCommand : uint8_t { None, EnterForward, EnterSlowForward, EnterReverse, Exit };
+
+    /// cDvbPlayer's Forward()/Backward() transition graph, folded over the direction: one notch
+    /// toward faster playback @p towardForward. An active opposite-direction mode winds down
+    /// through normal play/pause (multi-speed) or restarts in the new direction (single-speed).
+    auto CycleTrick(bool towardForward) -> void;
+    /// Shared trick entry: publish the trick state, apply the first speed notch, stage the feed
+    /// transition, wake the demux thread. Refused (no-op) without an open entry, or backward on a
+    /// source without a known duration (reverse needs seekable, bounded input).
+    auto EnterTrick(PlayMode mode, bool forward, int firstStep) -> void;
+    /// cDvbPlayer::TrickSpeed(Increment) verbatim: walk trickSpeedIdx one notch, saturate silently
+    /// on the table's 0 sentinels, resolve the '1' entry to Play()/Pause(), else map the table
+    /// entry to the device frame-repeat count and call DeviceTrickSpeed().
+    auto TrickSpeedStep(int increment) -> void;
+    /// Shared trick-exit core: publish @p nextMode with the trick state reset and end the device
+    /// trick via DevicePlay() (trickSpeed=0 + decoder trick exit + unpause). Callers add their own
+    /// re-anchor: ExitTrick() stages Exit; the demux auto-exits (EOF, reverse at start) re-anchor
+    /// inline.
+    auto EndTrick(PlayMode nextMode) -> void;
+    /// Main-thread trick exit: EndTrick(); exit-to-pause re-freezes right after (queues are empty
+    /// during trick, so nothing plays out); stages the Exit re-anchor for the demux thread.
+    auto ExitTrick(bool toPause) -> void;
+    /// Demux-thread fail-closed exit: a trick transition/step cannot proceed (its seek failed), so
+    /// running on in trick mode would play the wrong timeline or retry forever. Returns to where
+    /// the trick was entered from: pause for slow modes, play for fast. No re-anchor -- seeks are
+    /// exactly what just failed.
+    auto AbortTrick(const char *reason) -> void;
+    /// Arm ioInterrupt BEFORE staging a demux command; the consuming branch clears it after taking
+    /// the command. Armed AFTER the command it can go stray: the demux may consume the command in
+    /// between, and the then-unmatched interrupt aborts an innocent read (the abort also latches
+    /// AVERROR_EXIT/eof in the AVIOContext -- see ReadPacket's reset).
+    auto ArmDemuxInterrupt() noexcept -> void { ioInterrupt.store(true, std::memory_order_release); }
+    /// Wake the demux thread out of a pause park so a staged command is serviced promptly.
+    /// Blocking-read interruption is ArmDemuxInterrupt()'s job, BEFORE the command store.
+    auto WakeDemux() -> void;
+    /// Demux-thread half of a staged trick transition: SeekToMs() re-anchor at the shown position,
+    /// slow-motion preroll discard, and reverse-stepping init. Takes sourceMutex.
+    auto PerformTrickTransition(TrickCommand cmd) -> void;
+    /// One reverse trick step: container-seek just below the last shown keyframe, read exactly that
+    /// keyframe, submit it. Steps the target back further when a coarse seek lands on the same
+    /// keyframe; auto-resumes normal play at the file start. Returns false when no progress was
+    /// made (read failure / submit refused) so the caller sleeps. Takes sourceMutex.
+    [[nodiscard]] auto PerformReverseStep(cVaapiDevice *vaapiDev, AVPacket *packet) -> bool;
     /// Publish the source's audio streams to the device for cDisplayTracks and select the
     /// Setup.AudioLanguages-preferred initial track. sourceMutex held (from OpenCurrentEntry).
     auto RegisterAudioTracks() -> void;
@@ -365,12 +460,21 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     std::vector<PlaylistEntry> playlist; ///< One entry for a single file/URL; expanded rows for an .m3u
     std::atomic<size_t> currentIndex{0}; ///< Index into playlist of the entry playing now
 
-    std::unique_ptr<cVaapiMediaSource> source;     ///< Current entry's demuxer; swapped under sourceMutex
-    std::unique_ptr<cSubtitleConverter> subtitles; ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
-    std::atomic<State> state{State::Running};      ///< Lifecycle state; Eof/Stopped are what IsFinished() reports
-    std::atomic<bool> paused{false};               ///< Mirrors SetPaused(); the demux loop parks while set
-    std::atomic<bool> seekPending{false};          ///< Set by Seek(), consumed by Action() before the next read
-    std::atomic<int64_t> seekDeltaMs{0};           ///< Relative seek staged with seekPending (ms, may be negative)
+    std::unique_ptr<cVaapiMediaSource> source;      ///< Current entry's demuxer; swapped under sourceMutex
+    std::unique_ptr<cSubtitleConverter> subtitles;  ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
+    std::atomic<State> state{State::Running};       ///< Lifecycle state; Eof/Stopped are what IsFinished() reports
+    std::atomic<PlayMode> playMode{PlayMode::Play}; ///< Play phase (see PlayMode); the demux loop parks while Pause
+    std::atomic<bool> trickForward{true};           ///< Trick direction; meaningful while playMode is Slow/Fast
+    std::atomic<int> trickSpeedIdx{MEDIAPLAYER_TRICK_NORMAL_IDX}; ///< Speed notch: index into the trick-speed table
+    std::atomic<TrickCommand> trickCommand{TrickCommand::None};   ///< Staged feed transition; consumed in Action()
+    std::atomic<int> trickAnchorMs{-1}; ///< Shown position (ms) captured on the MAIN thread at the trick keypress,
+                                        ///< BEFORE DeviceTrickSpeed()/DevicePlay() wipe the decoder's lastPts --
+                                        ///< a demux-side position read races the flush and anchors at 0.
+                                        ///< PerformTrickTransition re-anchors here.
+    int64_t reverseTargetPts90k{-1};    ///< Demux-thread only: next reverse-step container seek target (90 kHz)
+    int64_t reverseShownPts90k{-1}; ///< Demux-thread only: PTS of the last submitted reverse keyframe (progress guard)
+    std::atomic<bool> seekPending{false}; ///< Set by Seek(), consumed by Action() before the next read
+    std::atomic<int64_t> seekDeltaMs{0};  ///< Relative seek staged with seekPending (ms, may be negative)
     /// Per-track-type switch coordination. A Set*Track() call (VDR thread) stages a request here;
     /// the demux Action() services it before the pause branch so a frozen player still switches.
     struct TrackSwitchState {
@@ -383,10 +487,12 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     TrackSwitchState subtitleSwitch;        ///< Subtitle-track switch request (menuIndex = last requested, -1 = off).
     std::atomic<bool> nextRequested{false}; ///< Set by Next(), consumed by Action() to advance the playlist
     std::atomic<bool> stopping{false};      ///< Shutdown signal; also breaks blocking libavformat I/O
-    std::atomic<bool> ioInterrupt{false};   ///< Set by Seek()/Next() (and shutdown) to break a blocking
-                                            ///< av_read_frame()/av_seek_frame() on a slow network URL so the
-                                            ///< command is serviced promptly instead of after the I/O timeout.
-                                            ///< Polled via cVaapiMediaSource::IoInterrupted(); cleared in ReadPacket.
+    std::atomic<bool> ioInterrupt{false};   ///< Breaks a blocking av_read_frame()/av_seek_frame() on a slow
+                                            ///< network URL so a staged command is serviced promptly instead of
+                                            ///< after the I/O timeout. INVARIANT: armed via ArmDemuxInterrupt()
+                                            ///< strictly BEFORE the command it belongs to is staged (see there).
+                                            ///< Polled via cVaapiMediaSource::IoInterrupted(); cleared by the
+                                            ///< command-consuming branches in Action() and in ReadPacket.
     /// Max AUDIO packet PTS submitted (90 kHz); drives the lookahead-vs-audio-clock throttle in Action(). Audio only:
     /// keying off the max of both streams lets a TS's video-leads-audio mux PTS offset inflate the lookahead and starve
     /// the audio queue. AV_NOPTS_VALUE for video-only.
@@ -449,6 +555,9 @@ class cVaapiControl final : public cControl {
     /// Handle a seek key: log, dispatch the relative seek, and pop up the replay bar so the
     /// user gets immediate visual feedback. @p label is the key name for the log line.
     [[nodiscard]] auto HandleSeekKey(const char *label, int deltaMs) -> eOSState;
+    /// Handle FastFwd/FastRew (press and release events): filter autorepeat, apply the
+    /// single-speed hold-to-scan release semantics, then cycle the trick state.
+    [[nodiscard]] auto HandleTrickKey(eKeys key, bool forward) -> eOSState;
 
     std::unique_ptr<cVaapiPlayer> player; ///< Sole owner. cControl::player is VDR's borrowed alias of the same pointer.
     cSkinDisplayReplay *displayReplay{nullptr}; ///< Skin replay display; owned while barVisible

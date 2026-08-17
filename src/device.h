@@ -328,6 +328,10 @@ class cVaapiDevice : public cDevice {
                  ///< Demux thread only; caller re-anchors via FlushForSeek. False on codec/ALSA failure.
     [[nodiscard]] auto IsMediaPlayerBackpressured() const noexcept
         -> bool; ///< True iff either decoder or audio queue is at capacity. Mediaplayer demux thread polls this.
+    [[nodiscard]] auto IsMediaPlayerTrickReady() const noexcept
+        -> bool; ///< Trick-feed gate for the mediaplayer demux (the HasFeedSpace() predicate Poll() uses on the
+                 ///< PES path). Paced trick submissions must gate here, not on IsMediaPlayerBackpressured():
+                 ///< the trick queue is 1 deep and EnqueuePacket() DROPS overflow.
     [[nodiscard]] auto GetAudioClock() const noexcept
         -> int64_t; ///< Audio master clock in 90 kHz ticks, or AV_NOPTS_VALUE before audio anchors / after Clear().
                     ///< Used by the mediaplayer demux to pace itself against wall-clock playback.

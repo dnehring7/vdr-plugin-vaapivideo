@@ -114,7 +114,12 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto Initialize() -> bool;              ///< Allocate staging frames, set ready, start thread.
     [[nodiscard]] auto IsQueueEmpty() const -> bool;      ///< VDR Poll(): true -> accept next PES packet.
     [[nodiscard]] auto IsQueueFull() const -> bool;       ///< True when queue has reached DECODER_QUEUE_CAPACITY.
-    [[nodiscard]] auto IsReady() const noexcept -> bool;  ///< True after Initialize() succeeds.
+    [[nodiscard]] auto IsInTrickMode() const noexcept -> bool {
+        return trickSpeed.load(std::memory_order_acquire) != 0;
+    } ///< True while the decoder routes packets through the depth-1 trick queue -- including the short
+      ///< window after DevicePlay() where the exit is still resolving on the present thread
+      ///< (RequestTrickExit's cancellation grace). Feed gates hold normal-play packets during it.
+    [[nodiscard]] auto IsReady() const noexcept -> bool; ///< True after Initialize() succeeds.
     [[nodiscard]] auto IsReadyForNextTrickFrame() const noexcept
         -> bool; ///< True when trick-mode pacing timer has expired.
     [[nodiscard]] auto TakeTrickStep(int64_t pts, int64_t prevPts)
@@ -442,7 +447,11 @@ class cVaapiDecoder : public cThread {
                                                         ///< Written by the PRESENT thread once per present iteration,
                                                         ///< read by the mediaplayer demux thread.
     std::atomic<bool> syncLogPending{false};            ///< Force sync log on next frame regardless of timer.
-    cTimeMs nextSyncLog;              ///< Presentation thread only. Deadline for the periodic sync-stats dsyslog.
+    cTimeMs nextSyncLog;              ///< Presentation thread only. Deadline for the periodic sync-stats evaluation.
+    cTimeMs syncLogHeartbeat;         ///< Presentation thread only. Max-silence deadline: forces a sync line even
+                                      ///< when nothing changed, so a quiet log still proves the loop is alive.
+    int64_t lastLoggedAvg90k{};       ///< Presentation thread only. smoothedDelta90k at the last emitted sync line;
+                                      ///< a new line fires when the EMA drifts >= SYNC_LOG_AVG_STEP from it.
     int drainMissCount{};             ///< Drain gaps > 2xframeDur since last sync log = upstream starvation.
                                       ///< Excludes controller-driven pacing (trick, sync sleep, still-frame hold).
     int syncDropSinceLog{};           ///< Frames dropped (video behind) since last sync log. Presentation thread only.

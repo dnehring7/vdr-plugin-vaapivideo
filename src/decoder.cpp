@@ -148,8 +148,14 @@ constexpr int DECODER_SYNC_EMA_SAMPLES =
     50; ///< EMA alpha = 1/N (~= 1 s @ 50 fps). Residual accumulator avoids truncation stall.
 constexpr int DECODER_SYNC_WARMUP_SAMPLES =
     50; ///< Mean-seed samples before EMA starts; sqrt(N) cuts 50p deinterlace bias.
-constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Periodic sync-stats dsyslog cadence.
-constexpr int DECODER_SYNC_FREERUN_FRAMES = 1;     ///< Unpaced frames after Clear() / track switch / trick-exit.
+constexpr int DECODER_SYNC_LOG_INTERVAL_MS = 2000; ///< Sync-stats evaluation cadence (not every check emits a line).
+constexpr int DECODER_SYNC_LOG_HEARTBEAT_MS =
+    30000; ///< Max silence between sync lines: a stable stream still proves liveness every 30 s,
+           ///< matching the systemd watchdog ping cadence so the two liveness signals interleave.
+constexpr int64_t DECODER_SYNC_LOG_AVG_STEP_90K =
+    PTS_TICKS_PER_MS; ///< avg drift (vs. the last emitted line) that justifies a new line: 1 ms. Sub-millisecond
+                      ///< wobble around a converged EMA carries no information and only buries real events.
+constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear() / track switch / trick-exit.
 constexpr int64_t DECODER_SYNC_HARD_THRESHOLD_90K =
     200 * PTS_TICKS_PER_MS; ///< 200 ms in 90k ticks. Beyond this the soft corridor cannot recover in one event.
 constexpr int DECODER_SYNC_CORRECTION_MAX_MS = static_cast<int>(DECODER_SYNC_HARD_THRESHOLD_90K / PTS_TICKS_PER_MS);
@@ -278,7 +284,12 @@ auto cVaapiDecoder::FlushForSeek() -> void {
     // safe: cVideoFilterChain methods only mutate hasFpsFilter_ from the decode thread under
     // codecMutex, and FlushForSeek already serializes with that mutex inside ClearInternal.
     const bool needFilterReset = filterChain.HasFpsFilter();
-    filterCompactRebuildPending.store(needFilterReset, std::memory_order_release);
+    // Set-only, never clear: a trick transition stages its own compact request just before its
+    // seek lands here, and a fixed store(false) would clobber it. Content boundaries cancel via
+    // Clear() instead.
+    if (needFilterReset) {
+        filterCompactRebuildPending.store(true, std::memory_order_release);
+    }
     // Carry the converged smoothedDelta across the flush as a "fast start" hint: the GPU vs.
     // audio offset is a property of the pipeline, unchanged by the playback position. The
     // preserve policy travels *with* the flush request (jitterFlushRequest=2), not as a separate
@@ -1225,6 +1236,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
                 // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref and must be torn down.
                 ClearPendingFilterRebuild();
                 filterChain.Reset();
+                filterCompactRebuildPending.store(true, std::memory_order_release); // trick rebuild: one line suffices
                 if (decodedFrame) {
                     av_frame_unref(decodedFrame.get());
                 }
@@ -1250,6 +1262,7 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
             const cMutexLock vaLock(&display->GetVaDriverMutex());
             ClearPendingFilterRebuild();
             filterChain.Reset();
+            filterCompactRebuildPending.store(true, std::memory_order_release); // trick rebuild: one line suffices
         }
 
         // Flags, pacing, the generation-boundary purge, and trickSpeed are ALL published while
@@ -1525,6 +1538,7 @@ auto cVaapiDecoder::Action() -> void {
                     }
                     ClearPendingFilterRebuild();
                     filterChain.Reset();
+                    filterCompactRebuildPending.store(true, std::memory_order_release); // once per reverse step
                 }
                 stampProducedEpoch(pendingFrames, firstProducedIndex, producedEpoch);
             }
@@ -2017,7 +2031,12 @@ auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<Vaap
     {
         const cMutexLock vaLock(&display->GetVaDriverMutex());
         if (!filterChain.IsBuilt()) {
-            (void)InitFilterGraph(decodedFrame.get());
+            // Second build site (the reverse-trick EOS drain funnels every keyframe step through
+            // here): same compact rules as the decode loop's build, or reverse would repeat the
+            // full diagnostic once per step.
+            const bool compactLog = filterCompactRebuildPending.exchange(false, std::memory_order_acq_rel) ||
+                                    trickSpeed.load(std::memory_order_acquire) != 0;
+            (void)InitFilterGraph(decodedFrame.get(), compactLog);
         }
 
         if (filterChain.IsBuilt() && filterChain.SendFrame(decodedFrame.get()) >= 0) {
@@ -2215,8 +2234,10 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 // old-sized frames keep painting at the old scanout rect until a matching fb
                 // arrives (PresentBuffer promotes videoRect there) and hold their producing graph
                 // alive via their FilterGraphToken. compactLog distinguishes this rebuild from a
-                // Clear/channel-switch rebuild so logging stays informative.
-                bool compactLog = false;
+                // Clear/channel-switch rebuild so logging stays informative. Trick-active builds
+                // are compact unconditionally: the pending flag alone is unreliable here -- the
+                // trick entry's jitter flush can cancel it on the present thread in a race.
+                bool compactLog = trickSpeed.load(std::memory_order_acquire) != 0;
                 if (TakeFilterRebuild()) {
                     filterChain.Reset();
                     compactLog = true;
@@ -2471,6 +2492,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 }
                 ClearPendingFilterRebuild();
                 filterChain.Reset();
+                filterCompactRebuildPending.store(true, std::memory_order_release); // trick exit: one line suffices
                 if (decodedFrame) {
                     av_frame_unref(decodedFrame.get());
                 }
@@ -2490,6 +2512,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             const cMutexLock vaLock(&display->GetVaDriverMutex());
             ClearPendingFilterRebuild();
             filterChain.Reset();
+            filterCompactRebuildPending.store(true, std::memory_order_release); // trick exit: one line suffices
         }
 
         // Publish normal-play state. Flags before the trickSpeed release-store so an acquire reader
@@ -2541,6 +2564,15 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // Show only the first (lowest-PTS) frame per GOP; skip the rest.
     if (isTrickReverse.load(std::memory_order_relaxed) && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE &&
         pts > prevPts) {
+        return true;
+    }
+
+    // Forward fast (mirror of the reverse skip): isolated open-GOP I-frames can leave the codec's
+    // reorder buffer out of PTS order, and a straggler older than the last shown keyframe would
+    // visibly step backward. The next pace's PTS delta grows by the skipped span, so the
+    // effective speed is unchanged.
+    if (isTrickFastForward.load(std::memory_order_relaxed) && pts != AV_NOPTS_VALUE && prevPts != AV_NOPTS_VALUE &&
+        pts < prevPts) {
         return true;
     }
 
@@ -2878,7 +2910,17 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
     if (!smoothedDeltaValid) {
         return;
     }
-    if (!(syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut())) {
+    const bool forced = syncLogPending.exchange(false, std::memory_order_relaxed);
+    if (!forced && !nextSyncLog.TimedOut()) {
+        return;
+    }
+    // Event-driven emission: the 2 s timer only *evaluates*. A line is emitted when something
+    // happened (a counter ticked, the EMA drifted >= 1 ms from the last line) or on the heartbeat;
+    // otherwise the window keeps accumulating so the eventual d= mean still covers the whole gap.
+    const bool countersDirty = drainMissCount != 0 || syncDropSinceLog != 0 || syncSkipSinceLog != 0;
+    const bool avgDrifted = std::abs(smoothedDelta90k - lastLoggedAvg90k) >= DECODER_SYNC_LOG_AVG_STEP_90K;
+    if (!forced && !countersDirty && !avgDrifted && !syncLogHeartbeat.TimedOut()) {
+        nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
         return;
     }
     // d= interval mean (not point sample). lat= SyncLatency90k (frameDur + user knob).
@@ -2900,7 +2942,9 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
     drainMissCount = 0;
     syncDropSinceLog = 0;
     syncSkipSinceLog = 0;
+    lastLoggedAvg90k = smoothedDelta90k;
     nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
+    syncLogHeartbeat.Set(DECODER_SYNC_LOG_HEARTBEAT_MS);
 }
 
 auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
@@ -3015,9 +3059,13 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // re-anchors. Discontinuous sources that skip Clear()/NotifyAudioChange() rely on this path.
         pendingDrops = 0;
         ResetSmoothedDelta();
-        if (syncLogPending.exchange(false, std::memory_order_relaxed) || nextSyncLog.TimedOut()) {
+        // Heartbeat-only cadence: freerun is a steady *state*, not an event -- a video-only source
+        // would otherwise repeat this line every evaluation interval for the whole playback.
+        if (syncLogPending.exchange(false, std::memory_order_relaxed) ||
+            (nextSyncLog.TimedOut() && syncLogHeartbeat.TimedOut())) {
             dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
+            syncLogHeartbeat.Set(DECODER_SYNC_LOG_HEARTBEAT_MS);
         }
         return SubmitIfCurrent(std::move(frame));
     }

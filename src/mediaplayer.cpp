@@ -14,7 +14,10 @@
  *   - Decoder/display/audio threads: unchanged from the PES path.
  *
  * A/V sync follows the audio master clock; pause routes through cDevice::Freeze/Play so
- * the clock halts with the demux loop.
+ * the clock halts with the demux loop. Trick play (fast/slow, forward/backward) mirrors
+ * cDvbPlayer's state machine and reuses the decoder's trick-speed machinery unchanged:
+ * forward tricks keep the linear demux (the decoder's FF filter keeps keyframes only),
+ * reverse steps keyframes backward via av_seek_frame -- there is no VDR index file.
  *
  * Invariants:
  *   1. sourceMutex MUST be released before calling Open/CloseCurrentEntry: they relock it
@@ -47,6 +50,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -128,6 +132,22 @@ constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 135000;
 /// Default seek deltas applied by the key bindings (milliseconds).
 constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
+
+/// Trick-play notch table, verbatim from vdr/dvbplayer.c (Speeds[]): positive entries are fast
+/// divisors, negative slow multipliers, the 0 sentinels saturate silently. Kept verbatim so the
+/// derived device repeat counts (fast 6/3/1, slow fwd 2/4/8, slow rev 24/48/96->63) are exactly
+/// the values cVaapiDecoder::SetTrickSpeed()'s mapping is tuned for.
+constexpr std::array<int, 9> MEDIAPLAYER_TRICK_SPEEDS{0, -2, -4, -8, 1, 2, 4, 12, 0};
+static_assert(MEDIAPLAYER_TRICK_SPEEDS.at(MEDIAPLAYER_TRICK_NORMAL_IDX) == 1);
+constexpr int MEDIAPLAYER_TRICK_STEPS_MAX = 3;   ///< Notches from normal to the extreme in either direction.
+constexpr int MEDIAPLAYER_TRICK_SPEED_MULT = 12; ///< dvbplayer SPEED_MULT: repeat-count numerator (except slow-fwd).
+constexpr int MEDIAPLAYER_TRICK_DEVICE_SPEED_MAX = 63; ///< dvbplayer MAX_VIDEO_SLOWMOTION clamp on the repeat count.
+
+/// Reverse stepping: seek target offset below the last shown keyframe (1 ms -- av_seek_frame with
+/// AVSEEK_FLAG_BACKWARD then lands on the preceding keyframe), and the extra back-step applied when
+/// a container with coarse seek granularity lands on the already-shown keyframe again (0.5 s).
+constexpr int64_t MEDIAPLAYER_REVERSE_EPSILON_90K = 90;
+constexpr int64_t MEDIAPLAYER_REVERSE_RETRY_STEP_90K = 45000;
 
 /// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof): at EOF the decode queue (~4 s) and decoded
 /// reserve (~1.3 s) still hold unseen frames, so immediate teardown cuts playback seconds short (worst on
@@ -725,6 +745,7 @@ auto cVaapiMediaSource::Close() noexcept -> void {
     audioInfo = AudioStreamInfo{};
     ptsOrigin90k = AV_NOPTS_VALUE;
     discardAudioBefore90k = AV_NOPTS_VALUE;
+    discardVideoBefore90k = AV_NOPTS_VALUE;
     eofReached = false;
 }
 
@@ -1073,6 +1094,14 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
             if (interruptFlag != nullptr) {
                 interruptFlag->store(false, std::memory_order_release);
             }
+            // The abort latches AVERROR_EXIT + eof_reached in the AVIOContext: without this reset
+            // every later read fails instantly on the sticky error without touching the file -- a
+            // permanent silent stall for any consumer that does not follow up with a container
+            // seek (trick feed, subtitle switch). Both fields are public AVIOContext API.
+            if (formatCtx->pb != nullptr) {
+                formatCtx->pb->error = 0;
+                formatCtx->pb->eof_reached = 0;
+            }
             return AVERROR(EAGAIN);
         }
         if (ret < 0) {
@@ -1145,6 +1174,19 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
             }
             discardAudioBefore90k = AV_NOPTS_VALUE;
         }
+        // Slow-motion entry: the video preroll must be decoded (reference chain) but never shown
+        // (trick pacing has no clock gate to swallow it) -- AV_PKT_FLAG_DISCARD makes libavcodec
+        // drop the decoded output. Keyed on PacketClock90k (PTS-or-DTS, like the audio discard
+        // above) so DTS-only TS video doesn't disarm the window early; a packet with no timing at
+        // all keeps it armed. A few reorder-late B-frames may still slip through the disarm; they
+        // sit within a frame or two of the target and are invisible.
+        if (stream == MediaPacketStream::Video && discardVideoBefore90k != AV_NOPTS_VALUE) {
+            if (clock90k != AV_NOPTS_VALUE && clock90k < discardVideoBefore90k) {
+                out->flags |= AV_PKT_FLAG_DISCARD;
+            } else if (clock90k != AV_NOPTS_VALUE) {
+                discardVideoBefore90k = AV_NOPTS_VALUE;
+            }
+        }
 
         return 0;
     }
@@ -1181,8 +1223,9 @@ auto cVaapiMediaSource::Flush() -> void {
     if (!formatCtx || videoStreamIndex < 0) {
         return false;
     }
-    // Reset upfront so a failed seek doesn't leave a stale discard window armed.
+    // Reset upfront so a failed seek doesn't leave stale discard windows armed.
     discardAudioBefore90k = AV_NOPTS_VALUE;
+    discardVideoBefore90k = AV_NOPTS_VALUE;
     // Convert from 90 kHz to the video stream's time base (av_seek_frame's units). Player Seek()
     // talks the zero-based timeline; we re-add the origin offset so we land at the matching
     // wall-clock keyframe inside the container's native timeline.
@@ -1271,12 +1314,12 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
     if (vaapiDev == nullptr) {
         return AV_NOPTS_VALUE;
     }
-    // During pause the demux loop is intentionally stopped and the audio clock extrapolates from
-    // its last anchor while ALSA is dropped, so lastAudio - audioClock turns into a fake negative
-    // value (the status log surfaced this as e.g. lookahead=-600ms while Paused). Returning NOPTS
-    // skips both the throttle and the misleading status line; the demuxer is paused-gated above
-    // it anyway.
-    if (paused.load(std::memory_order_acquire)) {
+    // Outside normal play the reference is meaningless: during pause the demux loop is stopped and
+    // the audio clock extrapolates from its last anchor while ALSA is dropped (lastAudio - audioClock
+    // turns into a fake negative value); during trick modes no audio is fed at all, so a stale
+    // lastAudio would deadlock the throttle. Returning NOPTS skips both the throttle and the
+    // misleading status line.
+    if (playMode.load(std::memory_order_acquire) != PlayMode::Play) {
         return AV_NOPTS_VALUE;
     }
     const int64_t audioClock = vaapiDev->GetAudioClock();
@@ -1422,20 +1465,194 @@ auto cVaapiPlayer::Activate(bool On) -> void {
     }
 }
 
-auto cVaapiPlayer::SetPaused(bool wantPaused) -> void {
-    const bool wasPaused = paused.exchange(wantPaused, std::memory_order_acq_rel);
-    if (wasPaused == wantPaused) {
+auto cVaapiPlayer::Play() -> void {
+    switch (playMode.load(std::memory_order_acquire)) {
+        case PlayMode::Play:
+            return;
+        case PlayMode::Pause:
+            // BOTH halves are required: DevicePlay() restarts the audio master clock; the mode
+            // change un-parks the demux loop (else the queues never refill). `state` tracks
+            // lifecycle, not transient phases, so this main-thread path never writes it.
+            playMode.store(PlayMode::Play, std::memory_order_release);
+            DevicePlay();
+            WakeDemux();
+            return;
+        case PlayMode::Fast:
+        case PlayMode::Slow:
+            ExitTrick(false);
+            return;
+    }
+}
+
+auto cVaapiPlayer::Pause() -> void {
+    switch (playMode.load(std::memory_order_acquire)) {
+        case PlayMode::Pause:
+            Play(); // toggle, like cDvbPlayer::Pause()
+            return;
+        case PlayMode::Play:
+            // BOTH halves are required: DeviceFreeze() halts the audio master clock (else resume
+            // re-anchors with a stutter); the mode change parks the demux loop (else queues fill
+            // while frozen and OOM on long pauses).
+            playMode.store(PlayMode::Pause, std::memory_order_release);
+            DeviceFreeze();
+            return;
+        case PlayMode::Fast:
+        case PlayMode::Slow:
+            ExitTrick(true);
+            return;
+    }
+}
+
+auto cVaapiPlayer::Forward() -> void { CycleTrick(true); }
+
+auto cVaapiPlayer::Backward() -> void { CycleTrick(false); }
+
+auto cVaapiPlayer::LeaveTrickWithoutReanchor() -> void {
+    if (IsTrickMode()) {
+        EndTrick(PlayMode::Play);
+    }
+}
+
+auto cVaapiPlayer::CycleTrick(bool towardForward) -> void {
+    // cDvbPlayer::Forward()/Backward() folded over the direction: they are exact mirrors, and one
+    // body keeps the transition graph in one place. sameDir = the active trick already runs in the
+    // pressed direction; the opposite direction winds down one notch instead (through Speeds' '1'
+    // entry into Play()/Pause()), so a scan is always left via normal play, never flipped abruptly.
+    const bool multiSpeed = Setup.MultiSpeedMode != 0;
+    const bool sameDir = trickForward.load(std::memory_order_acquire) == towardForward;
+    switch (playMode.load(std::memory_order_acquire)) {
+        case PlayMode::Fast:
+            if (multiSpeed) {
+                TrickSpeedStep(sameDir ? +1 : -1);
+                return;
+            }
+            if (sameDir) {
+                Play(); // single-speed: the second press (or the key release) ends the scan
+                return;
+            }
+            [[fallthrough]]; // single-speed opposite fast: restart in the pressed direction
+        case PlayMode::Play:
+            EnterTrick(PlayMode::Fast, towardForward, multiSpeed ? +1 : +MEDIAPLAYER_TRICK_STEPS_MAX);
+            return;
+        case PlayMode::Slow:
+            if (multiSpeed) {
+                TrickSpeedStep(sameDir ? -1 : +1);
+                return;
+            }
+            if (sameDir) {
+                Pause(); // single-speed: the second press ends slow motion
+                return;
+            }
+            [[fallthrough]]; // single-speed opposite slow: restart in the pressed direction
+        case PlayMode::Pause:
+            EnterTrick(PlayMode::Slow, towardForward, multiSpeed ? -1 : -MEDIAPLAYER_TRICK_STEPS_MAX);
+            return;
+    }
+}
+
+auto cVaapiPlayer::EnterTrick(PlayMode mode, bool forward, int firstStep) -> void {
+    const int durationMs = cachedDurationMs.load(std::memory_order_acquire);
+    if (durationMs < 0) {
+        return; // no entry open
+    }
+    if (!forward && durationMs == 0) {
+        // Reverse needs seekable, bounded input (cf. cDvbPlayer gating trick play on the index file).
+        isyslog("vaapivideo/mediaplayer: reverse trick play refused -- source has no known duration");
         return;
     }
-    // BOTH halves are required: DeviceFreeze() halts the audio master clock (else resume
-    // re-anchors with a stutter); the demux flag halts packet flow (else queues fill while
-    // frozen and OOM on long pauses). Pause lives in `paused` only -- `state` tracks lifecycle,
-    // not transient phases, so this main-thread path never writes it.
-    if (wantPaused) {
-        DeviceFreeze();
-    } else {
-        DevicePlay();
+    // Anchor position FIRST: TrickSpeedStep's generation flush wipes the decoder's lastPts, after
+    // which the demux-side transition could only fall back to the audio clock (stale in trick) or 0.
+    trickAnchorMs.store(CurrentPositionMs(), std::memory_order_release);
+    trickForward.store(forward, std::memory_order_release);
+    trickSpeedIdx.store(MEDIAPLAYER_TRICK_NORMAL_IDX, std::memory_order_release);
+    // Command BEFORE playMode: the demux gates its trick feed on "no pending command", so the mode
+    // becoming visible must imply the command is visible too (release/acquire); otherwise a
+    // mid-iteration mode snapshot runs the reverse feed on uninitialized step targets.
+    ArmDemuxInterrupt(); // and the interrupt before the command -- see the invariant at the declaration
+    TrickCommand cmd = TrickCommand::EnterReverse;
+    if (forward) {
+        cmd = mode == PlayMode::Slow ? TrickCommand::EnterSlowForward : TrickCommand::EnterForward;
     }
+    trickCommand.store(cmd, std::memory_order_release);
+    playMode.store(mode, std::memory_order_release);
+    // Device trick state before waking the demux: SetTrickSpeed's generation flush then usually
+    // precedes the aligned trick feed (first trick frames not wiped). A fast demux may consume the
+    // command earlier; the flush then wipes a few just-fed frames, which the feed simply re-sends.
+    // Coming from Pause the device is still frozen -- which is exactly what makes
+    // cVaapiDevice::TrickSpeed() derive isFast=false for the slow modes (Freeze-before-slow).
+    TrickSpeedStep(firstStep);
+    WakeDemux();
+}
+
+auto cVaapiPlayer::TrickSpeedStep(int increment) -> void {
+    const int idx = trickSpeedIdx.load(std::memory_order_acquire) + increment;
+    if (idx < 0 || idx >= static_cast<int>(MEDIAPLAYER_TRICK_SPEEDS.size())) [[unlikely]] {
+        return; // outside the table; unreachable via the key state machine
+    }
+    const int entry = MEDIAPLAYER_TRICK_SPEEDS.at(static_cast<size_t>(idx));
+    if (entry == 0) {
+        return; // sentinel: the speed saturates -- dvbplayer-style silent no-op, no device call
+    }
+    trickSpeedIdx.store(idx, std::memory_order_release);
+    if (entry == 1) {
+        // Wound back to normal: leave the trick -- resume play from fast, pause from slow.
+        if (playMode.load(std::memory_order_acquire) == PlayMode::Fast) {
+            Play();
+        } else {
+            Pause();
+        }
+        return;
+    }
+    const bool forward = trickForward.load(std::memory_order_acquire);
+    const bool slow = playMode.load(std::memory_order_acquire) == PlayMode::Slow;
+    // Repeat count exactly like cDvbPlayer::TrickSpeed(): Mult is 1 only for slow-forward (all
+    // frames repeated 2/4/8 times); every stepping mode uses SPEED_MULT over the table entry.
+    const int mult = (slow && forward) ? 1 : MEDIAPLAYER_TRICK_SPEED_MULT;
+    const int speed = std::min(entry > 0 ? mult / entry : -entry * mult, MEDIAPLAYER_TRICK_DEVICE_SPEED_MAX);
+    dsyslog("vaapivideo/mediaplayer: trick %s %s notch %d (device speed %d)", slow ? "slow" : "fast",
+            forward ? "forward" : "backward", std::abs(idx - MEDIAPLAYER_TRICK_NORMAL_IDX), speed);
+    DeviceTrickSpeed(speed, forward);
+}
+
+auto cVaapiPlayer::EndTrick(PlayMode nextMode) -> void {
+    trickForward.store(true, std::memory_order_release);
+    trickSpeedIdx.store(MEDIAPLAYER_TRICK_NORMAL_IDX, std::memory_order_release);
+    playMode.store(nextMode, std::memory_order_release);
+    // Safe from either thread: DevicePlay() is atomics + decoder/display notifications only.
+    DevicePlay();
+}
+
+auto cVaapiPlayer::AbortTrick(const char *reason) -> void {
+    // Slow modes were entered from pause, fast from play; return the user where they came from.
+    const bool toPause = playMode.load(std::memory_order_acquire) == PlayMode::Slow;
+    EndTrick(toPause ? PlayMode::Pause : PlayMode::Play);
+    if (toPause) {
+        DeviceFreeze();
+    }
+    esyslog("vaapivideo/mediaplayer: %s -- leaving trick mode", reason);
+}
+
+auto cVaapiPlayer::ExitTrick(bool toPause) -> void {
+    // Anchor the resume position before DevicePlay() ends the trick (lastPts is the last shown
+    // trick frame). Keep the entry anchor when nothing was presented yet (position reads 0).
+    if (const int pos = CurrentPositionMs(); pos > 0) {
+        trickAnchorMs.store(pos, std::memory_order_release);
+    }
+    EndTrick(toPause ? PlayMode::Pause : PlayMode::Play);
+    // The pause exit re-freezes right after DevicePlay() -- the queues are empty during trick,
+    // so nothing plays out in between.
+    if (toPause) {
+        DeviceFreeze();
+    }
+    ArmDemuxInterrupt(); // before the command, never after -- see the invariant at the declaration
+    trickCommand.store(TrickCommand::Exit, std::memory_order_release);
+    WakeDemux();
+    dsyslog("vaapivideo/mediaplayer: trick exit -> %s", toPause ? "pause" : "play");
+}
+
+auto cVaapiPlayer::WakeDemux() -> void {
+    // Wake the demux thread out of a pause park so it services the staged command immediately.
+    // ArmDemuxInterrupt() (called BEFORE the command store) covers the blocked-in-read case.
     const cMutexLock lock(&pauseMutex);
     pauseCondition.Broadcast();
 }
@@ -1446,20 +1663,17 @@ auto cVaapiPlayer::Seek(int64_t deltaMs) -> void {
     }
     // fetch_add (not store) so rapid key repeats sum: 5x kRight in one demux cycle = +50s,
     // not +10s. Per-key repeat shaping is RcRepeatDelay/RcRepeatDelta in setup.conf.
+    ArmDemuxInterrupt();
     seekDeltaMs.fetch_add(deltaMs, std::memory_order_relaxed);
     seekPending.store(true, std::memory_order_release);
-    // Break a blocking network read so the seek is serviced now, not after the I/O timeout.
-    ioInterrupt.store(true, std::memory_order_release);
-    // If paused, wake the demux thread so it can service the seek immediately.
-    const cMutexLock lock(&pauseMutex);
-    pauseCondition.Broadcast();
+    WakeDemux();
 }
 
 auto cVaapiPlayer::Next() -> void {
+    LeaveTrickWithoutReanchor(); // AdvancePlaylist reopens the pipeline; the next entry starts at normal speed
+    ArmDemuxInterrupt();
     nextRequested.store(true, std::memory_order_release);
-    ioInterrupt.store(true, std::memory_order_release); // see Seek(): break a parked network read
-    const cMutexLock lock(&pauseMutex);
-    pauseCondition.Broadcast();
+    WakeDemux();
 }
 
 [[nodiscard]] auto cVaapiPlayer::Title() const -> std::string {
@@ -1569,9 +1783,18 @@ auto cVaapiPlayer::ApplyStartPosition() -> void {
 }
 
 [[nodiscard]] auto cVaapiPlayer::GetReplayMode(bool &Play, bool &Forward, int &Speed) -> bool {
-    Play = !paused.load(std::memory_order_acquire);
-    Forward = true;
-    Speed = -1; // trick-speed is out of scope for this player
+    // cDvbPlayer::GetReplayMode() semantics: Speed -1 = normal play/pause, 0 = single-speed trick,
+    // >0 = multi-speed notch. Slow motion reports Play=false, so skins render "1|>" style symbols.
+    const PlayMode mode = playMode.load(std::memory_order_acquire);
+    const bool trick = mode == PlayMode::Fast || mode == PlayMode::Slow;
+    Play = mode == PlayMode::Play || mode == PlayMode::Fast;
+    Forward = !trick || trickForward.load(std::memory_order_acquire);
+    Speed = -1;
+    if (trick) {
+        Speed = Setup.MultiSpeedMode != 0
+                    ? std::abs(trickSpeedIdx.load(std::memory_order_acquire) - MEDIAPLAYER_TRICK_NORMAL_IDX)
+                    : 0;
+    }
     return true;
 }
 
@@ -1598,18 +1821,18 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
     if (!source) {
         return;
     }
-    SeekToMs(static_cast<int64_t>(CurrentPositionMs()) + deltaMs);
+    (void)SeekToMs(static_cast<int64_t>(CurrentPositionMs()) + deltaMs);
 }
 
-auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
+[[nodiscard]] auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> bool {
     // sourceMutex is held by the caller (PerformSeek / PerformAudioSwitch); not re-locked here
     // so the hold stays visible at the call site (relock would be tolerated but obscures it).
     if (!source) {
-        return;
+        return false;
     }
     auto *vaapiDev = FindPrimaryVaapiDevice();
     if (vaapiDev == nullptr) {
-        return;
+        return false;
     }
 
     const int totalMs = source->DurationMs();
@@ -1624,7 +1847,7 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     // playing the old position instead of staring at a blanked frame after a wiped pipeline.
     if (!source->Seek(targetPts90k)) {
         esyslog("vaapivideo/mediaplayer: seek to %lldms failed", static_cast<long long>(targetMs));
-        return;
+        return false;
     }
 
     vaapiDev->FlushForSeek();
@@ -1640,6 +1863,108 @@ auto cVaapiPlayer::SeekToMs(int64_t targetMs) -> void {
     // it a rapid follow-up Seek() would compute its delta against 0.
     pendingSeekTargetMs.store(static_cast<int>(targetMs), std::memory_order_release);
     dsyslog("vaapivideo/mediaplayer: seek -> %lldms (total=%dms)", static_cast<long long>(targetMs), totalMs);
+    return true;
+}
+
+auto cVaapiPlayer::PerformTrickTransition(TrickCommand cmd) -> void {
+    const cMutexLock lock(&sourceMutex);
+    if (!source) {
+        return;
+    }
+    // The anchor was captured on the main thread at the keypress; by now the trick flush has wiped
+    // the decoder's lastPts, so reading the position HERE would fall back to the (trick-stale)
+    // audio clock or 0. -1 = no capture (never staged without one; belt-and-braces fallback).
+    const int anchorMs = trickAnchorMs.load(std::memory_order_acquire);
+    const int posMs = anchorMs >= 0 ? anchorMs : CurrentPositionMs();
+    // Every transition re-anchors at the shown position via the jump-seek machinery. This is not
+    // optional, even for slow-forward: the decoder purges its decoded reserve on every trick
+    // generation boundary (clearEpoch bump in SetTrickSpeed) and Freeze() already dropped the
+    // packet queue, so continuing from the demux cursor would jump ~the reserve depth (1.5 s+)
+    // ahead. SeekToMs() also flushes the pre-trick audio queue (must never play into a trick)
+    // and re-arms the position fallback for the replay bar.
+    if (!SeekToMs(posMs)) {
+        // Fail closed on entry: trick mode without the re-anchor would run the wrong timeline
+        // (and reverse would retry a seek that can never work). A failed Exit re-anchor just
+        // continues unmoved from the demux cursor -- the least-surprise fallback.
+        if (cmd == TrickCommand::EnterForward || cmd == TrickCommand::EnterReverse) {
+            AbortTrick("trick entry re-anchor seek failed");
+        }
+        return;
+    }
+    switch (cmd) {
+        case TrickCommand::EnterSlowForward:
+            // Slow motion must resume exactly at the shown frame, but the seek re-feeds from the
+            // keyframe at/below it and trick pacing presents every decoded frame -- without this
+            // the preroll GOP would replay in slow motion (seconds of content at 1/8 speed).
+            source->DiscardVideoPrerollBefore(static_cast<int64_t>(posMs) * PTS_TICKS_PER_MS);
+            break;
+        case TrickCommand::EnterForward:
+            // Fast-forward wants no discard: its first keyframe at/below the position IS the
+            // intended start frame (non-keys are dropped by the decoder's FF filter anyway).
+            break;
+        case TrickCommand::EnterReverse:
+            // The first step's backward container seek then lands on the keyframe at/before here.
+            reverseTargetPts90k = static_cast<int64_t>(posMs) * PTS_TICKS_PER_MS;
+            reverseShownPts90k = std::numeric_limits<int64_t>::max();
+            break;
+        case TrickCommand::Exit:
+        case TrickCommand::None:
+            break;
+    }
+}
+
+[[nodiscard]] auto cVaapiPlayer::PerformReverseStep(cVaapiDevice *vaapiDev, AVPacket *packet) -> bool {
+    const cMutexLock lock(&sourceMutex);
+    if (!source) {
+        return false;
+    }
+    if (reverseTargetPts90k < 0) {
+        // Ran off the file start: auto-resume normal play from 0, like cDvbPlayer's rewind.
+        EndTrick(PlayMode::Play);
+        (void)SeekToMs(0);
+        isyslog("vaapivideo/mediaplayer: reverse reached the start -- resuming play");
+        return true;
+    }
+    if (!source->Seek(reverseTargetPts90k)) {
+        // Container seeks don't fail transiently; retrying would loop forever at 5 ms cadence.
+        AbortTrick("reverse step seek failed"); // av_seek_frame error logged by Seek()
+        return true;
+    }
+    // Read forward to the first video keyframe the backward seek landed on.
+    MediaPacketStream stream{MediaPacketStream::Video};
+    while (true) {
+        const int ret = source->ReadPacket(packet, stream);
+        if (ret == AVERROR_EOF) {
+            // Seek landed in a keyframe-less tail; step further back instead of spinning on EOF.
+            reverseTargetPts90k -= MEDIAPLAYER_REVERSE_RETRY_STEP_90K;
+            return true;
+        }
+        if (ret != 0) {
+            return false; // EAGAIN (command interrupt) / EXIT: let the outer loop service it
+        }
+        if (stream == MediaPacketStream::Video && (packet->flags & AV_PKT_FLAG_KEY) != 0 &&
+            packet->pts != AV_NOPTS_VALUE) {
+            break;
+        }
+        av_packet_unref(packet); // audio / subtitles / GOP tail: reverse shows keyframes only
+    }
+    const int64_t keyPts = packet->pts;
+    if (keyPts >= reverseShownPts90k) {
+        // Coarse seek granularity landed on the keyframe already shown: force real progress.
+        av_packet_unref(packet);
+        reverseTargetPts90k -= MEDIAPLAYER_REVERSE_RETRY_STEP_90K;
+        return true;
+    }
+    if (!vaapiDev->SubmitVideoPacket(packet)) {
+        av_packet_unref(packet); // transient (queue raced full); the whole step is redone
+        return false;
+    }
+    av_packet_unref(packet);
+    reverseShownPts90k = keyPts;
+    reverseTargetPts90k = keyPts - MEDIAPLAYER_REVERSE_EPSILON_90K;
+    // Keep the replay bar honest between the (sparse) reverse presents.
+    pendingSeekTargetMs.store(static_cast<int>(keyPts / PTS_TICKS_PER_MS), std::memory_order_release);
+    return true;
 }
 
 auto cVaapiPlayer::SetAudioTrack(eTrackType Type, const tTrackId * /*TrackId*/) -> void {
@@ -1653,11 +1978,11 @@ auto cVaapiPlayer::SetAudioTrack(eTrackType Type, const tTrackId * /*TrackId*/) 
     if (idx == audioSwitch.menuIndex.load(std::memory_order_acquire)) {
         return; // initial set / re-select of the active track: nothing to do
     }
+    LeaveTrickWithoutReanchor(); // PerformAudioSwitch re-anchors itself; run it in normal play
+    ArmDemuxInterrupt();
     audioSwitch.targetIdx.store(idx, std::memory_order_release);
     audioSwitch.pending.store(true, std::memory_order_release);
-    ioInterrupt.store(true, std::memory_order_release); // break a parked network read, like Seek()
-    const cMutexLock lock(&pauseMutex);
-    pauseCondition.Broadcast(); // wake the demux thread if paused
+    WakeDemux();
 }
 
 auto cVaapiPlayer::SetSubtitleTrack(eTrackType Type, const tTrackId * /*TrackId*/) -> void {
@@ -1679,11 +2004,10 @@ auto cVaapiPlayer::SetSubtitleTrack(eTrackType Type, const tTrackId * /*TrackId*
     if (subtitleSwitch.menuIndex.exchange(idx, std::memory_order_acq_rel) == idx) {
         return;
     }
+    ArmDemuxInterrupt();
     subtitleSwitch.targetIdx.store(idx, std::memory_order_release);
     subtitleSwitch.pending.store(true, std::memory_order_release);
-    ioInterrupt.store(true, std::memory_order_release);
-    const cMutexLock lock(&pauseMutex);
-    pauseCondition.Broadcast();
+    WakeDemux();
 }
 
 auto cVaapiPlayer::RegisterAudioTracks() -> void {
@@ -1781,7 +2105,7 @@ auto cVaapiPlayer::PerformAudioSwitch(int trackIdx) -> void {
         return;
     }
     // (c) re-anchor: seek to the captured position so the new stream flows from here and A/V resyncs.
-    SeekToMs(currentMs);
+    (void)SeekToMs(currentMs);
     audioSwitch.menuIndex.store(trackIdx, std::memory_order_release);
     isyslog("vaapivideo/mediaplayer: audio track -> %d", trackIdx);
 }
@@ -1834,9 +2158,11 @@ auto cVaapiPlayer::DrainTailAtEof() -> void {
     // Bail the instant the user wants something else, so a held tail can't delay it. Pause matters
     // most: it stops the presenter, so depth freezes and the stall watchdog would otherwise advance
     // the playlist behind the user's back -- instead Action()'s pause branch holds and the drain
-    // resumes when EOF is re-detected on Play.
+    // resumes when EOF is re-detected on Play. Any non-Play mode (pause, a freshly entered trick)
+    // or a staged trick transition aborts for the same reason.
     const auto aborted = [this]() noexcept -> bool {
-        return stopping.load(std::memory_order_acquire) || paused.load(std::memory_order_acquire) ||
+        return stopping.load(std::memory_order_acquire) || playMode.load(std::memory_order_acquire) != PlayMode::Play ||
+               trickCommand.load(std::memory_order_acquire) != TrickCommand::None ||
                seekPending.load(std::memory_order_acquire) || nextRequested.load(std::memory_order_acquire) ||
                audioSwitch.pending.load(std::memory_order_acquire) ||
                subtitleSwitch.pending.load(std::memory_order_acquire);
@@ -1891,8 +2217,9 @@ auto cVaapiPlayer::AdvancePlaylist() -> void {
 }
 
 auto cVaapiPlayer::Action() -> void {
-    // Each iteration: service pending command (seek/next) -> wait if paused -> honor device
-    // backpressure -> pull and dispatch one packet. EOF advances the playlist; EAGAIN sleeps.
+    // Each iteration: service pending commands (seek/trick/next) -> wait if paused -> honor device
+    // backpressure -> pull and dispatch one packet (or one reverse trick step). EOF advances the
+    // playlist; EAGAIN sleeps.
     const std::unique_ptr<AVPacket, FreeAVPacket> packet{av_packet_alloc()};
     if (!packet) [[unlikely]] {
         esyslog("vaapivideo/mediaplayer: AVPacket allocation failed -- aborting");
@@ -1936,6 +2263,19 @@ auto cVaapiPlayer::Action() -> void {
             }
         }
 
+        // -- trick transition ----------------------------------------------------
+        // Staged by the trick state machine (EnterTrick/ExitTrick); one-shot like the seek branch.
+        // Before the pause branch so an exit-to-pause still re-anchors while parked.
+        if (const TrickCommand cmd = trickCommand.exchange(TrickCommand::None, std::memory_order_acq_rel);
+            cmd != TrickCommand::None) {
+            ioInterrupt.store(false, std::memory_order_release); // same rationale as the seek branch
+            if (packetPending) { // a held packet belongs to the previous feed mode; the transition flushes
+                av_packet_unref(packet.get());
+                packetPending = false;
+            }
+            PerformTrickTransition(cmd);
+        }
+
         // -- audio track switch --------------------------------------------------
         // Before the pause branch so a frozen player still switches (then plays the new track on resume).
         if (audioSwitch.pending.exchange(false, std::memory_order_acq_rel)) {
@@ -1977,10 +2317,12 @@ auto cVaapiPlayer::Action() -> void {
         }
 
         // -- pause ---------------------------------------------------------------
-        if (paused.load(std::memory_order_acquire)) {
+        if (playMode.load(std::memory_order_acquire) == PlayMode::Pause) {
             const cMutexLock lock(&pauseMutex);
-            if (paused.load(std::memory_order_acquire) && !stopping.load(std::memory_order_acquire) &&
-                !seekPending.load(std::memory_order_acquire) && !nextRequested.load(std::memory_order_acquire) &&
+            if (playMode.load(std::memory_order_acquire) == PlayMode::Pause &&
+                !stopping.load(std::memory_order_acquire) && !seekPending.load(std::memory_order_acquire) &&
+                trickCommand.load(std::memory_order_acquire) == TrickCommand::None &&
+                !nextRequested.load(std::memory_order_acquire) &&
                 !audioSwitch.pending.load(std::memory_order_acquire) &&
                 !subtitleSwitch.pending.load(std::memory_order_acquire)) {
                 pauseCondition.TimedWait(pauseMutex, DEMUX_PAUSE_WAKEUP_MS);
@@ -1994,12 +2336,43 @@ auto cVaapiPlayer::Action() -> void {
             cCondWait::SleepMs(DEMUX_IDLE_SLEEP_MS);
             continue;
         }
+        // Feed-mode snapshot: dvbplayer-style trick modes replace the normal audio-clock-paced pump.
+        const PlayMode mode = playMode.load(std::memory_order_acquire);
+        const bool trickActive = mode == PlayMode::Fast || mode == PlayMode::Slow;
+
+        // A staged-but-unconsumed Enter* command means this mode's feed state (reverse step
+        // targets, aligned cursor) is not initialized yet: the command can land after this
+        // iteration's consume point but before the mode snapshot. Let the loop top take it first.
+        if (trickActive && trickCommand.load(std::memory_order_acquire) != TrickCommand::None) {
+            continue;
+        }
+
+        // -- reverse trick feed: one keyframe step per iteration -------------------
+        if (trickActive && !trickForward.load(std::memory_order_acquire)) {
+            if (packetPending) { // left over from another feed mode; reverse re-reads after seeking
+                av_packet_unref(packet.get());
+                packetPending = false;
+            }
+            // Gate BEFORE reading: the trick queue is 1 deep and drops overflow, so a keyframe must
+            // only be demuxed once the decoder is ready to take it.
+            if (!vaapiDev->IsMediaPlayerTrickReady()) {
+                cCondWait::SleepMs(MEDIAPLAYER_BACKPRESSURE_SLEEP_MS);
+                continue;
+            }
+            if (!PerformReverseStep(vaapiDev, packet.get())) {
+                cCondWait::SleepMs(DEMUX_IDLE_SLEEP_MS);
+            }
+            continue;
+        }
+
         // Backpressure gates NEW demux reads only. A packetPending has already advanced
         // libavformat's cursor; retry it even while queues are high. Otherwise a held audio
         // packet can be blocked by the very audioHighwater condition that submitting it
         // would help clear (the SubmitAudioPacket highwater check is the proper pacing
         // signal -- false return -> packetPending stays true -> retry next iter).
-        if (!packetPending && vaapiDev->IsMediaPlayerBackpressured()) {
+        // Trick modes skip this gate: it measures the normal-replay queues; the trick feed
+        // paces on IsMediaPlayerTrickReady() at the submit site instead.
+        if (!packetPending && !trickActive && vaapiDev->IsMediaPlayerBackpressured()) {
             cCondWait::SleepMs(MEDIAPLAYER_BACKPRESSURE_SLEEP_MS);
             continue;
         }
@@ -2045,13 +2418,34 @@ auto cVaapiPlayer::Action() -> void {
 
         if (packetPending && packetStream == MediaPacketStream::Subtitle) {
             // Subtitles never touch the device queues or the lookahead/backpressure throttle: hand the
-            // cue to the converter and consume the packet unconditionally (tiny, sparse).
-            if (subtitles) {
+            // cue to the converter and consume the packet unconditionally (tiny, sparse). During trick
+            // the cue is dropped -- there is no meaningful display timing at trick pace.
+            if (subtitles && !trickActive) {
                 subtitles->Convert(packet.get());
             }
             av_packet_unref(packet.get());
             packetPending = false;
             didWork = true;
+        } else if (packetPending && trickActive && packetStream == MediaPacketStream::Audio) {
+            // No audio in trick modes: never submitted (nothing may play, and the lookahead
+            // reference must not advance) -- the device-side trick swallow is only the backstop.
+            av_packet_unref(packet.get());
+            packetPending = false;
+            didWork = true;
+        } else if (packetPending && trickActive) {
+            // Forward trick video. Slow motion decodes every frame; fast-forward wants keyframes
+            // only -- non-key packets go through ungated so the decoder's FF filter (the single
+            // authority, cf. cVaapiDecoder::EnqueuePacket) drops them at demux skim speed. Paced
+            // packets gate on the trick queue (1 deep, drops overflow) via IsMediaPlayerTrickReady().
+            const bool paced = mode == PlayMode::Slow || (packet->flags & AV_PKT_FLAG_KEY) != 0;
+            if (paced && !vaapiDev->IsMediaPlayerTrickReady()) {
+                cCondWait::SleepMs(MEDIAPLAYER_BACKPRESSURE_SLEEP_MS); // retry the held packet
+            } else if (vaapiDev->SubmitVideoPacket(packet.get())) {
+                av_packet_unref(packet.get());
+                packetPending = false;
+                didWork = true;
+            }
+            // !submitted: keep packetPending=true and retry, like the normal path below.
         } else if (packetPending) {
             const bool submitted = (packetStream == MediaPacketStream::Video)
                                        ? vaapiDev->SubmitVideoPacket(packet.get())
@@ -2087,6 +2481,12 @@ auto cVaapiPlayer::Action() -> void {
         }
 
         if (advanceAfterUnlock) {
+            if (trickActive) {
+                // A forward trick ran into EOF: leave the trick first so the tail drain and the
+                // next playlist entry run at normal speed (dvbplayer ends fast-forward the same way).
+                EndTrick(PlayMode::Play);
+                dsyslog("vaapivideo/mediaplayer: trick reached EOF -- resuming play");
+            }
             // Natural EOF: present the buffered tail before teardown so playback runs to the real end.
             DrainTailAtEof();
             if (stopping.load(std::memory_order_acquire)) {
@@ -2094,8 +2494,10 @@ auto cVaapiPlayer::Action() -> void {
             }
             // The drain bailed on a user command: let the loop top service it instead of advancing
             // (pause holds; a seek resets eofReached; the tail re-drains once EOF is hit again).
-            if (paused.load(std::memory_order_acquire) || seekPending.load(std::memory_order_acquire) ||
-                nextRequested.load(std::memory_order_acquire) || audioSwitch.pending.load(std::memory_order_acquire) ||
+            if (playMode.load(std::memory_order_acquire) != PlayMode::Play ||
+                trickCommand.load(std::memory_order_acquire) != TrickCommand::None ||
+                seekPending.load(std::memory_order_acquire) || nextRequested.load(std::memory_order_acquire) ||
+                audioSwitch.pending.load(std::memory_order_acquire) ||
                 subtitleSwitch.pending.load(std::memory_order_acquire)) {
                 continue;
             }
@@ -2191,14 +2593,44 @@ auto cVaapiControl::RefreshReplayBar() -> void {
     displayReplay->SetProgress(current, total);
     displayReplay->SetCurrent(FormatHms(current));
     displayReplay->SetTotal(FormatHms(total));
-    displayReplay->SetMode(!player->IsPaused(), true, -1);
+    // The play/trick state drives the skin's mode symbols ("1>>", "<|1", ...), cf. cReplayControl.
+    bool play = true;
+    bool forward = true;
+    int speed = -1;
+    (void)player->GetReplayMode(play, forward, speed);
+    displayReplay->SetMode(play, forward, speed);
     displayReplay->Flush();
     lastBarRefresh.Set();
 }
 
 [[nodiscard]] auto cVaapiControl::HandleSeekKey(const char *label, int deltaMs) -> eOSState {
     dsyslog("vaapivideo/mediaplayer: key %s -- seek %+dms", label, deltaMs);
+    // Jumps leave trick mode first (cDvbPlayer::SkipSeconds semantics); the jump's own seek
+    // re-anchors, so the Exit re-anchor would only double the flush.
+    player->LeaveTrickWithoutReanchor();
     player->Seek(deltaMs);
+    ShowReplayBar();
+    return osContinue;
+}
+
+[[nodiscard]] auto cVaapiControl::HandleTrickKey(eKeys key, bool forward) -> eOSState {
+    // Discrete presses only: our dispatch masks k_Repeat (VDR's menu.c matches raw values, where
+    // repeats fall to default), so a held key must not step a notch per repeat event.
+    if ((key & k_Repeat) != 0) {
+        return osContinue;
+    }
+    // Release semantics follow menu.c: in single-speed mode the release ends a hold-to-scan
+    // (Forward()/Backward() from an active same-direction trick resumes play); multi-speed
+    // ignores releases -- each press steps one notch.
+    if ((key & k_Release) != 0 && Setup.MultiSpeedMode != 0) {
+        return osContinue;
+    }
+    dsyslog("vaapivideo/mediaplayer: key %s", forward ? "FastFwd" : "FastRew");
+    if (forward) {
+        player->Forward();
+    } else {
+        player->Backward();
+    }
     ShowReplayBar();
     return osContinue;
 }
@@ -2206,10 +2638,12 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 [[nodiscard]] auto cVaapiControl::ProcessKey(eKeys Key) -> eOSState {
     // Key bindings (plugin spec):
     //   OK              toggle replay bar
-    //   Play / Up       resume if paused
-    //   Pause / Down    toggle pause
-    //   Left  / Right   short seek (-/+ 10 s)
-    //   Green / Yellow  long  seek (-/+ 60 s)
+    //   Play / Up       resume normal playback (from pause or any trick mode)
+    //   Pause / Down    toggle pause; exits a trick mode into pause
+    //   FastFwd/FastRew trick play (dvbplayer-style): fast fwd/rew from play, slow motion from
+    //                   pause; repeated presses cycle the speed notches (Setup.MultiSpeedMode)
+    //   Left  / Right   short seek (-/+ 10 s); exits a trick mode first
+    //   Green / Yellow  long  seek (-/+ 60 s); exits a trick mode first
     //   Blue            cycle manual zoom (Off -> 1 -> .. -> N -> Off)
     //   Next            advance playlist
     //   Back / Stop     exit
@@ -2231,6 +2665,20 @@ auto cVaapiControl::RefreshReplayBar() -> void {
         }
     }
 
+    if (Key == kPlayPause) {
+        // Combined-key normalization like cReplayControl::ProcessKey(): inside a trick mode the
+        // "matching" half leaves the trick; in normal modes it toggles play/pause.
+        bool play = false;
+        bool forward = false;
+        int speed = -1;
+        (void)player->GetReplayMode(play, forward, speed);
+        if (speed >= 0) {
+            Key = play ? kPlay : kPause; // trick mode: the matching half leaves it
+        } else {
+            Key = play ? kPause : kPlay; // normal: toggle
+        }
+    }
+
     switch (Key & ~k_Repeat) {
         case kOk:
             dsyslog("vaapivideo/mediaplayer: key OK -- %s replay bar", barVisible ? "hide" : "show");
@@ -2243,21 +2691,25 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 
         case kPlay:
         case kUp:
-            dsyslog("vaapivideo/mediaplayer: key Play/Up -- %s",
-                    player->IsPaused() ? "resume from pause" : "already playing (no-op)");
-            if (player->IsPaused()) {
-                player->SetPaused(false);
-                RefreshReplayBar();
-            }
+            dsyslog("vaapivideo/mediaplayer: key Play/Up -- resume normal playback");
+            player->Play();
+            ShowReplayBar();
             return osContinue;
 
         case kPause:
         case kDown:
             dsyslog("vaapivideo/mediaplayer: key Pause/Down -- toggle (was %s)",
                     player->IsPaused() ? "paused" : "playing");
-            player->SetPaused(!player->IsPaused());
+            player->Pause();
             ShowReplayBar();
             return osContinue;
+
+        case kFastFwd:
+        case kFastFwd | k_Release:
+            return HandleTrickKey(Key, true);
+        case kFastRew:
+        case kFastRew | k_Release:
+            return HandleTrickKey(Key, false);
 
         case kLeft:
             return HandleSeekKey("Left", -MEDIAPLAYER_SEEK_SHORT_MS);

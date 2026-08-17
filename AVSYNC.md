@@ -58,8 +58,10 @@ source:
   are dropped in `ReadPacket` — both streams begin at rebased PTS 0 together.
   Subtitle packets never seed `ptsOrigin90k`, so a stray early cue can't shift the
   A/V timeline. A seek additionally arms `discardAudioBefore90k` so audio anchors at the requested
-  position, not at the earlier keyframe libavformat lands on. See
-  `cVaapiMediaSource` in [src/mediaplayer.cpp](src/mediaplayer.cpp).
+  position, not at the earlier keyframe libavformat lands on; a slow-motion trick entry likewise
+  arms `discardVideoBefore90k`, which flags the re-fed video preroll with `AV_PKT_FLAG_DISCARD`
+  (decoded for the reference chain, never output — trick pacing has no clock gate to swallow
+  preroll). See `cVaapiMediaSource` in [src/mediaplayer.cpp](src/mediaplayer.cpp).
 
 Three invariants:
 
@@ -623,6 +625,7 @@ grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_
 | Audio codec / track change       | unchanged         | unchanged | preserved; freerun armed |
 | PCM channel-layout change        | unchanged         | unchanged | preserved; ALSA reopens, clock re-anchors (brief NOPTS) |
 | Mediaplayer seek                 | reset             | unchanged | flushed; freerun armed; filter graph **preserved** |
+| Mediaplayer trick entry/exit     | reset             | unchanged | flushed + re-anchored at the shown position (same `FlushForSeek` path as a seek) |
 | Mediaplayer playlist advance     | reset (on reopen) | unchanged | flushed; freerun armed; filter graph rebuilt |
 
 Audio codec / track change preserves the buffer — catch-up silently realigns
@@ -644,6 +647,24 @@ at the next entry). Playlist advance closes the current `cVaapiMediaSource` and
 opens the next; `OpenCodecWithInfo()` performs a full teardown when codecId /
 extradata differ.
 
+Mediaplayer **trick transitions** ride the same seek path: every entry and exit
+re-anchors at the shown position via `SeekToMs()`. This is mandatory even for
+slow-forward — the decoder purges its decoded reserve on each trick generation
+boundary (`clearEpoch` bump in `SetTrickSpeed`) and `Freeze()` already dropped
+the packet queue, so continuing from the demux cursor would jump the reserve
+depth (~1.5 s) ahead of what the viewer saw. Slow-motion entry additionally
+flags the re-fed preroll with `AV_PKT_FLAG_DISCARD` (see Architecture above);
+fast/slow reverse feeds isolated keyframes by stepping `av_seek_frame` backward
+(there is no VDR index file), paced through `HasFeedSpace()` exactly like the
+PES trick path. No audio or subtitle packets are fed during any trick mode —
+the lookahead throttle returns NOPTS outside normal play for the same reason.
+Two exceptions to the uniform re-anchor: exits immediately followed by another
+repositioning command (jump keys, playlist advance, audio-track switch) skip it
+— that command's own seek/reopen re-anchors, and the Exit seek would only
+double the flush (`LeaveTrickWithoutReanchor`) — and a **failed** transition
+seek fails closed: the player leaves trick mode (`AbortTrick`) rather than
+running a trick on the wrong timeline or retrying a reverse seek forever.
+
 ## Diagnostic log
 
 ```
@@ -663,7 +684,16 @@ sync d=+15.2ms avg=+15.1ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
 
 `d ≈ avg` in steady state means the EMA has converged on current reality. The line
 is suppressed during warmup and reissued immediately on warmup completion.
-Periodic interval `LOG_INTERVAL_MS = 2 s`.
+Emission is event-driven: the `LOG_INTERVAL_MS = 2 s` timer only *evaluates*; a
+line is emitted when a counter ticked (`miss`/`drop`/`skip`), when `avg` drifted
+≥ 1 ms (`SYNC_LOG_AVG_STEP`) from the last emitted line, on a forced request
+(warmup completion, `Clear()`, trick transitions), or on the 30 s heartbeat
+(`SYNC_LOG_HEARTBEAT_MS`, matching the systemd watchdog cadence) — a stable
+stream logs two lines a minute instead of thirty. Skipped evaluations keep
+accumulating, so `d` still means "mean since
+the last *emitted* line". The `sync freerun (no clock)` line follows the same
+heartbeat (freerun is a state, not an event — a video-only source would
+otherwise repeat it every 2 s).
 
 **Healthy steady state:** `avg` inside `±CORRIDOR`, `d ≈ avg`,
 `miss = drop = skip = 0`. `buf` depth varies by mode (live: ALSA-cushion-driven;
@@ -707,7 +737,8 @@ relative to video, per `config.h`).
 
 Every constant below is file-scope — in [src/config.h](src/config.h),
 [src/audio.h](src/audio.h), [src/audio.cpp](src/audio.cpp),
-[src/mediaplayer.cpp](src/mediaplayer.cpp), [src/decoder.h](src/decoder.h),
+[src/mediaplayer.h](src/mediaplayer.h), [src/mediaplayer.cpp](src/mediaplayer.cpp),
+[src/decoder.h](src/decoder.h),
 [src/decoder.cpp](src/decoder.cpp), [src/device.cpp](src/device.cpp), or
 [src/display.cpp](src/display.cpp) — shared constants as `inline constexpr` in
 a header, single-user constants as `constexpr` in the consuming `.cpp`'s
@@ -750,6 +781,18 @@ Naming conventions:
 | `MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS`          | 20000  | Hard cap on the natural-EOF tail drain (`DrainTailAtEof`); backstop so a wedged pipeline can't hang teardown (covers the ~5 s queue + reserve tail) |
 | `MEDIAPLAYER_EOF_DRAIN_STALL_MS`            | 1500   | EOF tail-drain stall bail-out: give up once buffered depth stops shrinking for this long (must exceed one frame interval) |
 
+**Mediaplayer trick play** (mediaplayer.h, mediaplayer.cpp)
+
+| Constant                             | Value | Purpose |
+| ------------------------------------ | ----- | ------- |
+| `MEDIAPLAYER_TRICK_SPEEDS`           | {0,−2,−4,−8,1,2,4,12,0} | vdr/dvbplayer.c `Speeds[]` verbatim — notch table indexed by `trickSpeedIdx`; >0 fast divisors, <0 slow multipliers, 0 sentinels saturate |
+| `MEDIAPLAYER_TRICK_NORMAL_IDX`       | 4     | Index of the normal-speed '1' entry (in mediaplayer.h for member initialization) |
+| `MEDIAPLAYER_TRICK_STEPS_MAX`        | 3     | Notches from normal to the extreme in either direction (dvbplayer `MAX_SPEEDS`) |
+| `MEDIAPLAYER_TRICK_SPEED_MULT`       | 12    | dvbplayer `SPEED_MULT`: repeat-count numerator; Mult = 1 only for slow-forward |
+| `MEDIAPLAYER_TRICK_DEVICE_SPEED_MAX` | 63    | dvbplayer `MAX_VIDEO_SLOWMOTION` clamp on the device repeat count |
+| `MEDIAPLAYER_REVERSE_EPSILON_90K`    | 90    | Reverse step: seek target 1 ms below the shown keyframe, so `AVSEEK_FLAG_BACKWARD` lands on the preceding one |
+| `MEDIAPLAYER_REVERSE_RETRY_STEP_90K` | 45000 | Extra 0.5 s back-step when a container with coarse seek granularity lands on the already-shown keyframe again |
+
 **Video queues & decode-ahead reserve** (decoder.h, decoder.cpp)
 
 | Constant                    | Value | Purpose |
@@ -774,7 +817,9 @@ Naming conventions:
 | `DECODER_SYNC_CORRIDOR_90K`    | 4500  | Soft corridor half-width (= 50 ms × `PTS_TICKS_PER_MS`); below lipsync percept threshold |
 | `DECODER_SYNC_EMA_SAMPLES`     | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
 | `DECODER_SYNC_WARMUP_SAMPLES`  | 50    | Samples averaged before the EMA seed (~1 s @ 50 fps) |
-| `DECODER_SYNC_LOG_INTERVAL_MS` | 2000  | Periodic sync diagnostic interval (ms) |
+| `DECODER_SYNC_LOG_INTERVAL_MS` | 2000  | Sync diagnostic *evaluation* cadence; a line is only emitted on events (see below) |
+| `DECODER_SYNC_LOG_HEARTBEAT_MS` | 30000 | Max silence between sync lines while stable — liveness proof every 30 s (matches the systemd watchdog cadence) |
+| `DECODER_SYNC_LOG_AVG_STEP_90K` | 90    | `avg` drift vs. the last emitted line (= 1 ms) that counts as an event |
 | `DECODER_SYNC_FREERUN_FRAMES`  | 1     | Unpaced frames after sync-disrupting events |
 
 **Sync controller — hard transients** (decoder.cpp)

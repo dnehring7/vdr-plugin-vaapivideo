@@ -2776,6 +2776,14 @@ namespace {
     if (!HardwareReady() || !decoder || decoder->IsQueueFull()) [[unlikely]] {
         return false;
     }
+    // Trick-exit resolution window: Play() already cleared the device trickSpeed, but the decoder
+    // resolves its exit on the present thread after a one-frame cancellation grace. Normal-play
+    // packets enqueued in that window would land in the depth-1 trick queue and be DROPPED (the
+    // post-exit demux is unthrottled -- no audio clock yet); backpressure makes the feed hold and
+    // retry instead.
+    if (trickSpeed.load(std::memory_order_acquire) == 0 && decoder->IsInTrickMode()) [[unlikely]] {
+        return false;
+    }
     decoder->EnqueuePacket(packet);
     return true;
 }
@@ -2783,6 +2791,12 @@ namespace {
 [[nodiscard]] auto cVaapiDevice::SubmitAudioPacket(const AVPacket *packet) -> bool {
     if (!HardwareReady() || !audioProcessor) [[unlikely]] {
         return false;
+    }
+    // Trick modes never play audio (mirrors PlayAudio's gate): swallow the AU so a demux cursor
+    // that still delivers audio around a trick transition can't stall retrying it. The mediaplayer
+    // skips audio submission during trick anyway; this is the backstop.
+    if (trickSpeed.load(std::memory_order_acquire) != 0) [[unlikely]] {
+        return true;
     }
     // Video-only degrade (no audio codec): swallow the AU so the shared demux cursor doesn't stall
     // retrying a packet that can never be queued.
@@ -2930,6 +2944,16 @@ auto cVaapiDevice::FlushForSeek() -> void {
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
                             decoder->GetDecodedReserveSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;
+}
+
+[[nodiscard]] auto cVaapiDevice::IsMediaPlayerTrickReady() const noexcept -> bool {
+    if (!HardwareReady() || !decoder) [[unlikely]] {
+        return false;
+    }
+    // Not HasFeedSpace(): its IsPlayingVideo() branch keys off VDR's PES track state, which the
+    // mediaplayer bypasses (always false here) -- that dropped the depth check and let the slow-
+    // motion preroll flood the 1-deep trick queue into overflow drops (lost reference frames).
+    return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
 }
 
 [[nodiscard]] auto cVaapiDevice::GetAudioClock() const noexcept -> int64_t {

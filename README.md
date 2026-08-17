@@ -22,7 +22,7 @@ the plugin refuses to start without it.
 | Audio       | PCM decode/downmix with sink-driven multichannel output; IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
 | Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
-| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, audio-track switching, text subtitles — see [Mediaplayer](#mediaplayer) |
+| Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, trick play (fast/slow, forward/backward), audio-track switching, text subtitles — see [Mediaplayer](#mediaplayer) |
 | A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
 
@@ -449,22 +449,39 @@ deinterlacing, and IEC61937 audio passthrough work identically.
 
 ### Replay controls
 
-| Key                        | Action                       |
-|----------------------------|------------------------------|
-| `OK`                       | Toggle replay-bar OSD        |
-| `Play` / `Up`              | Resume if paused             |
-| `Pause` / `Down`           | Toggle pause                 |
-| `Left` / `Right`           | Seek −/+ 10 s                |
-| `Green` / `Yellow`         | Seek −/+ 60 s                |
-| `Blue`                     | Cycle manual zoom            |
-| `Audio`                    | Audio-track menu             |
-| `Subtitles`                | Subtitle-track menu          |
-| `Next`                     | Skip to next playlist entry  |
-| `Back` / `Stop`            | Return to the file browser   |
+| Key                        | Action                                             |
+|----------------------------|----------------------------------------------------|
+| `OK`                       | Toggle replay-bar OSD                              |
+| `Play` / `Up`              | Resume normal playback (from pause or trick play)  |
+| `Pause` / `Down`           | Toggle pause; exits trick play into pause          |
+| `FastFwd` / `FastRew`      | Trick play (see below)                             |
+| `Left` / `Right`           | Seek −/+ 10 s (exits trick play first)             |
+| `Green` / `Yellow`         | Seek −/+ 60 s (exits trick play first)             |
+| `Blue`                     | Cycle manual zoom                                  |
+| `Audio`                    | Audio-track menu                                   |
+| `Subtitles`                | Subtitle-track menu                                |
+| `Next`                     | Skip to next playlist entry                        |
+| `Back` / `Stop`            | Return to the file browser                         |
 
 Rapid seek presses sum (`Right` three times = +30 s). Seeking lands on the
 keyframe at or before the requested position, so the resume point may be a
 second or two early.
+
+### Trick play
+
+`FastFwd` / `FastRew` follow VDR's dvbplayer semantics. From normal play they
+enter fast forward/rewind, stepping through keyframes at ×2/×4/×8 (repeated
+presses cycle the speed, shown in the replay bar as `1>>` … `3>>` / `<<1` …
+`<<3`); from pause they enter slow motion (`1|>` / `<|1`, audio muted), which
+resumes at the shown position.
+With `Setup → Replay → Multi speed mode` on, pressing the opposite key winds
+an active mode back down through normal play/pause. With it off there is a
+single speed per mode: holding the key scans until release, and pressing the
+opposite key restarts the scan in the new direction. Fast rewind steps keyframes
+backward through the container (there is no VDR index file), so the effective
+rewind smoothness depends on the file's keyframe interval; audio and
+subtitles are off during all trick modes, and reaching the file start while
+rewinding resumes normal playback.
 
 ### Tracks and subtitles
 
@@ -739,13 +756,6 @@ full rules are in `.github/copilot-instructions.md`.
   fixed 50 Hz mode). `Match refresh rate` becomes a three-way choice —
   off / mode switch / VRR preferred — falling back to mode switching when the
   display has no usable VRR range.
-- **Mediaplayer trick play** — fast forward/rewind and slow motion for file
-  replay, alongside today's jump-style seeking. Fast modes step through
-  keyframes at increasing speeds (×2/×4/×8, `FastFwd`/`FastRew` keys with the
-  speed shown in the replay bar); slow motion paces full decode below real
-  time (audio muted), reusing the trick-speed machinery the live-TV path
-  already has. Rewind is keyframe-only by nature; exact speeds depend on the
-  file's keyframe interval.
 - **HLG → HDR10 (PQ) mapping** — for HDR panels that accept only the PQ EOTF
   (common on laptop eDP), convert HLG streams to PQ and signal ST 2084 to the
   sink. Uses the driver's VAAPI HDR tone-mapping filter
