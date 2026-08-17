@@ -23,7 +23,7 @@ Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${vdr:Depends}
 Description: VAAPI video output plugin for VDR
  Hardware-accelerated video output plugin for VDR using VAAPI decode, DRM
- atomic modesetting, and ALSA audio.
+ atomic mode-setting, and ALSA audio.
  .
  This plugin drives the display directly through the kernel DRM/KMS
  subsystem -- no X11, Wayland, or OpenGL required.  It runs on a bare

@@ -8,13 +8,13 @@
 %global __provides_exclude_from ^%{vdr_libdir}/.*\\.so.*$
 
 Name:           vdr-%{pname}
-Version:        1.8.2
+Version:        1.8.3
 Release:        1%{?dist}
 Summary:        VAAPI video plugin for VDR
 
 License:        AGPL-3.0-or-later
 URL:            https://github.com/dnehring7/vdr-plugin-%{pname}
-Source0:        %{url}/archive/refs/tags/V%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
 BuildRequires:  gcc-c++
 BuildRequires:  make
@@ -31,7 +31,7 @@ Requires:       vdr(abi)%{?_isa} = %{vdr_apiversion}
 
 %description
 Hardware-accelerated video output plugin for VDR using VAAPI decode, DRM
-atomic modesetting, and ALSA audio.
+atomic mode-setting, and ALSA audio.
 
 This plugin drives the display directly through the kernel DRM/KMS subsystem --
 no X11, Wayland, or OpenGL required. It runs on a bare console, as a systemd

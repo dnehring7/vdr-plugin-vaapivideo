@@ -58,10 +58,12 @@ source:
   are dropped in `ReadPacket` — both streams begin at rebased PTS 0 together.
   Subtitle packets never seed `ptsOrigin90k`, so a stray early cue can't shift the
   A/V timeline. A seek additionally arms `discardAudioBefore90k` so audio anchors at the requested
-  position, not at the earlier keyframe libavformat lands on; a slow-motion trick entry likewise
-  arms `discardVideoBefore90k`, which flags the re-fed video preroll with `AV_PKT_FLAG_DISCARD`
-  (decoded for the reference chain, never output — trick pacing has no clock gate to swallow
-  preroll). See `cVaapiMediaSource` in [src/mediaplayer.cpp](src/mediaplayer.cpp).
+  position, not at the earlier keyframe libavformat lands on; every re-anchor likewise arms
+  `discardVideoBefore90k`, which flags the video preroll with `AV_PKT_FLAG_DISCARD` — decoded for
+  the reference chain, never output, so it neither burns a GOP of VPP work on its way to being
+  catch-up-dropped nor replays in slow motion (trick pacing has no clock gate). Fast-forward
+  entry disarms the window: its start frame is deliberately the keyframe at/below the target.
+  See `cVaapiMediaSource` in [src/mediaplayer.cpp](src/mediaplayer.cpp).
 
 Three invariants:
 
@@ -652,9 +654,11 @@ re-anchors at the shown position via `SeekToMs()`. This is mandatory even for
 slow-forward — the decoder purges its decoded reserve on each trick generation
 boundary (`clearEpoch` bump in `SetTrickSpeed`) and `Freeze()` already dropped
 the packet queue, so continuing from the demux cursor would jump the reserve
-depth (~1.5 s) ahead of what the viewer saw. Slow-motion entry additionally
-flags the re-fed preroll with `AV_PKT_FLAG_DISCARD` (see Architecture above);
-fast/slow reverse feeds isolated keyframes by stepping `av_seek_frame` backward
+depth (~1.5 s) ahead of what the viewer saw. The re-anchor flags the re-fed
+preroll with `AV_PKT_FLAG_DISCARD` like every seek (see Architecture above);
+fast-forward entry disarms that window, since its start frame is the keyframe
+at/below the anchor.
+Fast/slow reverse feeds isolated keyframes by stepping `av_seek_frame` backward
 (there is no VDR index file), paced through `HasFeedSpace()` exactly like the
 PES trick path. No audio or subtitle packets are fed during any trick mode —
 the lookahead throttle returns NOPTS outside normal play for the same reason.

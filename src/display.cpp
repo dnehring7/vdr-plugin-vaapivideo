@@ -1661,7 +1661,7 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
     // UNIVERSAL_PLANES: exposes overlay and cursor planes (default: only primary/cursor).
-    // ATOMIC: switches the fd to the atomic modesetting uAPI used everywhere below.
+    // ATOMIC: switches the fd to the atomic mode-setting uAPI used everywhere below.
     // Both are per-fd opt-ins; no-ops on already-set caps.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ATOMIC, 1);

@@ -1,7 +1,7 @@
 # VDR VAAPI Video Plugin
 
 Hardware-accelerated video output for [VDR](https://www.tvdr.de/) using VAAPI
-decode, DRM atomic modesetting, and ALSA audio. No X11, Wayland, or OpenGL is
+decode, DRM atomic mode-setting, and ALSA audio. No X11, Wayland, or OpenGL is
 required — the plugin runs on the bare console, in a systemd service, or fully
 headless.
 
@@ -20,7 +20,7 @@ the plugin refuses to start without it.
 | Decode      | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10), AV1 Main / Main 10 — hardware (VAAPI) with per-profile software fallback |
 | Filters     | Deinterlace, denoise, DAR-preserving scale, sharpen — hardware (VAAPI VPP) or software (bwdif, hqdn3d) |
 | Audio       | PCM decode/downmix with sink-driven multichannel output; IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
-| Display     | DRM atomic modesetting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
+| Display     | DRM atomic mode-setting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, trick play (fast/slow, forward/backward), audio-track switching, text subtitles — see [Mediaplayer](#mediaplayer) |
 | A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
@@ -713,7 +713,7 @@ threading, buffering, correction regimes, diagnostics — is documented in
 | `src/device.cpp`      | VDR device integration, PES routing, hardware init/teardown, mediaplayer feed surface |
 | `src/decoder.cpp`     | Decoupled VAAPI decode + presentation threads, A/V sync controller                    |
 | `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
-| `src/display.cpp`     | DRM atomic modesetting, PRIME import, page-flip thread                                |
+| `src/display.cpp`     | DRM atomic mode-setting, PRIME import, page-flip thread                                |
 | `src/audio.cpp`       | ALSA output (multichannel PCM / downmix, chmap), IEC61937 passthrough, HDMI ELD read  |
 | `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
 | `src/mediaplayer.cpp` | libavformat demux, file browser, cControl with OSD replay bar                         |

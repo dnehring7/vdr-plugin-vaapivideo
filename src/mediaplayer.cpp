@@ -1174,12 +1174,11 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
             }
             discardAudioBefore90k = AV_NOPTS_VALUE;
         }
-        // Slow-motion entry: the video preroll must be decoded (reference chain) but never shown
-        // (trick pacing has no clock gate to swallow it) -- AV_PKT_FLAG_DISCARD makes libavcodec
-        // drop the decoded output. Keyed on PacketClock90k (PTS-or-DTS, like the audio discard
-        // above) so DTS-only TS video doesn't disarm the window early; a packet with no timing at
-        // all keeps it armed. A few reorder-late B-frames may still slip through the disarm; they
-        // sit within a frame or two of the target and are invisible.
+        // Re-anchor preroll (armed by SeekToMs): AV_PKT_FLAG_DISCARD decodes for the reference
+        // chain but drops the output. Keyed on PacketClock90k (PTS-or-DTS, like the audio discard
+        // above) so DTS-only TS video doesn't disarm the window early; a packet with no timing
+        // keeps it armed. A few reorder-late B-frames may slip the disarm; they sit within a
+        // frame or two of the target and are invisible.
         if (stream == MediaPacketStream::Video && discardVideoBefore90k != AV_NOPTS_VALUE) {
             if (clock90k != AV_NOPTS_VALUE && clock90k < discardVideoBefore90k) {
                 out->flags |= AV_PKT_FLAG_DISCARD;
@@ -1849,6 +1848,11 @@ auto cVaapiPlayer::PerformSeek(int64_t deltaMs) -> void {
         esyslog("vaapivideo/mediaplayer: seek to %lldms failed", static_cast<long long>(targetMs));
         return false;
     }
+    // The preroll between the landed keyframe and the target is decoded (reference chain) but
+    // never shown -- undiscarded it burns a GOP of full VPP work just to be catch-up-dropped
+    // against the audio anchor. Armed here, not in source->Seek(): the reverse stepper's
+    // keyframes sit below its step targets by design. FF entry disarms it.
+    source->DiscardVideoPrerollBefore(targetPts90k);
 
     vaapiDev->FlushForSeek();
     // Drop pending cues + hide any on-screen subtitle so a stale cue doesn't linger across the seek;
@@ -1892,21 +1896,20 @@ auto cVaapiPlayer::PerformTrickTransition(TrickCommand cmd) -> void {
         return;
     }
     switch (cmd) {
-        case TrickCommand::EnterSlowForward:
-            // Slow motion must resume exactly at the shown frame, but the seek re-feeds from the
-            // keyframe at/below it and trick pacing presents every decoded frame -- without this
-            // the preroll GOP would replay in slow motion (seconds of content at 1/8 speed).
-            source->DiscardVideoPrerollBefore(static_cast<int64_t>(posMs) * PTS_TICKS_PER_MS);
-            break;
         case TrickCommand::EnterForward:
-            // Fast-forward wants no discard: its first keyframe at/below the position IS the
-            // intended start frame (non-keys are dropped by the decoder's FF filter anyway).
+            // Fast-forward wants no preroll discard: its first keyframe at/below the position IS
+            // the intended start frame (non-keys are dropped by the decoder's FF filter anyway).
+            source->DiscardVideoPrerollBefore(AV_NOPTS_VALUE);
             break;
         case TrickCommand::EnterReverse:
-            // The first step's backward container seek then lands on the keyframe at/before here.
+            // The first step's backward container seek lands on the keyframe at/before here.
+            // SeekToMs's preroll window is moot: each step's source->Seek() resets it before any read.
             reverseTargetPts90k = static_cast<int64_t>(posMs) * PTS_TICKS_PER_MS;
             reverseShownPts90k = std::numeric_limits<int64_t>::max();
             break;
+        case TrickCommand::EnterSlowForward:
+            // SeekToMs's preroll window IS the slow-motion contract: trick pacing presents every
+            // decoded frame, so an undiscarded preroll GOP would replay in slow motion.
         case TrickCommand::Exit:
         case TrickCommand::None:
             break;

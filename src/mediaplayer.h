@@ -162,10 +162,11 @@ class cVaapiMediaSource final : public IMediaSource {
 
     [[nodiscard]] auto Seek(int64_t targetPts90k) -> bool; ///< av_seek_frame to nearest keyframe at/below target
     /// Arm a one-shot window flagging video packets below @p before90k with AV_PKT_FLAG_DISCARD:
-    /// libavcodec decodes them (the H.264/HEVC reference chain needs the preroll) but drops the
-    /// output. Needed for slow-motion entry, where trick pacing presents EVERY decoded frame --
-    /// there is no clock gate to swallow the preroll, so it would replay in slow motion otherwise.
-    /// Disarmed by the first video packet at/after the target, or by the next Seek().
+    /// libavcodec decodes them (the reference chain needs the preroll) but drops the output, so a
+    /// re-anchor's preroll neither burns the VPP chain nor replays in slow motion (trick pacing
+    /// has no clock gate). Armed by every SeekToMs(); AV_NOPTS_VALUE disarms (FF entry starts at
+    /// the keyframe at/below the target). Also disarmed by the first video packet at/after the
+    /// target, or by the next Seek().
     auto DiscardVideoPrerollBefore(int64_t before90k) noexcept -> void { discardVideoBefore90k = before90k; }
     [[nodiscard]] auto DurationMs() const noexcept -> int; ///< 0 when unknown (live streams)
     [[nodiscard]] auto IoInterrupted() const noexcept
@@ -234,7 +235,7 @@ class cVaapiMediaSource final : public IMediaSource {
                                                       ///< audio packets earlier than that so the master
                                                       ///< clock anchors at the requested timeline (and not
                                                       ///< at the earlier video keyframe libavformat lands on).
-    int64_t discardVideoBefore90k{AV_NOPTS_VALUE};    ///< Slow-motion entry guard: video below this gets
+    int64_t discardVideoBefore90k{AV_NOPTS_VALUE};    ///< Re-anchor preroll guard: video below this gets
                                                       ///< AV_PKT_FLAG_DISCARD (decoded for refs, never shown).
                                                       ///< See DiscardVideoPrerollBefore().
     VideoStreamInfo videoInfo;                  ///< Video decoder descriptor; .extradata aliases videoExtradataStorage

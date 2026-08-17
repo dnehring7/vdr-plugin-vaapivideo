@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file display.h
- * @brief Zero-copy VAAPI->DRM display: PRIME import, atomic modesetting, and page-flip pacing.
+ * @brief Zero-copy VAAPI->DRM display: PRIME import, atomic mode-setting, and page-flip pacing.
  */
 
 #ifndef VDR_VAAPIVIDEO_DISPLAY_H

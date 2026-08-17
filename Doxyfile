@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 
 PROJECT_NAME           = "VDR VAAPI Video Plugin"
-PROJECT_BRIEF          = "Zero-copy VAAPI decode, DRM atomic modesetting, ALSA IEC61937 passthrough"
+PROJECT_BRIEF          = "Zero-copy VAAPI decode, DRM atomic mode-setting, ALSA IEC61937 passthrough"
 OUTPUT_DIRECTORY       = docs
 
 INPUT                  = README.md AVSYNC.md vaapivideo.cpp src/

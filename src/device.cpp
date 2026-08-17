@@ -3157,7 +3157,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
         return false;
     }
 
-    // R+W required: resource query ioctls need R, KMS atomic modesetting needs W.
+    // R+W required: resource query ioctls need R, KMS atomic mode-setting needs W.
     // Missing group membership ('video' or 'render') is the common failure mode.
     if (access(drmPath.c_str(), R_OK | W_OK) != 0) [[unlikely]] {
         esyslog("vaapivideo/device: DRM device '%s' not accessible -- %s", drmPath.c_str(), std::strerror(errno));
