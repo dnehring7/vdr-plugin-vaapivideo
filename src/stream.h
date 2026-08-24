@@ -155,14 +155,23 @@ static_assert(std::ranges::all_of(VIDEO_BACKEND_TABLE,
 // === CODEC DETECTION ===
 // ============================================================================
 
+/// DetectAudioCodec() verdict. `chained` marks the strongest corroboration -- two complete frame
+/// headers linked by an exact frame-length step, i.e. two real audio frames -- vs single-frame
+/// evidence (exact payload fill, Dolby head-span, lone DTS/TrueHD sync). Only `chained` is strong
+/// enough for cVaapiDevice::PlayAudio's one-payload fresh-stream confirm; anything weaker needs 2-of-2.
+struct AudioDetection {
+    AVCodecID codecId{AV_CODEC_ID_NONE}; ///< Detected codec; AV_CODEC_ID_NONE = nothing corroborated
+    bool chained{false};                 ///< True iff two chained frame headers corroborated codecId
+};
+
 /// Identify an audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2 Layer II/
 /// TrueHD). Linear sync-word scan; a sync hit is decisive only when its declared frame
 /// length is corroborated (a chained valid header one frame ahead, an exact payload fill
 /// from offset 0, or -- Dolby only -- a head frame spanning past the payload) -- a lone
 /// short sync inside compressed payload bytes is noise, not evidence. Returns
-/// AV_CODEC_ID_NONE if nothing is corroborated; callers should treat that as "wait for
-/// the next payload".
-[[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID;
+/// codecId == AV_CODEC_ID_NONE if nothing is corroborated; callers should treat that as
+/// "wait for the next payload". See AudioDetection for the meaning of `chained`.
+[[nodiscard]] auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection;
 
 /// Identify a video codec from ES bytes (HEVC/H.264/MPEG-2). Weighted multi-codec
 /// Annex-B scan with cross-codec phantom-hit invalidation. Returns AV_CODEC_ID_NONE

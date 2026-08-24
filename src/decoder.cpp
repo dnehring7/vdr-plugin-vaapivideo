@@ -163,6 +163,11 @@ constexpr int DECODER_SYNC_CORRECTION_MAX_MS = static_cast<int>(DECODER_SYNC_HAR
 constexpr int DECODER_SYNC_HARD_AHEAD_MAX_MS =
     500; ///< Live hard-ahead sleep cap (ms); prevents indefinite chase + upstream queue overflow.
 
+// --- Stream-start trace milestones (cVaapiDecoder::startTrace; see StreamStartTrace in common.h) ---
+constexpr uint32_t TRACE_DECODED = 1U << 0;   ///< First frame out of the codec + filter (decode thread)
+constexpr uint32_t TRACE_PRESENTED = 1U << 1; ///< First frame handed to the display (present thread; usually freerun)
+constexpr uint32_t TRACE_PACED = 1U << 2;     ///< First clock-gated submit: A/V locked from here on
+
 // --- Present-thread drain ---
 // DECODER_RESERVE_HARD_CAP lives in decoder.h (statically coupled to the mediaplayer backpressure gate).
 constexpr int64_t DECODER_DRAIN_FUTURE_MAX_MS =
@@ -570,10 +575,25 @@ auto cVaapiDecoder::FlushParser() -> void {
     DrainPendingParserAU();
 }
 
+auto cVaapiDecoder::ReleasePendingAccessUnit() -> void {
+    const cMutexLock parseLock(&parserMutex);
+    if (!codecCtx || !parserCtx || currentCodecId == AV_CODEC_ID_NONE) {
+        return;
+    }
+    DrainPendingParserAU();
+    // The fresh parser reports key_frame=0 until the next in-band SPS/PPS -- consumed only by trick-play
+    // filtering and starvation diagnostics, neither active in the live startup window this serves.
+    parserCtx.reset(av_parser_init(currentCodecId));
+    if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
+        esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
+    }
+    trickAwaitSecondField = false; // parser reset: forget any pending PAFF field-pair (parserMutex held)
+}
+
 auto cVaapiDecoder::DrainPendingParserAU() -> void {
-    // NULL/0 input is the documented EOS-flush idiom for av_parser_parse2.
-    // Callers: FlushParser (still-picture) and SetTrickSpeed (reverse isolated I-frames).
-    // Caller holds parserMutex; packetMutex taken internally. codecCtx is read-only here.
+    // NULL/0 input is the documented EOS-flush idiom for av_parser_parse2. Callers: FlushParser
+    // (still-picture), SetTrickSpeed (reverse isolated I-frames) and ReleasePendingAccessUnit
+    // (live first keyframe). Caller holds parserMutex; packetMutex taken internally. codecCtx read-only.
     if (!codecCtx || !parserCtx) {
         return;
     }
@@ -1102,6 +1122,13 @@ auto cVaapiDecoder::NotifyAudioChange() -> void {
     syncLogPending.store(true, std::memory_order_relaxed);
     WakePresenter(); // present thread acts on freerunFrames; wake it so it doesn't wait out the poll.
 }
+
+auto cVaapiDecoder::ArmStartTrace(uint64_t epochMs) noexcept -> void {
+    tracePacketsSent.store(0, std::memory_order_relaxed);
+    startTrace.Arm(epochMs, TRACE_DECODED | TRACE_PRESENTED | TRACE_PACED);
+}
+
+auto cVaapiDecoder::DisarmStartTrace() noexcept -> void { startTrace.Disarm(); }
 
 auto cVaapiDecoder::SetAudioProcessor(cAudioProcessor *audio) -> void {
     audioProcessor.store(audio, std::memory_order_release);
@@ -2156,6 +2183,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             }
             packetSent = true; // success or EOF; don't retry
             NoteStarvationTick(pkt);
+            if (startTrace.Pending(TRACE_DECODED)) [[unlikely]] {
+                tracePacketsSent.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         bool receivedThisIteration = false;
@@ -2182,6 +2212,17 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             // Before the log + filter/HDR build below, so all of them see the corrected colorimetry.
             ApplyContainerColorHints(decodedFrame.get());
             ApplyColorDefaults(decodedFrame.get());
+
+            // The packet count exposes the reorder delay (an IDR leaves the DPB only after has_b_frames
+            // later pictures); the filter build is the other decode-side cost before presentation.
+            if (const int64_t traceMs = startTrace.Fire(TRACE_DECODED); traceMs >= 0) [[unlikely]] {
+                dsyslog("vaapivideo/decoder: trace +%lldms first decoded frame pts=%lld (%dx%d type=%c%s, after %zu "
+                        "packet(s), filter %s)",
+                        static_cast<long long>(traceMs), static_cast<long long>(decodedFrame->pts), decodedFrame->width,
+                        decodedFrame->height, av_get_picture_type_char(decodedFrame->pict_type),
+                        (decodedFrame->flags & AV_FRAME_FLAG_KEY) != 0 ? " key" : "",
+                        tracePacketsSent.load(std::memory_order_relaxed), filterChain.IsBuilt() ? "ready" : "to build");
+            }
 
             if (!hasLoggedFirstFrame.exchange(true, std::memory_order_relaxed)) {
                 const char *fmtName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decodedFrame->format));
@@ -2847,6 +2888,43 @@ auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserv
     return true;
 }
 
+auto cVaapiDecoder::TracePresent(int64_t pts, const cAudioProcessor *ap, const char *path, bool paced,
+                                 int64_t rawDelta90k) noexcept -> void {
+    // Present-thread only. "presented" = first visible (freerun) frame; "paced" = first frame the
+    // audio-clock gate released, i.e. picture and sound move together from here. The clock relation
+    // on the first frame predicts the still-frame hold (positive) or catch-up drops (negative).
+    // Same guard SubmitIfCurrent() applies right after: a Clear() that raced this iteration drops the
+    // frame, and a one-shot milestone spent on it would both misreport and hide the real first frame.
+    if (PresentEpochStale()) [[unlikely]] {
+        return;
+    }
+    if (const int64_t traceMs = startTrace.Fire(TRACE_PRESENTED); traceMs >= 0) [[unlikely]] {
+        const int64_t clock = ap ? ap->GetClock() : AV_NOPTS_VALUE;
+        if (clock == AV_NOPTS_VALUE || pts == AV_NOPTS_VALUE) {
+            dsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld -- audio clock not anchored "
+                    "yet, buf=%zu",
+                    static_cast<long long>(traceMs), path, static_cast<long long>(pts), jitterBuf.size());
+        } else {
+            const int64_t dueIn90k = pts - clock - SyncLatency90k(ap);
+            dsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld clock=%lld -- video "
+                    "%+lldms vs audio: %s, buf=%zu",
+                    static_cast<long long>(traceMs), path, static_cast<long long>(pts), static_cast<long long>(clock),
+                    static_cast<long long>(dueIn90k / PTS_TICKS_PER_MS),
+                    dueIn90k > 0 ? "still-frame hold until the audio clock catches up"
+                                 : "behind, catch-up drops until aligned",
+                    jitterBuf.size());
+        }
+    }
+    if (paced) {
+        if (const int64_t traceMs = startTrace.Fire(TRACE_PACED); traceMs >= 0) [[unlikely]] {
+            dsyslog(
+                "vaapivideo/decoder: trace +%lldms A/V locked -- first clock-paced frame pts=%lld raw=%+lldms buf=%zu",
+                static_cast<long long>(traceMs), static_cast<long long>(pts),
+                static_cast<long long>(rawDelta90k / PTS_TICKS_PER_MS), jitterBuf.size());
+        }
+    }
+}
+
 [[nodiscard]] auto cVaapiDecoder::SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame) -> bool {
     // Clear-race guard for paths that sleep before submit: a Clear() during the sleep makes
     // the frame's PTS belong to the old epoch. Drop silently (returning true so callers don't
@@ -3039,6 +3117,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // Freerun bypass: no audio processor, no PTS, or inside the post-Clear / trick-exit window.
     auto *const ap = audioProcessor.load(std::memory_order_acquire);
     if (!ap || pts == AV_NOPTS_VALUE) {
+        TracePresent(pts, ap, "unsynced", /*paced=*/false, 0);
         return SubmitIfCurrent(std::move(frame));
     }
     if (freerunFrames.load(std::memory_order_relaxed) > 0) {
@@ -3047,6 +3126,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // so the old clock domain doesn't bleed into the new one.
         pendingDrops = 0;
         ResetSmoothedDelta();
+        TracePresent(pts, ap, "freerun", /*paced=*/false, 0);
         return SubmitIfCurrent(std::move(frame));
     }
 
@@ -3067,6 +3147,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
             syncLogHeartbeat.Set(DECODER_SYNC_LOG_HEARTBEAT_MS);
         }
+        TracePresent(pts, ap, "no-clock freerun", /*paced=*/false, 0);
         return SubmitIfCurrent(std::move(frame));
     }
 
@@ -3317,6 +3398,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         }
     }
 
+    TracePresent(pts, ap, "paced", /*paced=*/true, rawDelta);
     const bool submitted = SubmitIfCurrent(std::move(frame));
     if (preSleepMs != 0) {
         // EMA feedback: subtract measured shift (elapsed - frameDur); std::max guards underflow.

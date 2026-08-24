@@ -136,6 +136,9 @@ class cVaapiDisplay : public cThread {
     auto BeginStreamSwitch() -> void;
     /// Release importMutex and resume frame delivery after a channel switch.
     auto EndStreamSwitch() -> void;
+    /// Stream-start trace: first fresh frame committed to the CRTC after the switch, vs the switch epoch.
+    auto ArmStartTrace(uint64_t epochMs) noexcept -> void;
+    auto DisarmStartTrace() noexcept -> void; ///< Drop the pending stream-start milestone.
     /// HDR classification of the stream currently programmed for scanout. Used by GrabImage to
     /// drive HDR-aware tonemapping; reading the AVFrame's color_trc isn't reliable because
     /// av_hwframe_transfer_data strips the transfer-characteristic metadata on download.
@@ -465,6 +468,7 @@ class cVaapiDisplay : public cThread {
                                            ///< as "queue empty" at vsync rate.
     std::atomic<uint64_t> lastFrameCommitMs{0};  ///< Wall-clock ms of the most recent fresh-frame commit;
                                                  ///< 0 = inactive (post-Clear). Gates the underrun tracker.
+    StreamStartTrace startTrace;                 ///< Stream-start milestone: first fresh commit after a switch
     std::atomic<uint64_t> lastVSyncTimeMs{0};    ///< Wall-clock ms of the most recent page-flip event
     uint32_t modeBlobId{};                       ///< KMS MODE_ID blob; must outlive CRTC enable, freed in Shutdown()
     std::atomic<uint64_t> modeGeneration{0};     ///< Incremented after every successful runtime mode change

@@ -157,6 +157,42 @@ struct HdrStreamInfo {
 }
 
 // ============================================================================
+// === STREAM-START TRACE ===
+// ============================================================================
+
+/// One-shot "time to first ..." trace for a stream start. SetPlayMode() arms every component with one
+/// common epoch; each reports its first post-start milestones exactly once as "+N ms" after it, so a
+/// single journal excerpt shows where channel-switch latency went (see AVSYNC.md "Stream-start trace").
+/// Lock-free so it may sit on hot paths: once drained, Fire() is a single acquire load.
+struct StreamStartTrace {
+    std::atomic<uint64_t> epochMs{0}; ///< cTimeMs::Now() at the switch; read only when a milestone fires
+    std::atomic<uint32_t> pending{0}; ///< Bit per milestone still to report; 0 = disarmed / drained
+
+    /// Arm with the switch epoch and the set of milestones to report (component-defined bit mask).
+    auto Arm(uint64_t epoch, uint32_t mask) noexcept -> void {
+        epochMs.store(epoch, std::memory_order_relaxed);
+        pending.store(mask, std::memory_order_release); // publishes epochMs to every Fire() that sees the mask
+    }
+    /// Disarm: every remaining milestone is dropped silently.
+    auto Disarm() noexcept -> void { pending.store(0, std::memory_order_relaxed); }
+    /// True while @p bit has not fired yet -- for callers that must probe state before deciding to fire.
+    [[nodiscard]] auto Pending(uint32_t bit) const noexcept -> bool {
+        return (pending.load(std::memory_order_acquire) & bit) != 0;
+    }
+    /// Report milestone @p bit: ms since the epoch on its first firing, -1 when it already fired,
+    /// the trace is disarmed, or another thread won the race for the bit.
+    [[nodiscard]] auto Fire(uint32_t bit) noexcept -> int64_t {
+        if ((pending.load(std::memory_order_acquire) & bit) == 0) [[likely]] {
+            return -1;
+        }
+        if ((pending.fetch_and(~bit, std::memory_order_acq_rel) & bit) == 0) [[unlikely]] {
+            return -1;
+        }
+        return static_cast<int64_t>(cTimeMs::Now() - epochMs.load(std::memory_order_relaxed));
+    }
+};
+
+// ============================================================================
 // === DRM/KMS UTILITIES ===
 // ============================================================================
 

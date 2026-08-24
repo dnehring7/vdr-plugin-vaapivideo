@@ -18,8 +18,10 @@ Contents:
 8. [Jitter buffer](#jitter-buffer-unified-drain) — the present-thread drain
 9. [Display prerender](#display-prerender) — the per-VSync cushion and underrun detection
 10. [Lifecycle](#lifecycle) — what each event resets
-11. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
-12. [Constants](#constants) — every tunable, with purpose and unit
+11. [Stream start](#stream-start) — channel-switch latency budget, first keyframe, first audio
+12. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
+13. [Stream-start trace](#stream-start-trace) — the `trace +Nms` timeline of a switch
+14. [Constants](#constants) — every tunable, with purpose and unit
 
 ## Problem
 
@@ -510,10 +512,11 @@ each through catch-up.
 `buf` (jitterBuf depth at log emission) reflects input arrival rate minus the
 gate's release rate.
 
-- **Live TV.** `AUDIO_ALSA_BUFFER_MS = 400 ms` sizes the ALSA ring, so
-  `GetClock()` lags wall time by roughly that; head frames sit in `jitterBuf`
-  until the lagged clock catches them.
-  `buf ≈ (AUDIO_ALSA_BUFFER_MS + broadcastLead) / frameDur`. Higher-bitrate
+- **Live TV.** The ALSA ring holds `AUDIO_ALSA_START_MS` (300 ms) once playback
+  starts — see [Ring cushion](#ring-cushion) for why that number, not
+  `AUDIO_ALSA_BUFFER_MS`, is the steady level — so `GetClock()` lags wall time by
+  roughly that; head frames sit in `jitterBuf` until the lagged clock catches
+  them. `buf ≈ (ringFill + broadcastLead) / frameDur`. Higher-bitrate
   streams ship more lead and run deeper; 4K VBR can swing `buf` by ~1 s within
   seconds as bitrate peaks stall packet arrival — that is the cushion working.
 - **Replay, cold start.** dvbplayer bursts disk reads to refill an empty PES
@@ -539,6 +542,32 @@ depends on the input path:
   lead working, not a decoder falling behind.
 
 Either way the real audio cushion is the ALSA ring, not this queue.
+
+### Ring cushion
+
+The ALSA ring is sized by `AUDIO_ALSA_BUFFER_MS` (800 ms), but the level it
+actually runs at is set by `AUDIO_ALSA_START_MS` (300 ms), the fill the DAC
+starts at. A live feed arrives at exactly 1x, so once playback starts, writes and
+playout advance at the same rate: **whatever is in the ring at the start is the
+average level for the rest of the stream** — it never grows back. The level then
+sawtooths with the arrival granularity, because a DVB audio PES is not one frame
+but up to eight: 4608-byte MP2 payloads carry 192 ms, 7680-byte AC-3 payloads
+160 ms, and each arrives one period after the last.
+
+So the cushion has to clear one PES period plus arrival jitter. With the earlier
+`bufferSize / 3` threshold (133 ms) it did not: measured on satip, the ring peaked
+at 144 ms and grazed **8–19 ms** on every PES cycle, and a single late payload
+underran it — `snd_pcm_writei` returned `-EPIPE`, `snd_pcm_recover()` re-prepared,
+and the DAC then stayed silent until the threshold refilled. Audibly: sound
+starts, drops out briefly ~0.5–1 s into the channel switch, and resumes. Nothing
+logged it, because the recovery was silent; it was only visible as `state: XRUN`
+in `/proc/asound/card*/pcm*p/sub*/status`. That recovery now logs (rate-limited),
+and at 300 ms the same measurement gives min 206–226 ms, avg 313–320 ms, no xruns.
+
+The cost is paid once per stream start: the DAC starts ~150 ms later, and A/V lock
+follows ~190 ms later, since the video waits for an audio clock that is now
+anchored further back. Volume changes also take up to one ring fill to become
+audible (mute does not — `DropOutput()` drops the ring).
 
 ## Display prerender
 
@@ -613,7 +642,7 @@ grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_
 | Event                            | EMA               | Cooldown  | Jitter buffer |
 | -------------------------------- | ----------------- | --------- | ------------- |
 | Plugin start                     | invalid           | —         | empty |
-| Channel switch (`Clear()`)       | reset             | unchanged | flushed; freerun armed |
+| Channel switch (`Clear()`)       | reset             | unchanged | flushed; freerun armed; stream-start trace armed by `SetPlayMode()` |
 | Catch-up enter                   | (drops silent)    | unchanged | drained silently to alignment |
 | Catch-up exit                    | reset             | unchanged | one frame submitted normally |
 | Soft drop                        | reset             | armed     | N frames dropped (one now, N−1 via `pendingDrops`, one per drain iteration) |
@@ -668,6 +697,91 @@ repositioning command (jump keys, playlist advance, audio-track switch) skip it
 double the flush (`LeaveTrickWithoutReanchor`) — and a **failed** transition
 seek fails closed: the player leaves trick mode (`AbortTrick`) rather than
 running a trick on the wrong timeline or retrying a reverse seek forever.
+
+## Stream start
+
+What a viewer waits for after a zap is, in order: the tuner / stream join
+(outside the plugin — ~1.7 s SAT>IP on the test rig, a multicast join or HTTP
+connect on IPTV), the next keyframe (a random position inside the GOP), the
+pipeline's own startup cost, and finally the moment picture and sound run
+together. The plugin's share is kept to a few tens of milliseconds by three
+rules in `cVaapiDevice::PlayVideo` / `PlayAudio`:
+
+- **The first keyframe PES opens the codec, unconditionally.** `DetectVideoCodec`
+  only fires on a parameter-set-bearing keyframe PES, so whatever it accepts is
+  the first decodable picture of the new stream. An earlier "same codec as the
+  previous channel → wait for a second detection" guard could only confirm on
+  the *next* keyframe, i.e. it threw away the first one and cost a full GOP on
+  every same-codec switch (0.6–0.9 s on DVB, several seconds on long-GOP IPTV)
+  — the dominant reason video trailed audio after a zap. The old-channel PES
+  residue it guarded against cannot occur with VDR 2.x transfer mode (the old
+  player is detached and `PlayTs(NULL)` resets the TS→PES assemblers before the
+  tuner is re-pointed; the new player attaches only after the new receiver
+  exists; the dvb/satip/iptv devices clear their TS rings in `OpenDvr()`).
+
+- **The first keyframe's access unit is released as soon as its PES is
+  complete** (live only). `av_parser_parse2` holds an AU back until the next
+  AU's start code arrives, which for the very first picture means waiting for
+  the next PES — one frame period on DVB, a whole delivery burst on IPTV. In a
+  TS the PES boundary is the AU boundary, and VDR chunks an oversized picture
+  into PES packets of exactly `VDR_MAX_PES_CHUNK` bytes, so any shorter video
+  PES ends its picture: `PlayVideo` then calls
+  `cVaapiDecoder::ReleasePendingAccessUnit()`, which drains the parser and
+  recreates it (a flushed `AVCodecParser` keeps a stale `frame_start_found` and
+  would otherwise cut the next AU at its first NAL). One-shot per codec open;
+  replay is excluded because the pre-TS PES recording format splits a picture
+  across many small PES packets.
+
+- **Audio confirms from two frames, not necessarily two PES.** Codec certainty
+  needs two corroborated audio frames (one frame misdetects), and an
+  in-session `audi N` track switch
+  can deliver one complete PES of the *old* PID first, which is why the 2-of-2
+  rule spans payloads. On a **fresh stream** (`audioFreshStart`, armed by
+  `SetPlayMode()`) nothing stale can precede the first PES, so a `chained`
+  detection — two frame headers linked by an exact frame-length step inside one
+  payload, i.e. two real audio frames — confirms immediately and the codec opens
+  on the first PES (~25–100 ms sooner; the log says `chained 1-PES`). Weaker
+  evidence (exact fill, Dolby head-span, DTS/TrueHD lone sync) keeps 2-of-2, and
+  its 1-of-2 candidate PES is then held, not dropped, and fed once confirmed, so
+  the wait costs no audio and the ALSA start threshold
+  (`AUDIO_ALSA_START_MS`) fills one PES sooner. In-session track changes
+  disable both fast paths: full 2-of-2 across payloads, candidate dropped. The
+  test is "this stream has already delivered an audio PES" (`audioPesSeen`), not
+  "a codec was confirmed" — a track change landing inside the detection window
+  is in-session too.
+
+- **A dolby track switch outruns VDR's own PID switch.** VDR fires
+  `SetDigitalAudioDevice(true)` *before* it assigns `currentAudioTrack`
+  (device.c), so `PlayTs()` keeps routing the **old** track's PID for as long as
+  the plugin's handler runs — and `cAudioProcessor::Clear()` in it can block tens
+  of milliseconds on the ALSA mutex. Those leftovers are complete, decisive PES:
+  fed to the detector they win the 2-of-2 vote for the codec being left behind,
+  after which the new track's bitstream starves the wrong decoder until the
+  cascade escalation re-detects (measured **9.5 s of silence** on an MP2 → Dolby
+  switch before the fix). A DVB dolby track always rides in `private_stream_1`,
+  so `PlayAudio()` drops audio PES with any other stream id until the switch
+  lands, bounded by `AUDIO_TRACK_SWITCH_GRACE_MS` (500 ms) so an unusual mux
+  costs a hiccup instead of the audio. The gate arms only for an **in-session**
+  switch (`audioPesSeen`) — a stream that has not delivered audio yet has no
+  leftovers to keep out — and is evaluated only on payloads `ParsePes()`
+  accepted, so the PES-shaped garbage an encrypted channel produces before its
+  CAM has keys can neither time it out nor be logged against it. Every other track hook fires *after* the
+  assignment, where at most the one PES already complete in `tsToPesAudio` can be
+  stale — that one the 2-of-2 rule covers. Measured after the fix: hook →
+  `confirmed (2-of-2)` in 230–520 ms, both directions, no cascade.
+
+What remains after the keyframe is inherent: decode + VPP build + one VSync
+(~40–60 ms keyframe-PES → CRTC on the test rig), then the **still-frame hold**.
+The first frame is shown unpaced (freerun) the moment it exists, but the audio
+that belongs to its PTS has not even arrived yet — in a DVB mux video is sent
+~0.5–1 s ahead of its PTS and audio only ~0.1–0.2 s, so the first picture
+freezes for roughly `videoLead − audioLead + AUDIO_ALSA_START_MS` (0.6–1.0 s
+observed, the last term being the ring cushion the stream needs anyway — see
+[Ring cushion](#ring-cushion)) until the audio clock reaches it, and motion starts
+A/V-locked from there. No player can start synced motion earlier than the arrival of that audio;
+the alternatives (muting instead of freezing, or crawling the video) are worse.
+Motion-compensated VAAPI deinterlacing adds a few more fields of reference
+history before its first output on 1080i channels.
 
 ## Diagnostic log
 
@@ -737,6 +851,39 @@ subtracts more from `rawDelta`, releasing each frame at an earlier audio-clock
 value — i.e. positive latency pulls video earlier vs audio (it delays audio
 relative to video, per `config.h`).
 
+## Stream-start trace
+
+Every stream start (`SetPlayMode(pmAudioVideo / pmVideoOnly / pmAudioOnly*)`:
+channel switch, replay start, mediaplayer open) arms a one-shot trace in the
+device, decoder, audio processor and display (`StreamStartTrace` in
+`src/common.h`, lock-free; `pmNone` disarms it). Each component reports its
+first milestones once, as `+N ms` after the common switch epoch, so one journal
+excerpt shows where the latency went:
+
+```
+device:  trace +1682ms first video PES (pts=…, 1746 bytes)
+device:  trace +1868ms first audio PES (pts=…, 3840 bytes)
+device:  trace +2012ms audio codec mp2 opened (PCM, chained 1-PES confirm), first decodable pts=…
+audio:   trace +2012ms first ALSA write -- clock anchored at pts=… (1152 frames queued, delay=1193)
+audio:   trace +2013ms DAC running -- audible from pts=… (ring=143ms)
+device:  trace +2352ms first keyframe PES (h264, pts=…, video PES #40)
+device:  trace +2353ms video codec h264 opened (profile=100, 8-bit), first fed pts=…
+decoder: trace +2357ms first decoded frame pts=… (1280x720 type=I key, after 1 packet(s), filter to build)
+decoder: trace +2399ms first frame presented (freerun) pts=… clock=… -- video +748ms vs audio: still-frame hold …
+display: trace +2411ms first frame committed to CRTC (1920x1080)
+decoder: trace +3170ms A/V locked -- first clock-paced frame pts=… raw=+17ms buf=31
+```
+
+Reading it: `first video PES` is when the tuner / stream delivers; the gap to
+`first keyframe PES` is the GOP position (`video PES #N` = how many pictures
+were skipped); keyframe → `committed to CRTC` is the plugin's own startup cost;
+`DAC running` is when sound becomes audible (the ALSA start threshold); the
+`video +Nms vs audio` figure on the first presented frame predicts the
+still-frame hold, and `A/V locked` is when motion starts in sync (see
+[Stream start](#stream-start)). `after N packet(s)` on the first decoded frame
+exposes the decoder's reorder delay; `filter to build` means the VPP graph was
+built for this frame (the `filter initialized` line follows).
+
 ## Constants
 
 Every constant below is file-scope — in [src/config.h](src/config.h),
@@ -767,13 +914,23 @@ Naming conventions:
 | Constant                      | Value | Purpose |
 | ----------------------------- | ----- | ------- |
 | `PTS_TICKS_PER_MS`            | 90    | DVB 90 kHz PTS clock factor: ticks = ms × this (here `_MS` means *per* ms) |
-| `AUDIO_ALSA_BUFFER_MS`        | 400   | ALSA ring size (ms); the lagged audio clock pulls live `buf` to ~MS/frameDur |
+| `AUDIO_ALSA_BUFFER_MS`        | 800   | ALSA ring size (ms); an upper bound, not the running level — see `AUDIO_ALSA_START_MS` |
+| `AUDIO_ALSA_START_MS`         | 300   | Ring fill the DAC starts at, hence the cushion the stream keeps for good (feed is 1x); must clear one audio PES period (up to 192 ms) plus jitter or the ring xruns — see [Ring cushion](#ring-cushion) |
+| `AUDIO_ALSA_EAGAIN_WAIT_MS`   | 5     | `snd_pcm_wait()` slice taken when the ring has no room for the next write |
+| `AUDIO_ALSA_EAGAIN_WAIT_LIMIT`| 400   | Consecutive full-ring waits (~2 s) before `-EAGAIN` falls into the write-error recovery tiers, so a sink that stops draining without erroring is recovered instead of wedging the audio thread |
 | `AUDIO_CLOCK_STALE_MS`        | 1000  | `GetClock()` extrapolation timeout before returning NOPTS |
 | `AUDIO_QUEUE_HIGHWATER`            | 10    | Audio-feed backpressure gate for dvbplayer/PES replay (~320 ms AC-3) |
 | `AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER`| 32    | Audio-feed gate for the single-cursor mediaplayer demux (~1 s AC-3); deeper than `HIGHWATER` because one cursor feeds both audio and video |
 | `AUDIO_QUEUE_CAPACITY`             | 100   | Audio packet-queue overflow backstop (~3.2 s); the HIGHWATER gates are the real limit |
 | `CONFIG_AUDIO_LATENCY_MIN_MS` | −200  | Lower clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
 | `CONFIG_AUDIO_LATENCY_MAX_MS` | 200   | Upper clamp on the `PcmLatency` / `PassthroughLatency` operator knobs |
+
+**Stream start** (device.cpp)
+
+| Constant                       | Value      | Purpose |
+| ------------------------------ | ---------- | ------- |
+| `VDR_MAX_PES_CHUNK`            | 0xFFF0 + 6 | Length of every non-final PES chunk VDR's `cTsToPes` makes of an oversized video picture (remux.c `MAXPESLENGTH` + header); a shorter live video PES ends its picture and releases the first keyframe's AU early (see [Stream start](#stream-start)) |
+| `AUDIO_TRACK_SWITCH_GRACE_MS`  | 500        | How long `PlayAudio()` drops non-`private_stream_1` PES after a dolby-entry track switch, i.e. how long it waits for VDR's PID switch to land before trusting whatever the mux delivers (see [Stream start](#stream-start)) |
 
 **Mediaplayer feed pacing** (mediaplayer.cpp, device.cpp)
 

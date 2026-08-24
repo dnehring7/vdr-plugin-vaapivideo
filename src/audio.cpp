@@ -84,9 +84,22 @@ namespace {
 // real time by ~this much. The video due-gate accumulates the matching frame count in
 // jitterBuf so audio and video share one cushion and lip-sync is preserved. This is a
 // floor; ALSA may negotiate slightly larger. See AVSYNC.md.
-constexpr int AUDIO_ALSA_BUFFER_MS = 400;
+constexpr int AUDIO_ALSA_BUFFER_MS = 800;
+
+/// Ring fill the DAC starts at = the cushion the stream keeps for good (the 1x feed never grows it
+/// back). It must clear one audio PES period plus arrival jitter -- DVB packs up to 192 ms of MP2 or
+/// 160 ms of AC-3 per PES -- or the level grazes zero every PES cycle and any late payload is an
+/// audible xrun. 300 ms leaves ~100 ms margin; costs the same ~150 ms in audible-start and A/V-lock
+/// latency (AVSYNC.md "Ring cushion").
+constexpr int AUDIO_ALSA_START_MS = 300;
+static_assert(AUDIO_ALSA_START_MS < AUDIO_ALSA_BUFFER_MS, "the ring must hold the start cushion plus write headroom");
 
 constexpr int AUDIO_ALSA_ERROR_LIMIT = 5; ///< Consecutive snd_pcm_writei failures before device reopen
+
+constexpr int AUDIO_ALSA_EAGAIN_WAIT_MS = 5; ///< snd_pcm_wait() slice taken while the ring has no room
+/// Consecutive full-ring waits before -EAGAIN falls into the write-error recovery tiers. A running DAC
+/// frees ring space every slice, so only a sink that stopped draining without erroring reaches this.
+constexpr int AUDIO_ALSA_EAGAIN_WAIT_LIMIT = 400; // ~2 s
 
 // After this age GetClock() returns AV_NOPTS_VALUE to force video freerun instead of
 // drifting against a frozen audio clock (channel switch, dead ALSA device).
@@ -105,6 +118,10 @@ constexpr int AUDIO_DECODER_GRACE_PACKETS =
 constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between repeated decode-error log messages (ms)
 
 // AUDIO_QUEUE_HIGHWATER / AUDIO_QUEUE_CAPACITY live in audio.h (shared with the device feed).
+
+// --- Stream-start trace milestones (cAudioProcessor::startTrace; see StreamStartTrace in common.h) ---
+constexpr uint32_t TRACE_FIRST_WRITE = 1U << 0; ///< First ALSA write after the switch: the master clock anchors here
+constexpr uint32_t TRACE_DAC_RUNNING = 1U << 1; ///< Ring crossed the start threshold; the DAC is audibly playing
 
 } // namespace
 
@@ -150,6 +167,12 @@ auto cAudioProcessor::Clear() -> void {
 
     RecreateParser();
 }
+
+auto cAudioProcessor::ArmStartTrace(uint64_t epochMs) noexcept -> void {
+    startTrace.Arm(epochMs, TRACE_FIRST_WRITE | TRACE_DAC_RUNNING);
+}
+
+auto cAudioProcessor::DisarmStartTrace() noexcept -> void { startTrace.Disarm(); }
 
 auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> void {
     if (!data || size == 0) [[unlikely]] {
@@ -485,10 +508,13 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     // Compare the *chosen* PCM output count (after downmix/cap), not the raw input count -- a 5.1
     // stream downmixed to 2.0 must NOT be seen as a channel change against a 2ch ALSA handle.
     const unsigned targetChannels = ChooseOutputChannels(params.channels);
+    // Passthrough adds decoderConfigChanged: the IEC61937 muxer is bound to the codec it was opened for,
+    // so a swap between codecs sharing a carrier rate (AC-3 -> DTS @48k, TrueHD -> DTS-HD @192k) needs the
+    // reopen even though the ALSA geometry is identical -- else every burst fails to wrap: silence.
     const bool needsReconfig =
         !initialized.load(std::memory_order_relaxed) || alsaHandle == nullptr ||
         currentlyPassthrough != wantPassthrough ||
-        (wantPassthrough ? targetRate != currentAlsaRate
+        (wantPassthrough ? (targetRate != currentAlsaRate || decoderConfigChanged)
                          : (targetRate != currentAlsaRate || targetChannels != currentAlsaChannels));
 
     // Bump clearGeneration BEFORE tearing down decoder/parser. The Action thread may
@@ -624,9 +650,7 @@ auto cAudioProcessor::CloseDevice() -> void {
     alsaSampleRate.store(0, std::memory_order_relaxed);
     outputChannelsChangePending.store(false, std::memory_order_relaxed);
     pcmChannelCeiling.store(8, std::memory_order_relaxed); // fresh device: let it advertise its full width again
-    swrInRate = 0;
-    swrOutChannels = 0;
-    swrOutRate = 0;
+    ResetResampler(); // CloseDecoder() above already freed swrCtx; this also clears the geometry it was built for
     initialized.store(false, std::memory_order_release);
 }
 
@@ -847,6 +871,17 @@ auto cAudioProcessor::Action() -> void {
     return sinkCaps.Supports(codecId);
 }
 
+auto cAudioProcessor::ResetResampler() noexcept -> void {
+    if (swrCtx) {
+        swr_free(&swrCtx);
+    }
+    swrChannels = 0;
+    swrFormat = AV_SAMPLE_FMT_NONE;
+    swrInRate = 0;
+    swrOutChannels = 0;
+    swrOutRate = 0;
+}
+
 auto cAudioProcessor::CloseDecoder() -> void {
     // Spin until all in-flight DecodeToPcm() callers release the refcount before freeing
     // the decoder and parser. AUDIO_DECODER_DRAIN_TIMEOUT_MS caps the wait.
@@ -857,14 +892,7 @@ auto cAudioProcessor::CloseDecoder() -> void {
 
     decoder.reset();
     parserCtx.reset();
-    if (swrCtx) {
-        swr_free(&swrCtx);
-    }
-    swrChannels = 0;
-    swrInRate = 0;
-    swrOutChannels = 0;
-    swrOutRate = 0;
-    swrFormat = AV_SAMPLE_FMT_NONE;
+    ResetResampler();
 }
 
 auto cAudioProcessor::FlushDecoderState() -> void {
@@ -1031,14 +1059,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
     (void)snd_pcm_drop(alsaHandle);
     snd_pcm_close(alsaHandle);
     alsaHandle = nullptr;
-    if (swrCtx) {
-        swr_free(&swrCtx); // make the reopen boundary explicit; the next frame rebuilds for `want`
-    }
-    swrChannels = 0;
-    swrInRate = 0;
-    swrOutChannels = 0;
-    swrOutRate = 0;
-    swrFormat = AV_SAMPLE_FMT_NONE;
+    ResetResampler(); // make the reopen boundary explicit; the next frame rebuilds for `want`
     ResetPlaybackClock();
 
     if (!OpenAlsaDevice()) {
@@ -1141,9 +1162,12 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         return false;
     }
 
-    // Start threshold at 1/3 of the ring: caps channel-switch-to-first-audio latency
-    // at ~133 ms while giving the decode ramp-up time to prebuffer.
-    const snd_pcm_uframes_t startThreshold = bufferSize / 3;
+    // Start threshold = AUDIO_ALSA_START_MS of audio, i.e. the cushion the stream keeps (see the
+    // constant). Capped at 3/4 of whatever the hardware actually granted so a device that rounded the
+    // ring down still keeps a quarter of it as write headroom and can reach the threshold at all.
+    const auto requestedStart =
+        static_cast<snd_pcm_uframes_t>(static_cast<uint64_t>(actualRate) * AUDIO_ALSA_START_MS / 1000);
+    const snd_pcm_uframes_t startThreshold = std::min(requestedStart, bufferSize / 4 * 3);
     if (const int err = snd_pcm_sw_params_set_start_threshold(handle, swParams, startThreshold); err < 0) {
         dsyslog("vaapivideo/audio: set_start_threshold failed: %s", snd_strerror(err));
         return false;
@@ -1164,8 +1188,9 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
     (void)snd_pcm_hw_params_get_period_size(hwParams, &actualPeriod, nullptr);
     const unsigned bufMs = (actualRate > 0) ? static_cast<unsigned>(actualBuffer * 1000 / actualRate) : 0;
     const unsigned periodMs = (actualRate > 0) ? static_cast<unsigned>(actualPeriod * 1000 / actualRate) : 0;
-    dsyslog("vaapivideo/audio: ALSA buffer=%ums period=%ums start=%ums (target=%dms)", bufMs, periodMs, bufMs / 3,
-            AUDIO_ALSA_BUFFER_MS);
+    const unsigned startMs = (actualRate > 0) ? static_cast<unsigned>(startThreshold * 1000 / actualRate) : 0;
+    dsyslog("vaapivideo/audio: ALSA buffer=%ums period=%ums start=%ums (target=%d/%dms)", bufMs, periodMs, startMs,
+            AUDIO_ALSA_START_MS, AUDIO_ALSA_BUFFER_MS);
 
     unsigned configuredChannels = 0;
     unsigned configuredRate = 0;
@@ -1298,7 +1323,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
 
         if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels || static_cast<int>(outCh) != swrOutChannels ||
                        frame->sample_rate != swrInRate || outRate != swrOutRate)) {
-            swr_free(&swrCtx);
+            ResetResampler();
         }
 
         if (!swrCtx) {
@@ -1311,14 +1336,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
             if (ret < 0 || !swrCtx || swr_init(swrCtx) < 0) {
                 esyslog("vaapivideo/audio: swr_alloc_set_opts2 failed for %s %dch %dHz -> S16 %uch %dHz",
                         av_get_sample_fmt_name(frameFmt), frameCh, frame->sample_rate, outCh, outRate);
-                if (swrCtx) {
-                    swr_free(&swrCtx);
-                }
-                swrChannels = 0;
-                swrInRate = 0;
-                swrOutChannels = 0;
-                swrOutRate = 0;
-                swrFormat = AV_SAMPLE_FMT_NONE;
+                ResetResampler();
                 decoderRefCount.fetch_sub(1, std::memory_order_release);
                 return false;
             }
@@ -1503,6 +1521,157 @@ auto cAudioProcessor::CloseSpdifMuxer() -> void {
     return {spdifOutputBuf.data(), spdifOutputBuf.size()};
 }
 
+namespace {
+
+/// The element name every ALSA driver agrees on for the consumer channel-status word.
+constexpr const char *IEC958_CTL_NAME = "IEC958 Playback Default";
+
+/// Control-index sweep bound; no consumer card comes near 16 digital converters.
+constexpr unsigned IEC958_CTL_SCAN_LIMIT = 16;
+
+/// ELD index sweep bound: multi-port HDMI cards expose one ELD per physical port.
+constexpr unsigned ELD_SCAN_LIMIT = 8;
+
+[[nodiscard]] auto CtlElemExists(snd_ctl_t *ctl, snd_ctl_elem_iface_t iface, const char *name, unsigned device,
+                                 unsigned index) noexcept -> bool {
+    snd_ctl_elem_id_t *id = nullptr;
+    snd_ctl_elem_id_alloca(&id);
+    snd_ctl_elem_id_set_interface(id, iface);
+    snd_ctl_elem_id_set_name(id, name);
+    snd_ctl_elem_id_set_device(id, device);
+    snd_ctl_elem_id_set_index(id, index);
+
+    snd_ctl_elem_info_t *info = nullptr;
+    snd_ctl_elem_info_alloca(&info);
+    snd_ctl_elem_info_set_id(info, id);
+    return snd_ctl_elem_info(ctl, info) == 0;
+}
+
+[[nodiscard]] auto IsDigitalPcmName(const char *name) noexcept -> bool {
+    if (name == nullptr) [[unlikely]] {
+        return false;
+    }
+    constexpr std::array<std::string_view, 6> kDigitalMarkers{"HDMI",   "DisplayPort", "Digital",
+                                                              "IEC958", "SPDIF",       "S/PDIF"};
+    const std::string_view label{name};
+    return std::ranges::any_of(kDigitalMarkers, [label](std::string_view marker) -> bool {
+        return label.find(marker) != std::string_view::npos;
+    });
+}
+
+/// Position of `deviceId` among the card's digital playback PCMs. snd_hda_intel indexes its per-converter
+/// "IEC958 Playback Default" controls card-wide in the same order the PCM devices are numbered
+/// (hda_codec.c find_empty_mixer_ctl_idx), so this ordinal IS our pin's control index. UINT_MAX when the
+/// device is not a digital output or the card refuses to enumerate.
+[[nodiscard]] auto DigitalPcmOrdinal(snd_ctl_t *ctl, int deviceId) noexcept -> unsigned {
+    snd_pcm_info_t *info = nullptr;
+    snd_pcm_info_alloca(&info);
+
+    unsigned ordinal = 0;
+    int device = -1;
+    while (snd_ctl_pcm_next_device(ctl, &device) == 0 && device >= 0) {
+        snd_pcm_info_set_device(info, static_cast<unsigned>(device));
+        snd_pcm_info_set_subdevice(info, 0);
+        snd_pcm_info_set_stream(info, SND_PCM_STREAM_PLAYBACK);
+        if (snd_ctl_pcm_info(ctl, info) < 0) {
+            continue; // device has no playback stream
+        }
+        // An ELD proves an HDMI/DP pin even on cards whose PCM name does not say so. Sweep the same index
+        // range the ELD read below uses: a card that puts its ELD at a later index would otherwise drop out
+        // of this walk and shift every following pin's ordinal -- i.e. arm the wrong port's IEC958 control.
+        bool hasEld = false;
+        for (unsigned index = 0; index < ELD_SCAN_LIMIT && !hasEld; ++index) {
+            hasEld = CtlElemExists(ctl, SND_CTL_ELEM_IFACE_PCM, "ELD", static_cast<unsigned>(device), index);
+        }
+        if (!hasEld && !IsDigitalPcmName(snd_pcm_info_get_name(info))) {
+            continue;
+        }
+        if (device == deviceId) {
+            return ordinal;
+        }
+        ++ordinal;
+    }
+    return UINT_MAX;
+}
+
+} // namespace
+
+auto cAudioProcessor::ResolveIec958Control(snd_ctl_t *ctl, int deviceId) -> void {
+    // Resolve into locals and publish only on success: this runs again on every re-probe of the same
+    // sink, and a transient miss must not disarm a control that was already resolved and is in use.
+    bool mixer = false;
+    unsigned device = 0;
+    unsigned index = UINT_MAX;
+
+    // 1. Drivers that key the channel status by PCM device (USB, and single-digital-out cards).
+    for (unsigned idx = 0; idx < IEC958_CTL_SCAN_LIMIT && index == UINT_MAX; ++idx) {
+        if (CtlElemExists(ctl, SND_CTL_ELEM_IFACE_PCM, IEC958_CTL_NAME, static_cast<unsigned>(deviceId), idx)) {
+            device = static_cast<unsigned>(deviceId);
+            index = idx;
+        }
+    }
+
+    // 2. snd_hda_intel -- every HDMI rig this plugin targets: iface=MIXER, no device field, indexed in
+    //    PCM-device order (DigitalPcmOrdinal). Without that mapping the lookup missed -- HDMI controls are
+    //    never on iface=PCM, and index 0 can be another port's pin.
+    if (index == UINT_MAX) {
+        if (const unsigned ordinal = DigitalPcmOrdinal(ctl, deviceId);
+            ordinal != UINT_MAX && CtlElemExists(ctl, SND_CTL_ELEM_IFACE_MIXER, IEC958_CTL_NAME, 0, ordinal)) {
+            index = ordinal;
+            mixer = true;
+        }
+    }
+
+    // 3. Exactly one such control on the whole card: nothing to disambiguate, whatever the scheme.
+    unsigned candidates = 0;
+    if (index == UINT_MAX) {
+        bool onlyMixer = false;
+        unsigned onlyIndex = 0;
+        for (const bool wantMixer : {false, true}) {
+            const auto iface = wantMixer ? SND_CTL_ELEM_IFACE_MIXER : SND_CTL_ELEM_IFACE_PCM;
+            for (unsigned idx = 0; idx < IEC958_CTL_SCAN_LIMIT; ++idx) {
+                if (CtlElemExists(ctl, iface, IEC958_CTL_NAME, 0, idx)) {
+                    onlyMixer = wantMixer;
+                    onlyIndex = idx;
+                    ++candidates;
+                }
+            }
+        }
+        if (candidates == 1) {
+            index = onlyIndex;
+            mixer = onlyMixer;
+        }
+    }
+
+    if (index == UINT_MAX) [[unlikely]] {
+        if (alsaIec958CtlIndex != UINT_MAX) {
+            return; // keep the element resolved earlier for this sink; it is still the right one
+        }
+        // No control (dmix 'default'), or several none of the mappings tie to our device -- a guess
+        // would arm the wrong port.
+        dsyslog("vaapivideo/audio: IEC958 Playback Default not resolved on hw:%d device %d (%u candidate(s)) -- "
+                "non-audio bit will not be managed",
+                alsaCardId, deviceId, candidates);
+        return;
+    }
+
+    const bool unchanged = index == alsaIec958CtlIndex && device == alsaIec958CtlDevice && mixer == alsaIec958CtlMixer;
+    alsaIec958CtlDevice = device;
+    alsaIec958CtlIndex = index;
+    alsaIec958CtlMixer = mixer;
+    if (!unchanged) { // re-probes of an ELD-less sink run this repeatedly; log the element once
+        dsyslog("vaapivideo/audio: IEC958 Playback Default on hw:%d -- iface=%s device=%u index=%u", alsaCardId,
+                mixer ? "MIXER" : "PCM", device, index);
+    }
+}
+
+auto cAudioProcessor::FillIec958CtlId(snd_ctl_elem_id_t *id) const noexcept -> void {
+    snd_ctl_elem_id_set_interface(id, alsaIec958CtlMixer ? SND_CTL_ELEM_IFACE_MIXER : SND_CTL_ELEM_IFACE_PCM);
+    snd_ctl_elem_id_set_name(id, IEC958_CTL_NAME);
+    snd_ctl_elem_id_set_device(id, alsaIec958CtlDevice);
+    snd_ctl_elem_id_set_index(id, alsaIec958CtlIndex);
+}
+
 auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     if (alsaCardId < 0 || alsaIec958CtlIndex == UINT_MAX) {
         return; // probe never ran or IEC958 control not exposed (e.g. ALSA 'default' via dmix)
@@ -1518,24 +1687,23 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
         dsyslog("vaapivideo/audio: snd_ctl_open(%s) failed: %s", ctlName.data(), snd_strerror(err));
         return;
     }
+    // RAII from here: the read/write paths below each have their own early return.
+    const std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> ctlGuard{ctl, snd_ctl_close};
 
     snd_ctl_elem_id_t *id = nullptr;
     snd_ctl_elem_id_alloca(&id);
-    snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_PCM);
-    snd_ctl_elem_id_set_name(id, "IEC958 Playback Default");
-    snd_ctl_elem_id_set_index(id, alsaIec958CtlIndex);
+    FillIec958CtlId(id);
 
     snd_ctl_elem_value_t *val = nullptr;
     snd_ctl_elem_value_alloca(&val);
     snd_ctl_elem_value_set_id(val, id);
 
-    // IEC 60958-3 AES0 bit 1 ("non-audio") gates compressed bitstreams. Always write rather than
-    // compare-and-skip: the kernel cache drifts from the actual link state across AVR power-cycle,
-    // hotplug, or another process touching IEC958.
+    // Always write rather than compare-and-skip: the kernel cache drifts from the link across AVR
+    // power-cycle / hotplug / other writers. Log only an actual bit change, though -- every device open
+    // re-asserts, and "0x06 -> 0x06" on each passthrough-to-passthrough switch reads like a transition.
     if (const int err = snd_ctl_elem_read(ctl, val); err < 0) {
         dsyslog("vaapivideo/audio: IEC958 read failed (cardId=%d ctlIndex=%u): %s", alsaCardId, alsaIec958CtlIndex,
                 snd_strerror(err));
-        snd_ctl_close(ctl);
         return;
     }
     const auto aes0 = snd_ctl_elem_value_get_byte(val, 0);
@@ -1544,10 +1712,9 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     if (const int err = snd_ctl_elem_write(ctl, val); err < 0) {
         dsyslog("vaapivideo/audio: IEC958 write failed (cardId=%d aes0=0x%02x): %s", alsaCardId, aes0,
                 snd_strerror(err));
-    } else {
+    } else if (newAes0 != aes0) {
         dsyslog("vaapivideo/audio: IEC958 AES0 0x%02x -> 0x%02x (%s)", aes0, newAes0, enable ? "non-audio" : "audio");
     }
-    snd_ctl_close(ctl);
 }
 
 [[nodiscard]] auto cAudioProcessor::OpenAlsaDevice() -> bool {
@@ -1563,6 +1730,10 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     }
 
     alsaErrorCount.store(0, std::memory_order_relaxed);
+    // No stream exists on this device from here on, so no passthrough session does either. Clearing once
+    // here keeps the flag honest on every early return (a failure path once left a stale true behind,
+    // making GetClock()/WriteToAlsa() treat the next data as IEC61937 on a dead handle).
+    alsaPassthroughActive.store(false, std::memory_order_release);
 
     CloseSpdifMuxer();
 
@@ -1580,6 +1751,10 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     if (const int err = snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
         err < 0) {
         esyslog("vaapivideo/audio: snd_pcm_open failed for '%s': %s", alsaDeviceName.c_str(), snd_strerror(err));
+        // Deliberately NOT touching the non-audio bit: we hold no stream here, and -EBUSY means another
+        // process does -- clearing the card-wide control would drop ITS passthrough into PCM mode. Our own
+        // next successful open sets the bit for whatever it opens, and CloseDevice() clears it at shutdown,
+        // so nothing of ours can be stranded in IEC61937 by leaving it alone.
         return false;
     }
 
@@ -1633,6 +1808,8 @@ auto cAudioProcessor::SetIec958NonAudio(bool enable) const -> void {
     if (handle) {
         snd_pcm_close(handle);
     }
+    // Same as the open failure above: no stream is left, the sink must not stay armed for IEC61937.
+    SetIec958NonAudio(false);
     return false;
 }
 
@@ -1724,39 +1901,59 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     // decode thread's ChooseOutputChannels() trusting the *previous* sink's ELD (stale multichannel).
     sinkElded.store(false, std::memory_order_release);
     sinkMaxPcmChannels.store(sinkCaps.pcmMaxChannels, std::memory_order_release);
+    const bool deviceNameChanged = sinkCapsDevice != alsaDeviceName;
+    const int previousCardId = alsaCardId;
     sinkCapsDevice = alsaDeviceName;
     sinkCapsCached = true;
-    alsaCardId = -1;
-    alsaIec958CtlIndex = UINT_MAX;
-
-    snd_pcm_t *handle = nullptr;
-
-    // Retry on EBUSY: the PCM device may still be held by a previous open during a fast
-    // device-swap. Linear backoff: 100 ms, 200 ms.
-    for (int retry = 0; retry < 3; ++retry) {
-        const int ret = snd_pcm_open(&handle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
-
-        if (ret == 0) {
-            break;
-        }
-
-        if (ret == -EBUSY && retry < 2) {
-            dsyslog("vaapivideo/audio: device busy, retry %d/3", retry + 1);
-            cCondWait::SleepMs(100 * (retry + 1));
-            continue;
-        }
-
-        dsyslog("vaapivideo/audio: cannot probe capabilities, PCM-only mode: %s", snd_strerror(ret));
-        sinkCapsCached = false; // transient (e.g. device busy mid channel-switch): re-probe next time
-        return;
+    if (deviceNameChanged) {
+        // Only a DIFFERENT sink invalidates the resolved IEC958 element. A failed re-probe of the same
+        // device (AVR asleep) must keep it: dropping it silently stops managing the non-audio bit --
+        // including the clear on the next PCM open -- and strands the sink in IEC61937 mode.
+        alsaCardId = -1;
+        alsaIec958CtlDevice = 0;
+        alsaIec958CtlIndex = UINT_MAX; // re-resolved by ResolveIec958Control() below
+        alsaIec958CtlMixer = false;
     }
+
+    // Card/device ids come from the handle we already hold whenever one is open: a SECOND handle on an
+    // exclusive HDMI PCM is -EBUSY, so the retry loop below slept 300 ms with the audio mutex held and
+    // gave up -- every re-probe of a sink whose ELD was unreadable at startup did that, and passthrough
+    // could never light up until a VDR restart (the case "don't cache the miss" exists for).
+    snd_pcm_t *probeHandle = nullptr;
+
+    if (alsaHandle == nullptr) {
+        // Retry on EBUSY: the PCM device may still be held by a previous open during a fast
+        // device-swap. Linear backoff: 100 ms, 200 ms.
+        for (int retry = 0; retry < 3; ++retry) {
+            const int ret =
+                snd_pcm_open(&probeHandle, alsaDeviceName.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+
+            if (ret == 0) {
+                break;
+            }
+
+            if (ret == -EBUSY && retry < 2) {
+                dsyslog("vaapivideo/audio: device busy, retry %d/3", retry + 1);
+                cCondWait::SleepMs(100 * (retry + 1));
+                continue;
+            }
+
+            dsyslog("vaapivideo/audio: cannot probe capabilities, PCM-only mode: %s", snd_strerror(ret));
+            sinkCapsCached = false; // transient (e.g. device busy mid channel-switch): re-probe next time
+            return;
+        }
+    }
+
+    snd_pcm_t *const infoHandle = (alsaHandle != nullptr) ? alsaHandle : probeHandle;
 
     snd_pcm_info_t *info = nullptr;
     snd_pcm_info_alloca(&info);
 
-    if (const int err = snd_pcm_info(handle, info); err < 0) {
+    if (const int err = snd_pcm_info(infoHandle, info); err < 0) {
         dsyslog("vaapivideo/audio: snd_pcm_info failed: %s", snd_strerror(err));
-        snd_pcm_close(handle);
+        if (probeHandle != nullptr) {
+            snd_pcm_close(probeHandle);
+        }
         sinkCapsCached = false; // not a permanent verdict; allow a later retry to read the ELD
         return;
     }
@@ -1764,118 +1961,110 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     const int cardId = snd_pcm_info_get_card(info);
     const int deviceId = static_cast<int>(snd_pcm_info_get_device(info));
 
+    // A hotplug can renumber cards under an unchanged name ("hw:0,3" is an index, not an identity), and a
+    // cached control index then belongs to the previous card. Drop it so the resolve below runs fresh.
+    if (!deviceNameChanged && previousCardId >= 0 && previousCardId != cardId) {
+        alsaIec958CtlDevice = 0;
+        alsaIec958CtlIndex = UINT_MAX;
+        alsaIec958CtlMixer = false;
+    }
     alsaCardId = cardId;
 
-    snd_pcm_close(handle);
+    if (probeHandle != nullptr) {
+        snd_pcm_close(probeHandle);
+    }
 
     const auto ctlName = std::format("hw:{}", cardId);
 
     snd_ctl_t *ctlRaw = nullptr;
     if (const int err = snd_ctl_open(&ctlRaw, ctlName.c_str(), SND_CTL_READONLY); err < 0) {
         dsyslog("vaapivideo/audio: snd_ctl_open failed for hw:%d: %s", cardId, snd_strerror(err));
-    } else {
-        const std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> ctl{ctlRaw, snd_ctl_close};
+        // No control interface means no ELD and no IEC958 element -- we learned nothing, so this must not
+        // harden into a cached PCM-only verdict. Same rule as the open/info failures above: leave the
+        // cache invalid so the next codec change re-probes once the sink answers.
+        sinkCapsCached = false;
+        return;
+    }
+    const std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> ctl{ctlRaw, snd_ctl_close};
 
-        snd_ctl_elem_id_t *elemId = nullptr;
-        snd_ctl_elem_id_alloca(&elemId);
-        snd_ctl_elem_id_set_interface(elemId, SND_CTL_ELEM_IFACE_PCM);
-        snd_ctl_elem_id_set_name(elemId, "ELD");
-        snd_ctl_elem_id_set_device(elemId, static_cast<unsigned>(deviceId));
+    snd_ctl_elem_id_t *elemId = nullptr;
+    snd_ctl_elem_id_alloca(&elemId);
+    snd_ctl_elem_id_set_interface(elemId, SND_CTL_ELEM_IFACE_PCM);
+    snd_ctl_elem_id_set_name(elemId, "ELD");
+    snd_ctl_elem_id_set_device(elemId, static_cast<unsigned>(deviceId));
 
-        snd_ctl_elem_value_t *elemValue = nullptr;
-        snd_ctl_elem_value_alloca(&elemValue);
+    snd_ctl_elem_value_t *elemValue = nullptr;
+    snd_ctl_elem_value_alloca(&elemValue);
 
-        bool foundValidEld = false;
+    bool foundValidEld = false;
 
-        // Multi-port HDMI cards expose one ELD per physical port; scan all indices.
-        for (unsigned index = 0; index < 8 && !foundValidEld; ++index) {
-            snd_ctl_elem_id_set_index(elemId, index);
-            snd_ctl_elem_value_set_id(elemValue, elemId);
+    // Multi-port HDMI cards expose one ELD per physical port; scan all indices.
+    for (unsigned index = 0; index < ELD_SCAN_LIMIT && !foundValidEld; ++index) {
+        snd_ctl_elem_id_set_index(elemId, index);
+        snd_ctl_elem_value_set_id(elemValue, elemId);
 
-            if (snd_ctl_elem_read(ctl.get(), elemValue) < 0) {
-                continue;
-            }
-
-            snd_ctl_elem_info_t *elemInfo = nullptr;
-            snd_ctl_elem_info_alloca(&elemInfo);
-            snd_ctl_elem_info_set_id(elemInfo, elemId);
-
-            if (snd_ctl_elem_info(ctl.get(), elemInfo) < 0) {
-                continue;
-            }
-
-            const unsigned eldSize = snd_ctl_elem_info_get_count(elemInfo);
-            constexpr unsigned kEldFixedHeader = 20; ///< ELD fixed header (bytes 0-19); see kernel sound/hda/hda_eld.c
-            if (eldSize < kEldFixedHeader) {
-                dsyslog("vaapivideo/audio: ELD too small (%u bytes) at index %u", eldSize, index);
-                continue;
-            }
-
-            std::vector<uint8_t> eldBuffer(eldSize);
-            for (unsigned i = 0; i < eldSize; ++i) {
-                eldBuffer.at(i) = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
-            }
-
-            // All CEA-861 SAD / speaker-allocation / LPCM-cap decoding lives in caps.cpp
-            // (pure, testable). Keep only the ALSA control plumbing here. Build the span from
-            // data()+size() instead of passing eldBuffer directly: equivalent in C++20, but the explicit
-            // form sidesteps an IntelliSense parser limitation on span's contiguous_range constructor.
-            const std::span<const uint8_t> eldSpan{eldBuffer.data(), eldBuffer.size()};
-            if (auto parsed = ParseEldSinkCaps(eldSpan); parsed) {
-                sinkCaps = *parsed;
-                foundValidEld = true;
-            } else {
-                dsyslog("vaapivideo/audio: ELD at index %u unparsable (truncated); trying next index", index);
-            }
+        if (snd_ctl_elem_read(ctl.get(), elemValue) < 0) {
+            continue;
         }
 
-        sinkCaps.elded = foundValidEld;
-        if (foundValidEld) {
-            // Render the parsed PCM caps once so an operator can see what the sink advertises.
-            std::string rates;
-            for (const int hz : sinkCaps.pcmRates) {
-                rates += std::format("{}{}", rates.empty() ? "" : ",", hz);
-            }
-            dsyslog("vaapivideo/audio: sink PCM caps: maxCh=%u rates=[%s] speakers=[%s] (0x%02x)",
-                    sinkCaps.pcmMaxChannels, rates.empty() ? "48000(default)" : rates.c_str(),
-                    DescribeSpeakerAlloc(sinkCaps.speakerAlloc).c_str(), sinkCaps.speakerAlloc);
+        snd_ctl_elem_info_t *elemInfo = nullptr;
+        snd_ctl_elem_info_alloca(&elemInfo);
+        snd_ctl_elem_info_set_id(elemInfo, elemId);
+
+        if (snd_ctl_elem_info(ctl.get(), elemInfo) < 0) {
+            continue;
+        }
+
+        const unsigned eldSize = snd_ctl_elem_info_get_count(elemInfo);
+        constexpr unsigned kEldFixedHeader = 20; ///< ELD fixed header (bytes 0-19); see kernel sound/hda/hda_eld.c
+        if (eldSize < kEldFixedHeader) {
+            dsyslog("vaapivideo/audio: ELD too small (%u bytes) at index %u", eldSize, index);
+            continue;
+        }
+
+        std::vector<uint8_t> eldBuffer(eldSize);
+        for (unsigned i = 0; i < eldSize; ++i) {
+            eldBuffer.at(i) = static_cast<uint8_t>(snd_ctl_elem_value_get_byte(elemValue, i));
+        }
+
+        // All CEA-861 SAD / speaker-allocation / LPCM-cap decoding lives in caps.cpp
+        // (pure, testable). Keep only the ALSA control plumbing here. Build the span from
+        // data()+size() instead of passing eldBuffer directly: equivalent in C++20, but the explicit
+        // form sidesteps an IntelliSense parser limitation on span's contiguous_range constructor.
+        const std::span<const uint8_t> eldSpan{eldBuffer.data(), eldBuffer.size()};
+        if (auto parsed = ParseEldSinkCaps(eldSpan); parsed) {
+            sinkCaps = *parsed;
+            foundValidEld = true;
         } else {
-            // Don't cache the miss: an all-zero/absent ELD often means the receiver is off or asleep, and
-            // becomes valid after a wake/hotplug. Re-probe on the next call so multichannel can light up
-            // without a VDR restart. A sink that genuinely has a valid ELD takes the branch above and caches.
-            dsyslog("vaapivideo/audio: no valid ELD found across all indices");
-            sinkCapsCached = false;
-        }
-
-        // Publish the lock-free snapshot the decode thread reads when choosing the PCM output
-        // layout (ChooseOutputChannels): sinkCaps itself carries a std::vector and must not be
-        // touched off-mutex.
-        sinkElded.store(sinkCaps.elded, std::memory_order_release);
-        sinkMaxPcmChannels.store(sinkCaps.pcmMaxChannels, std::memory_order_release);
-
-        snd_ctl_elem_id_t *iecId = nullptr;
-        snd_ctl_elem_id_alloca(&iecId);
-        snd_ctl_elem_id_set_interface(iecId, SND_CTL_ELEM_IFACE_PCM);
-        snd_ctl_elem_id_set_name(iecId, "IEC958 Playback Default");
-
-        snd_ctl_elem_value_t *iecVal = nullptr;
-        snd_ctl_elem_value_alloca(&iecVal);
-
-        // Multi-port HDMI cards expose one IEC958 control per port; find ours by scanning indices.
-        for (unsigned idx = 0; idx < 16; ++idx) {
-            snd_ctl_elem_id_set_index(iecId, idx);
-            snd_ctl_elem_value_set_id(iecVal, iecId);
-            if (snd_ctl_elem_read(ctl.get(), iecVal) == 0) {
-                alsaIec958CtlIndex = idx;
-                dsyslog("vaapivideo/audio: IEC958 Playback Default found at index %u", idx);
-                break;
-            }
-        }
-        if (alsaIec958CtlIndex == UINT_MAX) {
-            dsyslog("vaapivideo/audio: IEC958 Playback Default not found on hw:%d -- non-audio bit will not be managed",
-                    cardId);
+            dsyslog("vaapivideo/audio: ELD at index %u unparsable (truncated); trying next index", index);
         }
     }
+
+    sinkCaps.elded = foundValidEld;
+    if (foundValidEld) {
+        // Render the parsed PCM caps once so an operator can see what the sink advertises.
+        std::string rates;
+        for (const int hz : sinkCaps.pcmRates) {
+            rates += std::format("{}{}", rates.empty() ? "" : ",", hz);
+        }
+        dsyslog("vaapivideo/audio: sink PCM caps: maxCh=%u rates=[%s] speakers=[%s] (0x%02x)", sinkCaps.pcmMaxChannels,
+                rates.empty() ? "48000(default)" : rates.c_str(), DescribeSpeakerAlloc(sinkCaps.speakerAlloc).c_str(),
+                sinkCaps.speakerAlloc);
+    } else {
+        // Don't cache the miss: an all-zero/absent ELD often means the receiver is off or asleep, and
+        // becomes valid after a wake/hotplug. Re-probe on the next call so multichannel can light up
+        // without a VDR restart. A sink that genuinely has a valid ELD takes the branch above and caches.
+        dsyslog("vaapivideo/audio: no valid ELD found across all indices");
+        sinkCapsCached = false;
+    }
+
+    // Publish the lock-free snapshot the decode thread reads when choosing the PCM output
+    // layout (ChooseOutputChannels): sinkCaps itself carries a std::vector and must not be
+    // touched off-mutex.
+    sinkElded.store(sinkCaps.elded, std::memory_order_release);
+    sinkMaxPcmChannels.store(sinkCaps.pcmMaxChannels, std::memory_order_release);
+
+    ResolveIec958Control(ctl.get(), deviceId);
 
     // Plugin-actionable passthrough formats only; `hasAny` gates the "PCM-only" verdict.
     // AAC is deliberately excluded here -- it is diagnostic-only and appended separately
@@ -1967,6 +2156,24 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     // NOPTS continuations of a multi-frame PES inherit endPts as their startPts90k.
     pcmNextPts.store(endPts, std::memory_order_relaxed);
 
+    // The anchor write, then the write that tips the ring over the start threshold (snd_pcm_state flips
+    // PREPARED -> RUNNING inside it -- nothing is audible before). Pending() keeps this off steady state.
+    if (startTrace.Pending(TRACE_FIRST_WRITE | TRACE_DAC_RUNNING)) [[unlikely]] {
+        if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_WRITE); traceMs >= 0) {
+            dsyslog("vaapivideo/audio: trace +%lldms first ALSA write -- clock anchored at pts=%lld (%u frames queued, "
+                    "delay=%ld)",
+                    static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts), frames,
+                    static_cast<long>(delayFrames));
+        }
+        if (alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING) {
+            if (const int64_t traceMs = startTrace.Fire(TRACE_DAC_RUNNING); traceMs >= 0) {
+                dsyslog("vaapivideo/audio: trace +%lldms DAC running -- audible from pts=%lld (ring=%ldms)",
+                        static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts),
+                        static_cast<long>(rate > 0 ? static_cast<uint64_t>(delayFrames) * 1000 / rate : 0));
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2029,9 +2236,10 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     }
 
     size_t offset = 0;
+    int eagainWaits = 0; // consecutive full-ring waits; audio-thread-local, per call
 
     // Four-tier ALSA error recovery:
-    //   1. EAGAIN               -> snd_pcm_wait 5 ms (ring full, normal under load)
+    //   1. EAGAIN               -> bounded snd_pcm_wait (ring full, normal under load)
     //   2. EINTR/EPIPE/ESTRPIPE -> snd_pcm_recover (xruns, suspend)
     //   3. repeated failures    -> close + OpenAlsaDevice (rate-limited to 1 s)
     //   4. reopen failed        -> inline teardown (cannot call Shutdown() from this
@@ -2044,19 +2252,52 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         if (written >= 0) {
             offset += static_cast<size_t>(written) * bpf;
             alsaErrorCount.store(0, std::memory_order_relaxed);
+            eagainWaits = 0;
             continue;
         }
 
         const int err = static_cast<int>(written);
 
         if (err == -EAGAIN) {
-            snd_pcm_wait(alsaHandle, 5);
-            continue;
+            // Ring full -- normal for a moment after a channel switch (backlog drains faster than 1x).
+            // Both the bound and the stopping check matter: an unbounded wait is invisible to the recovery
+            // tiers below and deaf to Shutdown(), so a sink that stops draining without erroring would
+            // wedge this thread.
+            if (stopping.load(std::memory_order_acquire)) [[unlikely]] {
+                return false;
+            }
+            if (eagainWaits < AUDIO_ALSA_EAGAIN_WAIT_LIMIT) [[likely]] {
+                ++eagainWaits;
+                // A negative return means the state changed while waiting (xrun, suspend, disconnect), not
+                // that the ring stayed full: the next writei reports the same condition and routes it to the
+                // tier that handles it, so only the full-ring budget must not count this round.
+                if (snd_pcm_wait(alsaHandle, AUDIO_ALSA_EAGAIN_WAIT_MS) < 0) {
+                    eagainWaits = 0;
+                }
+                continue;
+            }
+            esyslog("vaapivideo/audio: sink freed no ring space in %d ms -- handling as a write error",
+                    AUDIO_ALSA_EAGAIN_WAIT_LIMIT * AUDIO_ALSA_EAGAIN_WAIT_MS);
+            eagainWaits = 0;
         }
 
         // ESTRPIPE arrives via <alsa/asoundlib.h>; clang-tidy's IWYU misses that path.
         if ((err == -EINTR || err == -EPIPE || err == -ESTRPIPE) && // NOLINT(misc-include-cleaner)
             snd_pcm_recover(alsaHandle, err, 1) >= 0) {
+            // Only -EPIPE is an underrun, and only an underrun is audible (ring ran dry; DAC silent until
+            // the start threshold refills) -- EINTR/ESTRPIPE recover gapless and must not inflate the
+            // dropout diagnostic. Silent recovery used to hide underruns entirely (visible only in
+            // /proc/asound/.../status). Rate-limited; audio-thread-only state.
+            if (err == -EPIPE) {
+                ++alsaXrunsSinceLog;
+                if (lastXrunLog.Elapsed() > 5000) {
+                    dsyslog("vaapivideo/audio: ALSA underrun recovered -- %u xrun(s) since last report (ring ran "
+                            "dry; cushion=%dms)",
+                            alsaXrunsSinceLog, AUDIO_ALSA_START_MS);
+                    alsaXrunsSinceLog = 0;
+                    lastXrunLog.Set();
+                }
+            }
             continue;
         }
 

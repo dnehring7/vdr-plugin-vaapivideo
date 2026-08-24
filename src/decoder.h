@@ -101,6 +101,10 @@ class cVaapiDecoder : public cThread {
         -> void; ///< Mediaplayer path: clone a pre-demuxed AU (whole access unit) onto the decode queue.
     auto FlushParser()
         -> void; ///< Force-drain the parser's held-back AU. Required for still-picture (single I-frame delivery).
+    auto ReleasePendingAccessUnit()
+        -> void; ///< FlushParser() + parser recreate: a flushed AVCodecParser keeps a stale frame_start_found
+                 ///< that would cut the next AU at its first NAL. Once per live codec open, when the first
+                 ///< keyframe's PES is complete, so it decodes without waiting for the next PES.
     [[nodiscard]] auto GetLastPts() const noexcept
         -> int64_t; ///< PTS of the most recently decoded frame in 90 kHz ticks, or AV_NOPTS_VALUE.
                     ///< Includes catch-up-dropped frames (see PublishLastPts site in DecodeOnePacket).
@@ -135,6 +139,9 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Open (or reuse) a decoder. HW vs SW selected via SelectVideoBackendCap() + GpuCaps.
                  ///< Reuse requires matching codec ID, HW/SW choice, and extradata; anything else triggers teardown.
     auto NotifyAudioChange() -> void; ///< Arm freerun after an audio codec/track switch; audio clock is NOPTS briefly.
+    auto ArmStartTrace(uint64_t epochMs) noexcept
+        -> void; ///< Stream-start trace: first decoded / presented / clock-paced frame vs the switch epoch.
+    auto DisarmStartTrace() noexcept -> void; ///< Drop pending stream-start milestones.
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the A/V sync master clock. Stored as atomic pointer.
     auto SetLoopTickCallback(std::function<void()> callback)
@@ -241,6 +248,9 @@ class cVaapiDecoder : public cThread {
                  ///< ScaleVideo-driven rebuilds (chain line only); false for first build / channel switch.
     [[nodiscard]] auto ShouldUseHdrPassthrough(const HdrStreamInfo &info) const noexcept
         -> bool; ///< True when stream + GPU (vppP010) + display (EDID) + user config all permit HDR passthrough.
+    auto TracePresent(int64_t pts, const cAudioProcessor *ap, const char *path, bool paced,
+                      int64_t rawDelta90k) noexcept
+        -> void; ///< Stream-start trace: first frame handed to the display, and first clock-paced frame.
     [[nodiscard]] auto SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Submit unless clearEpoch raced this iteration; stale-epoch frames are dropped silently
                  ///< (returns true so callers don't count it as a submit failure).
@@ -383,6 +393,8 @@ class cVaapiDecoder : public cThread {
     /// One-time "still no frame 15 s after open" warning; reset per codec open.
     std::atomic<bool> starvationWarnedSustained{false};
     std::atomic<uint64_t> codecOpenTimeMs{0};   ///< cTimeMs::Now() at last OpenCodecWithInfo(); starvation tiers.
+    StreamStartTrace startTrace;                ///< Stream-start milestones (decoded / presented / paced)
+    std::atomic<size_t> tracePacketsSent{0};    ///< Packets fed since Arm; shows the reorder delay at first frame
     std::atomic<size_t> packetsSinceOpen{0};    ///< avcodec_send_packet calls since last open; starvation counters.
     std::atomic<size_t> keyPacketsSinceOpen{0}; ///< Subset with AV_PKT_FLAG_KEY; silent feed vs HW stall.
     /// Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.

@@ -128,6 +128,9 @@ constexpr int DISPLAY_WARMUP_ACTIVE_WINDOW_MS =
 constexpr int DISPLAY_WARMUP_GRACE_MS =
     3000; ///< Post-idle grace suppressing underrun logs while the pipeline re-anchors after a resume.
 
+// --- Stream-start trace milestone (cVaapiDisplay::startTrace; see StreamStartTrace in common.h) ---
+constexpr uint32_t TRACE_FIRST_COMMIT = 1U << 0; ///< First fresh frame committed to the CRTC after the switch
+
 // ============================================================================
 // === HELPER FUNCTIONS ===
 // ============================================================================
@@ -342,6 +345,10 @@ auto cVaapiDisplay::BeginStreamSwitch() -> void {
     // Reset under importMutex so an in-flight fresh commit cannot republish a pre-Clear timestamp.
     lastFrameCommitMs.store(0, std::memory_order_release);
 }
+
+auto cVaapiDisplay::ArmStartTrace(uint64_t epochMs) noexcept -> void { startTrace.Arm(epochMs, TRACE_FIRST_COMMIT); }
+
+auto cVaapiDisplay::DisarmStartTrace() noexcept -> void { startTrace.Disarm(); }
 
 auto cVaapiDisplay::EndStreamSwitch() -> void {
     // Unlock first, then clear isClearing -- consumer re-checks isClearing under importMutex
@@ -904,6 +911,12 @@ auto cVaapiDisplay::Action() -> void {
                                 warmupGraceUntil.Set(DISPLAY_WARMUP_GRACE_MS);
                             }
                             lastFrameCommitMs.store(nowMs, std::memory_order_release);
+                            // The new stream's first picture is on its way to the panel (flip lands next VSync).
+                            if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_COMMIT); traceMs >= 0)
+                                [[unlikely]] {
+                                dsyslog("vaapivideo/display: trace +%lldms first frame committed to CRTC (%ux%u)",
+                                        static_cast<long long>(traceMs), pendingBuffer.width, pendingBuffer.height);
+                            }
                             // Recovery log: onset fires at THRESHOLD regardless of how long the
                             // gap actually lasts; peak captures the real wall-clock length.
                             if (peakGapMs >= thresholdMs) {

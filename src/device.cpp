@@ -151,6 +151,31 @@ constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 /// frame can't fit a corroborating pair in 2 KB.
 constexpr size_t AUDIO_DETECT_WINDOW = 2048;
 
+/// ISO 13818-1 private_stream_1 -- the PES stream id every DVB dolby track (AC-3, E-AC-3, DTS) rides in.
+constexpr uchar PES_PRIVATE_STREAM_1 = 0xBD;
+
+/// How long PlayAudio() may drop non-private_stream_1 PES after a dolby-entry track switch before it accepts
+/// whatever the mux delivers. Two PES periods of headroom for the switch to land (AC-3 frames one PES ~32 ms,
+/// MPEG audio up to ~192 ms), and short enough that an unusual mux costs a hiccup, not the audio.
+constexpr uint64_t AUDIO_TRACK_SWITCH_GRACE_MS = 500;
+
+/// Total length of every non-final PES chunk VDR's cTsToPes makes of an oversized picture (remux.c GetPes:
+/// body `l = min(remaining, MAXPESLENGTH=0xFFF0)` + 6-byte header). The TOTAL length is the only sound
+/// test for "picture continues": `l` also counts the variable PES extension header (8 bytes on the first
+/// slice with a PTS, 3 on continuations), so a payload-size test would read a continued slice as final and
+/// cut the access unit. `Length <` this is deliberately conservative -- it forgoes the early release only
+/// for a final continuation slice of exactly 65526..65528 bytes, costing latency, never correctness.
+constexpr int VDR_MAX_PES_CHUNK = 0xFFF0 + 6;
+
+// --- Stream-start trace milestones (cVaapiDevice::startTrace; see StreamStartTrace in common.h) ---
+constexpr uint32_t TRACE_AUDIO_PES = 1U << 0;   ///< First audio PES reached PlayAudio()
+constexpr uint32_t TRACE_AUDIO_CODEC = 1U << 1; ///< Audio codec confirmed and opened
+constexpr uint32_t TRACE_VIDEO_PES = 1U << 2;   ///< First video PES reached PlayVideo()
+constexpr uint32_t TRACE_VIDEO_KEY = 1U << 3;   ///< First keyframe PES (the first one the codec detector accepts)
+constexpr uint32_t TRACE_VIDEO_CODEC = 1U << 4; ///< Video codec opened; the decoder takes over from here
+constexpr uint32_t TRACE_DEVICE_ALL =
+    TRACE_AUDIO_PES | TRACE_AUDIO_CODEC | TRACE_VIDEO_PES | TRACE_VIDEO_KEY | TRACE_VIDEO_CODEC;
+
 // --- Runtime display-mode switching (stability / rate-limit / matcher tolerances) ---
 constexpr uint64_t DISPLAY_MODE_STABLE_MS =
     1500; ///< How long a reactively observed format must hold before it may drive a modeset.
@@ -554,6 +579,35 @@ auto cVaapiDevice::ShowEncryptedScreen() -> void {
     return channel != nullptr && channel->Ca() != 0;
 }
 
+auto cVaapiDevice::ArmStartTrace(uint64_t epochMs, bool withDisplay) -> void {
+    // One epoch for every component so the "+N ms" figures line up. Re-arming an undrained trace (a zap
+    // mid-startup) is deliberate: leftover milestones would report against a dead epoch otherwise.
+    traceVideoPesCount.store(0, std::memory_order_relaxed);
+    startTrace.Arm(epochMs, TRACE_DEVICE_ALL);
+    if (decoder) [[likely]] {
+        decoder->ArmStartTrace(epochMs);
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->ArmStartTrace(epochMs);
+    }
+    if (display && withDisplay) [[likely]] {
+        display->ArmStartTrace(epochMs);
+    }
+}
+
+auto cVaapiDevice::DisarmStartTrace() noexcept -> void {
+    startTrace.Disarm();
+    if (decoder) [[likely]] {
+        decoder->DisarmStartTrace();
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->DisarmStartTrace();
+    }
+    if (display) [[likely]] {
+        display->DisarmStartTrace();
+    }
+}
+
 auto cVaapiDevice::ResetNoVideoMonitors() noexcept -> void {
     // Single funnel for tearing down both no-video screens (radio splash + encrypted notice) on every
     // lifecycle boundary, so no path forgets a field. DIRTY makes the next radio entry repaint.
@@ -778,6 +832,13 @@ auto cVaapiDevice::Clear() -> void {
     // A seek jumps the PTS timeline; drop the baseline so the first frame at the new position isn't
     // mistaken for the old position's EOF repeat.
     ResetReplayAudioEofBaseline();
+    // Same in-session test as HandleAudioTrackChange: once this stream has delivered audio, the next PES
+    // may still be the OLD track's (the replay path below switches tracks without a device hook), so the
+    // fresh-stream fast paths must go. SetPlayMode() re-arms the flag after the Clear() it issues, so a
+    // real stream start keeps them.
+    if (audioPesSeen.load(std::memory_order_relaxed)) {
+        audioFreshStart.store(false, std::memory_order_relaxed);
+    }
 
     // Force audio codec re-detection. This is the only place that catches the replay
     // track-switch path: "audi N" -> cDvbPlayer::SetAudioTrack -> Goto -> Empty ->
@@ -1455,7 +1516,7 @@ auto cVaapiDevice::Play() -> void {
     return Length;
 }
 
-[[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar /*Id*/) -> int {
+[[nodiscard]] auto cVaapiDevice::PlayAudio(const uchar *Data, int Length, uchar Id) -> int {
     if (!Data || Length <= 0) [[unlikely]] {
         return Length;
     }
@@ -1480,6 +1541,34 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
+    // Dolby-entry switch in flight: anything not on private_stream_1 is still the OLD track's PID (see
+    // audioAwaitDolbyUntilMs) -- fed to the detector it wins the vote for the codec being left behind.
+    // AFTER ParsePes() on purpose: pre-CAM scrambled bytes assemble into PES-shaped garbage whose random
+    // stream id must neither time the gate out nor be logged against it.
+    if (const uint64_t awaitUntil = audioAwaitDolbyUntilMs.load(std::memory_order_relaxed); awaitUntil != 0)
+        [[unlikely]] {
+        if (Id == PES_PRIVATE_STREAM_1) {
+            audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed); // the switch landed
+        } else if (cTimeMs::Now() < awaitUntil) {
+            return Length;
+        } else {
+            // Never say never: a mux may carry its "dolby" track outside private_stream_1. Trust the stream
+            // rather than mute it, and say so once -- a recurring line here means the track map is unusual.
+            audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed);
+            dsyslog("vaapivideo/device: no private_stream_1 within %llu ms of the dolby track switch -- "
+                    "accepting stream id 0x%02x",
+                    static_cast<unsigned long long>(AUDIO_TRACK_SWITCH_GRACE_MS), Id);
+        }
+    }
+
+    if (const int64_t traceMs = startTrace.Fire(TRACE_AUDIO_PES); traceMs >= 0) [[unlikely]] {
+        dsyslog("vaapivideo/device: trace +%lldms first audio PES (pts=%lld, %zu bytes)",
+                static_cast<long long>(traceMs), static_cast<long long>(pes.pts), pes.payloadSize);
+    }
+
+    // From here on a track-change hook is an in-session switch (see audioPesSeen).
+    audioPesSeen.store(true, std::memory_order_relaxed);
+
     // audioCodecId == NONE triggers detection; reset by SetPlayMode(pmNone),
     // HandleAudioTrackChange(), or Clear() (replay audi-N path).
     AVCodecID currentCodec = audioCodecId.load(std::memory_order_relaxed);
@@ -1492,6 +1581,7 @@ auto cVaapiDevice::Play() -> void {
     if (currentCodec != AV_CODEC_ID_NONE && audioProcessor->TakeCodecRedetectRequest()) [[unlikely]] {
         esyslog("vaapivideo/device: audio codec %s never produced a frame -- re-detecting",
                 avcodec_get_name(currentCodec));
+        audioFreshStart.store(false, std::memory_order_relaxed); // bytes of a misdetected era: no fast paths for them
         ResetAudioCodecState();
         ResetReplayAudioEofBaseline();
         previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -1512,16 +1602,22 @@ auto cVaapiDevice::Play() -> void {
             }
         }
 
+        // A reset elsewhere bumps audioDetectGen. Seen BEFORE this payload: only accumulated state (LATM
+        // window, held PES) is stale, the payload itself opens the new era. Seen DURING (the genAtEntry
+        // re-checks below): the payload predates the reset and is dropped.
+        const uint32_t genAtEntry = audioDetectGen.load(std::memory_order_relaxed);
+        if (genAtEntry != audioDetectGenSeen) {
+            audioDetectGenSeen = genAtEntry;
+            audioDetectBuffer.clear();
+            audioHeldPayload.clear();
+        }
+
         // Payload-first: AC-3/MP2/ADTS carry whole frames per PES payload, so one is decisive and
         // the window would only hurt them (see AUDIO_DETECT_WINDOW). Only AAC-LATM, whose frames
         // span PES boundaries, needs the cross-payload window -- reached solely on a NONE here.
-        AVCodecID detectedCodec = ::DetectAudioCodec({pes.payload, pes.payloadSize});
-        if (detectedCodec == AV_CODEC_ID_NONE) {
-            // A reset on another thread bumps audioDetectGen; drop stale bytes before mixing PIDs.
-            if (const uint32_t gen = audioDetectGen.load(std::memory_order_relaxed); gen != audioDetectGenSeen) {
-                audioDetectGenSeen = gen;
-                audioDetectBuffer.clear();
-            }
+        AudioDetection detected = ::DetectAudioCodec({pes.payload, pes.payloadSize});
+        bool detectedFromWindow = false;
+        if (detected.codecId == AV_CODEC_ID_NONE) {
             audioDetectBuffer.insert(audioDetectBuffer.end(), pes.payload, pes.payload + pes.payloadSize);
             if (audioDetectBuffer.size() > AUDIO_DETECT_WINDOW) {
                 audioDetectBuffer.erase(
@@ -1529,7 +1625,15 @@ auto cVaapiDevice::Play() -> void {
                     audioDetectBuffer.begin() +
                         static_cast<std::ptrdiff_t>(audioDetectBuffer.size() - AUDIO_DETECT_WINDOW));
             }
-            detectedCodec = ::DetectAudioCodec({audioDetectBuffer.data(), audioDetectBuffer.size()});
+            detected = ::DetectAudioCodec({audioDetectBuffer.data(), audioDetectBuffer.size()});
+            detectedFromWindow = true;
+        }
+        const AVCodecID detectedCodec = detected.codecId;
+
+        // Reset landed while this payload was being examined: its evidence belongs to the era that just
+        // ended, so it must not mature into a confirmation for the new one.
+        if (audioDetectGen.load(std::memory_order_relaxed) != genAtEntry) [[unlikely]] {
+            return Length;
         }
 
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
@@ -1537,55 +1641,103 @@ auto cVaapiDevice::Play() -> void {
             // uncorrelated false positives minutes apart could accumulate into a bogus confirmation.
             audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
             audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+            audioHeldPayload.clear();
             return Length;
         }
 
-        // Always require 2-of-2 confirmation. SVDRP "audi N" resets audioCodecId on the main
-        // thread while PlayTs may have already buffered a full PES from the OLD PID in
-        // tsToPesAudio. That stale PES arrives here first and would detect the wrong codec.
-        // Depth=2 suffices: tsToPesAudio.Reset() fires on every PUSI, so at most one stale
-        // PES can sneak through. Cost: ~24-32 ms extra latency on codec open.
+        // Confirmation policy. Two requirements: (1) codec certainty needs TWO corroborated audio frames
+        // (one frame misdetects); (2) an in-session "audi N" switch can deliver ONE
+        // complete PES of the OLD PID first, so evidence must then span two payloads however strong the
+        // first looks. On a FRESH stream (audioFreshStart -- nothing stale precedes the first PES) (2) is
+        // void, so a `chained` detection (two linked frame headers = two real frames in this payload)
+        // satisfies (1) alone and confirms immediately, ~25-100 ms sooner. Everything else keeps 2-of-2;
+        // on a fresh stream its 1-of-2 candidate PES is HELD and fed once confirmed, so the wait costs no
+        // audio. A mismatching follow-up discards the held PES with its candidate.
+        const bool freshStart = audioFreshStart.load(std::memory_order_relaxed);
+        // Window evidence spans PES payloads, so it is neither "chained inside this one PES" nor a payload
+        // worth holding: the bytes ahead of it were consumed by detection and never fed, so replaying only
+        // the last one would hand the decoder a mid-frame fragment. It also costs nothing to exclude --
+        // reaching the window already spent the payload periods the fast confirm exists to save.
+        const bool chainedFastConfirm = freshStart && detected.chained && !detectedFromWindow;
+        // A scrub seek resets audioCodecId on every Clear() (the audi-N track-switch path above), so the
+        // same codec re-confirms constantly. Gate the awaiting/confirmed logs on an ACTUAL change from the
+        // last confirmed codec: previousAudioCodec survives Clear(), and SetPlayMode(pmNone) clears it so a
+        // fresh session still logs once. The detection itself always runs -- only the logging is gated.
+        const bool codecChanged = detectedCodec != previousAudioCodec.load(std::memory_order_relaxed);
+
+        // Bookkeeping runs for EVERY decisive payload (a disagreeing detection retires the candidate AND
+        // its held PES); a chained fresh-start detection skips only the 2-of-2 WAIT below.
         if (detectedCodec == audioCodecCandidate.load(std::memory_order_relaxed)) {
             audioCodecCandidateCount.fetch_add(1, std::memory_order_relaxed);
         } else {
             audioCodecCandidate.store(detectedCodec, std::memory_order_relaxed);
             audioCodecCandidateCount.store(1, std::memory_order_relaxed);
+            audioHeldPayload.clear();
         }
-        // A scrub seek resets audioCodecId on every Clear() (the audi-N track-switch path above), so the
-        // same codec re-confirms constantly. Gate the awaiting/confirmed logs on an ACTUAL change from the
-        // last confirmed codec: previousAudioCodec survives Clear(), and SetPlayMode(pmNone) clears it so a
-        // fresh session still logs once. The 2-of-2 detection itself always runs -- only the logging is gated.
-        const bool codecChanged = detectedCodec != previousAudioCodec.load(std::memory_order_relaxed);
-        const int candidateCount = audioCodecCandidateCount.load(std::memory_order_relaxed);
-        if (candidateCount < 2) {
+
+        if (const int candidateCount = audioCodecCandidateCount.load(std::memory_order_relaxed);
+            !chainedFastConfirm && candidateCount < 2) {
             if (codecChanged) {
                 dsyslog("vaapivideo/device: audio codec %s -- awaiting confirmation (%d/2)",
                         avcodec_get_name(detectedCodec), candidateCount);
+            }
+            if (freshStart && !detectedFromWindow) {
+                audioHeldPayload.assign(pes.payload, pes.payload + pes.payloadSize);
+                audioHeldPts = pes.pts;
             }
             return Length;
         }
 
         audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
         audioCodecCandidateCount.store(0, std::memory_order_relaxed);
-        audioDetectBuffer.clear(); // detection done; free the window until the next codec-less phase
-        audioDetectBuffer.shrink_to_fit();
+        audioDetectBuffer.clear(); // detection done; the 2 KB window stays allocated for the next stream
 
         if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
             return Length;
         }
 
+        // Era re-test, repeated because OpenCodec() can block tens of ms on an ALSA reopen: publishing a
+        // codec a reset already retired would pin the wrong decoder until the cascade escalation notices.
+        // The open itself already reconfigured the sink, though, and it outlived the Clear() the resetting
+        // thread issued -- so undo it here, or the retired codec keeps a decoder and a playback clock until
+        // the next payload reopens the right one.
+        if (audioDetectGen.load(std::memory_order_relaxed) != genAtEntry) [[unlikely]] {
+            audioProcessor->Clear();
+            return Length;
+        }
+
         audioCodecId.store(detectedCodec, std::memory_order_relaxed);
+        // Fresh-start credit is spent: it covers this stream's FIRST detection only. Every path that
+        // re-opens detection later (track hook, Clear(), sink-forced re-detect) is by definition
+        // in-session, and each clears the flag too -- this makes the invariant hold without them.
+        audioFreshStart.store(false, std::memory_order_relaxed);
         previousAudioCodec.store(detectedCodec, std::memory_order_relaxed);
         if (codecChanged) {
-            isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s)", avcodec_get_name(detectedCodec),
-                    isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM");
+            isyslog("vaapivideo/device: audio codec %s confirmed (%s, %s, %s)", avcodec_get_name(detectedCodec),
+                    isLive ? "live" : "replay", audioProcessor->IsPassthrough() ? "passthrough" : "PCM",
+                    chainedFastConfirm ? "chained 1-PES" : "2-of-2");
+        }
+        if (const int64_t traceMs = startTrace.Fire(TRACE_AUDIO_CODEC); traceMs >= 0) [[unlikely]] {
+            // A held 1-of-2 payload is fed below ahead of this PES, so its pts anchors the master clock.
+            const int64_t firstPts = audioHeldPayload.empty() ? pes.pts : audioHeldPts;
+            dsyslog("vaapivideo/device: trace +%lldms audio codec %s opened (%s, %s), first decodable pts=%lld",
+                    static_cast<long long>(traceMs), avcodec_get_name(detectedCodec),
+                    audioProcessor->IsPassthrough() ? "passthrough" : "PCM",
+                    chainedFastConfirm ? "chained 1-PES confirm" : "2-of-2 confirm", static_cast<long long>(firstPts));
         }
 
         // Mirrors HandleAudioTrackChange: re-arms freerun so a cold-VPP stall can't anchor
         // sync to a clock that ran ~5 s ahead while the GPU loaded firmware on first use.
         if (decoder) [[likely]] {
             decoder->NotifyAudioChange();
+        }
+
+        // Feed the held 1-of-2 PES first: it precedes this one on the timeline and anchors the master
+        // clock one PES earlier. It detected as the codec just confirmed, so it is safe to feed.
+        if (!audioHeldPayload.empty()) {
+            audioProcessor->Decode(audioHeldPayload.data(), audioHeldPayload.size(), audioHeldPts);
+            audioHeldPayload.clear(); // capacity kept: the next stream start refills the same one PES
         }
     }
 
@@ -1653,6 +1805,14 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
+    if (startTrace.Pending(TRACE_VIDEO_KEY)) [[unlikely]] {
+        traceVideoPesCount.fetch_add(1, std::memory_order_relaxed);
+        if (const int64_t traceMs = startTrace.Fire(TRACE_VIDEO_PES); traceMs >= 0) {
+            dsyslog("vaapivideo/device: trace +%lldms first video PES (pts=%lld, %zu bytes)",
+                    static_cast<long long>(traceMs), static_cast<long long>(pes.pts), pes.payloadSize);
+        }
+    }
+
     const AVCodecID currentCodec = videoCodecId.load(std::memory_order_relaxed);
     bool isLive = liveMode.load(std::memory_order_relaxed);
 
@@ -1668,26 +1828,20 @@ auto cVaapiDevice::Play() -> void {
             return Length;
         }
 
-        // Stale-PES guard only when codec matches previous channel: prevents ring-buffer
-        // residue from reopening the old decoder. Narrower than audio's unconditional guard
-        // because video has no audi-N race (no out-of-band track switch at this layer).
-        const AVCodecID prevVideo = previousVideoCodec.load(std::memory_order_relaxed);
-        if (detectedCodec == prevVideo && prevVideo != AV_CODEC_ID_NONE) [[unlikely]] {
-            if (detectedCodec == videoCodecCandidate.load(std::memory_order_relaxed)) {
-                videoCodecCandidateCount.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                videoCodecCandidate.store(detectedCodec, std::memory_order_relaxed);
-                videoCodecCandidateCount.store(1, std::memory_order_relaxed);
-            }
-            const int candidateCount = videoCodecCandidateCount.load(std::memory_order_relaxed);
-            if (candidateCount < 2) {
-                dsyslog("vaapivideo/device: video codec %s same as previous -- awaiting confirmation (%d/2)",
-                        avcodec_get_name(detectedCodec), candidateCount);
-                return Length;
-            }
-            dsyslog("vaapivideo/device: video codec %s confirmed after %d detections", avcodec_get_name(detectedCodec),
-                    candidateCount);
+        // The detector only fires on a parameter-set-bearing keyframe PES (see DetectVideoCodec), so this
+        // is the first decodable picture of the new stream; the PES ordinal is the GOP position we landed on.
+        if (const int64_t traceMs = startTrace.Fire(TRACE_VIDEO_KEY); traceMs >= 0) [[unlikely]] {
+            dsyslog("vaapivideo/device: trace +%lldms first keyframe PES (%s, pts=%lld, video PES #%u)",
+                    static_cast<long long>(traceMs), avcodec_get_name(detectedCodec), static_cast<long long>(pes.pts),
+                    traceVideoPesCount.load(std::memory_order_relaxed));
         }
+
+        // Accepted as-is -- deliberately NO "same codec as before, await a second detection" guard: it
+        // could only re-fire on the NEXT parameter-set-bearing keyframe, costing a full GOP per same-codec
+        // switch (0.6-0.9 s DVB, seconds on long-GOP IPTV) -- the dominant zap latency. The stale-PES
+        // residue it guarded against cannot occur in VDR 2.x transfer mode (detach resets the TS->PES
+        // assemblers before the tuner moves; dvb/satip/iptv clear their TS rings in OpenDvr()). A genuine
+        // mismatch still surfaces through the decoder's starvation tiers.
 
         // Wait for in-band config before opening: H.264/HEVC need the SPS bit-depth/profile for
         // backend selection (else the 8-bit row misclassifies 10-bit streams); MPEG-2 needs the
@@ -1704,20 +1858,27 @@ auto cVaapiDevice::Play() -> void {
             }
         }
 
-        // Clear the same-codec confirmation only now that config is in hand. A `return Length` above
-        // leaves the candidate confirmed, so the next PES resumes at the probe instead of restarting
-        // the 2-of-2 count -- which could otherwise keep skipping the sparse GOP-header PES.
-        videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-        videoCodecCandidateCount.store(0, std::memory_order_relaxed);
-
         if (!decoder->OpenCodecWithInfo(streamInfo)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open video codec %s", avcodec_get_name(detectedCodec));
             return Length;
         }
 
         videoCodecId.store(detectedCodec, std::memory_order_relaxed);
+        // Live only (see the release block below): in the pre-TS PES recording format a PES end is not an
+        // access-unit end, so replay must not release early.
+        firstAuReleasePending.store(isLive, std::memory_order_relaxed);
         ResetNoVideoMonitors(); // video now decodes: neither no-video screen may repaint over it
         isyslog("vaapivideo/device: video codec %s (%s)", avcodec_get_name(detectedCodec), isLive ? "live" : "replay");
+        if (const int64_t traceMs = startTrace.Fire(TRACE_VIDEO_CODEC); traceMs >= 0) [[unlikely]] {
+            // MPEG-2 carries no profile in the sequence header the detector reads, so it stays at
+            // FF_PROFILE_UNKNOWN (-99) -- print that as "?" rather than a number that reads like a value.
+            const std::string profileText =
+                streamInfo.profile < 0 ? std::string{"?"} : std::format("{}", streamInfo.profile);
+            dsyslog("vaapivideo/device: trace +%lldms video codec %s opened (profile=%s, %d-bit%s), first fed pts=%lld",
+                    static_cast<long long>(traceMs), avcodec_get_name(detectedCodec), profileText.c_str(),
+                    streamInfo.bitDepth == BitDepth::k10 ? 10 : 8, streamInfo.streamInterlaced ? ", interlaced" : "",
+                    static_cast<long long>(pes.pts));
+        }
     }
 
     // Replay backpressure: return 0 so VDR retries via Poll(). Live: never block.
@@ -1731,6 +1892,26 @@ auto cVaapiDevice::Play() -> void {
             }
         } else if (decoder->IsQueueFull()) {
             return 0;
+        }
+    }
+
+    // First keyframe after a live codec open: the parser holds an AU back until the NEXT AU's start code,
+    // which for the very first picture means waiting for the next PES (a frame period on DVB, a delivery
+    // burst on IPTV). In a TS the PES boundary IS the AU boundary and VDR chunks an oversized picture into
+    // PES of exactly VDR_MAX_PES_CHUNK bytes, so a shorter PES ends the picture: release the AU now. A PES
+    // carrying a PTS is already the next picture (the parser emits the keyframe by itself): disarm only.
+    if (firstAuReleasePending.load(std::memory_order_relaxed)) [[unlikely]] {
+        const bool opensAu = pes.pts != AV_NOPTS_VALUE;
+        const bool firstAuPes = currentCodec == AV_CODEC_ID_NONE; // the PES that opened the codec above
+        if (opensAu && !firstAuPes) {
+            firstAuReleasePending.store(false, std::memory_order_relaxed);
+        } else {
+            decoder->EnqueueData(pes.payload, pes.payloadSize, pes.pts);
+            if (Length < VDR_MAX_PES_CHUNK) {
+                firstAuReleasePending.store(false, std::memory_order_relaxed);
+                decoder->ReleasePendingAccessUnit();
+            }
+            return Length;
         }
     }
 
@@ -1921,10 +2102,16 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     };
     const auto idx = static_cast<unsigned>(PlayMode);
     dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
+    // VDR attaches the new player right after this call, so "now" is the switch as the viewer sees it.
+    const uint64_t switchMs = cTimeMs::Now();
+    bool armStartTrace = false;
+    bool armDisplayTrace = true;
 
     // Stream boundary, same reason as in Clear(): a candidate armed for the outgoing stream must
     // not mature against the incoming one.
     InvalidateDisplayModeCandidate();
+    // Same boundary for the dolby-entry gate: the incoming stream's track hooks re-arm it if needed.
+    audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed);
 
 #if APIVERSNUM >= 30014
     eosDrainRequested.store(false, std::memory_order_relaxed); // Drain() contract: SetPlayMode() cancels a drain
@@ -1972,12 +2159,10 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
 
     switch (PlayMode) {
         case pmNone:
-            // Capture previous video codec BEFORE clearing: PlayVideo's 2-of-2 guard uses it
-            // to reject stale TS-buffer bytes after the switch. Audio path runs the guard
-            // unconditionally so it doesn't need a previous-codec capture.
             ResetNoVideoMonitors();
-            previousVideoCodec.store(videoCodecId.exchange(AV_CODEC_ID_NONE, std::memory_order_relaxed),
-                                     std::memory_order_relaxed);
+            DisarmStartTrace(); // the outgoing stream's remaining milestones must not report against a dead epoch
+            videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+            firstAuReleasePending.store(false, std::memory_order_relaxed);
             // Drop the audio log-dedup baseline so the next session logs its codec once (scrub Clear()s
             // keep it, suppressing the per-seek re-confirm spam; a real session boundary re-arms the log).
             previousAudioCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
@@ -1990,8 +2175,6 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
                 decoder->SetLiveMode(false);
                 decoder->RequestCodecReopen();
             }
-            videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-            videoCodecCandidateCount.store(0, std::memory_order_relaxed);
             // Reset dedup so the new channel's first audio-track hook re-detects.
             lastHandledAudioTrack = ttNone;
             lastHandledAudioPid = 0;
@@ -2022,6 +2205,8 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // Poll deadline is left to the decoder tick (which owns radioSplashPoll); its first
             // refresh after entry recomputes the same event and no-ops, then arms the 2 s cadence.
             RefreshRadioSplash(/*force=*/true);
+            armStartTrace = true;
+            armDisplayTrace = false; // radio has no video frame; the only commit would be a splash repaint
             break;
         case pmAudioVideo:
         case pmVideoOnly:
@@ -2039,10 +2224,17 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
             dsyslog("vaapivideo/device: pmAudioVideo -- armed no-video watchdogs (grace %d ms)",
                     ENCRYPTED_NOTICE_DELAY_MS);
+            armStartTrace = true;
             break;
         default:
             ResetNoVideoMonitors(); // pmExtern / unknown: not our scanout
             break;
+    }
+    if (armStartTrace) {
+        // Fresh stream: nothing stale precedes the first audio PES -- enable the detection fast paths.
+        audioFreshStart.store(true, std::memory_order_relaxed);
+        audioPesSeen.store(false, std::memory_order_relaxed);
+        ArmStartTrace(switchMs, armDisplayTrace);
     }
     return true;
 }
@@ -2203,6 +2395,9 @@ auto cVaapiDevice::SuspendHardware() -> void {
     // AttachHardware() CAS expects 0, so 1 keeps it rejected. The terminal store(0) below finalizes.
     initState.store(1, std::memory_order_release);
 
+    // Before the teardown frees them: the components are still alive here, and a detach mid-startup
+    // would otherwise leave milestones armed against an epoch whose stream is gone.
+    DisarmStartTrace();
     DetachAllReceivers();
 
     if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
@@ -2227,9 +2422,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
 
     // Reset all playback state so a subsequent Attach() re-detects codecs from scratch.
     videoCodecId.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    previousVideoCodec.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    videoCodecCandidateCount.store(0, std::memory_order_relaxed);
+    firstAuReleasePending.store(false, std::memory_order_relaxed);
     // The no-video monitors are not cleared via SetPlayMode on the SVDRP DETA path, so reset them
     // here too -- otherwise a stale splash flag could fire against the next attached stream.
     ResetNoVideoMonitors();
@@ -2699,11 +2892,11 @@ namespace {
     decoder->SetLiveMode(false);
     ResetZoom(); // Each opened file/URL starts unzoomed; the codec-open below rebuilds the graph.
 
-    // Skip the 2-of-2 codec-detection dance: the demuxer reported authoritative codec IDs.
-    videoCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-    videoCodecCandidateCount.store(0, std::memory_order_relaxed);
+    // Skip the audio 2-of-2 codec-detection dance: the demuxer reported authoritative codec IDs.
+    firstAuReleasePending.store(false, std::memory_order_relaxed); // pre-framed AUs never go through the parser
     audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
     audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+    audioHeldPayload.clear();
 
     if (!decoder->OpenCodecWithInfo(video)) [[unlikely]] {
         esyslog("vaapivideo/device: OpenForMediaPlayer video codec %s open failed", avcodec_get_name(video.codecId));
@@ -3132,15 +3325,34 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
         kind = "dolby"; // enteringDolby covers the ambiguous-dolby fallback
     }
 
+    // In-session switch (the stream has delivered audio): the next PES may still be the OLD PID's, complete
+    // in tsToPesAudio before the PID changed -- fresh-stream fast paths must go. A hook BEFORE the first PES
+    // is the stream's own initial track assignment (nothing stale precedes it), so the fresh-start flag
+    // stays; keying on the PES rather than "a codec was confirmed" also covers a switch landing inside the
+    // detection window. It also names the event honestly: an encrypted channel's PMT retune replays the
+    // whole hook sequence, so reporting every one of them as a "switch" claimed two per zap that never were.
+    const bool inSession = audioPesSeen.load(std::memory_order_relaxed);
+    if (inSession) {
+        audioFreshStart.store(false, std::memory_order_relaxed);
+    }
+    const char *const event = inSession ? "switched to" : "selected";
+
     if (track != nullptr) {
-        isyslog("vaapivideo/device: %s -> %s track %d (lang=%s, desc=%s, PID=%u)", reason, kind, static_cast<int>(type),
-                (track->language[0] != '\0') ? track->language : "?",
+        isyslog("vaapivideo/device: %s %s %s track %d (lang=%s, desc=%s, PID=%u)", reason, event, kind,
+                static_cast<int>(type), (track->language[0] != '\0') ? track->language : "?",
                 (track->description[0] != '\0') ? track->description : "?", pid);
     } else {
-        // Ambiguous dolby: next-packet log identifies the actual codec.
-        isyslog("vaapivideo/device: %s -> %s track switch (codec re-detect on next packet)", reason, kind);
+        // Ambiguous dolby (several populated slots): next-packet log identifies the actual codec.
+        isyslog("vaapivideo/device: %s %s an ambiguous %s track (codec re-detect on next packet)", reason, event, kind);
     }
-
+    // Dolby entry is the one hook VDR fires BEFORE assigning currentAudioTrack (device.c:1172): PlayTs()
+    // keeps routing the OLD PID while this handler runs (Clear() below can block tens of ms on the ALSA
+    // mutex), so arm the stream-id gate for that window. Every other hook runs after the assignment, where
+    // at most one stale PES exists -- covered by the 2-of-2 rule. In-session only: a fresh stream has no
+    // leftovers, and arming would gate every dolby channel's initial track assignment. Store before the
+    // reset so no PES slips through in between.
+    audioAwaitDolbyUntilMs.store(enteringDolby && inSession ? cTimeMs::Now() + AUDIO_TRACK_SWITCH_GRACE_MS : 0,
+                                 std::memory_order_relaxed);
     ResetAudioCodecState();
     ResetReplayAudioEofBaseline();
     if (audioProcessor) [[likely]] {

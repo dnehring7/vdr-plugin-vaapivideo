@@ -296,7 +296,10 @@ another application at boot.
 
 **`Audio Passthrough`** — `auto` (default) reads the HDMI sink's ELD at startup
 and forwards a compressed codec as IEC61937 only when the sink advertises
-support for it; everything else is decoded to PCM. `on` forces passthrough for
+support for it; everything else is decoded to PCM. If the ELD is unreadable at
+that point (AVR asleep, TV off), the probe repeats on the next codec change, so
+passthrough and multichannel light up as soon as the sink answers — no VDR
+restart needed. `on` forces passthrough for
 every wrappable codec (AC-3, E-AC-3, TrueHD, DTS, AC-4, MPEG-H 3D) and ignores
 the ELD — for topologies where the probed capabilities are wrong, typically an
 AVR behind a TV whose EDID masks the AVR's real decoders. Make sure the
@@ -304,6 +307,22 @@ downstream device really decodes the codec: ALSA cannot detect a silent decode
 failure at the sink, you will simply hear nothing. `off` always decodes to PCM.
 Changes take effect when the audio device is reopened — switch channels once
 after leaving the setup menu.
+
+Passthrough also flips the IEC 60958-3 "non-audio" bit (AES0 bit 1) that tells
+the sink a bitstream, not PCM, is coming, and clears it again on every PCM open
+(HDMI codecs keep the bit across `snd_pcm_close()`). The control is resolved per
+output at startup — HDA cards expose one `IEC958 Playback Default` per digital
+converter on `iface=MIXER`, indexed in PCM-device order, so `hw:0,3` (the first
+HDMI pin) uses index 0. The log names the element it picked:
+`IEC958 Playback Default on hw:0 -- iface=MIXER device=0 index=0`, and every
+*change* as `IEC958 AES0 0x04 -> 0x06 (non-audio)`. The bit is re-asserted on
+every device open (the kernel's cached value can drift from the link across an
+AVR power-cycle or a hotplug), but a write that changes nothing is not logged:
+no line on a passthrough-to-passthrough channel switch means the sink was
+already armed, not that the bit was skipped. If the log instead reports
+`not resolved`, the card exposes no such control (an ALSA `default`/dmix device
+does not) and the bit is left alone — passthrough still works on sinks that key
+off the IEC61937 preamble alone.
 
 **`PCM Channels`** — applies whenever audio is decoded to PCM (no passthrough,
 or a codec without IEC61937 framing such as AAC or MP2):
@@ -647,6 +666,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
 | Audio   | Multichannel plays as stereo / wrong speakers | Use a direct `hw:`/`plughw:CARD,DEV`, not `default` |
 | Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough Audio Latency` (see [AVSYNC.md](AVSYNC.md)) |
+| Audio   | Short dropout shortly after a channel switch | ALSA ring ran dry — the log reports `ALSA … recovered -- N xrun(s)`; check `state:`/`avail_max` in `/proc/asound/card0/pcm3p/sub0/status` and see [AVSYNC.md](AVSYNC.md#ring-cushion) |
 | Perf    | AMD iGPU stutters / drops            | GPU pinned `low` DPM — `power_dpm_force_performance_level=auto` |
 | Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlace = auto` |
 | Perf    | High CPU on encrypted HD             | Software CSA descrambling (CAM/softcam), not the plugin — a CI+ CAM offloads it |
@@ -654,6 +674,12 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
 sync diagnostics; the periodic `sync d=… avg=…` line is described in
 [AVSYNC.md](AVSYNC.md#diagnostic-log).
+
+Slow channel switches (picture or sound arriving late) are diagnosed from the
+`trace +Nms …` lines every stream start emits — first audio/video PES, first
+keyframe, codec open, first decoded / presented / committed frame, DAC start,
+A/V lock — all relative to the same switch epoch; see
+[AVSYNC.md](AVSYNC.md#stream-start-trace).
 
 
 ## Development

@@ -418,6 +418,10 @@ class cVaapiDevice : public cDevice {
                  ///< current source. Caller holds displayModeMutex.
     auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs)
         -> void; ///< Start the stability window for @p request. Caller holds displayModeMutex.
+    auto ArmStartTrace(uint64_t epochMs, bool withDisplay)
+        -> void; ///< Arm the stream-start trace (SetPlayMode). withDisplay=false for audio-only modes,
+                 ///< which never produce a video frame for the display milestone to describe.
+    auto DisarmStartTrace() noexcept -> void; ///< Drop pending milestones (pmNone / suspend).
     auto ClearModeCandidateLocked()
         -> void; ///< Disarm the stability window. Caller holds displayModeMutex. Both helpers exist so
                  ///< modeCandidateDueMs can never drift from modeCandidateSinceMs.
@@ -488,9 +492,29 @@ class cVaapiDevice : public cDevice {
     PlaybackSource lastRequestSource{PlaybackSource::LiveTv};     ///< Source that published lastRequest
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount{0};                 ///< Confirmation count for audioCodecCandidate
-    std::vector<uint8_t> audioDetectBuffer;   ///< AAC-LATM fallback window for DetectAudioCodec() (see
-                                              ///< AUDIO_DETECT_WINDOW). Owned solely by the PlayAudio feed thread;
-                                              ///< the reset paths never touch it (see audioDetectGen).
+    std::vector<uint8_t> audioDetectBuffer; ///< AAC-LATM fallback window for DetectAudioCodec() (see
+                                            ///< AUDIO_DETECT_WINDOW). Owned solely by the PlayAudio feed thread;
+                                            ///< the reset paths never touch it (see audioDetectGen).
+    std::vector<uint8_t> audioHeldPayload;  ///< The 1-of-2 candidate PES, held until its codec confirms and then
+                                            ///< fed ahead of the confirming PES so detection costs no audio.
+                                            ///< Feed-thread-owned; invalidated through audioDetectGen.
+    int64_t audioHeldPts{AV_NOPTS_VALUE};   ///< PTS of audioHeldPayload
+    /// Detection runs against a FRESH stream (SetPlayMode(); cleared by an in-session track change or a
+    /// sink-forced re-detect). Nothing stale can precede a fresh stream's first PES, so PlayAudio() may
+    /// confirm a chained detection from one payload and hold the 1-of-2 candidate instead of dropping it.
+    /// In-session, the first PES may still be the OLD PID's: full 2-of-2 across payloads, candidate dropped.
+    std::atomic<bool> audioFreshStart{false};
+    /// This stream has delivered an audio PES. A track hook BEFORE it is the stream's own initial track
+    /// assignment (nothing stale precedes it -- the fresh-start fast paths survive); any hook after it is
+    /// an in-session switch, including one inside the detection window, which a "codec already confirmed"
+    /// test would miss.
+    std::atomic<bool> audioPesSeen{false};
+    /// Deadline (walltime ms, 0 = inactive) until which PlayAudio() drops non-private_stream_1 audio PES.
+    /// Armed by the dolby-ENTRY hook, which VDR fires BEFORE assigning currentAudioTrack: until then
+    /// PlayTs() still routes the OLD PID, whose complete, decisive PES would win the codec vote for the
+    /// codec being left behind. Cleared by the first private_stream_1 PES or the deadline, so an unusual
+    /// mux costs a hiccup, not the audio.
+    std::atomic<uint64_t> audioAwaitDolbyUntilMs{0};
     uint32_t audioDetectGenSeen{};            ///< PlayAudio's last-seen audioDetectGen; a mismatch clears the window
     std::atomic<uint32_t> audioDetectGen{0};  ///< Bumped by ResetAudioCodecState() to invalidate the window across
                                               ///< threads without racing the vector
@@ -506,10 +530,18 @@ class cVaapiDevice : public cDevice {
 #endif
     /// Last confirmed audio codec; survives Clear() so a same-codec re-detect after a scrub seek logs nothing
     std::atomic<AVCodecID> previousAudioCodec{AV_CODEC_ID_NONE};
-    std::atomic<AVCodecID> previousVideoCodec{AV_CODEC_ID_NONE}; ///< Previous channel's video codec (stale guard)
-    bool inStillPicture{false};                                  ///< Re-entry guard for cDevice::StillPicture
-    std::atomic<bool> radioBlackPending{false};                  ///< Awaiting radio-only channel detection
-    cTimeMs radioBlackTimer;                                     ///< Radio-mode detection timeout
+    /// One-shot (PlayVideo feed thread; reset on mode changes): a live stream's first keyframe is still being
+    /// fed and its access unit must be released as soon as its last PES chunk lands, instead of waiting for
+    /// the next picture's start code. See the release block in PlayVideo().
+    std::atomic<bool> firstAuReleasePending{false};
+    /// Stream-start trace: device-side milestones; decoder / audio / display are armed with the same epoch.
+    StreamStartTrace startTrace;
+    /// Video PES since Arm: how deep into a GOP the switch landed (the first keyframe PES is the N-th).
+    /// Counted only while that milestone is pending, so steady state pays nothing.
+    std::atomic<uint32_t> traceVideoPesCount{0};
+    bool inStillPicture{false};                 ///< Re-entry guard for cDevice::StillPicture
+    std::atomic<bool> radioBlackPending{false}; ///< Awaiting radio-only channel detection
+    cTimeMs radioBlackTimer;                    ///< Radio-mode detection timeout
     /// PlayAudio saw no video after the grace; CheckRadioSplash resolves it
     std::atomic<bool> radioCheckPending{false};
     std::atomic<bool> radioSplashActive{false}; ///< A refreshable radio (no-video) splash is on screen
@@ -530,11 +562,9 @@ class cVaapiDevice : public cDevice {
     /// replay's trick STC (read only while trickSpeed != 0) and the pacing hold's previous-step reference. Reset by
     /// Clear() and TrickSpeed().
     std::atomic<int64_t> trickAudioPts{AV_NOPTS_VALUE};
-    std::atomic<int> trickSpeed{0};                               ///< VDR trick speed; 0 = normal
-    VaapiContext vaapi{};                                         ///< Shared VAAPI context
-    std::atomic<AVCodecID> videoCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 video codec confirm
-    std::atomic<int> videoCodecCandidateCount{0};                 ///< Confirmation count for videoCodecCandidate
-    std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE};        ///< Active video codec
+    std::atomic<int> trickSpeed{0};                        ///< VDR trick speed; 0 = normal
+    VaapiContext vaapi{};                                  ///< Shared VAAPI context
+    std::atomic<AVCodecID> videoCodecId{AV_CODEC_ID_NONE}; ///< Active video codec
 };
 
 #endif // VDR_VAAPIVIDEO_DEVICE_H

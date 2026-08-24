@@ -129,6 +129,9 @@ class cAudioProcessor : public cThread {
         return codecRedetectRequested.exchange(false, std::memory_order_acq_rel);
     } ///< Consumes the sink's "wrong codec" verdict (true once, after AUDIO_CASCADE_RECOVERY_LIMIT
       ///< cascades with no decoded frame). Only the PES feed can reset audioCodecId and re-detect.
+    auto ArmStartTrace(uint64_t epochMs) noexcept
+        -> void; ///< Stream-start trace: first ALSA write (clock anchor) + DAC start, vs the switch epoch.
+    auto DisarmStartTrace() noexcept -> void; ///< Drop pending stream-start milestones.
 
   protected:
     // ========================================================================
@@ -155,11 +158,14 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Reconfigures ALSA and the FFmpeg decoder when codec, rate, or passthrough mode changes.
                  ///< Returns false if the pipeline could not be established.
     auto CloseDecoder() -> void; ///< Spins until in-flight DecodeToPcm() callers finish, then frees decoder + parser
-    auto DrainPacketQueue() -> void;   ///< Pops and frees every queued packet. Takes queueMutex internally.
-    auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
-    auto RecreateParser() -> void;     ///< Close + re-init parser for the current codec; caller holds mutex.
-    auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
-                                       ///< Caller must hold mutex (single-writer invariant).
+    auto DrainPacketQueue() -> void;        ///< Pops and frees every queued packet. Takes queueMutex internally.
+    auto FlushDecoderState() -> void;       ///< avcodec_flush_buffers + swr teardown + error counter reset
+    auto RecreateParser() -> void;          ///< Close + re-init parser for the current codec; caller holds mutex.
+    auto ResetPlaybackClock() -> void;      ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
+                                            ///< Caller must hold mutex (single-writer invariant).
+    auto ResetResampler() noexcept -> void; ///< Frees swrCtx + clears its geometry (single owner of that
+                                            ///< teardown -- a partial reset pairs stale geometry with a null
+                                            ///< context). The next DecodeToPcm() rebuilds it.
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
     [[nodiscard]] auto ChooseOutputChannels(int inChannels) const noexcept
@@ -193,8 +199,13 @@ class cAudioProcessor : public cThread {
                                      ///< call
     auto ProbeSinkCaps()
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; cached per device name
+    auto ResolveIec958Control(snd_ctl_t *ctl, int deviceId)
+        -> void; ///< Locates the sink's "IEC958 Playback Default" element and caches its id in alsaIec958Ctl*.
+                 ///< Called by ProbeSinkCaps() once per device; the naming scheme is driver-specific (see impl).
+    auto FillIec958CtlId(snd_ctl_elem_id_t *id) const noexcept
+        -> void; ///< Stamps the resolved element id (iface/name/device/index) so read and write agree
     auto SetIec958NonAudio(bool enable) const
-        -> void; ///< Sets/clears IEC 60958-3 AES0 bit 1 ("non-audio") on the HDMI mixer control.
+        -> void; ///< Sets/clears IEC 60958-3 AES0 bit 1 ("non-audio") on the sink's IEC958 control.
                  ///< Must be set before passthrough writes; cleared on PCM open to prevent noise on the receiver.
     [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,
                                       uint32_t expectedGeneration)
@@ -213,7 +224,9 @@ class cAudioProcessor : public cThread {
     std::atomic<int> alsaErrorCount{0};             ///< Consecutive snd_pcm_writei failures
     std::atomic<size_t> alsaFrameBytes{0};          ///< Bytes per interleaved frame
     snd_pcm_t *alsaHandle{nullptr};                 ///< Open PCM device handle; nullptr when closed
+    unsigned alsaIec958CtlDevice{0};                ///< Device field of the resolved IEC958 control (0 on iface=MIXER)
     unsigned alsaIec958CtlIndex{UINT_MAX};          ///< "IEC958 Playback Default" control index; UINT_MAX = unresolved
+    bool alsaIec958CtlMixer{false};                 ///< Resolved control sits on iface=MIXER (HDA) instead of PCM
     std::atomic<bool> alsaPassthroughActive{false}; ///< True in IEC61937 passthrough mode
     std::atomic<unsigned> alsaSampleRate{0};        ///< Negotiated sample rate (Hz)
     std::atomic<uint64_t> channelReorder{0}; ///< Packed swr->device channel permutation (QueryDeviceChannelOrder):
@@ -286,6 +299,7 @@ class cAudioProcessor : public cThread {
                                                        ///< Clear() / ResetPlaybackClock() / the next WritePcmToAlsa.
                                                        ///< While set, GetClock() returns playbackPts verbatim instead
                                                        ///< of extrapolating against wall-clock through ALSA silence.
+    StreamStartTrace startTrace;                       ///< Stream-start milestones (first write / DAC running)
 
     // ========================================================================
     // === SINK CAPABILITIES ===
@@ -328,9 +342,11 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === TIMING ===
     // ========================================================================
-    cTimeMs lastDecodeErrorLog; ///< Rate-limits decode-error syslog to once per AUDIO_ERROR_LOG_INTERVAL_MS
-    cTimeMs lastQueueWarn;      ///< Rate-limits "queue full" syslog to once per 500 ms
-    cTimeMs lastReopenAttempt;  ///< Rate-limits ALSA device-reopen attempts to once per 1000 ms
+    unsigned alsaXrunsSinceLog{}; ///< xruns recovered since the last report (audio thread only)
+    cTimeMs lastDecodeErrorLog;   ///< Rate-limits decode-error syslog to once per AUDIO_ERROR_LOG_INTERVAL_MS
+    cTimeMs lastQueueWarn;        ///< Rate-limits "queue full" syslog to once per 500 ms
+    cTimeMs lastReopenAttempt;    ///< Rate-limits ALSA device-reopen attempts to once per 1000 ms
+    cTimeMs lastXrunLog;          ///< Rate-limits the xrun report to once per 5 s
 };
 
 #endif // VDR_VAAPIVIDEO_AUDIO_H

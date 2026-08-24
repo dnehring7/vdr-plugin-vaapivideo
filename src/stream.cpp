@@ -146,6 +146,20 @@ struct CodecEvidence {
     return static_cast<size_t>(words) * 2U;
 }
 
+/// Strength of a frame-length corroboration (FrameLengthCorroborates): callers treat Chained -- two
+/// complete frame headers linked by an exact frame-length step, i.e. two real audio frames -- as
+/// stronger evidence than a single frame (exact payload fill / Dolby head-span).
+enum class Corroboration : uint8_t {
+    None = 0,    ///< Not corroborated; the sync hit is payload noise
+    SingleFrame, ///< One frame of evidence (exact fill / head-span)
+    Chained,     ///< Two chained frame headers
+};
+
+/// Builds the DetectAudioCodec() verdict for a corroborated hit.
+[[nodiscard]] constexpr auto Confirmed(AVCodecID codecId, Corroboration hit) noexcept -> AudioDetection {
+    return {.codecId = codecId, .chained = hit == Corroboration::Chained};
+}
+
 /// Corroborate a sync candidate at @p pos declaring @p frameLen bytes. A lone short-sync hit
 /// is not decisive -- compressed payload aliases 11/12-bit sync words constantly. Accepted only
 /// on: a valid chained header one frame ahead; an exact payload fill from offset 0 (the DVB
@@ -155,18 +169,18 @@ struct CodecEvidence {
 /// or a validated neighbor; a length that merely lands on the boundary deeper in is coincidence.
 template <typename SyncPredicate>
 [[nodiscard]] auto FrameLengthCorroborates(size_t pos, size_t frameLen, size_t size, bool allowHeadSpan,
-                                           const SyncPredicate &syncAt) noexcept -> bool {
+                                           const SyncPredicate &syncAt) noexcept -> Corroboration {
     const size_t next = pos + frameLen;
     if (next > size) {
-        return allowHeadSpan && pos == 0;
+        return (allowHeadSpan && pos == 0) ? Corroboration::SingleFrame : Corroboration::None;
     }
     if (next == size) {
-        return pos == 0;
+        return pos == 0 ? Corroboration::SingleFrame : Corroboration::None;
     }
     if (next + 2 <= size) {
-        return syncAt(next);
+        return syncAt(next) ? Corroboration::Chained : Corroboration::None;
     }
-    return false;
+    return Corroboration::None;
 }
 
 /// Returns 3 for `00 00 01`, 4 for `00 00 00 01`, 0 otherwise.
@@ -189,12 +203,12 @@ template <typename SyncPredicate>
 
 } // namespace
 
-auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
+auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection {
     // Linear scan; first FrameLengthCorroborates() match wins. A raw sync hit is never enough:
     // AAC-LATM payloads alias the 11-bit MPEG audio sync (0xFFE?) every few packets, which used
     // to misconfirm mp2 on HE-AAC services and permanently mute audio.
     if (data.size() < 4) [[unlikely]] {
-        return AV_CODEC_ID_NONE;
+        return {};
     }
 
     const size_t size = data.size();
@@ -210,26 +224,29 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
             // random second sync-alike one frame ahead cannot confirm a false first header.
             if ((sync & 0xFFF6) == 0xFFF0 && i + 6 <= size) [[unlikely]] {
                 const size_t frameLen = AdtsFrameLength(p + i);
-                if (frameLen != 0 && FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/false,
-                                                             [p, size](size_t pos) noexcept -> bool {
-                                                                 return pos + 6 <= size &&
-                                                                        (AV_RB16(p + pos) & 0xFFF6) == 0xFFF0 &&
-                                                                        AdtsFrameLength(p + pos) != 0;
-                                                             })) {
-                    return AV_CODEC_ID_AAC;
+                if (frameLen != 0) {
+                    const Corroboration hit = FrameLengthCorroborates(
+                        i, frameLen, size, /*allowHeadSpan=*/false, [p, size](size_t pos) noexcept -> bool {
+                            return pos + 6 <= size && (AV_RB16(p + pos) & 0xFFF6) == 0xFFF0 &&
+                                   AdtsFrameLength(p + pos) != 0;
+                        });
+                    if (hit != Corroboration::None) {
+                        return Confirmed(AV_CODEC_ID_AAC, hit);
+                    }
                 }
             }
             if ((sync & 0xFFE0) == 0xFFE0) [[likely]] {
                 const size_t frameLen = Mp2FrameLength(AV_RB32(p + i));
                 // Mask 0xFFFE requires the neighbor to repeat version + layer (drops only protection).
-                if (frameLen != 0 && FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/false,
-                                                             [p, size, sync](size_t pos) noexcept -> bool {
-                                                                 return pos + 4 <= size &&
-                                                                        (AV_RB16(p + pos) & 0xFFFE) ==
-                                                                            (sync & 0xFFFE) &&
-                                                                        Mp2FrameLength(AV_RB32(p + pos)) != 0;
-                                                             })) {
-                    return AV_CODEC_ID_MP2;
+                if (frameLen != 0) {
+                    const Corroboration hit = FrameLengthCorroborates(
+                        i, frameLen, size, /*allowHeadSpan=*/false, [p, size, sync](size_t pos) noexcept -> bool {
+                            return pos + 4 <= size && (AV_RB16(p + pos) & 0xFFFE) == (sync & 0xFFFE) &&
+                                   Mp2FrameLength(AV_RB32(p + pos)) != 0;
+                        });
+                    if (hit != Corroboration::None) {
+                        return Confirmed(AV_CODEC_ID_MP2, hit);
+                    }
                 }
             }
         }
@@ -238,8 +255,8 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
         // carries one AudioMuxElement per PES, so exact fill (not the chained sync) usually confirms.
         if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
             const auto muxLen = static_cast<size_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
-            if (muxLen >= 2 &&
-                FrameLengthCorroborates(
+            if (muxLen >= 2) {
+                const Corroboration hit = FrameLengthCorroborates(
                     i, muxLen + 3, size, /*allowHeadSpan=*/false, [p, size](size_t pos) noexcept -> bool {
                         if (pos + 3 > size || (AV_RB16(p + pos) & 0xFFE0) != 0x56E0) {
                             return false;
@@ -247,8 +264,10 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
                         const auto nextMuxLen =
                             static_cast<size_t>(((AV_RB16(p + pos) & 0x1FU) << 8) | AV_RB8(p + pos + 2));
                         return nextMuxLen >= 2;
-                    })) {
-                return AV_CODEC_ID_AAC_LATM;
+                    });
+                if (hit != Corroboration::None) {
+                    return Confirmed(AV_CODEC_ID_AAC_LATM, hit);
+                }
             }
         }
 
@@ -267,26 +286,30 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
                 frameLen = (static_cast<size_t>(AV_RB16(p + i + 2) & 0x07FF) + 1) * 2;
                 dolby = frameLen >= 6 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_NONE;
             }
-            if (dolby != AV_CODEC_ID_NONE && frameLen != 0 &&
-                FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/true,
-                                        [p](size_t pos) noexcept -> bool { return AV_RB16(p + pos) == 0x0B77; })) {
-                return dolby;
+            if (dolby != AV_CODEC_ID_NONE && frameLen != 0) {
+                const Corroboration hit =
+                    FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/true,
+                                            [p](size_t pos) noexcept -> bool { return AV_RB16(p + pos) == 0x0B77; });
+                if (hit != Corroboration::None) {
+                    return Confirmed(dolby, hit);
+                }
             }
         }
 
-        // DTS Coherent Acoustics core (ETSI TS 102 114). 32-bit sync, no ambiguity.
+        // DTS Coherent Acoustics core (ETSI TS 102 114). 32-bit sync, no ambiguity -- but a lone
+        // sync is still one header of evidence: chained=false keeps the 2-of-2 payload rule.
         if (AV_RB32(p + i) == 0x7FFE8001) [[unlikely]] {
-            return AV_CODEC_ID_DTS;
+            return Confirmed(AV_CODEC_ID_DTS, Corroboration::SingleFrame);
         }
 
         // TrueHD major sync (0xF8726FBA, Dolby TrueHD sec.5.3). Mandatory in the first frame
         // and recurs periodically, so probing for it on early input is reliable.
         if (AV_RB32(p + i) == 0xF8726FBA) [[unlikely]] {
-            return AV_CODEC_ID_TRUEHD;
+            return Confirmed(AV_CODEC_ID_TRUEHD, Corroboration::SingleFrame);
         }
     }
 
-    return AV_CODEC_ID_NONE;
+    return {};
 }
 
 auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
