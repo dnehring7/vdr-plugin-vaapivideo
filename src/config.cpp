@@ -170,14 +170,14 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
         MinResolutionModeName(minResolution.load(std::memory_order_relaxed)),
         MaxRefreshModeName(maxRefreshRate.load(std::memory_order_relaxed)), modeScope.empty() ? "none" : modeScope);
     return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, PCM channels: {}, HDR: {}, "
-                       "Clear on channel switch: {}, Post-proc: {}, Mode switch: {}, Zoom levels (0=off): {}, "
-                       "Bookmark: {}",
+                       "Clear on channel switch: {}, Trace: {}, Post-proc: {}, Mode switch: {}, "
+                       "Zoom levels (0=off): {}, Bookmark: {}",
                        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
                        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
                        PcmChannelModeName(pcmChannelMode.load(std::memory_order_relaxed)),
                        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
-                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off", postProc, modeSwitch, zoom,
-                       mark);
+                       clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off",
+                       trace.load(std::memory_order_relaxed) ? "on" : "off", postProc, modeSwitch, zoom, mark);
 }
 
 namespace {

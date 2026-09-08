@@ -237,7 +237,7 @@ speakers. Find the device with:
 
 ### Command-line options
 
-    vdr -P 'vaapivideo [-a DEV] [-c NAME] [-D] [-d DEV] [-m DIR] [-r WxH@R]'
+    vdr -P 'vaapivideo [-a DEV] [-c NAME] [-D] [-d DEV] [-m DIR] [-r WxH@R] [-t]'
 
 | Option                           | Default         | Description                                           |
 |----------------------------------|-----------------|-------------------------------------------------------|
@@ -247,6 +247,7 @@ speakers. Find the device with:
 | `-d DEV`, `--drm=DEV`            | auto-detect     | DRM device path (`/dev/dri/cardN`)                    |
 | `-m DIR`, `--media-dir=DIR`      | `/`             | Mediaplayer file-browser root directory               |
 | `-r WxH@R`, `--resolution=WxH@R` | `1920x1080@50`  | Default output resolution and refresh rate (whole Hz, max 3840×2160) |
+| `-t`, `--trace`                  | off             | Emit the A/V-sync and stream-start diagnostics (needs `vdr -l 3`) |
 
 Use `-d` explicitly when multiple GPUs are present, and `-c` to select a
 specific output when multiple displays are connected (names as under
@@ -597,6 +598,7 @@ signaling and cannot be detected.
 | `PLUG vaapivideo ATTA`         | Re-attach to DRM/VAAPI hardware; if primary, resume output |
 | `PLUG vaapivideo PLAY <uri>`   | Start mediaplayer on a file, URL, or `.m3u/.m3u8` playlist |
 | `PLUG vaapivideo ZOOM [next\|0-5]` | Cycle manual zoom (`next`) or select a stop (0 = off)  |
+| `PLUG vaapivideo TRACE [on\|off]` | Turn A/V-sync and stream-start tracing on or off (no argument queries) |
 
 `DETA` hands the display to another application and `ATTA` reclaims it without
 restarting VDR; when the plugin is the primary device, `ATTA` also re-tunes the
@@ -672,14 +674,22 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Perf    | High CPU on encrypted HD             | Software CSA descrambling (CAM/softcam), not the plugin — a CI+ CAM offloads it |
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
-sync diagnostics; the periodic `sync d=… avg=…` line is described in
-[AVSYNC.md](AVSYNC.md#diagnostic-log).
+audio diagnostics.
 
-Slow channel switches (picture or sound arriving late) are diagnosed from the
-`trace +Nms …` lines every stream start emits — first audio/video PES, first
-keyframe, codec open, first decoded / presented / committed frame, DAC start,
-A/V lock — all relative to the same switch epoch; see
-[AVSYNC.md](AVSYNC.md#stream-start-trace).
+The A/V-sync and channel-switch diagnostics need one switch more, because they
+narrate the presentation thread frame by frame: run VDR at `-l 3` *and* turn
+tracing on, either with the plugin's `-t` / `--trace` option or at runtime with
+`svdrpsend PLUG vaapivideo TRACE on`. That yields
+
+- the periodic `sync d=… avg=…` line plus a line per drop, skip and catch-up —
+  see [AVSYNC.md](AVSYNC.md#diagnostic-log), and
+- for slow channel switches (picture or sound arriving late), the `trace +Nms …`
+  timeline: first audio/video PES, first keyframe, codec open, first decoded /
+  presented / committed frame, DAC start, A/V lock, all relative to the same
+  switch epoch — see [AVSYNC.md](AVSYNC.md#stream-start-trace).
+
+Faults report themselves without tracing: `catch-up cycling sustained`,
+`jitterBuf overflow`, and every warning and error stay at the ordinary levels.
 
 
 ## Development

@@ -545,7 +545,9 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
                     "  -m DIR, --media-dir=DIR     Mediaplayer initial directory "
                     "(default: '/')\n"
                     "  -r RES, --resolution=RES    Output resolution "
-                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n",
+                    "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n"
+                    "  -t, --trace                 Enable A/V-sync and stream-start tracing "
+                    "(needs 'vdr -l 3')\n",
                     DISPLAY_DEFAULT_WIDTH, DISPLAY_DEFAULT_HEIGHT, DISPLAY_DEFAULT_REFRESH_RATE);
     return kHelp.c_str();
 }
@@ -607,18 +609,19 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
     // NOLINTBEGIN(misc-include-cleaner) -- getopt symbols (option, getopt_long, optind, optarg,
     // required_argument, no_argument) come from <getopt.h>, but clang-tidy's IWYU doesn't track them.
-    static constexpr std::array<option, 7> kLongOptions = {
+    static constexpr std::array<option, 8> kLongOptions = {
         {{.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
          {.name = "detached", .has_arg = no_argument, .flag = nullptr, .val = 'D'},
          {.name = "drm", .has_arg = required_argument, .flag = nullptr, .val = 'd'},
          {.name = "media-dir", .has_arg = required_argument, .flag = nullptr, .val = 'm'},
          {.name = "resolution", .has_arg = required_argument, .flag = nullptr, .val = 'r'},
+         {.name = "trace", .has_arg = no_argument, .flag = nullptr, .val = 't'},
          {.name = nullptr, .has_arg = 0, .flag = nullptr, .val = 0}}};
 
     optind = 1; // getopt state is global; reset so re-invocation by VDR parses cleanly.
     int opt{};
-    while ((opt = getopt_long(argc, argv, "d:a:c:r:m:D", kLongOptions.data(), nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:a:c:r:m:Dt", kLongOptions.data(), nullptr)) != -1) {
         switch (opt) {
             case 'd':
                 if (optarg == nullptr || *optarg == '\0') {
@@ -667,6 +670,10 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
             case 'D':
                 startDetached = true;
                 dsyslog("vaapivideo: detached startup requested");
+                break;
+            case 't':
+                vaapiConfig.trace.store(true, std::memory_order_relaxed);
+                isyslog("vaapivideo: tracing enabled (the trace lines need VDR log level 3)");
                 break;
             default:
                 esyslog("vaapivideo: unrecognized command-line option (see stderr)");
@@ -866,6 +873,29 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
         return cString::sprintf("%s", vaapiDevice->DisplayModeReport().c_str());
     }
 
+    if (strcasecmp(command, "TRACE") == 0) {
+        // No device needed: the flag only gates logging, and it must stay settable while detached.
+        if (option != nullptr && *option != '\0') {
+            if (strcasecmp(option, "on") == 0) {
+                vaapiConfig.trace.store(true, std::memory_order_relaxed);
+            } else if (strcasecmp(option, "off") == 0) {
+                vaapiConfig.trace.store(false, std::memory_order_relaxed);
+            } else {
+                replyCode = 550;
+                return "TRACE needs 'on', 'off', or no argument to query";
+            }
+        }
+        replyCode = 900;
+        if (!TraceEnabled()) {
+            return "Tracing off";
+        }
+        // The lines are debug level: say so rather than let a level-2 user wait for output syslog drops.
+        if (SysLogLevel <= 2) {
+            return "Tracing on -- but VDR runs below log level 3, so the trace lines are discarded";
+        }
+        return "Tracing on";
+    }
+
     if (strcasecmp(command, "CONF") == 0) {
         replyCode = 900;
         return cString::sprintf("Configuration:\n%s", vaapiConfig.GetSummary().c_str());
@@ -947,6 +977,7 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.",
         "CONF\n    Display current configuration settings.",
+        "TRACE [on|off]\n    Turn A/V-sync and stream-start tracing on or off (no argument queries it).",
         *kModeHelp,
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
         *kZoomHelp,

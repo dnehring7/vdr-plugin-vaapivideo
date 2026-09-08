@@ -94,6 +94,10 @@ class cVaapiDecoder : public cThread {
     auto Clear() -> void;        ///< Flush queued packets, codec buffers, and filter graph; resets A/V sync state.
     auto DrainQueue() -> void;   ///< Discard all queued packets without touching codec or filter state.
     auto FlushForSeek() -> void; ///< Same as Clear() but keeps the filter graph alive (mediaplayer seek path).
+    auto NoteAudioPts(int64_t audioPts) noexcept
+        -> void; ///< Sample the multiplex's A/V interleave: how far the video feed has run ahead of
+                 ///< @p audioPts, the PTS of an audio AU arriving right now. Called by the device from
+                 ///< both audio feed paths (PES and mediaplayer); reported by the A/V-locked trace.
     auto EnqueueData(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< PES path: parse raw NAL bytes via av_parser_parse2 and push complete AUs onto the queue.
     // [MEDIAPLAYER-SEAM] Currently unused: reserved for the libavformat-based mediaplayer path.
@@ -399,6 +403,12 @@ class cVaapiDecoder : public cThread {
     std::atomic<size_t> keyPacketsSinceOpen{0}; ///< Subset with AV_PKT_FLAG_KEY; silent feed vs HW stall.
     /// Last decoded PTS in 90 kHz ticks. Read by GetLastPts() / device STC.
     std::atomic<int64_t> lastPts{AV_NOPTS_VALUE};
+    /// Newest PTS the stream has delivered to the decoder, recorded at ingress before any codec or
+    /// parser gate -- so it tracks the feed, not the decode. Input to NoteAudioPts().
+    std::atomic<int64_t> lastEnqueuedPts{AV_NOPTS_VALUE};
+    /// Last interleave sample from NoteAudioPts(), in 90 kHz ticks; + = video ahead of audio in the
+    /// stream. AV_NOPTS_VALUE until both feeds have delivered a timed unit. Diagnostic only.
+    std::atomic<int64_t> streamAvSkew{AV_NOPTS_VALUE};
     std::atomic<uint64_t> clearEpoch{0};   ///< Generation tag for lastPts; bumped by Clear() / SetTrickSpeed(0).
     uint64_t presentEpoch{0};              ///< Presentation thread only. Snapshot of clearEpoch at each present-loop
                                            ///< iteration; gates submit (SubmitIfCurrent), PublishLastPts, and the

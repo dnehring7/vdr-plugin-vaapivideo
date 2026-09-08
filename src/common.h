@@ -113,6 +113,16 @@ inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; c
 inline constexpr const char *PLUGIN_VERSION = "1.8.3";   ///< Reported to VDR; "make dist" greps this line.
 
 // ============================================================================
+// === TRACE LOGGING ===
+// ============================================================================
+
+/// Debug log line emitted only while tracing is on (-t / --trace, SVDRP TRACE on|off).
+/// Shaped like VDR's own dsyslog: the arguments are not evaluated when the gate is closed,
+/// so it is cheap enough for the A/V-sync hot paths whose per-frame narration it carries
+/// (see AVSYNC.md "Tracing"). Everything a user needs without -t stays on dsyslog/isyslog.
+#define tsyslog(...) void(TraceEnabled() && (dsyslog(__VA_ARGS__), true)) // NOLINT(cppcoreguidelines-macro-usage)
+
+// ============================================================================
 // === CONSTANTS ===
 // ============================================================================
 
@@ -160,9 +170,11 @@ struct HdrStreamInfo {
 // === STREAM-START TRACE ===
 // ============================================================================
 
-/// One-shot "time to first ..." trace for a stream start. SetPlayMode() arms every component with one
-/// common epoch; each reports its first post-start milestones exactly once as "+N ms" after it, so a
-/// single journal excerpt shows where channel-switch latency went (see AVSYNC.md "Stream-start trace").
+/// One-shot "time to first ..." trace for a stream start. While tracing is on, SetPlayMode() arms every
+/// component with one common epoch; each reports its first post-start milestones exactly once as
+/// "+N ms" after it, so a single journal excerpt shows where channel-switch latency went (see AVSYNC.md
+/// "Stream-start trace"). The milestones are emitted with tsyslog(), so turning tracing off mid-stream
+/// drops the ones still pending.
 /// Lock-free so it may sit on hot paths: once drained, Fire() is a single acquire load.
 struct StreamStartTrace {
     std::atomic<uint64_t> epochMs{0}; ///< cTimeMs::Now() at the switch; read only when a milestone fires

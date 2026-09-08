@@ -102,6 +102,10 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto IsPassthrough() const noexcept
         -> bool;                                    ///< True when the device is currently in IEC61937 passthrough mode
     [[nodiscard]] auto IsQueueFull() const -> bool; ///< True when the packet queue has reached AUDIO_QUEUE_CAPACITY
+    [[nodiscard]] auto GetBufferedMs() const noexcept
+        -> int; ///< Unplayed audio already handed to ALSA, in ms (end-of-queued PTS minus the DAC clock).
+                ///< Lock-free and diagnostic-only: 0 whenever the tail or the clock is undefined (pre-roll,
+                ///< DropOutput, freeze), and a concurrent re-anchor can make it momentarily stale.
     [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Exact packet-queue depth (takes queueMutex)
     [[nodiscard]] auto GetQueueSizeRelaxed() const noexcept -> size_t {
         return approxQueueSize.load(std::memory_order_relaxed);

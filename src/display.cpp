@@ -914,7 +914,7 @@ auto cVaapiDisplay::Action() -> void {
                             // The new stream's first picture is on its way to the panel (flip lands next VSync).
                             if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_COMMIT); traceMs >= 0)
                                 [[unlikely]] {
-                                dsyslog("vaapivideo/display: trace +%lldms first frame committed to CRTC (%ux%u)",
+                                tsyslog("vaapivideo/display: trace +%lldms first frame committed to CRTC (%ux%u)",
                                         static_cast<long long>(traceMs), pendingBuffer.width, pendingBuffer.height);
                             }
                             // Recovery log: onset fires at THRESHOLD regardless of how long the

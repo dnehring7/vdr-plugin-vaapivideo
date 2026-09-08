@@ -353,6 +353,22 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     return packetQueue.size();
 }
 
+[[nodiscard]] auto cAudioProcessor::GetBufferedMs() const noexcept -> int {
+    // The tail estimate GetPendingWorkSize() makes, as a duration instead of a packet count: pcmNextPts
+    // is one past the last sample handed to ALSA (both PCM and passthrough advance it in
+    // WritePcmToAlsa), GetClock() is where the DAC actually is. After DropOutput() the ring is empty
+    // while both values survive, so that flag has to veto the difference -- same reason as below.
+    if (outputDropped.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    const int64_t endPts = pcmNextPts.load(std::memory_order_acquire);
+    const int64_t clock = GetClock();
+    if (endPts == AV_NOPTS_VALUE || clock == AV_NOPTS_VALUE || clock >= endPts) [[unlikely]] {
+        return 0;
+    }
+    return static_cast<int>((endPts - clock) / PTS_TICKS_PER_MS);
+}
+
 [[nodiscard]] auto cAudioProcessor::GetPendingWorkSize() const -> size_t {
     size_t depth = 0;
     {
@@ -2160,14 +2176,14 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     // PREPARED -> RUNNING inside it -- nothing is audible before). Pending() keeps this off steady state.
     if (startTrace.Pending(TRACE_FIRST_WRITE | TRACE_DAC_RUNNING)) [[unlikely]] {
         if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_WRITE); traceMs >= 0) {
-            dsyslog("vaapivideo/audio: trace +%lldms first ALSA write -- clock anchored at pts=%lld (%u frames queued, "
+            tsyslog("vaapivideo/audio: trace +%lldms first ALSA write -- clock anchored at pts=%lld (%u frames queued, "
                     "delay=%ld)",
                     static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts), frames,
                     static_cast<long>(delayFrames));
         }
         if (alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING) {
             if (const int64_t traceMs = startTrace.Fire(TRACE_DAC_RUNNING); traceMs >= 0) {
-                dsyslog("vaapivideo/audio: trace +%lldms DAC running -- audible from pts=%lld (ring=%ldms)",
+                tsyslog("vaapivideo/audio: trace +%lldms DAC running -- audible from pts=%lld (ring=%ldms)",
                         static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts),
                         static_cast<long>(rate > 0 ? static_cast<uint64_t>(delayFrames) * 1000 / rate : 0));
             }

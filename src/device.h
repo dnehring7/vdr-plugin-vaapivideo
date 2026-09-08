@@ -419,8 +419,8 @@ class cVaapiDevice : public cDevice {
     auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs)
         -> void; ///< Start the stability window for @p request. Caller holds displayModeMutex.
     auto ArmStartTrace(uint64_t epochMs, bool withDisplay)
-        -> void; ///< Arm the stream-start trace (SetPlayMode). withDisplay=false for audio-only modes,
-                 ///< which never produce a video frame for the display milestone to describe.
+        -> void; ///< Arm the stream-start trace (SetPlayMode); a no-op unless TraceEnabled(). withDisplay=false for
+                 ///< audio-only modes, which never produce a video frame for the display milestone to describe.
     auto DisarmStartTrace() noexcept -> void; ///< Drop pending milestones (pmNone / suspend).
     auto ClearModeCandidateLocked()
         -> void; ///< Disarm the stability window. Caller holds displayModeMutex. Both helpers exist so

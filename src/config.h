@@ -457,6 +457,9 @@ struct VaapiConfig {
     /// Decoded-PCM channel policy; re-read per decoded frame (decode-driven)
     std::atomic<PcmChannelMode> pcmChannelMode{PcmChannelMode::Auto};
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
+    /// Diagnostic tracing (-t / --trace, SVDRP TRACE on|off); never persisted to setup.conf.
+    /// Read from the present/decode hot paths via TraceEnabled() -- relaxed, no ordering dependency.
+    std::atomic<bool> trace{false};
     /// Runtime cycle stop (0=Off, 1..ZOOM_PRESET_COUNT=level); transient, never persisted
     std::atomic<int> zoomActive{0};
     /// Zoom-in factor per preset, in tenths-of-% (344 = +34.4%, the picture enlarged 1.344x); the equal per-side
@@ -484,5 +487,8 @@ inline constexpr int CONFIG_AUDIO_LATENCY_MAX_MS = 200;  ///< Upper bound for PC
 // ============================================================================
 
 extern VaapiConfig vaapiConfig; ///< Singleton plugin configuration; see VaapiConfig for thread-safety contract
+
+/// True while diagnostic tracing is on; the gate behind every tsyslog() (see common.h).
+[[nodiscard]] inline auto TraceEnabled() noexcept -> bool { return vaapiConfig.trace.load(std::memory_order_relaxed); }
 
 #endif // VDR_VAAPIVIDEO_CONFIG_H

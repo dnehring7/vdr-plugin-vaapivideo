@@ -19,9 +19,10 @@ Contents:
 9. [Display prerender](#display-prerender) — the per-VSync cushion and underrun detection
 10. [Lifecycle](#lifecycle) — what each event resets
 11. [Stream start](#stream-start) — channel-switch latency budget, first keyframe, first audio
-12. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
-13. [Stream-start trace](#stream-start-trace) — the `trace +Nms` timeline of a switch
-14. [Constants](#constants) — every tunable, with purpose and unit
+12. [Tracing](#tracing) — the `-t` / `TRACE` gate in front of the diagnostics below
+13. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
+14. [Stream-start trace](#stream-start-trace) — the `trace +Nms` timeline of a switch
+15. [Constants](#constants) — every tunable, with purpose and unit
 
 ## Problem
 
@@ -642,7 +643,7 @@ grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_
 | Event                            | EMA               | Cooldown  | Jitter buffer |
 | -------------------------------- | ----------------- | --------- | ------------- |
 | Plugin start                     | invalid           | —         | empty |
-| Channel switch (`Clear()`)       | reset             | unchanged | flushed; freerun armed; stream-start trace armed by `SetPlayMode()` |
+| Channel switch (`Clear()`)       | reset             | unchanged | flushed; freerun armed; stream-start trace armed by `SetPlayMode()` when tracing is on |
 | Catch-up enter                   | (drops silent)    | unchanged | drained silently to alignment |
 | Catch-up exit                    | reset             | unchanged | one frame submitted normally |
 | Soft drop                        | reset             | armed     | N frames dropped (one now, N−1 via `pendingDrops`, one per drain iteration) |
@@ -783,16 +784,39 @@ the alternatives (muting instead of freezing, or crawling the video) are worse.
 Motion-compensated VAAPI deinterlacing adds a few more fields of reference
 history before its first output on 1080i channels.
 
+## Tracing
+
+The A/V-sync narration and the stream-start milestones are opt-in. They go
+through `tsyslog()` (`src/common.h`), one gate on top of VDR's `dsyslog`, so
+**both** switches have to be on:
+
+- the plugin's `-t` / `--trace` startup option, or `svdrpsend PLUG vaapivideo
+  TRACE on` at runtime (`TRACE off` turns it back off, `TRACE` with no argument
+  reports the current state), **and**
+- VDR's `-l 3` log level.
+
+Gated: the periodic `sync d=…` line, every per-event correction line named
+below, and the whole [stream-start trace](#stream-start-trace). Not gated:
+`catch-up cycling sustained` / `settled`, the `jitterBuf` / handoff overflow
+lines, and every warning and error — a real fault still reports itself at the
+ordinary log levels, with no extra switch.
+
+The gate exists because the correction lines are per-frame: through a sustained
+mismatch the drop/skip paths would write ~50 lines a second from the
+presentation thread, and that syslog I/O is itself a pacing hazard on the thread
+that has to hit VSync. With tracing off the arguments are never evaluated.
+
 ## Diagnostic log
 
 ```
-sync d=+15.2ms avg=+15.1ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
+sync d=+15.2ms avg=+15.1ms av=+812ms lat=20ms buf=40 aq=0 miss=0 drop=0 skip=0
 ```
 
 | Field  | Meaning |
 | ------ | ------- |
 | `d`    | Interval mean of `rawDelta` since the last log; comparable to `avg` |
 | `avg`  | EMA-smoothed delta; drives every soft-correction decision |
+| `av`   | The multiplex's A/V interleave, sampled at audio ingress — see [Stream-start trace](#stream-start-trace). A feed property, so it holds still while the other fields move; it changes only when the stream does |
 | `lat`  | Active `SyncLatency90k` (1-frame tail + active operator knob) |
 | `buf`  | `jitterBuf` depth in frames at log emission |
 | `aq`   | Audio packet queue depth |
@@ -820,7 +844,9 @@ reserve cap). `aq` is 0 on the live/PES path and pegged at the mediaplayer
 highwater (32) during file replay — see
 [Audio packet queue](#audio-packet-queue-aq).
 
-Each soft / hard event also emits a per-event `dsyslog` line naming the cause
+Both this line and the per-event lines below require [tracing](#tracing).
+
+Each soft / hard event also emits a per-event `tsyslog` line naming the cause
 (`soft-ahead`, `soft-behind`, `hard-ahead live`, `hard-ahead replay`,
 `hard-behind`, `stale-jitter bulk`, `catch-up entered (spike|warmup|sustained)`,
 `catch-up complete`, `head too far in future … dropping`) for "why did this fire?"
@@ -853,8 +879,9 @@ relative to video, per `config.h`).
 
 ## Stream-start trace
 
-Every stream start (`SetPlayMode(pmAudioVideo / pmVideoOnly / pmAudioOnly*)`:
-channel switch, replay start, mediaplayer open) arms a one-shot trace in the
+With [tracing](#tracing) on, every stream start
+(`SetPlayMode(pmAudioVideo / pmVideoOnly / pmAudioOnly*)`: channel switch,
+replay start, mediaplayer open) arms a one-shot trace in the
 device, decoder, audio processor and display (`StreamStartTrace` in
 `src/common.h`, lock-free; `pmNone` disarms it). Each component reports its
 first milestones once, as `+N ms` after the common switch epoch, so one journal
@@ -871,7 +898,7 @@ device:  trace +2353ms video codec h264 opened (profile=100, 8-bit), first fed p
 decoder: trace +2357ms first decoded frame pts=… (1280x720 type=I key, after 1 packet(s), filter to build)
 decoder: trace +2399ms first frame presented (freerun) pts=… clock=… -- video +748ms vs audio: still-frame hold …
 display: trace +2411ms first frame committed to CRTC (1920x1080)
-decoder: trace +3170ms A/V locked -- first clock-paced frame pts=… raw=+17ms buf=31
+decoder: trace +3170ms A/V locked pts=… av=+812ms lat=20ms raw=+17ms buf=31 vbuf=620ms abuf=143ms
 ```
 
 Reading it: `first video PES` is when the tuner / stream delivers; the gap to
@@ -883,6 +910,37 @@ still-frame hold, and `A/V locked` is when motion starts in sync (see
 [Stream start](#stream-start)). `after N packet(s)` on the first decoded frame
 exposes the decoder's reorder delay; `filter to build` means the VPP graph was
 built for this frame (the `filter initialized` line follows).
+
+`A/V locked` marks the first frame the audio-clock gate released — everything
+before it was freerun:
+
+| Field | Meaning |
+| ----- | ------- |
+| `av`  | The **multiplex's** A/V interleave: when an audio AU arrives, how far ahead the video feed already is (+ = video ahead). Sampled at audio ingress against the video feed's position at that same instant, so no queue depth, jitter buffer, ALSA tail or latency knob enters it. Several hundred ms is normal on DVB — it is the encoder's video buffer delay, not a fault, and nothing the plugin can shrink |
+| `lat` | Compensation in force: the operator knob (`PcmLatency` / `PassthroughLatency`, whichever path is active) + the one-frame pipeline tail |
+| `raw` | Residual the sync gate acts on — `videoPTS − audioClock − lat`, the same `raw` the correction lines and the periodic [sync line](#diagnostic-log) report |
+
+`av` describes the *stream*, `lat` and `raw` the *pipeline*. The buffers are the
+answer to `av`, never part of it: `av` is what the jitter buffer has to absorb,
+which is why `vbuf` grows to roughly that size while the pipeline waits for audio
+to catch up. `raw` near zero with a large `av` is the healthy case — the
+interleave was absorbed. A large `lat` holding a small `raw` means the operator
+knob is carrying the stream.
+
+The sample is taken in `cVaapiDecoder::NoteAudioPts()`, called by the device from
+both audio feed paths (`PlayAudio()` for PES, `SubmitAudioPacket()` for the
+mediaplayer) against the video feed position recorded in `EnqueueData()` /
+`EnqueuePacket()`. Every one of those points is upstream of the codecs, so the
+figure is two ingress positions and nothing else. `Clear()` resets it, so a
+pre-switch interleave can never be reported for the new stream.
+
+`A/V locked` also reports the cushion on both sides at that moment: `vbuf` is the jitter
+buffer (`buf` frames × the output frame duration) and `abuf` the unplayed ALSA
+tail (end-of-queued PTS minus the DAC clock, so it covers PCM and passthrough
+alike). Both are the margin the pipeline has before the next hiccup shows on
+screen — a lock that arrives with `vbuf` near one frame or `abuf` near zero is a
+lock that is about to underrun. `abuf` reads 0 while the clock has not anchored
+yet or after a `Freeze()` / trick-mode drop emptied the ring.
 
 ## Constants
 

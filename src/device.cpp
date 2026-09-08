@@ -580,6 +580,9 @@ auto cVaapiDevice::ShowEncryptedScreen() -> void {
 }
 
 auto cVaapiDevice::ArmStartTrace(uint64_t epochMs, bool withDisplay) -> void {
+    if (!TraceEnabled()) {
+        return;
+    }
     // One epoch for every component so the "+N ms" figures line up. Re-arming an undrained trace (a zap
     // mid-startup) is deliberate: leftover milestones would report against a dead epoch otherwise.
     traceVideoPesCount.store(0, std::memory_order_relaxed);
@@ -1562,12 +1565,18 @@ auto cVaapiDevice::Play() -> void {
     }
 
     if (const int64_t traceMs = startTrace.Fire(TRACE_AUDIO_PES); traceMs >= 0) [[unlikely]] {
-        dsyslog("vaapivideo/device: trace +%lldms first audio PES (pts=%lld, %zu bytes)",
+        tsyslog("vaapivideo/device: trace +%lldms first audio PES (pts=%lld, %zu bytes)",
                 static_cast<long long>(traceMs), static_cast<long long>(pes.pts), pes.payloadSize);
     }
 
     // From here on a track-change hook is an in-session switch (see audioPesSeen).
     audioPesSeen.store(true, std::memory_order_relaxed);
+
+    // Stream A/V interleave, sampled where the audio AU actually arrives: the decoder pairs it with
+    // the video feed's position at this same instant (reported by the A/V-locked trace).
+    if (decoder) [[likely]] {
+        decoder->NoteAudioPts(pes.pts);
+    }
 
     // audioCodecId == NONE triggers detection; reset by SetPlayMode(pmNone),
     // HandleAudioTrackChange(), or Clear() (replay audi-N path).
@@ -1721,7 +1730,7 @@ auto cVaapiDevice::Play() -> void {
         if (const int64_t traceMs = startTrace.Fire(TRACE_AUDIO_CODEC); traceMs >= 0) [[unlikely]] {
             // A held 1-of-2 payload is fed below ahead of this PES, so its pts anchors the master clock.
             const int64_t firstPts = audioHeldPayload.empty() ? pes.pts : audioHeldPts;
-            dsyslog("vaapivideo/device: trace +%lldms audio codec %s opened (%s, %s), first decodable pts=%lld",
+            tsyslog("vaapivideo/device: trace +%lldms audio codec %s opened (%s, %s), first decodable pts=%lld",
                     static_cast<long long>(traceMs), avcodec_get_name(detectedCodec),
                     audioProcessor->IsPassthrough() ? "passthrough" : "PCM",
                     chainedFastConfirm ? "chained 1-PES confirm" : "2-of-2 confirm", static_cast<long long>(firstPts));
@@ -1808,7 +1817,7 @@ auto cVaapiDevice::Play() -> void {
     if (startTrace.Pending(TRACE_VIDEO_KEY)) [[unlikely]] {
         traceVideoPesCount.fetch_add(1, std::memory_order_relaxed);
         if (const int64_t traceMs = startTrace.Fire(TRACE_VIDEO_PES); traceMs >= 0) {
-            dsyslog("vaapivideo/device: trace +%lldms first video PES (pts=%lld, %zu bytes)",
+            tsyslog("vaapivideo/device: trace +%lldms first video PES (pts=%lld, %zu bytes)",
                     static_cast<long long>(traceMs), static_cast<long long>(pes.pts), pes.payloadSize);
         }
     }
@@ -1831,7 +1840,7 @@ auto cVaapiDevice::Play() -> void {
         // The detector only fires on a parameter-set-bearing keyframe PES (see DetectVideoCodec), so this
         // is the first decodable picture of the new stream; the PES ordinal is the GOP position we landed on.
         if (const int64_t traceMs = startTrace.Fire(TRACE_VIDEO_KEY); traceMs >= 0) [[unlikely]] {
-            dsyslog("vaapivideo/device: trace +%lldms first keyframe PES (%s, pts=%lld, video PES #%u)",
+            tsyslog("vaapivideo/device: trace +%lldms first keyframe PES (%s, pts=%lld, video PES #%u)",
                     static_cast<long long>(traceMs), avcodec_get_name(detectedCodec), static_cast<long long>(pes.pts),
                     traceVideoPesCount.load(std::memory_order_relaxed));
         }
@@ -1874,7 +1883,7 @@ auto cVaapiDevice::Play() -> void {
             // FF_PROFILE_UNKNOWN (-99) -- print that as "?" rather than a number that reads like a value.
             const std::string profileText =
                 streamInfo.profile < 0 ? std::string{"?"} : std::format("{}", streamInfo.profile);
-            dsyslog("vaapivideo/device: trace +%lldms video codec %s opened (profile=%s, %d-bit%s), first fed pts=%lld",
+            tsyslog("vaapivideo/device: trace +%lldms video codec %s opened (profile=%s, %d-bit%s), first fed pts=%lld",
                     static_cast<long long>(traceMs), avcodec_get_name(detectedCodec), profileText.c_str(),
                     streamInfo.bitDepth == BitDepth::k10 ? 10 : 8, streamInfo.streamInterlaced ? ", interlaced" : "",
                     static_cast<long long>(pes.pts));
@@ -3018,6 +3027,9 @@ namespace {
     // real-time gate.)
     if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER) {
         return false;
+    }
+    if (decoder) [[likely]] {
+        decoder->NoteAudioPts(packet->pts); // interleave sample; same as the PES path in PlayAudio()
     }
     return audioProcessor->EnqueuePacket(packet);
 }

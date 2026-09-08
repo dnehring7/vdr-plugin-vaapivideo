@@ -351,6 +351,8 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
     // recheck and aborts/undoes. Reversed order would let a stale publish overwrite NOPTS.
     clearEpoch.fetch_add(1, std::memory_order_release);
     lastPts.store(AV_NOPTS_VALUE, std::memory_order_release);
+    lastEnqueuedPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed); // new stream: no interleave measured yet
+    streamAvSkew.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     codecDrainPending.store(false, std::memory_order_relaxed);
     stillPictureMode.store(false, std::memory_order_relaxed);
 
@@ -383,9 +385,25 @@ auto cVaapiDecoder::DrainQueue() -> void {
     packetCondition.Broadcast();
 }
 
+auto cVaapiDecoder::NoteAudioPts(int64_t audioPts) noexcept -> void {
+    // Both operands are ingress positions in the same multiplex, read at the instant the audio AU
+    // arrives -- so no queue depth, jitter buffer, ALSA tail or latency knob can enter the figure.
+    // What is left is the broadcaster's own interleave, which no amount of buffering changes; the
+    // buffers only absorb it.
+    const int64_t videoPts = lastEnqueuedPts.load(std::memory_order_relaxed);
+    if (audioPts == AV_NOPTS_VALUE || videoPts == AV_NOPTS_VALUE) [[unlikely]] {
+        return;
+    }
+    streamAvSkew.store(videoPts - audioPts, std::memory_order_relaxed);
+}
+
 auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -> void {
     if (!data || size == 0 || stopping.load(std::memory_order_relaxed)) {
         return;
+    }
+    if (pts != AV_NOPTS_VALUE) {
+        // Before the codec/parser gates below: this is what the stream delivered, not what decoded.
+        lastEnqueuedPts.store(pts, std::memory_order_relaxed);
     }
 
     // parserMutex only: av_parser_parse2 reads codecCtx's codec_id (set once at open) and writes
@@ -475,6 +493,9 @@ auto cVaapiDecoder::EnqueuePacket(const AVPacket *packet) -> void {
     // Clone the caller's packet and push through the same trick/queue-depth policy as EnqueueData.
     if (!packet || stopping.load(std::memory_order_relaxed)) {
         return;
+    }
+    if (packet->pts != AV_NOPTS_VALUE) {
+        lastEnqueuedPts.store(packet->pts, std::memory_order_relaxed); // feed position; see EnqueueData
     }
 
     // parserMutex (NOT codecMutex) for the codecCtx-existence guard, mirroring EnqueueData. The decode
@@ -1841,7 +1862,7 @@ auto cVaapiDecoder::PresentAction() -> void {
                                 // both flood the journal and block this (present) hot thread on it.
                                 ++futureDropSinceLog;
                                 if (futureDropLogGate.Elapsed() >= 500) {
-                                    dsyslog("vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- "
+                                    tsyslog("vaapivideo/decoder: head too far in future (dueIn=%+lldms buf=%zu) -- "
                                             "dropping (%zu since last)",
                                             static_cast<long long>(dueIn / PTS_TICKS_PER_MS), jitterBuf.size(),
                                             futureDropSinceLog);
@@ -2216,7 +2237,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             // The packet count exposes the reorder delay (an IDR leaves the DPB only after has_b_frames
             // later pictures); the filter build is the other decode-side cost before presentation.
             if (const int64_t traceMs = startTrace.Fire(TRACE_DECODED); traceMs >= 0) [[unlikely]] {
-                dsyslog("vaapivideo/decoder: trace +%lldms first decoded frame pts=%lld (%dx%d type=%c%s, after %zu "
+                tsyslog("vaapivideo/decoder: trace +%lldms first decoded frame pts=%lld (%dx%d type=%c%s, after %zu "
                         "packet(s), filter %s)",
                         static_cast<long long>(traceMs), static_cast<long long>(decodedFrame->pts), decodedFrame->width,
                         decodedFrame->height, av_get_picture_type_char(decodedFrame->pict_type),
@@ -2650,7 +2671,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 }
 
 auto cVaapiDecoder::WaitForAudioCatchUp(cAudioProcessor *ap, int64_t pts, int64_t latency, int64_t delta) -> void {
-    dsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio",
+    tsyslog("vaapivideo/decoder: sync ahead d=%+lldms -- waiting for audio",
             static_cast<long long>(delta / PTS_TICKS_PER_MS));
 
     // Cap = delta + 1 s headroom, max 5 s: prevents a dead audio path from blocking indefinitely.
@@ -2901,12 +2922,12 @@ auto cVaapiDecoder::TracePresent(int64_t pts, const cAudioProcessor *ap, const c
     if (const int64_t traceMs = startTrace.Fire(TRACE_PRESENTED); traceMs >= 0) [[unlikely]] {
         const int64_t clock = ap ? ap->GetClock() : AV_NOPTS_VALUE;
         if (clock == AV_NOPTS_VALUE || pts == AV_NOPTS_VALUE) {
-            dsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld -- audio clock not anchored "
+            tsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld -- audio clock not anchored "
                     "yet, buf=%zu",
                     static_cast<long long>(traceMs), path, static_cast<long long>(pts), jitterBuf.size());
         } else {
             const int64_t dueIn90k = pts - clock - SyncLatency90k(ap);
-            dsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld clock=%lld -- video "
+            tsyslog("vaapivideo/decoder: trace +%lldms first frame presented (%s) pts=%lld clock=%lld -- video "
                     "%+lldms vs audio: %s, buf=%zu",
                     static_cast<long long>(traceMs), path, static_cast<long long>(pts), static_cast<long long>(clock),
                     static_cast<long long>(dueIn90k / PTS_TICKS_PER_MS),
@@ -2917,10 +2938,19 @@ auto cVaapiDecoder::TracePresent(int64_t pts, const cAudioProcessor *ap, const c
     }
     if (paced) {
         if (const int64_t traceMs = startTrace.Fire(TRACE_PACED); traceMs >= 0) [[unlikely]] {
-            dsyslog(
-                "vaapivideo/decoder: trace +%lldms A/V locked -- first clock-paced frame pts=%lld raw=%+lldms buf=%zu",
-                static_cast<long long>(traceMs), static_cast<long long>(pts),
-                static_cast<long long>(rawDelta90k / PTS_TICKS_PER_MS), jitterBuf.size());
+            // av is the multiplex's own interleave (NoteAudioPts), untouched by any buffering: it says
+            // how far apart the two elementary streams arrive. lat and raw describe the pipeline's
+            // answer to it, vbuf/abuf the cushions holding it -- those absorb av, they do not define it.
+            const int64_t skew90k = streamAvSkew.load(std::memory_order_relaxed);
+            const int64_t streamAv90k = (skew90k == AV_NOPTS_VALUE) ? 0 : skew90k;
+            const int frameDurMs = std::max(1, outputFrameDurationMs.load(std::memory_order_relaxed));
+            tsyslog("vaapivideo/decoder: trace +%lldms A/V locked pts=%lld av=%+lldms lat=%lldms raw=%+lldms buf=%zu "
+                    "vbuf=%dms abuf=%dms",
+                    static_cast<long long>(traceMs), static_cast<long long>(pts),
+                    static_cast<long long>(streamAv90k / PTS_TICKS_PER_MS),
+                    static_cast<long long>(SyncLatency90k(ap) / PTS_TICKS_PER_MS),
+                    static_cast<long long>(rawDelta90k / PTS_TICKS_PER_MS), jitterBuf.size(),
+                    static_cast<int>(jitterBuf.size()) * frameDurMs, ap ? ap->GetBufferedMs() : 0);
         }
     }
 }
@@ -3010,9 +3040,14 @@ auto cVaapiDecoder::LogSyncStats(int64_t rawDelta90k, int64_t latency90k, const 
     // aq via the lock-free GetQueueSizeRelaxed(): the mutexed GetQueueSize() would park this (present)
     // thread behind WritePcmToAlsa's EAGAIN spin (audio mutex held while the ALSA ring is full under a
     // bursty replay feed) -- a hot-path stall that surfaced as periodic soft/hard-behind drops.
-    dsyslog("vaapivideo/decoder: sync d=%+lld.%01lldms avg=%+lld.%01lldms lat=%lldms buf=%zu aq=%zu miss=%d "
-            "drop=%d skip=%d",
+    // av rides along so the stream's interleave can be watched against the buffers reacting to it:
+    // it holds still while buf/aq swing, which is the difference between a feed property and a
+    // pipeline one (see AVSYNC.md "Stream-start trace" for the full field list).
+    const int64_t skew90k = streamAvSkew.load(std::memory_order_relaxed);
+    tsyslog("vaapivideo/decoder: sync d=%+lld.%01lldms avg=%+lld.%01lldms av=%+lldms lat=%lldms buf=%zu aq=%zu "
+            "miss=%d drop=%d skip=%d",
             meanTenths / 10, std::abs(meanTenths % 10), avgTenths / 10, std::abs(avgTenths % 10),
+            static_cast<long long>((skew90k == AV_NOPTS_VALUE ? 0 : skew90k) / PTS_TICKS_PER_MS),
             static_cast<long long>(latency90k / PTS_TICKS_PER_MS), jitterBuf.size(), ap->GetQueueSizeRelaxed(),
             drainMissCount, syncDropSinceLog, syncSkipSinceLog);
     rawDeltaSumSinceLog90k = 0;
@@ -3067,7 +3102,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             staleJitterDropsSinceLog += dropped;
             if (staleJitterLogGate.Elapsed() >= 500) {
                 const uint64_t sinceCatchUpMs = (lastCatchUpExitMs != 0) ? (cTimeMs::Now() - lastCatchUpExitMs) : 0;
-                dsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu "
+                tsyslog("vaapivideo/decoder: sync drop (stale-jitter bulk) count=%d firstRaw=%+lldms buf=%zu "
                         "sinceCatchUp=%llums (%d since last)",
                         dropped, static_cast<long long>(firstDelta90k / PTS_TICKS_PER_MS), jitterBuf.size(),
                         static_cast<unsigned long long>(sinceCatchUpMs), staleJitterDropsSinceLog);
@@ -3143,7 +3178,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         // would otherwise repeat this line every evaluation interval for the whole playback.
         if (syncLogPending.exchange(false, std::memory_order_relaxed) ||
             (nextSyncLog.TimedOut() && syncLogHeartbeat.TimedOut())) {
-            dsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
+            tsyslog("vaapivideo/decoder: sync freerun (no clock) buf=%zu", jitterBuf.size());
             nextSyncLog.Set(DECODER_SYNC_LOG_INTERVAL_MS);
             syncLogHeartbeat.Set(DECODER_SYNC_LOG_HEARTBEAT_MS);
         }
@@ -3219,7 +3254,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             const uint64_t exitNowMs = cTimeMs::Now();
             const uint64_t cycleWallMs = exitNowMs - catchUpStartMs;
             if (catchUpLogThisCycle) {
-                dsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms "
+                tsyslog("vaapivideo/decoder: catch-up complete dropped=%d wall=%llums exit-raw=%+lldms "
                         "follow-up=%d (target=%+lldms%s)",
                         catchUpDrops, static_cast<unsigned long long>(cycleWallMs),
                         static_cast<long long>(rawDelta / PTS_TICKS_PER_MS), followUpDrops, targetMs,
@@ -3269,7 +3304,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpDrops = 1;
         ++syncDropSinceLog;
         if (BeginCatchUpLogCycle()) {
-            dsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms",
+            tsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms",
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
         }
         return true;
@@ -3280,7 +3315,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpDrops = 1;
         ++syncDropSinceLog;
         if (BeginCatchUpLogCycle()) {
-            dsyslog("vaapivideo/decoder: catch-up entered (warmup) raw=%+lldms",
+            tsyslog("vaapivideo/decoder: catch-up entered (warmup) raw=%+lldms",
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
         }
         return true;
@@ -3290,7 +3325,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         catchUpDrops = 1;
         ++syncDropSinceLog;
         if (BeginCatchUpLogCycle()) {
-            dsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
+            tsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
                     static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS),
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
         }
@@ -3313,7 +3348,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         const int totalDrops = std::max(1, (correctMs + (frameDurMs / 2)) / frameDurMs);
         pendingDrops = totalDrops - 1;
         ++syncDropSinceLog;
-        dsyslog("vaapivideo/decoder: sync drop (hard-behind) pts=%lld raw=%+lldms thr=%lldms drops=%d",
+        tsyslog("vaapivideo/decoder: sync drop (hard-behind) pts=%lld raw=%+lldms thr=%lldms drops=%d",
                 static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS),
                 static_cast<long long>(DECODER_SYNC_HARD_THRESHOLD_90K / PTS_TICKS_PER_MS), totalDrops);
         ResetSmoothedDelta();
@@ -3333,7 +3368,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
         if (!liveMode.load(std::memory_order_relaxed)) {
             WaitForAudioCatchUp(ap, pts, latency, rawDelta);
             ++syncSkipSinceLog;
-            dsyslog("vaapivideo/decoder: sync skip (hard-ahead replay, post audio-catchup) pts=%lld raw=%+lldms",
+            tsyslog("vaapivideo/decoder: sync skip (hard-ahead replay, post audio-catchup) pts=%lld raw=%+lldms",
                     static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
             pendingDrops = 0;
             syncCooldown.Set(DECODER_SYNC_COOLDOWN_MS);
@@ -3350,7 +3385,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             display->SetSyncSleeping(false);
         }
         ++syncSkipSinceLog;
-        dsyslog("vaapivideo/decoder: sync skip (hard-ahead live) pts=%lld raw=%+lldms slept=%dms",
+        tsyslog("vaapivideo/decoder: sync skip (hard-ahead live) pts=%lld raw=%+lldms slept=%dms",
                 static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS),
                 bigSleepMs + frameDurMs);
         pendingDrops = 0;
@@ -3375,7 +3410,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                 pendingDrops = totalDrops - 1;
                 const auto triggerAvgMs = static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS);
                 ++syncDropSinceLog;
-                dsyslog("vaapivideo/decoder: sync drop (soft-behind) pts=%lld raw=%+lldms avg=%+lldms corr=%dms "
+                tsyslog("vaapivideo/decoder: sync drop (soft-behind) pts=%lld raw=%+lldms avg=%+lldms corr=%dms "
                         "drops=%d",
                         static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS), triggerAvgMs,
                         correctMs, totalDrops);
@@ -3392,7 +3427,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
                 display->SetSyncSleeping(false);
             }
             ++syncSkipSinceLog;
-            dsyslog("vaapivideo/decoder: sync skip (soft-ahead) pts=%lld raw=%+lldms avg=%+lldms slept=%dms",
+            tsyslog("vaapivideo/decoder: sync skip (soft-ahead) pts=%lld raw=%+lldms avg=%+lldms slept=%dms",
                     static_cast<long long>(pts), static_cast<long long>(rawDelta / PTS_TICKS_PER_MS),
                     static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS), correctMs + frameDurMs);
         }
