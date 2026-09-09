@@ -604,6 +604,15 @@ signaling and cannot be detected.
 restarting VDR; when the plugin is the primary device, `ATTA` also re-tunes the
 channel so data flows through the fresh pipeline.
 
+There is one DRM master per card, and the plugin can only take it while nobody
+holds it. For logind-managed sessions (X, a Wayland compositor) the master
+follows the **active VT**, so `ATTA` switches to VDR's VT before opening the card
+and retries for up to 1.5 s while logind revokes the previous holder. Drive it in
+that order by hand too: `DETA` *before* switching away, `ATTA` only from a VT no
+other display server is on. A client that opened the card directly must release
+it itself — `ATTA` cannot take it away; see [Sharing the
+seat](#sharing-the-seat-with-an-x-server-or-compositor).
+
 
 ## Console and keyboard integration
 
@@ -613,7 +622,8 @@ auto-management** (startup and `ATTA` pull VDR's VT to the foreground; `DETA`
 yields to `tty1`, override with `VDR_CONSOLE_TTY=N`, so the user lands on a
 login shell — this needs `CAP_SYS_TTY_CONFIG`).
 
-A single systemd drop-in covers both; `tty7` keeps `tty1` free for a getty:
+A single systemd drop-in covers both. Pick a VT no getty, X server or
+compositor uses — `tty8` here, since `tty7` is the customary display-server VT:
 
         sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
         sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
@@ -622,7 +632,7 @@ A single systemd drop-in covers both; `tty7` keeps `tty1` free for a getty:
         Group=video
         AmbientCapabilities=CAP_SYS_TTY_CONFIG
         StandardInput=tty
-        TTYPath=/dev/tty7
+        TTYPath=/dev/tty8
         TTYReset=yes
         TTYVHangup=yes
         EOF
@@ -634,10 +644,27 @@ A single systemd drop-in covers both; `tty7` keeps `tty1` free for a getty:
 `CAP_SYS_TTY_CONFIG` before the plugin can use it.
 
 Verify with `journalctl -u vdr -b | grep -E 'kbd|console VT'` — expect
-`KBD remote control thread started` and `console VT7 activated`. Switch to VDR
-with `Ctrl+Alt+F7`, back to a login shell with `Ctrl+Alt+F1`. The plugin logs
+`KBD remote control thread started` and `console VT8 activated`. Switch to VDR
+with `Ctrl+Alt+F8`, back to a login shell with `Ctrl+Alt+F1`. The plugin logs
 `stdin is not a VT` (drop-in missing, KBD disabled) or `VT_ACTIVATE denied`
 (capability missing, VT switches manual) when the configuration is incomplete.
+
+### Sharing the seat with an X server or compositor
+
+vaapivideo drives KMS directly and **does not need an X server**. If one shares
+the seat anyway — a VDR distribution's frontend setup may start `Xorg :0 vt7`,
+for instance — both want the single DRM master, and `ATTA` (or a plugin start)
+fails with
+
+    vaapivideo/device: '/dev/dri/card1' opened, but another DRM client holds the display -- ...
+
+Stop that server, or give VDR a VT of its own via the drop-in above and `ATTA`
+from there: with VDR's VT in the foreground the other session is paused. That VT
+must not be the X server's — usually `tty7`, hence `tty8` above — or logind
+hands the display straight back. Without the drop-in VDR has no VT to
+switch to, so do it by hand (`Ctrl+Alt+F<n>`) before the `ATTA`.
+`sudo fuser -v /dev/dri/card*` lists every process with the card open; the master
+is one of them.
 
 
 ## Inter-plugin service API
@@ -662,6 +689,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Startup | DRM device not found                 | `ls -l /dev/dri/`; pass `-d /dev/dri/cardN` explicitly     |
 | Startup | No video output                      | Check group membership (`video`, `render`); run `vainfo`   |
 | Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
+| Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Console and keyboard integration](#sharing-the-seat-with-an-x-server-or-compositor)) |
 | Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlace = software: bwdif` (or `w3fdif`) |
 | Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoise = off`       |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |

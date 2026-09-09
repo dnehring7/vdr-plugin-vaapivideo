@@ -120,12 +120,17 @@ cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
 // ============================================================================
 
 auto cVaapiOsdProvider::AttachDisplay(cVaapiDisplay *display) noexcept -> void {
+    const cMutexLock lock(&state_->mutex); // same lock as DetachDisplay: a Flush must not straddle the swap
     auto *oldDisplay = display_.exchange(display, std::memory_order_acq_rel);
     dsyslog("vaapivideo/osd: attaching display %p (was %p)", static_cast<void *>(display),
             static_cast<void *>(oldDisplay));
 }
 
 auto cVaapiOsdProvider::DetachDisplay() noexcept -> void {
+    // Flush() and ~cVaapiOsd() drive the display under this mutex, so taking it here waits for an
+    // in-flight flush -- otherwise SuspendHardware() frees the display underneath one. Bounded:
+    // nothing held under that mutex waits on this thread.
+    const cMutexLock lock(&state_->mutex);
     auto *oldDisplay = display_.exchange(nullptr, std::memory_order_acq_rel);
     dsyslog("vaapivideo/osd: detaching display (was %p)", static_cast<void *>(oldDisplay));
 }

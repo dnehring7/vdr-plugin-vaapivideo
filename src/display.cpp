@@ -1123,7 +1123,16 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // size), so an EINVAL here is a genuinely invalid plane state -- surface it loud, no retry.
     // Rate-limited: the 5 ms re-present retry path would otherwise emit this at up to 200 Hz.
     if (atomicFailureLogCooldown.TimedOut()) {
-        esyslog("vaapivideo/display: atomic commit failed -- %s (flags=0x%x)", std::strerror(origErrno), commitFlags);
+        if (origErrno == EACCES) {
+            // EACCES on a DRM_MASTER ioctl means one thing: this fd is no longer the current master, i.e.
+            // another client took the display. No mode is at fault, whatever the caller reports.
+            esyslog("vaapivideo/display: atomic commit refused -- not DRM master, another client holds the display "
+                    "(flags=0x%x)",
+                    commitFlags);
+        } else {
+            esyslog("vaapivideo/display: atomic commit failed -- %s (flags=0x%x)", std::strerror(origErrno),
+                    commitFlags);
+        }
         atomicFailureLogCooldown.Set(DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS);
     }
     return false;

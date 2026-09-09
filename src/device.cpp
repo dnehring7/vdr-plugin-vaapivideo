@@ -199,16 +199,21 @@ constexpr uint32_t DISPLAY_MODE_MAX_RATE_MULTIPLE = 8; ///< Highest k considered
 
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
-// to VDR's KBD. DETA: yield to tty1 so the user lands on getty. Needs the
+// to VDR's KBD, and so logind revokes the DRM master of the session that owned
+// the previously active VT -- the card open that follows can only take master
+// while none exists. DETA: yield to tty1 so the user lands on getty. Needs the
 // systemd drop-in (TTYPath=/dev/ttyN + AmbientCapabilities=CAP_SYS_TTY_CONFIG);
 // failures log once at INFO and fall back to manual Ctrl+Alt+F<n>. See README.
 //
 // VT_ACTIVATE/VT_WAITACTIVE work on any VT fd, so STDIN_FILENO is used directly
 // (set up by TTYPath=) and /dev/tty0 is left alone -- no udev rule needed.
 
-constexpr int VT_SWITCH_TIMEOUT_MS = 1500; ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
-                                           ///< that refuse to release would otherwise block startup forever
-                                           ///< and look like a 60 s "plugin hang" until the watchdog fires.
+constexpr int VT_SWITCH_TIMEOUT_MS = 1500;          ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
+                                                    ///< that refuse to release would otherwise block startup forever
+                                                    ///< and look like a 60 s "plugin hang" until the watchdog fires.
+constexpr int DRM_MASTER_ACQUIRE_TIMEOUT_MS = 1500; ///< OpenDrmAsMaster() retry window: logind revokes the other
+                                                    ///< session's master asynchronously after the VT switch.
+constexpr int DRM_MASTER_ACQUIRE_POLL_MS = 50;      ///< Reopen cadence while another master is still there.
 
 std::atomic<bool> capWarned{false}, noVtHinted{false};
 
@@ -222,7 +227,15 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     return (vt >= 1 && vt <= 63) ? vt : 0;
 }
 
+[[nodiscard]] auto ActiveVt() -> int {
+    vt_stat state{};
+    return ioctl(STDIN_FILENO, VT_GETSTATE, &state) == 0 ? static_cast<int>(state.v_active) : -1;
+}
+
 [[nodiscard]] auto SwitchToVt(int vt) -> bool {
+    if (ActiveVt() == vt) {
+        return true; // already foreground: skip an ioctl needing CAP_SYS_TTY_CONFIG we may not have
+    }
     if (ioctl(STDIN_FILENO, VT_ACTIVATE, vt) != 0) {
         const int err = errno;
         if (bool expected = false; capWarned.compare_exchange_strong(expected, true)) {
@@ -238,8 +251,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     // VT_PROCESS mode if the owning process never releases. Bounded wait keeps startup non-fatal.
     const cTimeMs timeout(VT_SWITCH_TIMEOUT_MS);
     while (!timeout.TimedOut()) {
-        vt_stat state{};
-        if (ioctl(STDIN_FILENO, VT_GETSTATE, &state) == 0 && static_cast<int>(state.v_active) == vt) {
+        if (ActiveVt() == vt) {
             return true;
         }
         cCondWait::SleepMs(10);
@@ -271,6 +283,9 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     if (ownVt == 0) {
         return true;
     }
+    if (ActiveVt() != ownVt) {
+        return true; // user already switched away (DETA over SVDRP): don't yank them off that console
+    }
     int targetVt = (ownVt == 1) ? 2 : 1;
     if (const char *env = std::getenv("VDR_CONSOLE_TTY"); env != nullptr) {
         char *endp = nullptr;
@@ -284,6 +299,40 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     }
     isyslog("vaapivideo/device: yielded VT%d -> VT%d for text console (DETA)", ownVt, targetVt);
     return true;
+}
+
+/// open() the card node until the kernel grants implicit DRM master. Master is decided at open time
+/// (granted iff none exists) and a missed fd cannot be promoted without CAP_SYS_ADMIN
+/// (drm_master_check_perm), so a miss must be closed and retried while the preceding VT switch lets
+/// logind revoke the other session's. Names the cause on timeout -- left to the first modeset, EACCES
+/// would surface as a bogus "rejected mode".
+[[nodiscard]] auto OpenDrmAsMaster(const std::string &path) -> int {
+    const cTimeMs deadline(DRM_MASTER_ACQUIRE_TIMEOUT_MS);
+    while (true) {
+        const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) [[unlikely]] {
+            esyslog("vaapivideo/device: failed to open '%s' -- %s", path.c_str(), std::strerror(errno));
+            return -1;
+        }
+        if (drmIsMaster(fd)) [[likely]] {
+            return fd;
+        }
+        close(fd);
+        if (deadline.TimedOut()) {
+            break;
+        }
+        cCondWait::SleepMs(DRM_MASTER_ACQUIRE_POLL_MS);
+    }
+    esyslog("vaapivideo/device: '%s' opened, but another DRM client holds the display -- an X server or "
+            "compositor whose VT is active -- vaapivideo needs none",
+            path.c_str());
+    esyslog("vaapivideo/device: find it with 'sudo fuser -v /dev/dri/card*'; ATTA from a VT it is not on, or "
+            "stop it -- see README 'Console and keyboard integration'");
+    if (OwnVt() == 0) {
+        esyslog("vaapivideo/device: VDR's stdin is not a VT, so it cannot switch consoles itself -- give it one "
+                "with TTYPath= in the systemd drop-in");
+    }
+    return -1;
 }
 
 } // namespace
@@ -3187,6 +3236,17 @@ auto cVaapiDevice::FlushForSeek() -> void {
         return false;
     }
 
+    // A failed attach leaves the auto-latched connector behind (SuspendHardware clears it only on DETA),
+    // so the retry would treat it like a pinned -c even after the display moved.
+    if (!connectorUserSupplied) {
+        connectorName.clear();
+    }
+
+    // Must precede OpenHardware(): logind releases the other session's master only once its VT loses
+    // focus, and master can only be taken at open time. Non-fatal -- without CAP_SYS_TTY_CONFIG the
+    // switch is the operator's job, and the open still succeeds whenever nobody else holds the display.
+    (void)ActivateOwnVt();
+
     if (!OpenHardware()) [[unlikely]] {
         esyslog("vaapivideo/device: hardware initialization failed");
         initState.store(0, std::memory_order_release);
@@ -3266,9 +3326,6 @@ auto cVaapiDevice::FlushForSeek() -> void {
     dsyslog("vaapivideo/device: showing startup splash");
     const bool splashShown = SubmitBlackFrame(tr("VDR with vaapivideo is getting ready..."));
     dsyslog("vaapivideo/device: startup splash %s", splashShown ? "submitted" : "FAILED");
-
-    // Foreground VDR's VT so KBD receives keys after startup / SVDRP ATTA. Non-fatal.
-    (void)ActivateOwnVt();
 
     return true;
 }
@@ -3389,12 +3446,11 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
         return false;
     }
 
-    drmFd = open(drmPath.c_str(), O_RDWR | O_CLOEXEC);
+    drmFd = OpenDrmAsMaster(drmPath);
     if (drmFd < 0) [[unlikely]] {
-        esyslog("vaapivideo/device: failed to open '%s' -- %s", drmPath.c_str(), std::strerror(errno));
         return false;
     }
-    dsyslog("vaapivideo/device: opened DRM fd=%d", drmFd);
+    dsyslog("vaapivideo/device: opened DRM fd=%d (master)", drmFd);
 
     if (!SelectDrmConnector()) [[unlikely]] {
         esyslog("vaapivideo/device: no connected display found on %s", drmPath.c_str());
