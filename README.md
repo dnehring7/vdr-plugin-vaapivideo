@@ -417,7 +417,7 @@ itself out within about a second.
 
 > **Caution:** a **resolution** change resizes the OSD mid-session, a path some
 > skins have never had to handle. Enabling only `Match refresh rate` avoids the
-> OSD resize entirely. Also note an AVR locked onto an IEC61937 bitstream may
+> OSD resize entirely. Also note that an AVR locked onto an IEC61937 bitstream may
 > briefly drop out of passthrough when the link re-trains.
 
 Use `svdrpsend PLUG vaapivideo MODE` to see the connector's usable modes with
@@ -554,7 +554,7 @@ atomic — a stream change never leaves stale HDR signaling on the wire.
   combinations that would produce a black screen are still refused.
 - **off** — always use the SDR path.
 
-Tone-mapping is deliberately **not** implemented: HDR content forced through
+Tone mapping is deliberately **not** implemented: HDR content forced through
 the SDR path shows clipped highlights and washed-out color, which is why
 `auto` is the default. VP9 HDR needs container color tags (Matroska/WebM),
 which the mediaplayer forwards to the decoder; an untagged HDR file cannot be
@@ -622,22 +622,22 @@ auto-management** (startup and `ATTA` pull VDR's VT to the foreground; `DETA`
 yields to `tty1`, override with `VDR_CONSOLE_TTY=N`, so the user lands on a
 login shell — this needs `CAP_SYS_TTY_CONFIG`).
 
-A single systemd drop-in covers both. Pick a VT no getty, X server or
+A single systemd drop-in covers both. Pick a VT no getty, X server, or
 compositor uses — `tty8` here, since `tty7` is the customary display-server VT:
 
-        sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
-        sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
-        [Service]
-        User=vdr
-        Group=video
-        AmbientCapabilities=CAP_SYS_TTY_CONFIG
-        StandardInput=tty
-        TTYPath=/dev/tty8
-        TTYReset=yes
-        TTYVHangup=yes
-        EOF
-        sudo systemctl daemon-reload
-        sudo systemctl restart vdr.service
+    sudo install -d -m 0755 /etc/systemd/system/vdr.service.d
+    sudo tee /etc/systemd/system/vdr.service.d/50-vaapivideo-console.conf > /dev/null <<'EOF'
+    [Service]
+    User=vdr
+    Group=video
+    AmbientCapabilities=CAP_SYS_TTY_CONFIG
+    StandardInput=tty
+    TTYPath=/dev/tty8
+    TTYReset=yes
+    TTYVHangup=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart vdr.service
 
 `User=vdr` must be set here: the kernel clears ambient capabilities on any
 `setuid()` from root, so a `runvdr -u vdr` wrapper would strip
@@ -689,7 +689,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Startup | DRM device not found                 | `ls -l /dev/dri/`; pass `-d /dev/dri/cardN` explicitly     |
 | Startup | No video output                      | Check group membership (`video`, `render`); run `vainfo`   |
 | Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
-| Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Console and keyboard integration](#sharing-the-seat-with-an-x-server-or-compositor)) |
+| Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Sharing the seat](#sharing-the-seat-with-an-x-server-or-compositor)) |
 | Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlace = software: bwdif` (or `w3fdif`) |
 | Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoise = off`       |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
@@ -777,7 +777,7 @@ threading, buffering, correction regimes, diagnostics — is documented in
 | `src/device.cpp`      | VDR device integration, PES routing, hardware init/teardown, mediaplayer feed surface |
 | `src/decoder.cpp`     | Decoupled VAAPI decode + presentation threads, A/V sync controller                    |
 | `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
-| `src/display.cpp`     | DRM atomic mode-setting, PRIME import, page-flip thread                                |
+| `src/display.cpp`     | DRM atomic mode-setting, PRIME import, page-flip thread                               |
 | `src/audio.cpp`       | ALSA output (multichannel PCM / downmix, chmap), IEC61937 passthrough, HDMI ELD read  |
 | `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |
 | `src/mediaplayer.cpp` | libavformat demux, file browser, cControl with OSD replay bar                         |

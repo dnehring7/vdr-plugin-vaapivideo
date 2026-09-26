@@ -19,10 +19,11 @@ Contents:
 9. [Display prerender](#display-prerender) — the per-VSync cushion and underrun detection
 10. [Lifecycle](#lifecycle) — what each event resets
 11. [Stream start](#stream-start) — channel-switch latency budget, first keyframe, first audio
-12. [Tracing](#tracing) — the `-t` / `TRACE` gate in front of the diagnostics below
-13. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
-14. [Stream-start trace](#stream-start-trace) — the `trace +Nms` timeline of a switch
-15. [Constants](#constants) — every tunable, with purpose and unit
+12. [End of stream](#end-of-stream) — playing the tail out: VDR's `Drain()`, the mediaplayer's drain, what each buffer contributes
+13. [Tracing](#tracing) — the `-t` / `TRACE` gate in front of the diagnostics below
+14. [Diagnostic log](#diagnostic-log) — reading the `sync` line, tuning the baseline
+15. [Stream-start trace](#stream-start-trace) — the `trace +Nms` timeline of a switch
+16. [Constants](#constants) — every tunable, with purpose and unit
 
 ## Problem
 
@@ -73,11 +74,13 @@ Three invariants:
 1. **Audio is master.** `cAudioProcessor::GetClock()` returns the PTS at the DAC
    output: `playbackPts + (now − lastClockUpdateMs) × 90`. `playbackPts` is
    republished on every ALSA write as `endPts − snd_pcm_delay()` (i.e. per
-   decoded packet, well faster than the ~25 ms ALSA period); the wall-clock
+   decoded packet, much faster than the ~25 ms ALSA period); the wall-clock
    age-extrapolation fills the gaps between writes, so reads stay smooth to ~1 ms.
    A seqlock makes the read lock-free. `GetClock()` returns `AV_NOPTS_VALUE`
-   before the first write or once a write is older than
-   `AUDIO_CLOCK_STALE_MS = 1 s`, and the controller falls into freerun.
+   while the DAC is not running (below its start threshold `snd_pcm_delay()`
+   only counts queued frames, so a clock would advance through audio nobody
+   hears) or once a write is older than `AUDIO_CLOCK_STALE_MS = 1 s`; the
+   controller then holds or freeruns.
 
    Two write-path commands manage the clock:
    - **`Clear()`** (seek / channel change): `snd_pcm_drop`+`prepare`, drain the
@@ -85,7 +88,9 @@ Three invariants:
      decoder freeruns until audio re-anchors.
    - **`DropOutput()`** (Mute / Freeze / SetTrickSpeed): `snd_pcm_drop`+`prepare`
      and drain the packet queue, but **keep** `playbackPts` — the clock stays
-     valid, the decoder stays paced, the display queue does not underrun.
+     valid until the next write, so the decoder is not thrown into freerun.
+     That write finds the DAC stopped and publishes NOPTS: the picture holds
+     until sound is audible again, then re-anchors on the real DAC position.
      `pauseClock=true` (Freeze) additionally **pins** `GetClock()` to the static
      `playbackPts` so it can't extrapolate through ALSA silence and fake-advance
      across the pause (a fake-advanced clock on resume would drop the preserved
@@ -128,8 +133,8 @@ Three invariants:
    `outputRateNum ≠ displayHz × outputRateDen`, for any ratio), the filter graph
    appends `fps=<displayHz>`. The node buffers up/down so the *decoder* consumes
    source at real time; without it the decoder is paced only by `SubmitFrame`'s
-   VSync backpressure (= display rate) and drifts (60→50 consumes source at 83 %,
-   24→50 at 208 %). Audio-clocked paths would eventually correct that drift via
+   VSync backpressure (= display rate) and drifts (60→50 consumes source at 83%,
+   24→50 at 208%). Audio-clocked paths would eventually correct that drift via
    catch-up drops / re-presents, but **video-only** playback (HDR demo files) has
    no clock and depends entirely on `fps`; adding it everywhere is harmless and
    removes routine source>display catch-up-drop churn. The filter is
@@ -215,6 +220,14 @@ Hybrid SW/HW domain (a sw-* preset is active) — HW decode adds one hwdownload;
   [hwdownload (HW decode only)] → [bwdif|w3fdif] → [hqdn3d] → [crop → swscale] → [unsharp] → hwupload → [denoise_vaapi] → [crop → scale_vaapi] → [sharpness_vaapi] [→ fps]
 ```
 
+Frames leave the chain with the filters' own timestamps, rescaled from the
+sink's time base (halved by a field-rate deinterlacer, `1/rate` after `fps`)
+back to 90 kHz. A temporal deinterlacer emits frame N only once N+1 has
+arrived, so the input's PTS would label every 1080i frame one frame late and
+put video a frame behind audio. Only trick play stamps synthetically
+(`sourcePts + i·frameDur`): its pacing ignores PTS and its ghost-field drop
+recognizes the first output by that stamp.
+
 Bracketed nodes are conditional. In the GPU VPP domain the chain forks again on
 decode path (`isSoftwareDecode`): a SW-decoded frame is uploaded mid-chain
 (`format=nv12|p010le`, `p010le` under HDR, then `hwupload`), while a HW-decoded
@@ -285,7 +298,7 @@ sustained drift; the time constant is `1 / α` samples (~1 s @ 50 fps). Two phas
    fires off a partial mean.
 2. **Steady-state EMA.** Integer form of the formula above with a residual
    accumulator carrying the `diff mod N` remainder across samples — guaranteeing
-   exact convergence to the rawDelta mean even when `|diff| < N` (a naïve integer
+   exact convergence to the rawDelta mean even when `|diff| < N` (a naive integer
    step would round to 0).
 
 `ResetSmoothedDelta()` clears warmup, EMA, residual, hard-debounce counters, and
@@ -295,7 +308,7 @@ and `WaitForAudioCatchUp`.
 **Fast-start seed.** A `FlushForSeek()` (same stream, same pipeline) carries the
 pre-seek converged delta across the flush as `seekHintDelta90k` and seeds the EMA
 from it on the first post-seek frame, skipping the 50-sample warmup. The
-GPU-vs-audio offset is a property of the pipeline (decode + VPP + KMS latency vs
+GPU-vs-audio offset is a property of the pipeline (decode + VPP + KMS latency vs.
 ALSA hw_ptr), not the playback position, so the pre-seek steady state is the right
 seed and the right catch-up exit target. The hint is captured as the
 *pre-correction* `stableDelta90k` (a sleep's predictive EMA bump makes the live
@@ -398,7 +411,7 @@ are fast pops, audio barely moves). Once the cache drains, each further drop wai
 one VPP cycle for the next frame, so on marginal-VPP hardware (UHD upscale at
 ~50 fps == audio rate) PTS and clock advance equally and `rawDelta` stops
 climbing — targeting `+halfFrame` would hang catch-up forever. The small residual
-negative offset that may remain is well below the 80 ms lipsync percept threshold.
+negative offset that may remain is well below the 80 ms lip-sync perception threshold.
 
 On exit the EMA is reset, the exiting frame is submitted normally, and a small
 **follow-up drop burst** (≤ 8 frames via `pendingDrops`) nudges the head a touch
@@ -420,7 +433,8 @@ The sync gate is bypassed (frame submitted unpaced) in:
 - Trick mode (`SubmitTrickFrame()` paces via its own timer; audio is muted).
 - Freerun window after `Clear()`, trick exit, or `NotifyAudioChange()`.
 - Radio mode / NOPTS frame (no audio processor or no PTS to align on).
-- Audio not yet running (`GetClock()` is NOPTS until the first `WritePcmToAlsa()`).
+- Audio not yet running (`GetClock()` is NOPTS until the DAC starts, i.e. until
+  the ring holds `AUDIO_ALSA_START_MS`).
 
 ## Jitter buffer (unified drain)
 
@@ -491,7 +505,7 @@ The **pre-fill bypass** releases the head up to `frameDur / 2` early when the
 display prerender queue is empty (`PresentWakeThreshold90k()` returns `frameDur`
 instead of `halfFrame`), keeping `PendingDepth()` at 1–2 instead of 0–1. The
 total prefill window is therefore one `frameDur` — the decoder never runs more
-than one frame ahead of strict-due. This absorbs audio-clock vs VSync phase drift
+than one frame ahead of strict-due. This absorbs audio-clock vs. VSync phase drift
 that would otherwise tick the underrun counter on a healthy stream.
 
 ### Drain bypasses
@@ -653,7 +667,7 @@ grace — it does **not** gate the underrun log (that gate is `DISPLAY_UNDERRUN_
 | Hard-ahead (live)                | `−= measured`     | armed     | unchanged |
 | Trick entry (FF/REW/slow)        | reset             | unchanged | reserve purged (epoch bump); paced by `SubmitTrickFrame`, no freerun |
 | Trick exit → normal (`Play`)     | reset             | unchanged | reserve purged (epoch bump); freerun armed |
-| Pause / resume (`Freeze`/`Play`) | unchanged         | unchanged | held (drain stops); clock pinned, no drops |
+| Pause / resume (`Freeze`/`Play`) | unchanged         | unchanged | held (drain stops); clock pinned, no drops; resume holds until the DAC restarts |
 | Audio codec / track change       | unchanged         | unchanged | preserved; freerun armed |
 | PCM channel-layout change        | unchanged         | unchanged | preserved; ALSA reopens, clock re-anchors (brief NOPTS) |
 | Mediaplayer seek                 | reset             | unchanged | flushed; freerun armed; filter graph **preserved** |
@@ -735,7 +749,7 @@ rules in `cVaapiDevice::PlayVideo` / `PlayAudio`:
 
 - **Audio confirms from two frames, not necessarily two PES.** Codec certainty
   needs two corroborated audio frames (one frame misdetects), and an
-  in-session `audi N` track switch
+  in-session `AUDI N` track switch
   can deliver one complete PES of the *old* PID first, which is why the 2-of-2
   rule spans payloads. On a **fresh stream** (`audioFreshStart`, armed by
   `SetPlayMode()`) nothing stale can precede the first PES, so a `chained`
@@ -751,7 +765,7 @@ rules in `cVaapiDevice::PlayVideo` / `PlayAudio`:
   "a codec was confirmed" — a track change landing inside the detection window
   is in-session too.
 
-- **A dolby track switch outruns VDR's own PID switch.** VDR fires
+- **A Dolby track switch outruns VDR's own PID switch.** VDR fires
   `SetDigitalAudioDevice(true)` *before* it assigns `currentAudioTrack`
   (device.c), so `PlayTs()` keeps routing the **old** track's PID for as long as
   the plugin's handler runs — and `cAudioProcessor::Clear()` in it can block tens
@@ -759,7 +773,7 @@ rules in `cVaapiDevice::PlayVideo` / `PlayAudio`:
   fed to the detector they win the 2-of-2 vote for the codec being left behind,
   after which the new track's bitstream starves the wrong decoder until the
   cascade escalation re-detects (measured **9.5 s of silence** on an MP2 → Dolby
-  switch before the fix). A DVB dolby track always rides in `private_stream_1`,
+  switch before the fix). A DVB Dolby track always rides in `private_stream_1`,
   so `PlayAudio()` drops audio PES with any other stream id until the switch
   lands, bounded by `AUDIO_TRACK_SWITCH_GRACE_MS` (500 ms) so an unusual mux
   costs a hiccup instead of the audio. The gate arms only for an **in-session**
@@ -772,7 +786,10 @@ rules in `cVaapiDevice::PlayVideo` / `PlayAudio`:
   `confirmed (2-of-2)` in 230–520 ms, both directions, no cascade.
 
 What remains after the keyframe is inherent: decode + VPP build + one VSync
-(~40–60 ms keyframe-PES → CRTC on the test rig), then the **still-frame hold**.
+(a few tens of ms keyframe-PES → CRTC on progressive channels; on 1080i a
+temporal deinterlacer first waits for its reference frames — the VAAPI one never
+shows the very first picture, `bwdif` shows it one input later), then the
+**still-frame hold**.
 The first frame is shown unpaced (freerun) the moment it exists, but the audio
 that belongs to its PTS has not even arrived yet — in a DVB mux video is sent
 ~0.5–1 s ahead of its PTS and audio only ~0.1–0.2 s, so the first picture
@@ -781,8 +798,60 @@ observed, the last term being the ring cushion the stream needs anyway — see
 [Ring cushion](#ring-cushion)) until the audio clock reaches it, and motion starts
 A/V-locked from there. No player can start synced motion earlier than the arrival of that audio;
 the alternatives (muting instead of freezing, or crawling the video) are worse.
-Motion-compensated VAAPI deinterlacing adds a few more fields of reference
-history before its first output on 1080i channels.
+
+### Before the stream reaches the plugin
+
+VDR attaches a newly launched player only from its main loop, and
+`cTransfer::Receive()` discards the new channel's TS until then. That pass can
+come late: after a key zap the loop first draws the channel banner (a skin's
+signal bars block in `FE_GET_PROPERTY`); after an SVDRP or plugin switch it
+sleeps in `cRemote::Get(1000)`.
+
+`cVaapiSwitchAttacher` (device.cpp) therefore attaches the transfer player from
+`cStatus::ChannelSwitch()`, which VDR fires inside `SetChannel()` right after
+`cControl::Launch()`; the main loop's attach becomes a no-op. This also closes a
+race: on a primary device without a tuner `HasProgramme()` is true only once a
+player is attached, so the main loop could re-switch a channel caught in that
+gap. It gains time only where the first packet arrives before the banner is
+drawn (SVDRP, fast sources); a slow tuner or CAM already hid the gap.
+
+## End of stream
+
+A replay ends when the pipeline has played out, not when the last packet was
+accepted: decode queue (~4 s), decode-ahead reserve (~1.3 s), prerender slots,
+the frame awaiting its flip and the ALSA ring (~800 ms) hold seconds of
+material. Both players drain through the same pair — `RequestEosDrain()` starts
+it, `PendingPlayoutDepth()` counts what is left — and stop at depth 0:
+
+- **VDR replay** (API ≥ 30014): `cDvbPlayer` polls `cDevice::Drain()` every
+  few ms once its file is exhausted. `Drain()` first delivers the PES VDR holds
+  back (a video PES is complete only at the next payload start, which never
+  comes at EOF), then calls `DrainDevice()`. That requests the drain once — a
+  repeat would re-arm the codec drain and pin the depth above 0. `Clear()` and
+  `SetPlayMode()` cancel it; a PES accepted afterwards re-arms it, because a
+  growing recording can hit eof and resume without a `Clear()`.
+- **Mediaplayer**: `DrainTailAtEof()` waits on the same depth at real-time pace
+  and gives up on a user command, a stall, or a hard cap.
+
+The drain releases the AU the video parser withholds until the next start
+code, sends the codec its NULL packet once the queue is empty and flushes the
+chain (a temporal deinterlacer holds the last frame). Audio flushes parser,
+codec and resampler the same way and `snd_pcm_start()`s a ring still below its
+start threshold, since no further write will push it over. The codec drain
+counts as pending until its frames reach the reserve, a popped display frame
+until its flip lands, so no poll reads 0 with work in flight.
+
+Audio usually ends first (mux interleave), so its clock keeps extrapolating
+past the last sample instead of going stale: the video tail stays paced. A
+pause in the tail keeps the undecoded video packets (no player would feed them
+again) and defers the audio drain until `Play()` — started in the pause, the
+audio tail would unpin the clock and the video tail would read as late.
+`Play()` lifts the pin itself, as no write follows that could.
+
+Trace lines (see [Tracing](#tracing)): `EOS drain requested`, `codec drain`,
+`audio: EOS drain`, and the cancel / re-arm lines. Always logged, once per end:
+`EOS drained -- last frame on screen Nms after the request`, or in the
+mediaplayer `EOS tail drained after Nms` / why it was abandoned.
 
 ## Tracing
 
@@ -796,10 +865,11 @@ through `tsyslog()` (`src/common.h`), one gate on top of VDR's `dsyslog`, so
 - VDR's `-l 3` log level.
 
 Gated: the periodic `sync d=…` line, every per-event correction line named
-below, and the whole [stream-start trace](#stream-start-trace). Not gated:
-`catch-up cycling sustained` / `settled`, the `jitterBuf` / handoff overflow
-lines, and every warning and error — a real fault still reports itself at the
-ordinary log levels, with no extra switch.
+below, the whole [stream-start trace](#stream-start-trace), and the
+[end-of-stream](#end-of-stream) narration. Not gated: `catch-up cycling
+sustained` / `settled`, the `jitterBuf` / handoff overflow lines, the EOS
+outcome (`EOS drained` / `EOS tail …`), and every warning and error — a real
+fault still reports itself at the ordinary log levels, with no extra switch.
 
 The gate exists because the correction lines are per-frame: through a sustained
 mismatch the drop/skip paths would write ~50 lines a second from the
@@ -874,7 +944,7 @@ or throughput-bound:
 To re-center either regime, tune `PcmLatency` / `PassthroughLatency`. Since
 `rawDelta = videoPTS − GetClock() − pipelineLatency`, a **positive** value
 subtracts more from `rawDelta`, releasing each frame at an earlier audio-clock
-value — i.e. positive latency pulls video earlier vs audio (it delays audio
+value — i.e. positive latency pulls video earlier vs. audio (it delays audio
 relative to video, per `config.h`).
 
 ## Stream-start trace
@@ -882,7 +952,7 @@ relative to video, per `config.h`).
 With [tracing](#tracing) on, every stream start
 (`SetPlayMode(pmAudioVideo / pmVideoOnly / pmAudioOnly*)`: channel switch,
 replay start, mediaplayer open) arms a one-shot trace in the
-device, decoder, audio processor and display (`StreamStartTrace` in
+device, decoder, audio processor, and display (`StreamStartTrace` in
 `src/common.h`, lock-free; `pmNone` disarms it). Each component reports its
 first milestones once, as `+N ms` after the common switch epoch, so one journal
 excerpt shows where the latency went:
@@ -891,20 +961,21 @@ excerpt shows where the latency went:
 device:  trace +1682ms first video PES (pts=…, 1746 bytes)
 device:  trace +1868ms first audio PES (pts=…, 3840 bytes)
 device:  trace +2012ms audio codec mp2 opened (PCM, chained 1-PES confirm), first decodable pts=…
-audio:   trace +2012ms first ALSA write -- clock anchored at pts=… (1152 frames queued, delay=1193)
-audio:   trace +2013ms DAC running -- audible from pts=… (ring=143ms)
+audio:   trace +2012ms first ALSA write -- queued from pts=… (1152 frames, delay=1193)
+audio:   trace +2190ms DAC running -- clock anchored, audible from pts=… (ring=302ms)
 device:  trace +2352ms first keyframe PES (h264, pts=…, video PES #40)
 device:  trace +2353ms video codec h264 opened (profile=100, 8-bit), first fed pts=…
 decoder: trace +2357ms first decoded frame pts=… (1280x720 type=I key, after 1 packet(s), filter to build)
 decoder: trace +2399ms first frame presented (freerun) pts=… clock=… -- video +748ms vs audio: still-frame hold …
 display: trace +2411ms first frame committed to CRTC (1920x1080)
-decoder: trace +3170ms A/V locked pts=… av=+812ms lat=20ms raw=+17ms buf=31 vbuf=620ms abuf=143ms
+decoder: trace +3170ms A/V locked pts=… av=+812ms lat=20ms raw=+17ms buf=31 vbuf=620ms abuf=302ms
 ```
 
 Reading it: `first video PES` is when the tuner / stream delivers; the gap to
 `first keyframe PES` is the GOP position (`video PES #N` = how many pictures
 were skipped); keyframe → `committed to CRTC` is the plugin's own startup cost;
-`DAC running` is when sound becomes audible (the ALSA start threshold); the
+`DAC running` is when sound becomes audible and the audio clock anchors (the
+ALSA start threshold — nothing is paced before it); the
 `video +Nms vs audio` figure on the first presented frame predicts the
 still-frame hold, and `A/V locked` is when motion starts in sync (see
 [Stream start](#stream-start)). `after N packet(s)` on the first decoded frame
@@ -916,7 +987,7 @@ before it was freerun:
 
 | Field | Meaning |
 | ----- | ------- |
-| `av`  | The **multiplex's** A/V interleave: when an audio AU arrives, how far ahead the video feed already is (+ = video ahead). Sampled at audio ingress against the video feed's position at that same instant, so no queue depth, jitter buffer, ALSA tail or latency knob enters it. Several hundred ms is normal on DVB — it is the encoder's video buffer delay, not a fault, and nothing the plugin can shrink |
+| `av`  | The **multiplex's** A/V interleave: when an audio AU arrives, how far ahead the video feed already is (+ = video ahead). Sampled at audio ingress against the video feed's position at that same instant, so no queue depth, jitter buffer, ALSA tail, or latency knob enters it. Several hundred ms is normal on DVB — it is the encoder's video buffer delay, not a fault, and nothing the plugin can shrink |
 | `lat` | Compensation in force: the operator knob (`PcmLatency` / `PassthroughLatency`, whichever path is active) + the one-frame pipeline tail |
 | `raw` | Residual the sync gate acts on — `videoPTS − audioClock − lat`, the same `raw` the correction lines and the periodic [sync line](#diagnostic-log) report |
 
@@ -952,8 +1023,9 @@ Every constant below is file-scope — in [src/config.h](src/config.h),
 [src/display.cpp](src/display.cpp) — shared constants as `inline constexpr` in
 a header, single-user constants as `constexpr` in the consuming `.cpp`'s
 anonymous namespace — and each carries a `///<` comment with
-purpose and unit. Within each file they are grouped by sub-function under
-`// --- label ---` rulers; the groups below follow the same organization.
+purpose and unit. In `audio.cpp`, `decoder.cpp`, `device.cpp`, and `display.cpp`
+they are grouped by sub-function under `// --- label ---` rulers; the groups below
+follow the same organization.
 
 Naming conventions:
 
@@ -988,7 +1060,7 @@ Naming conventions:
 | Constant                       | Value      | Purpose |
 | ------------------------------ | ---------- | ------- |
 | `VDR_MAX_PES_CHUNK`            | 0xFFF0 + 6 | Length of every non-final PES chunk VDR's `cTsToPes` makes of an oversized video picture (remux.c `MAXPESLENGTH` + header); a shorter live video PES ends its picture and releases the first keyframe's AU early (see [Stream start](#stream-start)) |
-| `AUDIO_TRACK_SWITCH_GRACE_MS`  | 500        | How long `PlayAudio()` drops non-`private_stream_1` PES after a dolby-entry track switch, i.e. how long it waits for VDR's PID switch to land before trusting whatever the mux delivers (see [Stream start](#stream-start)) |
+| `AUDIO_TRACK_SWITCH_GRACE_MS`  | 500        | How long `PlayAudio()` drops non-`private_stream_1` PES after a Dolby-entry track switch, i.e. how long it waits for VDR's PID switch to land before trusting whatever the mux delivers (see [Stream start](#stream-start)) |
 
 **Mediaplayer feed pacing** (mediaplayer.cpp, device.cpp)
 
@@ -1033,7 +1105,7 @@ Naming conventions:
 | ------------------------------ | ----- | ------- |
 | `DECODER_SYNC_COOLDOWN_MS`     | 5000  | Min interval between soft corrections (= 5 EMA time constants) |
 | `DECODER_SYNC_HINT_MAX_AGE_MS` | 5000  | Max age (= `…COOLDOWN_MS`) of a pre-correction `stableDelta` snapshot before the seek hint falls back to the current `smoothedDelta` |
-| `DECODER_SYNC_CORRIDOR_90K`    | 4500  | Soft corridor half-width (= 50 ms × `PTS_TICKS_PER_MS`); below lipsync percept threshold |
+| `DECODER_SYNC_CORRIDOR_90K`    | 4500  | Soft corridor half-width (= 50 ms × `PTS_TICKS_PER_MS`); below the lip-sync perception threshold |
 | `DECODER_SYNC_EMA_SAMPLES`     | 50    | EMA divisor (~1 s @ 50 fps); residual accumulator → exact convergence |
 | `DECODER_SYNC_WARMUP_SAMPLES`  | 50    | Samples averaged before the EMA seed (~1 s @ 50 fps) |
 | `DECODER_SYNC_LOG_INTERVAL_MS` | 2000  | Sync diagnostic *evaluation* cadence; a line is only emitted on events (see below) |
@@ -1061,7 +1133,7 @@ Naming conventions:
 | Constant                      | Value | Purpose |
 | ----------------------------- | ----- | ------- |
 | `DECODER_DRAIN_FUTURE_MAX_MS` | 3000  | Future-head discontinuity guard: drop heads > 3 s ahead; smaller offsets hold (still frame) until due |
-| `DECODER_NO_CLOCK_HOLD_MS`    | 1500  | Walltime the drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before no-clock freerun (covers the mux-interleave seek offset) |
+| `DECODER_NO_CLOCK_HOLD_MS`    | 1500  | Wall-clock time the drain holds a non-empty jitterBuf while `GetClock()` is NOPTS before no-clock freerun (covers the mux-interleave seek offset) |
 | `DECODER_DRAIN_MISS_GRACE_MS` | 3000  | Post-flush grace before drain gaps count toward `miss` — transition cost (filter rebuild, HDMI retrain, audio re-anchor), not starvation; mirrors `DISPLAY_WARMUP_GRACE_MS` |
 
 **Trick-play pacing** (decoder.h, decoder.cpp)

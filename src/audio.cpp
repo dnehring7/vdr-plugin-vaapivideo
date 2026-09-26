@@ -153,6 +153,10 @@ auto cAudioProcessor::Clear() -> void {
     ResetPlaybackClock();
     clearGeneration.fetch_add(1, std::memory_order_release);
     DrainPacketQueue();
+    {
+        const cMutexLock queueLock(queueMutex.get());
+        drainRequested = false; // a Clear() cancels an EOS drain (cDevice::Drain() contract); DropOutput() keeps it
+    }
     // The parser recreate below subsumes any pending reset requested by Action().
     parserNeedsReset.store(false, std::memory_order_relaxed);
     // Stream boundary (seek / channel change): pre-boundary failure evidence must not carry over.
@@ -247,7 +251,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     //
     // If WritePcmToAlsa() stops firing (channel switch, codec swap), extrapolation
     // balloons. Return AV_NOPTS_VALUE after AUDIO_CLOCK_STALE_MS to force video freerun;
-    // lipsync re-anchors at the next valid write.
+    // lip-sync re-anchors at the next valid write.
     //
     // Seqlock read of the (playbackPts, lastClockUpdateMs) pair: retry until two even sequence loads
     // match. Both barriers are load-bearing -- seq1's acquire stops the data loads from hoisting above
@@ -288,7 +292,9 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     const uint64_t nowMs = cTimeMs::Now();
     // Unsigned subtraction: wrap on clock skew / atomic race makes ageMs huge -> stale check fires safely.
     const uint64_t ageMs = nowMs - lastMs;
-    if (ageMs > AUDIO_CLOCK_STALE_MS) {
+    // After the EOS drain no write will follow, yet the video tail past the last sample must stay
+    // paced: keep extrapolating instead of going stale (the presenter would hold, then freerun).
+    if (ageMs > AUDIO_CLOCK_STALE_MS && !eosClockHold.load(std::memory_order_acquire)) {
         // Stale path: writer thread stopped publishing without ResetPlaybackClock(). Edge-triggered
         // log so a 50 Hz polling decoder doesn't spam syslog while the stall persists. Flag clears
         // on the next valid read below.
@@ -373,7 +379,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     size_t depth = 0;
     {
         const cMutexLock lock(queueMutex.get());
-        depth = packetQueue.size();
+        depth = packetQueue.size() + (drainRequested ? 1U : 0U);
     }
     // Queue reads 0 while Action() still holds a popped packet mid-handoff to ALSA.
     if (packetInFlight.load(std::memory_order_acquire)) {
@@ -689,6 +695,124 @@ auto cAudioProcessor::RecreateParser() -> void {
     }
 }
 
+auto cAudioProcessor::ResumeClock() -> void {
+    const cMutexLock lock(mutex.get());
+    if (!clockPaused.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    {
+        // An EOS drain held back by the pause may run now.
+        const cMutexLock queueLock(queueMutex.get());
+        packetCondition.Broadcast();
+    }
+    if (playbackPts.load(std::memory_order_relaxed) == AV_NOPTS_VALUE) {
+        return;
+    }
+    // Extrapolation restarts at the pinned position: the pause must not count as elapsed time.
+    clockSequence.fetch_add(1, std::memory_order_acq_rel);
+    lastClockUpdateMs.store(cTimeMs::Now(), std::memory_order_relaxed);
+    clockSequence.fetch_add(1, std::memory_order_release);
+}
+
+auto cAudioProcessor::RequestDrain() -> void {
+    const cMutexLock lock(queueMutex.get());
+    if (!initialized.load(std::memory_order_acquire)) {
+        return; // no worker to consume it; an armed request would hold the EOS depth up forever
+    }
+    drainRequested = true;
+    packetCondition.Broadcast();
+}
+
+auto cAudioProcessor::DrainAtEos(uint32_t generation, bool passthrough) -> void {
+    // Worker thread, queue empty. Parser AU, codec and resampler tails (PCM only), then the ring: below
+    // its start threshold ALSA never starts on its own, and no further write will push it over.
+    const cMutexLock lock(mutex.get());
+    if (clearGeneration.load(std::memory_order_acquire) != generation) {
+        return; // still requested: the worker retries with the current generation
+    }
+    {
+        // Checked under `mutex`, so a Clear() (cancelled) or Freeze() (clock pinned; the worker waits for
+        // ResumeClock()) lands entirely before or after this drain.
+        const cMutexLock queueLock(queueMutex.get());
+        if (!drainRequested || clockPaused.load(std::memory_order_acquire)) {
+            return;
+        }
+        drainRequested = false; // consumed; packetInFlight carries the depth from here
+    }
+    if (outputDropped.load(std::memory_order_acquire)) {
+        // A pause dropped the ring since the last write, so pcmNextPts is past what was heard: anchoring on
+        // it would jump the clock ahead and cut the video tail as stale. The resumed clock runs on instead.
+        RecreateParser();
+        eosClockHold.store(true, std::memory_order_release);
+        tsyslog(
+            "vaapivideo/audio: EOS drain -- output dropped since the last write, tail skipped, clock held past EOS");
+        return;
+    }
+    int parserTailBytes = 0;
+    if (parserCtx && decoder) {
+        uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
+        int parsedSize = 0;
+        const int parsed = av_parser_parse2(parserCtx.get(), decoder.get(), &parsedData, &parsedSize, nullptr, 0,
+                                            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+        if (parsed >= 0 && parsedSize > 0 && parsedData) {
+            parserTailBytes = parsedSize;
+            if (parserCtx->pts != AV_NOPTS_VALUE) {
+                pcmNextPts.store(parserCtx->pts, std::memory_order_relaxed);
+            }
+            if (passthrough) {
+                const auto burst = WrapIec61937(parsedData, parsedSize);
+                const size_t bpf = alsaFrameBytes.load(std::memory_order_relaxed);
+                if (!burst.empty() && bpf > 0) {
+                    (void)WritePcmToAlsa(burst, pcmNextPts.load(std::memory_order_relaxed),
+                                         static_cast<unsigned>(burst.size() / bpf), generation);
+                }
+            } else {
+                (void)DecodeToPcm({parsedData, static_cast<size_t>(parsedSize)}, parserCtx->pts, generation);
+            }
+        }
+        RecreateParser(); // a flushed parser keeps stale framing state
+    }
+    if (!passthrough && decoder) {
+        (void)DecodeToPcm({}, AV_NOPTS_VALUE, generation); // NULL packet: codec + resampler tails
+    }
+    const long started = StartPreparedTail();
+    eosClockHold.store(true, std::memory_order_release);
+    tsyslog("vaapivideo/audio: EOS drain -- parser tail %d bytes, %s, unplayed tail %d ms, clock held past EOS",
+            parserTailBytes, started > 0 ? "DAC started by hand" : "DAC already running or ring empty",
+            GetBufferedMs());
+}
+
+[[nodiscard]] auto cAudioProcessor::StartPreparedTail() -> long {
+    // Caller holds mutex. Publishes the clock WritePcmToAlsa() withheld while the DAC stood still, so the
+    // tail counts down in GetPendingWorkSize() and GetSTC() keeps advancing.
+    if (!alsaHandle || snd_pcm_state(alsaHandle) != SND_PCM_STATE_PREPARED) {
+        return 0;
+    }
+    // A dropped+prepared ring reports a stale positive delay; the free space is what says "empty".
+    const snd_pcm_sframes_t avail = snd_pcm_avail_update(alsaHandle);
+    const auto ring = static_cast<snd_pcm_sframes_t>(alsaBufferFrames.load(std::memory_order_relaxed));
+    if (avail < 0 || ring <= 0 || avail >= ring) {
+        return 0;
+    }
+    const snd_pcm_sframes_t delayFrames = ring - avail;
+    if (const int err = snd_pcm_start(alsaHandle); err < 0) {
+        dsyslog("vaapivideo/audio: snd_pcm_start for the EOS tail failed: %s", snd_strerror(err));
+        return 0;
+    }
+    const unsigned rate = alsaSampleRate.load(std::memory_order_relaxed);
+    const int64_t endPts = pcmNextPts.load(std::memory_order_relaxed);
+    if (rate == 0 || endPts == AV_NOPTS_VALUE) {
+        return delayFrames;
+    }
+    const auto delay90k = static_cast<int64_t>((static_cast<uint64_t>(delayFrames) * PTSTICKS) / rate);
+    clockSequence.fetch_add(1, std::memory_order_acq_rel);
+    playbackPts.store(endPts - delay90k, std::memory_order_relaxed);
+    lastClockUpdateMs.store(cTimeMs::Now(), std::memory_order_relaxed);
+    clockSequence.fetch_add(1, std::memory_order_release);
+    clockPaused.store(false, std::memory_order_release);
+    return delayFrames;
+}
+
 auto cAudioProcessor::DropOutput(bool pauseClock) -> void {
     // Clock-preserving variant of Clear(): silence playback NOW (snd_pcm_drop drains the ~200 ms
     // already queued in the ALSA sink), bump clearGeneration so in-flight decoder packets from the
@@ -737,6 +861,7 @@ auto cAudioProcessor::ResetPlaybackClock() -> void {
     pcmNextPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
     // Reset content boundary: clear any pause pin so the new timeline doesn't inherit it.
     clockPaused.store(false, std::memory_order_release);
+    eosClockHold.store(false, std::memory_order_release);
 }
 
 // ============================================================================
@@ -747,13 +872,17 @@ auto cAudioProcessor::Action() -> void {
     while (!stopping.load(std::memory_order_acquire)) {
         std::unique_ptr<AVPacket, FreeAVPacket> packet;
         bool passthrough = false;
+        bool drainNow = false;
         uint32_t generationAtDequeue = 0;
 
         {
             // queueMutex (not `mutex`): the queue is its own domain now, so popping never blocks the
             // producer behind the ALSA write. The processing below re-takes `mutex` in a separate scope.
             const cMutexLock lock(queueMutex.get());
-            while (packetQueue.empty() && !stopping.load(std::memory_order_acquire)) {
+            // An EOS drain waits out a pause: started now, its tail would play into the pause and unpin the
+            // clock. ResumeClock() wakes us.
+            while (packetQueue.empty() && (!drainRequested || clockPaused.load(std::memory_order_acquire)) &&
+                   !stopping.load(std::memory_order_acquire)) {
                 packetCondition.TimedWait(*queueMutex, 100);
             }
 
@@ -761,8 +890,12 @@ auto cAudioProcessor::Action() -> void {
                 break;
             }
 
-            packet.reset(packetQueue.front());
-            packetQueue.pop();
+            if (packetQueue.empty()) {
+                drainNow = true; // DrainAtEos() consumes the request, so a Freeze()/Clear() racing in cannot lose it
+            } else {
+                packet.reset(packetQueue.front());
+                packetQueue.pop();
+            }
             approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
             // Latch under queueMutex so GetPendingWorkSize() never sees empty-queue + no-in-flight
             // while this iteration is still draining the packet to ALSA.
@@ -778,6 +911,12 @@ auto cAudioProcessor::Action() -> void {
         // An old-era PTS would silently anchor the new-era timeline, causing
         // WritePcmToAlsa() to publish a bogus playbackPts on the next valid packet.
         if (clearGeneration.load(std::memory_order_acquire) != generationAtDequeue) {
+            packetInFlight.store(false, std::memory_order_release);
+            continue;
+        }
+
+        if (drainNow) {
+            DrainAtEos(generationAtDequeue, passthrough);
             packetInFlight.store(false, std::memory_order_release);
             continue;
         }
@@ -1165,6 +1304,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         dsyslog("vaapivideo/audio: snd_pcm_hw_params failed: %s", snd_strerror(err));
         return false;
     }
+    alsaBufferFrames.store(bufferSize, std::memory_order_relaxed);
     if (const int err = snd_pcm_prepare(handle); err < 0) {
         dsyslog("vaapivideo/audio: snd_pcm_prepare failed: %s", snd_strerror(err));
         return false;
@@ -1263,16 +1403,23 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         FlushDecoderState();
     }
 
+    // An empty span is the EOS flush: NULL packet, then the resampler tail, then the codec is re-armed.
+    const bool flush = data.empty();
     const std::unique_ptr<AVPacket, FreeAVPacket> packet{av_packet_alloc()};
-    if (!packet || av_new_packet(packet.get(), static_cast<int>(data.size())) < 0) {
+    if (!packet || (!flush && av_new_packet(packet.get(), static_cast<int>(data.size())) < 0)) {
         decoderRefCount.fetch_sub(1, std::memory_order_release);
         return false;
     }
 
-    std::memcpy(packet->data, data.data(), data.size());
-    packet->pts = pts;
+    if (!flush) {
+        std::memcpy(packet->data, data.data(), data.size());
+        packet->pts = pts;
+    }
 
-    const int sendRet = avcodec_send_packet(decoder.get(), packet.get());
+    int sendRet = avcodec_send_packet(decoder.get(), flush ? nullptr : packet.get());
+    if (flush && sendRet == AVERROR_EOF) {
+        sendRet = 0; // already draining: nothing new to flush, still collect the tail below
+    }
 
     if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) [[unlikely]] {
         if (decoderGracePackets > 0) {
@@ -1366,59 +1513,27 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
                     av_get_sample_fmt_name(frameFmt), frameCh, frame->sample_rate, outCh, outRate);
         }
 
-        const uint8_t *pcmData = nullptr;
-        size_t pcmSize = 0;
-        unsigned writtenFrames = 0;
-        std::vector<uint8_t> convertedBuffer;
+        const int estimatedOut = swr_get_out_samples(swrCtx, frame->nb_samples);
+        const int maxOutSamples = std::max(estimatedOut, frame->nb_samples) + 128;
+        std::vector<uint8_t> convertedBuffer(static_cast<size_t>(maxOutSamples) * outCh * 2);
 
-        {
-            const int estimatedOut = swr_get_out_samples(swrCtx, frame->nb_samples);
-            const int maxOutSamples = std::max(estimatedOut, frame->nb_samples) + 128;
-            const size_t bufferSize = static_cast<size_t>(maxOutSamples) * outCh * 2;
-            convertedBuffer.resize(bufferSize);
+        // outPtr cannot be const: swr_convert writes through &outPtr.
+        uint8_t *outPtr = convertedBuffer.data(); // NOLINT(misc-const-correctness)
+        const int converted = swr_convert(swrCtx, &outPtr, maxOutSamples, frame->data, frame->nb_samples);
 
-            // outPtr cannot be const: swr_convert writes through &outPtr.
-            uint8_t *outPtr = convertedBuffer.data(); // NOLINT(misc-const-correctness)
-            const int converted = swr_convert(swrCtx, &outPtr, maxOutSamples, frame->data, frame->nb_samples);
-
-            if (converted < 0) [[unlikely]] {
-                esyslog("vaapivideo/audio: swr_convert failed");
-                decoderRefCount.fetch_sub(1, std::memory_order_release);
-                return false;
-            }
-
-            pcmSize = static_cast<size_t>(converted) * outCh * 2;
-            pcmData = convertedBuffer.data();
-            writtenFrames = static_cast<unsigned>(converted);
+        if (converted < 0) [[unlikely]] {
+            esyslog("vaapivideo/audio: swr_convert failed");
+            decoderRefCount.fetch_sub(1, std::memory_order_release);
+            return false;
         }
 
-        if (writtenFrames == 0) {
+        if (converted == 0) {
             // swr legitimately returns 0 while priming a resampler (non-48 kHz input); not a failure.
             // WriteToAlsa() rejects an empty span, so skip the write and wait for the next frame.
             av_frame_unref(frame.get());
             continue;
         }
 
-        // Permute swr's FFmpeg-order interleaved output into the device's channel slots (QueryDeviceChannelOrder).
-        // No-op when the packed count is 0 (device matches swr / order unreadable). The count guard also drops a
-        // torn read against an in-flight reopen -- such frames are dropped by the generation check just below anyway.
-        if (const uint64_t packed = channelReorder.load(std::memory_order_acquire);
-            (packed & 0xFU) == outCh && outCh > 2) {
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): convertedBuffer holds S16_LE by contract.
-            auto *samples = reinterpret_cast<int16_t *>(convertedBuffer.data());
-            std::array<int16_t, 8> slotSamples{};
-            for (unsigned f = 0; f < writtenFrames; ++f) {
-                int16_t *base = samples + (static_cast<size_t>(f) * outCh);
-                for (unsigned slot = 0; slot < outCh; ++slot) {
-                    slotSamples.at(slot) = base[(packed >> (4U * (slot + 1U))) & 0xFU];
-                }
-                for (unsigned slot = 0; slot < outCh; ++slot) {
-                    base[slot] = slotSamples.at(slot);
-                }
-            }
-        }
-
-        // Clock advances by the real output count (== nb_samples unless swr resamples / rebuffers).
         // Re-check generation: the receive_frame loop can run for many ms (large packets,
         // swr conversion), giving SetStreamParams()/Clear() a window to race.
         // Drop the frame so stale PCM never reaches ALSA or corrupts pcmNextPts.
@@ -1427,9 +1542,8 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
             return true;
         }
 
-        const int64_t startPts90k = pcmNextPts.load(std::memory_order_relaxed);
-        const bool writeOk =
-            WritePcmToAlsa(std::span(pcmData, pcmSize), startPts90k, writtenFrames, expectedGeneration);
+        const bool writeOk = EmitConvertedPcm(std::span<uint8_t>(convertedBuffer), static_cast<unsigned>(converted),
+                                              outCh, expectedGeneration);
         av_frame_unref(frame.get());
 
         if (!writeOk) {
@@ -1438,8 +1552,50 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         }
     }
 
+    if (flush) {
+        // The resampler holds a few samples of delay across calls; only a NULL input releases them.
+        if (swrCtx && swrOutChannels > 0) {
+            if (const int pendingOut = swr_get_out_samples(swrCtx, 0); pendingOut > 0) {
+                const auto outCh = static_cast<unsigned>(swrOutChannels);
+                std::vector<uint8_t> tail(static_cast<size_t>(pendingOut + 128) * outCh * 2);
+                uint8_t *outPtr = tail.data(); // NOLINT(misc-const-correctness)
+                const int converted = swr_convert(swrCtx, &outPtr, pendingOut + 128, nullptr, 0);
+                if (converted > 0 && clearGeneration.load(std::memory_order_acquire) == expectedGeneration) {
+                    (void)EmitConvertedPcm(std::span<uint8_t>(tail), static_cast<unsigned>(converted), outCh,
+                                           expectedGeneration);
+                }
+            }
+        }
+        // send_packet(NULL) left the codec at EOF; data can follow without a Clear() (a growing recording).
+        FlushDecoderState();
+    }
+
     decoderRefCount.fetch_sub(1, std::memory_order_release);
     return true;
+}
+
+[[nodiscard]] auto cAudioProcessor::EmitConvertedPcm(std::span<uint8_t> pcm, unsigned frames, unsigned outCh,
+                                                     uint32_t expectedGeneration) -> bool {
+    // Permute swr's FFmpeg-order interleaved output into the device's channel slots (QueryDeviceChannelOrder).
+    // No-op when the packed count is 0 (device matches swr / order unreadable). The count guard also drops a
+    // torn read against an in-flight reopen -- the caller's generation check drops such frames anyway.
+    if (const uint64_t packed = channelReorder.load(std::memory_order_acquire); (packed & 0xFU) == outCh && outCh > 2) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): pcm holds S16_LE by contract.
+        auto *samples = reinterpret_cast<int16_t *>(pcm.data());
+        std::array<int16_t, 8> slotSamples{};
+        for (unsigned f = 0; f < frames; ++f) {
+            int16_t *base = samples + (static_cast<size_t>(f) * outCh);
+            for (unsigned slot = 0; slot < outCh; ++slot) {
+                slotSamples.at(slot) = base[(packed >> (4U * (slot + 1U))) & 0xFU];
+            }
+            for (unsigned slot = 0; slot < outCh; ++slot) {
+                base[slot] = slotSamples.at(slot);
+            }
+        }
+    }
+    // Clock advances by the real output count (== nb_samples unless swr resamples / rebuffers).
+    return WritePcmToAlsa(pcm.first(static_cast<size_t>(frames) * outCh * 2),
+                          pcmNextPts.load(std::memory_order_relaxed), frames, expectedGeneration);
 }
 
 namespace {
@@ -2157,35 +2313,42 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         currentPlaybackPts = endPts - delay90k;
     }
 
+    // No clock before the DAC runs: in PREPARED snd_pcm_delay() only counts queued frames, so GetClock()
+    // would extrapolate through audio nobody hears and snap back on every write. NOPTS keeps the decoder
+    // in its no-clock hold, so the picture starts with the sound after a switch, seek or resume.
+    const bool dacRunning = alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING;
+
     // Single-writer seqlock: mutex already excludes ResetPlaybackClock(). GetClock()
     // retries past the odd sequence so no concurrent reader sees a torn pair.
     const uint64_t nowMs = cTimeMs::Now();
     clockSequence.fetch_add(1, std::memory_order_acq_rel);
-    playbackPts.store(currentPlaybackPts, std::memory_order_relaxed);
+    playbackPts.store(dacRunning ? currentPlaybackPts : AV_NOPTS_VALUE, std::memory_order_relaxed);
     lastClockUpdateMs.store(nowMs, std::memory_order_relaxed);
     clockSequence.fetch_add(1, std::memory_order_release);
     // First write after Freeze() re-anchors the clock: lift the pin so GetClock() resumes
     // wall-clock extrapolation on top of the new (now-advancing) playbackPts. Outside the
     // seqlock pair on purpose -- the pin is its own atomic, not part of the (pts, lastMs) tuple.
     clockPaused.store(false, std::memory_order_release);
+    eosClockHold.store(false, std::memory_order_release); // data flows again: staleness detection is back on
 
     // NOPTS continuations of a multi-frame PES inherit endPts as their startPts90k.
     pcmNextPts.store(endPts, std::memory_order_relaxed);
 
-    // The anchor write, then the write that tips the ring over the start threshold (snd_pcm_state flips
-    // PREPARED -> RUNNING inside it -- nothing is audible before). Pending() keeps this off steady state.
+    // The first write, then the write that tips the ring over the start threshold (snd_pcm_state flips
+    // PREPARED -> RUNNING inside it -- nothing is audible and no clock exists before). Pending() keeps
+    // this off steady state.
     if (startTrace.Pending(TRACE_FIRST_WRITE | TRACE_DAC_RUNNING)) [[unlikely]] {
         if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_WRITE); traceMs >= 0) {
-            tsyslog("vaapivideo/audio: trace +%lldms first ALSA write -- clock anchored at pts=%lld (%u frames queued, "
-                    "delay=%ld)",
-                    static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts), frames,
+            tsyslog("vaapivideo/audio: trace +%lldms first ALSA write -- queued from pts=%lld (%u frames, delay=%ld)",
+                    static_cast<long long>(traceMs), static_cast<long long>(startPts90k), frames,
                     static_cast<long>(delayFrames));
         }
-        if (alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING) {
+        if (dacRunning) {
             if (const int64_t traceMs = startTrace.Fire(TRACE_DAC_RUNNING); traceMs >= 0) {
-                tsyslog("vaapivideo/audio: trace +%lldms DAC running -- audible from pts=%lld (ring=%ldms)",
-                        static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts),
-                        static_cast<long>(rate > 0 ? static_cast<uint64_t>(delayFrames) * 1000 / rate : 0));
+                tsyslog(
+                    "vaapivideo/audio: trace +%lldms DAC running -- clock anchored, audible from pts=%lld (ring=%ldms)",
+                    static_cast<long long>(traceMs), static_cast<long long>(currentPlaybackPts),
+                    static_cast<long>(rate > 0 ? static_cast<uint64_t>(delayFrames) * 1000 / rate : 0));
             }
         }
     }

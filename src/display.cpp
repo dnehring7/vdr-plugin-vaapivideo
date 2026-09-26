@@ -87,7 +87,7 @@ constexpr size_t DISPLAY_PRERENDER_SLOTS =
        ///< single UHD VPP/memory-bandwidth spike (observed ~80 ms in replay) AND the per-frame
        ///< variance of CPU-side SW decoders (libdav1d 1080p50 spikes 30-40 ms on complex frames)
        ///< without draining the cache and forcing a re-present. SubmitFrame blocks when all slots
-       ///< are full so audio clock stays in lipsync (the whole pipeline is delayed in lockstep, not
+       ///< are full so the audio clock stays in lip-sync (the whole pipeline is delayed in lockstep, not
        ///< just video). FHD HW paths never fill past 1-2 slots; the extra depth is a no-op there.
        ///< COUPLED to DISPLAY_UNDERRUN_THRESHOLD_VSYNCS (= SLOTS + 2) below; revisit that margin if
        ///< you change this (the relationship is not linear -- see the note at that definition).
@@ -780,6 +780,7 @@ auto cVaapiDisplay::Shutdown() -> void {
 
     pendingFrames.push_back(std::move(frame));
     pendingDepth.store(pendingFrames.size(), std::memory_order_release);
+    frameSlotCond.Broadcast(); // an idle display thread waits on this for its first frame
     return true;
 }
 
@@ -831,6 +832,9 @@ auto cVaapiDisplay::Action() -> void {
             }
             continue;
         }
+        // Past the gate the last commit has flipped (or its event was given up on): whatever was
+        // popped is on screen. Cleared before the pop below may set it again for the next frame.
+        frameInFlight.store(false, std::memory_order_release);
 
         // Runtime mode change, serviced here and nowhere else: this thread owns every DRM commit
         // and is the sole drmHandleEvent dispatcher, so doing the ALLOW_MODESET inline needs no
@@ -882,12 +886,15 @@ auto cVaapiDisplay::Action() -> void {
                     if (!pendingFrames.empty()) {
                         frameToShow = std::move(pendingFrames.front());
                         pendingFrames.pop_front();
+                        // In flight before the depth drops: an EOS poll between the two must not read 0.
+                        frameInFlight.store(true, std::memory_order_release);
                         pendingDepth.store(pendingFrames.size(), std::memory_order_release);
                         frameSlotCond.Broadcast();
                     }
                 }
 
                 if (frameToShow && !isClearing.load(std::memory_order_acquire)) {
+                    const bool syntheticFrame = frameToShow->synthetic;
                     DrmFramebuffer newFb = MapVaapiFrame(std::move(frameToShow));
 
                     // MapVaapiFrame is the slow path (PRIME export + GEM import + AddFB2);
@@ -912,10 +919,13 @@ auto cVaapiDisplay::Action() -> void {
                             }
                             lastFrameCommitMs.store(nowMs, std::memory_order_release);
                             // The new stream's first picture is on its way to the panel (flip lands next VSync).
-                            if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_COMMIT); traceMs >= 0)
-                                [[unlikely]] {
-                                tsyslog("vaapivideo/display: trace +%lldms first frame committed to CRTC (%ux%u)",
-                                        static_cast<long long>(traceMs), pendingBuffer.width, pendingBuffer.height);
+                            // A painted notice or black frame is not that picture: it leaves the milestone armed.
+                            if (!syntheticFrame) {
+                                if (const int64_t traceMs = startTrace.Fire(TRACE_FIRST_COMMIT); traceMs >= 0)
+                                    [[unlikely]] {
+                                    tsyslog("vaapivideo/display: trace +%lldms first frame committed to CRTC (%ux%u)",
+                                            static_cast<long long>(traceMs), pendingBuffer.width, pendingBuffer.height);
+                                }
                             }
                             // Recovery log: onset fires at THRESHOLD regardless of how long the
                             // gap actually lasts; peak captures the real wall-clock length.
@@ -986,7 +996,12 @@ auto cVaapiDisplay::Action() -> void {
                     peakGapMs = 0;
                 }
             } else {
-                cCondWait::SleepMs(5);
+                // Nothing on screen yet: wait for SubmitFrame()'s broadcast instead of a blind 5 ms,
+                // so the first picture is not held back by the tail of that sleep.
+                const cMutexLock lock(&bufferMutex);
+                if (pendingFrames.empty() && !stopping.load(std::memory_order_acquire)) {
+                    frameSlotCond.TimedWait(bufferMutex, 5);
+                }
             }
         }
     }

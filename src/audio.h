@@ -93,8 +93,13 @@ class cAudioProcessor : public cThread {
                  ///< the preserved jitterBuf head on resume.
     auto Decode(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding/passthrough
+    auto RequestDrain() -> void; ///< EOS: after the last packet, play out parser, codec, resampler and ring tails.
+                                 ///< Counted by GetPendingWorkSize(); Clear() cancels, DropOutput() (pause) keeps it.
+    auto ResumeClock() -> void;  ///< Play() after Freeze(): lift the pause pin now. The next write would, but at
+                                 ///< EOS none follows and the video tail would wait on a clock that never moves.
     [[nodiscard]] auto GetClock() const noexcept
-        -> int64_t; ///< Estimated PTS at the DAC output in 90 kHz ticks; AV_NOPTS_VALUE when stale or uninitialized
+        -> int64_t; ///< Estimated PTS at the DAC output in 90 kHz ticks; AV_NOPTS_VALUE while the DAC is not
+                    ///< running (ring below its start threshold), when stale, or uninitialized
     [[nodiscard]] auto Initialize(std::string_view alsaDevice)
         -> bool; ///< Opens the ALSA device and starts the processing thread; idempotent for the same device name
     [[nodiscard]] auto IsInitialized() const noexcept
@@ -162,14 +167,23 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Reconfigures ALSA and the FFmpeg decoder when codec, rate, or passthrough mode changes.
                  ///< Returns false if the pipeline could not be established.
     auto CloseDecoder() -> void; ///< Spins until in-flight DecodeToPcm() callers finish, then frees decoder + parser
-    auto DrainPacketQueue() -> void;        ///< Pops and frees every queued packet. Takes queueMutex internally.
-    auto FlushDecoderState() -> void;       ///< avcodec_flush_buffers + swr teardown + error counter reset
-    auto RecreateParser() -> void;          ///< Close + re-init parser for the current codec; caller holds mutex.
-    auto ResetPlaybackClock() -> void;      ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
-                                            ///< Caller must hold mutex (single-writer invariant).
-    auto ResetResampler() noexcept -> void; ///< Frees swrCtx + clears its geometry (single owner of that
-                                            ///< teardown -- a partial reset pairs stale geometry with a null
-                                            ///< context). The next DecodeToPcm() rebuilds it.
+    auto DrainAtEos(uint32_t generation, bool passthrough)
+        -> void; ///< Worker only, queue empty: flushes parser + codec + resampler tails to ALSA, then
+                 ///< StartPreparedTail().
+    auto DrainPacketQueue() -> void; ///< Pops and frees every queued packet. Takes queueMutex internally.
+    [[nodiscard]] auto EmitConvertedPcm(std::span<uint8_t> pcm, unsigned frames, unsigned outCh,
+                                        uint32_t expectedGeneration)
+        -> bool; ///< Device channel-order permute + WritePcmToAlsa() of swr output; false = write failed.
+    auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
+    auto RecreateParser() -> void;     ///< Close + re-init parser for the current codec; caller holds mutex.
+    auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
+                                       ///< Caller must hold mutex (single-writer invariant).
+    [[nodiscard]] auto StartPreparedTail() -> long; ///< EOS: snd_pcm_start() a ring stuck below its start threshold
+                                                    ///< and publish the clock for it; returns the frames started
+                                                    ///< (0 = nothing to start). Caller holds mutex.
+    auto ResetResampler() noexcept -> void;         ///< Frees swrCtx + clears its geometry (single owner of that
+                                                    ///< teardown -- a partial reset pairs stale geometry with a null
+                                                    ///< context). The next DecodeToPcm() rebuilds it.
     [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
         -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
     [[nodiscard]] auto ChooseOutputChannels(int inChannels) const noexcept
@@ -222,12 +236,13 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === ALSA DEVICE ===
     // ========================================================================
-    int alsaCardId{-1};                             ///< ALSA card number; cached by ProbeSinkCaps()
-    std::atomic<unsigned> alsaChannels{0};          ///< Negotiated channel count
-    std::string alsaDeviceName;                     ///< ALSA PCM device name (e.g. "plughw:0,3")
-    std::atomic<int> alsaErrorCount{0};             ///< Consecutive snd_pcm_writei failures
-    std::atomic<size_t> alsaFrameBytes{0};          ///< Bytes per interleaved frame
-    snd_pcm_t *alsaHandle{nullptr};                 ///< Open PCM device handle; nullptr when closed
+    int alsaCardId{-1};                                 ///< ALSA card number; cached by ProbeSinkCaps()
+    std::atomic<unsigned> alsaChannels{0};              ///< Negotiated channel count
+    std::string alsaDeviceName;                         ///< ALSA PCM device name (e.g. "plughw:0,3")
+    std::atomic<int> alsaErrorCount{0};                 ///< Consecutive snd_pcm_writei failures
+    std::atomic<snd_pcm_uframes_t> alsaBufferFrames{0}; ///< Negotiated ring size in frames
+    std::atomic<size_t> alsaFrameBytes{0};              ///< Bytes per interleaved frame
+    snd_pcm_t *alsaHandle{nullptr};                     ///< Open PCM device handle; nullptr when closed
     unsigned alsaIec958CtlDevice{0};                ///< Device field of the resolved IEC958 control (0 on iface=MIXER)
     unsigned alsaIec958CtlIndex{UINT_MAX};          ///< "IEC958 Playback Default" control index; UINT_MAX = unresolved
     bool alsaIec958CtlMixer{false};                 ///< Resolved control sits on iface=MIXER (HDA) instead of PCM
@@ -280,6 +295,7 @@ class cAudioProcessor : public cThread {
     std::atomic<size_t> approxQueueSize{0};  ///< packetQueue.size() mirror, stored under queueMutex at every push/pop,
                                              ///< read lock-free by GetQueueSizeRelaxed() (present-thread diagnostic).
     cCondVar packetCondition;                ///< Wakes Action() on enqueue
+    bool drainRequested{false};              ///< RequestDrain() pending (queueMutex); consumed after the last packet
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
                                              ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
     std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
@@ -299,6 +315,9 @@ class cAudioProcessor : public cThread {
     mutable std::atomic<bool> clockStaleLogged{false}; ///< Edge-trigger flag for the GetClock() stale-age diagnostic;
                                                        ///< set when GetClock() first returns NOPTS due to age, cleared
                                                        ///< on the next valid read. Prevents log spam at 50 Hz polling.
+    std::atomic<bool> eosClockHold{false};             ///< Set once the EOS drain ran: GetClock() keeps extrapolating
+                                                       ///< past AUDIO_CLOCK_STALE_MS so the video tail after the last
+                                                       ///< sample stays paced. Cleared by the next write / reset.
     std::atomic<bool> clockPaused{false};              ///< Set by DropOutput(pauseClock=true) (Freeze()); cleared by
                                                        ///< Clear() / ResetPlaybackClock() / the next WritePcmToAlsa.
                                                        ///< While set, GetClock() returns playbackPts verbatim instead

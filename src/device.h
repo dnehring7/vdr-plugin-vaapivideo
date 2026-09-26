@@ -20,6 +20,7 @@
 #pragma GCC diagnostic pop
 
 class cAudioProcessor;
+class cStatus;
 class cVaapiDecoder;
 class cVaapiDisplay;
 struct AudioStreamInfo;
@@ -187,9 +188,6 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto DeviceName() const
         -> cString override; ///< Descriptive name (DRM path + connector) for SVDRP PRIM/LSTD replies
     [[nodiscard]] auto DeviceType() const -> cString override; ///< Returns "VAAPI"
-#if APIVERSNUM >= 30014
-    [[nodiscard]] auto Drain() -> bool override; ///< EOS: true once all buffered A/V has played out; never blocks.
-#endif
     [[nodiscard]] auto Flush(int TimeoutMs = 0)
         -> bool override;           ///< Wait until packet queue drains; returns true when empty
     auto Freeze() -> void override; ///< Pause output: drain queue and stop audio
@@ -302,7 +300,7 @@ class cVaapiDevice : public cDevice {
     // (see src/mediaplayer.{h,cpp}). The PES path remains the only writer through
     // PlayVideo/PlayAudio; these methods exist so the mediaplayer never touches the
     // private decoder / audioProcessor pointers directly. The EOS-drain pair
-    // (RequestEosDrain/PendingPlayoutDepth) is also what cDevice::Drain() runs on.
+    // (RequestEosDrain/PendingPlayoutDepth) is also what DrainDevice() runs on.
     [[nodiscard]] auto OpenForMediaPlayer(const VideoStreamInfo &video, const AudioStreamInfo &audio)
         -> bool; ///< Opens video + audio codecs with full stream descriptors. Returns false iff either codec failed.
     [[nodiscard]] auto SubmitVideoPacket(const AVPacket *packet)
@@ -341,6 +339,10 @@ class cVaapiDevice : public cDevice {
     // === VDR DEVICE OVERRIDES (protected in cDevice) ===
     // ========================================================================
     [[nodiscard]] auto CanReplay() const -> bool override; ///< True when hardware is ready and decoder is open
+#if APIVERSNUM >= 30014
+    [[nodiscard]] auto DrainDevice()
+        -> bool override; ///< EOS, via cDevice::Drain(): true once all buffered A/V has played out; never blocks.
+#endif
     auto MakePrimaryDevice(bool On) -> void override; ///< Install or remove OSD provider when becoming/leaving primary
     [[nodiscard]] auto PlayAudio(const uchar *Data, int Length, uchar Id)
         -> int override; ///< Demux one audio PES packet and enqueue for decoding
@@ -379,7 +381,13 @@ class cVaapiDevice : public cDevice {
     auto ResetNoVideoMonitors() noexcept
         -> void; ///< Clear all radio-splash + encrypted-notice state; call on every lifecycle boundary.
     auto ResetReplayAudioEofBaseline() noexcept
-        -> void; ///< Clear the replay EOF-repeat baseline; call on every replay-audio timeline reset.
+        -> void; ///< Clear the replay EOF-repeat baseline; call on every replay-audio timeline reset (API < 30014).
+    auto NoteDataAfterEosDrain() noexcept
+        -> void; ///< Replay data arriving after DrainDevice() ends the draining state: re-arms the one-shot latch.
+#if APIVERSNUM >= 30014
+    auto CancelEosDrain(const char *by) noexcept
+        -> void; ///< Clear() / SetPlayMode(): end the draining state (DrainDevice() contract), log if it was pending.
+#endif
     [[nodiscard]] auto HasFeedSpace(int currentSpeed) const
         -> bool; ///< Poll() gate: true when the decoder can accept another packet. Trick mode (currentSpeed != 0)
                  ///< also gates on the per-frame pacing timer; normal replay gates on the packet + audio highwater.
@@ -473,6 +481,9 @@ class cVaapiDevice : public cDevice {
     uint64_t osdModeGeneration{};                          ///< Display mode generation the osdWidth/osdHeight cache
                                                            ///< was taken at; a mismatch invalidates it so VDR's 1 Hz
                                                            ///< UpdateOsdSize() poll sees the new size after a modeset
+    /// Attaches VDR's transfer player at the channel switch instead of on the next main-loop pass
+    /// (cVaapiSwitchAttacher in device.cpp). Created in the ctor, unregistered first thing in the dtor.
+    std::unique_ptr<cStatus> switchAttacher;
 
     // --- Display mode switching (all guarded by displayModeMutex) ---
     mutable cMutex displayModeMutex;   ///< Serializes the debounce state below; EvaluateDisplayMode() is
@@ -525,8 +536,10 @@ class cVaapiDevice : public cDevice {
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
     std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
 #if APIVERSNUM >= 30014
-    /// One RequestEosDrain() per Drain() cycle; Clear() and SetPlayMode() cancel and re-arm it (Drain() contract).
-    std::atomic<bool> eosDrainRequested{false};
+    /// DrainDevice() cycle: 0 = none, EOS_DRAIN_REPORTED = requested and drained, else cTimeMs::Now() of the
+    /// request. One RequestEosDrain() per cycle; Clear() and SetPlayMode() cancel it. A single atomic, so the
+    /// main thread never sees a torn request/start pair.
+    std::atomic<uint64_t> eosDrainSinceMs{0};
 #endif
     /// Last confirmed audio codec; survives Clear() so a same-codec re-detect after a scrub seek logs nothing
     std::atomic<AVCodecID> previousAudioCodec{AV_CODEC_ID_NONE};
@@ -554,10 +567,13 @@ class cVaapiDevice : public cDevice {
     /// against the deadline it observed -- a concurrent re-arm stores a strictly-future value an expired observation
     /// never matches, making it impossible to cancel a fresh arm (see CheckEncryptionTimeout).
     std::atomic<uint64_t> encryptedDeadlineMs{0};
+#if APIVERSNUM < 30014
     /// PTS of the last replay PES fed to the decoder, 90 kHz. At EOF cDvbPlayer re-pushes the last PES; decoding the
     /// repeats keeps the DAC clock alive, so radio replay never hits VDR's StuckAtEof. Dropping an exact PTS repeat
     /// lets the clock stall instead. Reset via ResetReplayAudioEofBaseline() on every replay-audio timeline break.
+    /// From API 30014 on Drain() plays the tail out and nothing is re-pushed.
     std::atomic<int64_t> lastReplayAudioPts{AV_NOPTS_VALUE};
+#endif
     /// PTS of the last step PlayTrickAudio() let through, 90 kHz; AV_NOPTS_VALUE = none. Serves as both the audio-only
     /// replay's trick STC (read only while trickSpeed != 0) and the pacing hold's previous-step reference. Reset by
     /// Clear() and TrickSpeed().

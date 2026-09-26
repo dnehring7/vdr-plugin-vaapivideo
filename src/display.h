@@ -233,9 +233,11 @@ class cVaapiDisplay : public cThread {
     /// Lock-free pendingFrames depth poll. Decoder uses depth==0 to decide whether to pre-submit
     /// one frame ahead of strict-due (avoids a VSync re-present from audio-clock vs VSync drift).
     [[nodiscard]] auto PendingDepth() const noexcept -> size_t { return pendingDepth.load(std::memory_order_acquire); }
-    /// True between commit and page-flip event: the committed buffer is not yet on screen.
-    /// EOS drains count it so the final frame cannot be cut before its flip.
-    [[nodiscard]] auto HasPendingFlip() const noexcept -> bool { return isFlipPending.load(std::memory_order_acquire); }
+    /// True from the pop of a submitted frame until its flip has landed (import, commit, VSync wait). EOS
+    /// drains count it so the last picture is not cut; the re-presents that follow are not counted.
+    [[nodiscard]] auto HasFrameInFlight() const noexcept -> bool {
+        return frameInFlight.load(std::memory_order_acquire);
+    }
     /// Wall-clock ms of the most recent page-flip event; used by the decoder for VSync pacing.
     [[nodiscard]] auto GetLastVSyncTimeMs() const noexcept -> uint64_t {
         return lastVSyncTimeMs.load(std::memory_order_relaxed);
@@ -501,8 +503,10 @@ class cVaapiDisplay : public cThread {
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
     /// Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
     std::deque<std::unique_ptr<VaapiFrame>> pendingFrames;
-    std::atomic<size_t> pendingDepth{0}; ///< Lock-free mirror of pendingFrames.size(); updated under bufferMutex
-                                         ///< on every push/pop/clear, polled by the decoder via PendingDepth().
+    std::atomic<bool> frameInFlight{false}; ///< A popped frame has not flipped yet (set before pendingDepth drops,
+                                            ///< cleared once the flip gate passes); see HasFrameInFlight().
+    std::atomic<size_t> pendingDepth{0};    ///< Lock-free mirror of pendingFrames.size(); updated under bufferMutex
+                                            ///< on every push/pop/clear, polled by the decoder via PendingDepth().
     /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
     /// reports no clock.
     std::atomic<uint32_t> outputRefreshMilliHz{DISPLAY_DEFAULT_REFRESH_RATE * 1000};

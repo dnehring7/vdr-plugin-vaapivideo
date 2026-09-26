@@ -100,8 +100,10 @@ extern "C" {
 #include <vdr/i18n.h>
 #include <vdr/osd.h>
 #include <vdr/player.h>
+#include <vdr/status.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
+#include <vdr/transfer.h>
 #pragma GCC diagnostic pop
 
 // ============================================================================
@@ -150,6 +152,11 @@ constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
 /// payload and must NOT reach here -- the window's front-erase lands mid-frame and a ~1.5 KB AC-3
 /// frame can't fit a corroborating pair in 2 KB.
 constexpr size_t AUDIO_DETECT_WINDOW = 2048;
+
+#if APIVERSNUM >= 30014
+/// eosDrainSinceMs once the drain has been reported: still latched (no second RequestEosDrain()), no longer pending.
+constexpr uint64_t EOS_DRAIN_REPORTED = std::numeric_limits<uint64_t>::max();
+#endif
 
 /// ISO 13818-1 private_stream_1 -- the PES stream id every DVB dolby track (AC-3, E-AC-3, DTS) rides in.
 constexpr uchar PES_PRIVATE_STREAM_1 = 0xBD;
@@ -753,6 +760,7 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
     // Submit through the normal display path: modeset / DRM plane state mirrors a real frame.
     auto frame = std::make_unique<VaapiFrame>();
     frame->avFrame = hwFrame.release();
+    frame->synthetic = true; // not the stream's first picture: the display keeps its start trace armed
     // FFmpeg VAAPI ABI: data[3] holds the VASurfaceID directly, cast through uintptr_t.
     frame->vaSurfaceId = static_cast<VASurfaceID>(
         reinterpret_cast<uintptr_t>(frame->avFrame->data[3])); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
@@ -783,13 +791,60 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
     return queued;
 }
 
-cVaapiDevice::cVaapiDevice() {
+namespace {
+
+// VDR attaches a launched player only from its main loop, and cTransfer::Receive() discards the TS until
+// then. That pass comes late: after a key zap the skin draws the channel display first (signal bars block
+// in FE_GET_PROPERTY), after an SVDRP/plugin switch the loop sleeps in cRemote::Get(1000). ChannelSwitch()
+// fires right after cControl::Launch() inside SetChannel(), so attaching there lets the stream flow at
+// once; the main loop's Attach() becomes a no-op. Lock order is VDR's own (mutexChannel -> cControl).
+class cVaapiSwitchAttacher : public cStatus {
+  public:
+    explicit cVaapiSwitchAttacher(const cVaapiDevice *ownerDevice) : owner(ownerDevice) {}
+    ~cVaapiSwitchAttacher() noexcept override = default;
+    cVaapiSwitchAttacher(const cVaapiSwitchAttacher &) = delete;
+    cVaapiSwitchAttacher(cVaapiSwitchAttacher &&) noexcept = delete;
+    auto operator=(const cVaapiSwitchAttacher &) -> cVaapiSwitchAttacher & = delete;
+    auto operator=(cVaapiSwitchAttacher &&) noexcept -> cVaapiSwitchAttacher & = delete;
+
+  protected:
+    auto ChannelSwitch(const cDevice *device, int channelNumber, bool liveView) -> void override;
+
+  private:
+    const cVaapiDevice *owner; ///< Our device; switches VDR reports for any other device are ignored
+};
+
+auto cVaapiSwitchAttacher::ChannelSwitch(const cDevice *device, const int channelNumber, const bool liveView) -> void {
+    // Number 0 reports the start of a switch, before anything is launched. A detached device leaves the
+    // attach (and its "no decoder" handling) to the main loop.
+    if (channelNumber == 0 || !liveView || device != owner || device != cDevice::PrimaryDevice() ||
+        !owner->HardwareReady()) {
+        return;
+    }
+    // Held across Attach() (recursive), so the control attached is the one checked. By type, not identity:
+    // a newer transfer control is what the main loop would attach next anyway; anything else is left to it.
+    cMutexLock controlLock;
+    if (!dynamic_cast<cTransferControl *>(cControl::Control(controlLock, /*Hidden=*/true))) {
+        return;
+    }
+    dsyslog("vaapivideo/device: channel %d -- attaching the transfer player at the switch (%s thread)", channelNumber,
+            cThread::IsMainThread() != 0 ? "main" : "switching");
+    cControl::Attach();
+}
+
+} // namespace
+
+cVaapiDevice::cVaapiDevice() : switchAttacher(std::make_unique<cVaapiSwitchAttacher>(this)) {
     isyslog("vaapivideo/device: created");
     SetDescription("VAAPI Video Device");
     SetVideoFormat(true);
 }
 
 cVaapiDevice::~cVaapiDevice() noexcept {
+    // First, so no later SetChannel() attaches into a half-destroyed device. Removal does not wait for a
+    // running callback (VDR walks cStatus unlocked), but SVDRP is stopped before the devices.
+    switchAttacher.reset();
+
     // Pass CheckDecoder=false: the decoder may already be torn down (e.g. after Detach()),
     // and the default HasDecoder() gate would misreport this device as non-primary.
     dsyslog("vaapivideo/device: destroying (isPrimary=%d)", IsPrimaryDevice(/*CheckDecoder=*/false));
@@ -871,7 +926,7 @@ auto cVaapiDevice::Clear() -> void {
     cDevice::Clear();
 
 #if APIVERSNUM >= 30014
-    eosDrainRequested.store(false, std::memory_order_relaxed); // a Clear() cancels an in-flight Drain()
+    CancelEosDrain("Clear()");
 #endif
 
     // trickSpeed intentionally NOT reset: Clear() is a buffer flush, not a mode change.
@@ -937,17 +992,33 @@ auto cVaapiDevice::Clear() -> void {
 [[nodiscard]] auto cVaapiDevice::DeviceType() const -> cString { return "VAAPI"; }
 
 #if APIVERSNUM >= 30014
-[[nodiscard]] auto cVaapiDevice::Drain() -> bool {
-    // Never waits: VDR polls this from cDvbPlayer's loop, which holds its thread lock meanwhile.
+[[nodiscard]] auto cVaapiDevice::DrainDevice() -> bool {
+    // Never waits: cDvbPlayer polls this every few ms from its loop, holding its thread lock meanwhile.
     if (!decoder) [[unlikely]] {
         return true;
     }
-    // Once: a re-request would re-arm the pending-drain flag and hold the depth above 0 forever.
-    if (!eosDrainRequested.exchange(true, std::memory_order_relaxed)) {
+    uint64_t sinceMs = eosDrainSinceMs.load(std::memory_order_relaxed);
+    if (sinceMs == 0) {
+        // Once per cycle: a re-request would re-arm the codec drain and hold the depth above 0 forever.
+        // cDevice::Drain() has already handed down the PES that PlayTs() held back at EOF.
+        sinceMs = std::max<uint64_t>(cTimeMs::Now(), 1);
+        eosDrainSinceMs.store(sinceMs, std::memory_order_relaxed);
         RequestEosDrain();
+        tsyslog("vaapivideo/device: EOS drain requested -- video queue %zu, reserve %zu, display %zu, audio %zu",
+                decoder->GetQueueSize(), decoder->GetDecodedReserveSize(),
+                display ? display->PendingDepth() : size_t{0},
+                audioProcessor ? audioProcessor->GetPendingWorkSize() : size_t{0});
     }
-    // Zero once decode, display, and audio backlogs have played out: the final PTS is on the output.
-    return PendingPlayoutDepth() == 0;
+    // Zero once decode, display, and audio backlogs have played out: the last frame is on screen.
+    if (PendingPlayoutDepth() != 0) {
+        return false;
+    }
+    if (sinceMs != EOS_DRAIN_REPORTED &&
+        eosDrainSinceMs.compare_exchange_strong(sinceMs, EOS_DRAIN_REPORTED, std::memory_order_relaxed)) {
+        dsyslog("vaapivideo/device: EOS drained -- last frame on screen %llums after the request",
+                static_cast<unsigned long long>(cTimeMs::Now() - sinceMs));
+    }
+    return true;
 }
 #endif
 
@@ -976,7 +1047,10 @@ auto cVaapiDevice::Freeze() -> void {
     // Drop queued packets so un-pause shows the user's intended frame, not stale lookahead.
     // Does NOT reset sync EMA: that would cause a reseed transient on resume.
     if (decoder) [[likely]] {
-        decoder->DrainQueue();
+        // Not during an EOS drain: the queue holds the stream's last packets, which no player feeds again.
+        if (!decoder->IsCodecDrainPending()) {
+            decoder->DrainQueue();
+        }
         // Hold the drain so the jitterBuf head's PTS doesn't drift during the pause: ALSA is
         // dropped below and WritePcmToAlsa stops, GetClock() goes stale within ~1 s, and the
         // decoder's no-clock-freerun would otherwise submit frames at vsync rate -- leaving the
@@ -1513,11 +1587,9 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
 auto cVaapiDevice::Mute() -> void {
     cDevice::Mute();
 
-    // DropOutput silences the queued tail without nulling the playback clock; the persistent mute
-    // case is handled by SetVolumeDevice(0) (VDR's mute key drives that path, not this override).
-    // Full Clear() here would null GetClock() and cause a video freerun + display underrun for
-    // every OSD-mediated mute. HardwareReady()-gated: skins can mute on menu open/close (main
-    // thread) during an in-flight ATTA.
+    // DropOutput, not Clear(): the picture holds until the ring refills and re-anchors the clock, where a
+    // Clear() would arm freerun and underrun the display. Persistent mute is SetVolumeDevice(0) (the mute
+    // key's path). HardwareReady()-gated: skins can mute on menu open/close during an in-flight ATTA.
     if (HardwareReady() && audioProcessor) [[likely]] {
         audioProcessor->DropOutput();
     }
@@ -1536,10 +1608,11 @@ auto cVaapiDevice::Play() -> void {
     }
 
     paused.store(false, std::memory_order_relaxed);
-    // Release the drain-loop hold. The next WritePcmToAlsa anchors the clock and lifts the
-    // pause pin (Freeze() set clockPaused=true via DropOutput); until then GetClock() returns
-    // the pinned playbackPts so the drain due-gate stays stable across the resume window.
-    // Seek/startup NOPTS handling remains covered by DECODER_NO_CLOCK_HOLD_MS.
+    // Lift Freeze()'s clock pin before releasing the drain hold: normally the next write would, but at
+    // EOS none follows and the video tail would wait forever.
+    if (HardwareReady() && audioProcessor) [[likely]] {
+        audioProcessor->ResumeClock();
+    }
     if (decoder) [[likely]] {
         decoder->SetDevicePaused(false);
     }
@@ -1831,10 +1904,15 @@ auto cVaapiDevice::Play() -> void {
         return 0;
     }
 
+    if (!isLive) {
+        NoteDataAfterEosDrain();
+    }
     audioProcessor->Decode(pes.payload, pes.payloadSize, pes.pts);
+#if APIVERSNUM < 30014
     if (!isLive && pes.pts != AV_NOPTS_VALUE) {
         lastReplayAudioPts.store(pes.pts, std::memory_order_relaxed);
     }
+#endif
     return Length;
 }
 
@@ -1951,6 +2029,7 @@ auto cVaapiDevice::Play() -> void {
         } else if (decoder->IsQueueFull()) {
             return 0;
         }
+        NoteDataAfterEosDrain(); // accepted from here on: every path below enqueues
     }
 
     // First keyframe after a live codec open: the parser holds an AU back until the NEXT AU's start code,
@@ -2172,7 +2251,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed);
 
 #if APIVERSNUM >= 30014
-    eosDrainRequested.store(false, std::memory_order_relaxed); // Drain() contract: SetPlayMode() cancels a drain
+    CancelEosDrain("SetPlayMode()");
 #endif
 
     // External-player handover (vdr-mpv): suspend hardware so it can grab DRM/VAAPI/ALSA.
@@ -3105,7 +3184,13 @@ auto cVaapiDevice::ClearForMediaPlayer() -> void {
 
 auto cVaapiDevice::RequestEosDrain() -> void {
     if (decoder) [[likely]] {
+        // The parser withholds the last AU until a start code follows it: queue it before the codec drain,
+        // which the decode thread runs only once its queue is empty.
+        decoder->ReleasePendingAccessUnit();
         decoder->RequestCodecDrain();
+    }
+    if (audioProcessor) [[likely]] {
+        audioProcessor->RequestDrain();
     }
 }
 
@@ -3124,7 +3209,7 @@ auto cVaapiDevice::RequestEosDrain() -> void {
         // Frames leave the decoder reserve before they are on screen; without these terms the last
         // frames of the tail would be cut at EOS (audio often ends before the final video flip).
         depth += display->PendingDepth();
-        if (display->HasPendingFlip()) {
+        if (display->HasFrameInFlight()) {
             ++depth;
         }
     }
@@ -3543,8 +3628,31 @@ auto cVaapiDevice::ResetAudioCodecState() -> void {
 }
 
 auto cVaapiDevice::ResetReplayAudioEofBaseline() noexcept -> void {
+#if APIVERSNUM < 30014
     lastReplayAudioPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+#endif
 }
+
+auto cVaapiDevice::NoteDataAfterEosDrain() noexcept -> void {
+#if APIVERSNUM >= 30014
+    // A growing recording can hit eof and resume without a Clear() (cIndexFile's catch-up wait outlasts a
+    // stalled recorder). Left latched, the real EOF would skip its codec drain and lose the reorder tail.
+    // Load first: this runs per PES, the store almost never.
+    if (eosDrainSinceMs.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        eosDrainSinceMs.store(0, std::memory_order_relaxed);
+        tsyslog("vaapivideo/device: replay data after Drain() -- EOS drain re-armed");
+    }
+#endif
+}
+
+#if APIVERSNUM >= 30014
+auto cVaapiDevice::CancelEosDrain(const char *by) noexcept -> void {
+    if (const uint64_t sinceMs = eosDrainSinceMs.exchange(0, std::memory_order_relaxed);
+        sinceMs != 0 && sinceMs != EOS_DRAIN_REPORTED) {
+        tsyslog("vaapivideo/device: EOS drain cancelled by %s -- depth %zu", by, PendingPlayoutDepth());
+    }
+}
+#endif
 
 // ============================================================================
 // === DISPLAY MODE MATCHING ===

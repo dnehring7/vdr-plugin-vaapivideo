@@ -68,6 +68,8 @@ struct VaapiFrame {
                                  ///< older than the current clearEpoch, so pre-Clear material self-discards regardless
                                  ///< of the race timing between decode, present, and Clear().
     int64_t pts{AV_NOPTS_VALUE}; ///< Presentation timestamp in 90 kHz units.
+    bool synthetic{false};       ///< Painted by the device (black frame, notice, splash), not decoded from the
+                                 ///< stream; the display leaves the stream-start trace armed for such a frame
     VASurfaceID vaSurfaceId{VA_INVALID_SURFACE}; ///< Cached from avFrame->data[3]; used for zero-copy DRM PRIME export.
 };
 
@@ -168,9 +170,9 @@ class cVaapiDecoder : public cThread {
     auto SetLiveMode(bool live) -> void; ///< true = live TV (jitter buffer active); false = replay.
     auto RequestCodecDrain() -> void;    ///< Ask decode thread to drain B-frame reorder buffer (e.g. before still).
     [[nodiscard]] auto IsCodecDrainPending() const noexcept -> bool {
-        return codecDrainPending.load(std::memory_order_acquire);
-    } ///< True until the decode thread consumes the drain. Keeps the mediaplayer EOS wait alive until
-      ///< the reorder-buffer tail has been pushed to the reserve.
+        return codecDrainPending.load(std::memory_order_acquire) || codecDrainActive.load(std::memory_order_acquire);
+    } ///< True from the request until the drained reorder tail has been pushed to the reserve, so an EOS
+      ///< depth poll never reads 0 while the decode thread is still filtering that tail.
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
     auto RequestFilterRebuild()
@@ -236,6 +238,8 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
     auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
+    auto FillMissingFramePts(AVFrame *frame) noexcept -> void; ///< Labels a NOPTS decoded frame from lastDecodedPts
+                                                               ///< before it enters the chain. Caller holds codecMutex.
     auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< Push decodedFrame through the filter graph (lazily built) and append with monotonic PTS.
                  ///< Caller holds codecMutex and must have populated decodedFrame.
@@ -358,6 +362,8 @@ class cVaapiDecoder : public cThread {
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> codecCtx;
     AVCodecID currentCodecId{AV_CODEC_ID_NONE}; ///< Codec ID currently open; used for reuse check and parser recreate.
     bool forceCodecReopen{};                    ///< Set by RequestCodecReopen(); cleared by OpenCodecWithInfo().
+    int64_t lastDecodedPts{AV_NOPTS_VALUE};     ///< PTS of the last frame fed to the chain (codecMutex); the label a
+                                                ///< NOPTS frame gets, plus one frame period. NOPTS after every flush.
     bool streamInterlaced{false};               ///< Positive sequence-level hint; forces deinterlace at graph build.
     // Container HDR hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED on the PES path.
     AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};             ///< Container colour primaries
@@ -389,6 +395,8 @@ class cVaapiDecoder : public cThread {
     // === PLAYBACK STATE ===
     // ========================================================================
     std::atomic<bool> codecDrainPending{false};   ///< Decode thread drains codec (NULL packet) then clears this.
+    std::atomic<bool> codecDrainActive{false};    ///< Set before codecDrainPending is consumed, cleared after the
+                                                  ///< drained frames are handed off; IsCodecDrainPending() covers both.
     std::atomic<bool> stillPictureMode{false};    ///< Selects spatial-only (bob) deinterlace; cleared after drain.
     std::atomic<bool> hasExited{true};            ///< False only while Action() (decode) runs; checked by Shutdown().
     std::atomic<bool> presentExited{true};        ///< False only while PresentAction() runs; checked by Shutdown().

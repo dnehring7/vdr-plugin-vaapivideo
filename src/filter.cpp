@@ -32,14 +32,17 @@ extern "C" {
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/rational.h>
 }
 #pragma GCC diagnostic pop
 
@@ -836,7 +839,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 // "duplicated" only when the display rate is a whole multiple of the source rate
                 // (every frame shown the same number of times); anything else beats out a 3:2-style
                 // uneven pattern. Compared with the same tolerance as the match test above so a
-                // 23.976-into-59.94 pull-down is not mislabelled over a rounding remainder.
+                // 23.976-into-59.94 pull-down is not mislabeled over a rounding remainder.
                 const uint64_t multiple =
                     (static_cast<uint64_t>(displayMilliHz) + (naturalOutputMilliHz / 2)) / naturalOutputMilliHz;
                 const uint64_t ideal = multiple * naturalOutputMilliHz;
@@ -890,7 +893,22 @@ auto cVideoFilterChain::ReceiveFrame(AVFrame *out) noexcept -> int {
     if (!graph_ || !bufferSinkCtx_) [[unlikely]] {
         return AVERROR(EINVAL);
     }
-    return av_buffersink_get_frame(bufferSinkCtx_, out);
+    const int ret = av_buffersink_get_frame(bufferSinkCtx_, out);
+    if (ret < 0) {
+        return ret;
+    }
+    // The sink's time base differs from the source's 1/90k (halved by a field-rate deinterlacer, 1/rate
+    // after fps=). Rescale rather than relabel: only a temporal filter knows which frame it emitted.
+    const AVRational sinkTimeBase = av_buffersink_get_time_base(bufferSinkCtx_);
+    constexpr AVRational kPtsTimeBase{.num = 1, .den = PTSTICKS};
+    if (out->pts != AV_NOPTS_VALUE) {
+        out->pts = av_rescale_q(out->pts, sinkTimeBase, kPtsTimeBase);
+    }
+    if (out->duration > 0) {
+        out->duration = av_rescale_q(out->duration, sinkTimeBase, kPtsTimeBase);
+    }
+    out->time_base = kPtsTimeBase;
+    return ret;
 }
 
 auto cVideoFilterChain::Reset() noexcept -> void {

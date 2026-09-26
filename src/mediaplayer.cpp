@@ -2198,8 +2198,14 @@ auto cVaapiPlayer::DrainTailAtEof() -> void {
 
     // Flush the reorder tail into the reserve (the decode thread defers that until its queue has
     // emptied), then drain everything to the screen at real-time pace.
+    const cTimeMs start;
+    tsyslog("vaapivideo/mediaplayer: EOS tail drain requested -- depth %zu", vaapiDev->PendingPlayoutDepth());
     vaapiDev->RequestEosDrain();
     drainUntilEmpty([vaapiDev]() noexcept -> size_t { return vaapiDev->PendingPlayoutDepth(); });
+    const size_t left = vaapiDev->PendingPlayoutDepth();
+    dsyslog("vaapivideo/mediaplayer: EOS tail %s after %llums%s", left == 0 ? "drained" : "drain abandoned",
+            static_cast<unsigned long long>(start.Elapsed()),
+            left == 0 ? "" : (aborted() ? " (user command)" : " (stall)"));
 }
 
 auto cVaapiPlayer::AdvancePlaylist() -> void {
