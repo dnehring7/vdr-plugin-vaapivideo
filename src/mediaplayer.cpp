@@ -63,6 +63,7 @@
 #include <vector>
 
 #include <dirent.h>
+#include <unistd.h>
 
 // FFmpeg
 #pragma GCC diagnostic push
@@ -93,6 +94,7 @@ extern "C" {
 #include <vdr/config.h>
 #include <vdr/device.h>
 #include <vdr/i18n.h>
+#include <vdr/interface.h>
 #include <vdr/keys.h>
 #include <vdr/menu.h>
 #include <vdr/osdbase.h>
@@ -1729,46 +1731,63 @@ auto cVaapiPlayer::ApplyStartPosition() -> void {
     const double fps = source->VideoFps();
     const size_t idx = currentIndex.load(std::memory_order_relaxed);
 
-    std::string text;
+    // Rows first, text last: translated labels differ in length, so the value column is placed after the
+    // longest label (counted in characters, not UTF-8 bytes). An empty row is a blank separator line.
+    std::vector<std::pair<std::string, std::string>> rows;
     if (idx < playlist.size()) {
-        text += std::format("Title:    {}\n", playlist.at(idx).title);
-        text += std::format("URI:      {}\n\n", playlist.at(idx).uri);
+        rows.emplace_back(tr("Title"), playlist.at(idx).title);
+        rows.emplace_back("URI", playlist.at(idx).uri);
+        rows.emplace_back();
     }
-    text += std::format("Duration: {}\n", *FormatHms(source->DurationMs()));
-    text += std::format("Video:    {} {}x{}", avcodec_get_name(v.codecId), w, h);
+    rows.emplace_back(tr("Duration"), *FormatHms(source->DurationMs()));
+    std::string video = std::format("{} {}x{}", avcodec_get_name(v.codecId), w, h);
     if (fps > 0.0) {
-        text += std::format(" @ {:.3f} fps", fps);
+        video += std::format(" @ {:.3f} fps", fps);
     }
-    text += "\n";
+    rows.emplace_back(tr("Video"), std::move(video));
     const auto &tracks = source->AudioTracks();
     const int current = source->CurrentAudioTrack();
     if (tracks.empty()) {
-        text += "Audio:    (none)\n";
-    } else {
-        for (size_t i = 0; i < tracks.size(); ++i) {
-            const auto &track = tracks.at(i);
-            const std::string_view layout = AudioLayoutLabel(track.srcChannels);
-            const std::string channels = layout.empty() ? std::format("{} ch", track.srcChannels) : std::string{layout};
-            const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
-            // A leading "* " marks the active track; "  " keeps the others column-aligned.
-            text += std::format("Audio {}: {}{} {} Hz {}{}\n", i + 1, (static_cast<int>(i) == current) ? "* " : "  ",
-                                avcodec_get_name(track.info.codecId), track.info.sampleRate, channels, lang);
-        }
+        // TRANSLATORS: value of the file-info "Audio" row for a file without audio tracks (shown in parentheses)
+        const char *const noTracks = trNOOP("none");
+        rows.emplace_back(tr("Audio"), std::format("({})", TrLabel(noTracks)));
+    }
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        const auto &track = tracks.at(i);
+        const std::string_view layout = AudioLayoutLabel(track.srcChannels);
+        const std::string channels = layout.empty() ? std::format("{} ch", track.srcChannels) : std::string{layout};
+        const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
+        // A leading "* " marks the active track; "  " keeps the others column-aligned.
+        rows.emplace_back(std::format("{} {}", tr("Audio"), i + 1),
+                          std::format("{}{} {} Hz {}{}", (static_cast<int>(i) == current) ? "* " : "  ",
+                                      avcodec_get_name(track.info.codecId), track.info.sampleRate, channels, lang));
     }
     const auto &subtitleTracks = source->SubtitleTracks();
     const int currentSub = source->CurrentSubtitleTrack();
-    if (!subtitleTracks.empty()) {
-        for (size_t i = 0; i < subtitleTracks.size(); ++i) {
-            const auto &track = subtitleTracks.at(i);
-            const char *codecName = SubtitleCodecName(track.codecId);
-            const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
-            // A leading "* " marks the active subtitle track; "off" reads as none selected.
-            text += std::format("Subs {}:  {}{}{}\n", i + 1, (static_cast<int>(i) == currentSub) ? "* " : "  ",
-                                codecName, lang);
-        }
+    for (size_t i = 0; i < subtitleTracks.size(); ++i) {
+        const auto &track = subtitleTracks.at(i);
+        const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
+        rows.emplace_back(std::format("{} {}", tr("Subtitle"), i + 1),
+                          std::format("{}{}{}", (static_cast<int>(i) == currentSub) ? "* " : "  ",
+                                      SubtitleCodecName(track.codecId), lang));
     }
     if (playlist.size() > 1) {
-        text += std::format("Playlist: {}/{}\n", idx + 1, playlist.size());
+        rows.emplace_back(tr("Playlist"), std::format("{}/{}", idx + 1, playlist.size()));
+    }
+
+    int labelWidth = 0;
+    for (const auto &[label, value] : rows) {
+        labelWidth = std::max(labelWidth, Utf8StrLen(label.c_str()));
+    }
+    std::string text;
+    for (const auto &[label, value] : rows) {
+        if (!label.empty()) {
+            const int pad = labelWidth - Utf8StrLen(label.c_str()) + 1; // >= 1: labelWidth is the maximum
+            text += label + ':';
+            text.append(static_cast<size_t>(pad), ' ');
+            text += value;
+        }
+        text += '\n';
     }
     return text;
 }
@@ -2559,7 +2578,7 @@ auto cVaapiControl::Hide() -> void { HideReplayBar(); }
     if (body.empty()) {
         return nullptr;
     }
-    return new cMenuText(tr("File Info"), body.c_str());
+    return new cMenuText(tr("File info"), body.c_str());
 }
 
 auto cVaapiControl::ShowReplayBar() -> void {
@@ -2732,7 +2751,7 @@ auto cVaapiControl::RefreshReplayBar() -> void {
             } else {
                 const int stop = vaapiDev->CycleZoom();
                 dsyslog("vaapivideo/mediaplayer: key Blue -- zoom cycle to stop %d", stop);
-                Skins.QueueMessage(mtInfo, vaapiDev->ZoomStatusLabel().c_str());
+                Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
             }
             return osContinue;
         }
@@ -2757,6 +2776,12 @@ cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir) : cOsdMenu("") {
     if (startDir.empty()) {
         startDir = "/";
     }
+    // Browsing may leave the root (a bookmark elsewhere, ".." above it); deleting must not. Canonical, like
+    // currentDir, so the containment test compares resolved paths. Unresolvable -> empty -> no Delete at all.
+    std::error_code rootEc;
+    if (const auto root = std::filesystem::canonical(startDir, rootEc); !rootEc) {
+        mediaRoot = root.string();
+    }
     // Open on the bookmark (parent dir, cursor on the file); a URL / deleted file / gone m3u entry
     // falls back to the start folder. Read here so every browser open lands on the bookmark.
     if (const std::string mark = NormalizeBookmarkUri(LoadBookmark().uri); !mark.empty() && !HasUrlScheme(mark)) {
@@ -2765,6 +2790,7 @@ cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir) : cOsdMenu("") {
         if (std::filesystem::is_regular_file(mark, ec) && !ec && std::filesystem::is_directory(parent, ec) && !ec) {
             LoadDirectory(parent);
             if (SelectEntryByName(Basename(mark))) {
+                SetHelpKeys();
                 return;
             }
         }
@@ -2898,6 +2924,7 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
         Add(new cOsdItem(label, osUnknown));
     }
     Display();
+    SetHelpKeys(); // after Display(): Clear() left no current row, Display() selects the first one
 }
 
 [[nodiscard]] auto cVaapiFileBrowser::SelectedEntry() const -> const BrowserEntry * {
@@ -2916,6 +2943,63 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
         return Dirname(currentDir);
     }
     return currentDir + (currentDir.back() == '/' ? "" : "/") + entry.name;
+}
+
+[[nodiscard]] auto cVaapiFileBrowser::SelectedDeletable() const -> const BrowserEntry * {
+    if (mediaRoot.empty()) {
+        return nullptr;
+    }
+    // Component-wise, so /srv/mediafoo is not "inside" /srv/media; lexically_normal() folds any ".." a
+    // non-canonical currentDir (canonical() failed) could carry.
+    const auto relative = std::filesystem::path(currentDir).lexically_normal().lexically_relative(mediaRoot);
+    if (relative.empty() || *relative.begin() == "..") {
+        return nullptr;
+    }
+    const auto *entry = SelectedEntry();
+    if (entry == nullptr || (entry->kind != EntryKind::File && entry->kind != EntryKind::Playlist)) {
+        return nullptr;
+    }
+    return entry;
+}
+
+auto cVaapiFileBrowser::SetHelpKeys() -> void {
+    const int keys = SelectedDeletable() != nullptr ? 1 : 0;
+    if (keys != helpKeys) { // SetHelp() repaints the buttons, so skip it while nothing changed
+        helpKeys = keys;
+        SetHelp(nullptr, nullptr, keys != 0 ? trVDR("Button$Delete") : nullptr, nullptr);
+    }
+}
+
+auto cVaapiFileBrowser::DeleteSelected() -> void {
+    const auto *entry = SelectedDeletable();
+    if (entry == nullptr) {
+        return;
+    }
+    const std::string name = entry->name;
+    const std::string fullPath = BuildFullPath(*entry);
+    // The file name goes into the prompt so the user sees what goes.
+    if (!Interface->Confirm(cString::sprintf(tr("Delete %s?"), name.c_str()))) {
+        return;
+    }
+    // unlink(), not std::filesystem::remove(): the entry may have changed while the prompt was up, and remove()
+    // would also delete an empty directory now at that path, and report a vanished file as nothing to do.
+    if (::unlink(fullPath.c_str()) != 0) {
+        const std::error_code ec(errno, std::generic_category());
+        esyslog("vaapivideo/mediaplayer: delete %s: %s", fullPath.c_str(), ec.message().c_str());
+        Skins.Message(mtError, cString::sprintf(tr("Delete failed: %s"), ec.message().c_str()));
+    } else {
+        isyslog("vaapivideo/mediaplayer: deleted %s", fullPath.c_str());
+    }
+
+    // Relist either way (a failure may mean the file is already gone) and keep the cursor on the same row
+    // (after a delete, the next file), as VDR's recordings menu does.
+    const int row = Current();
+    LoadDirectory(currentDir);
+    if (!entries.empty()) {
+        SetCurrent(Get(std::min(row, static_cast<int>(entries.size()) - 1)));
+        SetHelpKeys();
+        Display();
+    }
 }
 
 [[nodiscard]] auto cVaapiFileBrowser::ProcessKey(eKeys Key) -> eOSState {
@@ -2940,10 +3024,17 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
     // see the key here when it returned osUnknown, i.e. nothing the menu knew how to do.
     const eOSState state = cOsdMenu::ProcessKey(Key);
     if (state != osUnknown) {
+        SetHelpKeys(); // the cursor may have moved onto or off a deletable row
         return state;
     }
 
     switch (Key & ~k_Repeat) {
+        case kYellow:
+            // Held key: one prompt per press, never a chain of deletes down the list.
+            if ((Key & k_Repeat) == 0) {
+                DeleteSelected();
+            }
+            return osContinue;
         case kOk: {
             const auto *entry = SelectedEntry();
             if (entry == nullptr) {

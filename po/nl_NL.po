@@ -1,0 +1,192 @@
+# Dutch translations for vdr-vaapivideo.
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+# This file is distributed under the same license as the vdr-vaapivideo package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: vdr-vaapivideo 1.9.0\n"
+"Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
+"POT-Creation-Date: 2026-09-27 23:50+0200\n"
+"PO-Revision-Date: 2026-09-27 23:30+0200\n"
+"Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
+"Language-Team: Dutch <vdr@linuxtv.org>\n"
+"Language: nl\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "VAAPI Video"
+msgstr "VAAPI Video"
+
+msgid "Audio"
+msgstr "Audio"
+
+msgid "Audio passthrough"
+msgstr "Audio-passthrough"
+
+msgid "PCM channels"
+msgstr "PCM-kanalen"
+
+msgid "PCM audio latency (ms)"
+msgstr "PCM-audiolatentie (ms)"
+
+msgid "Passthrough audio latency (ms)"
+msgstr "Passthrough-audiolatentie (ms)"
+
+msgid "Video"
+msgstr "Video"
+
+msgid "Deinterlacing"
+msgstr "Deinterlacing"
+
+msgid "Denoising"
+msgstr "Ruisonderdrukking"
+
+msgid "Scaling"
+msgstr "Schaling"
+
+msgid "Sharpening"
+msgstr "Verscherping"
+
+msgid "HDR passthrough"
+msgstr "HDR-passthrough"
+
+msgid "Display mode"
+msgstr "Weergavemodus"
+
+msgid "Match refresh rate"
+msgstr "Verversingsfrequentie aanpassen"
+
+msgid "Match resolution"
+msgstr "Resolutie aanpassen"
+
+msgid "Minimum resolution"
+msgstr "Minimale resolutie"
+
+msgid "Maximum refresh rate"
+msgstr "Maximale verversingsfrequentie"
+
+msgid "Switch for live TV"
+msgstr "Omschakelen bij live-tv"
+
+msgid "Switch for recordings"
+msgstr "Omschakelen bij opnames"
+
+msgid "Switch for mediaplayer"
+msgstr "Omschakelen in mediaspeler"
+
+msgid "Zoom (in 0.1% steps)"
+msgstr "Zoom (in stappen van 0,1%)"
+
+#, c-format
+msgid "Zoom level %d"
+msgstr "Zoomniveau %d"
+
+msgid "General"
+msgstr "Algemeen"
+
+msgid "Clear display on channel switch"
+msgstr "Zwart beeld bij kanaalwissel"
+
+msgid "VAAPI device not ready"
+msgstr "VAAPI-apparaat niet gereed"
+
+msgid "Mediaplayer"
+msgstr "Mediaspeler"
+
+msgid "Zoom"
+msgstr "Zoom"
+
+msgid "VDR with vaapivideo is getting ready..."
+msgstr "VDR met vaapivideo wordt gestart..."
+
+msgid "Title"
+msgstr "Titel"
+
+msgid "Duration"
+msgstr "Duur"
+
+#. TRANSLATORS: value of the file-info "Audio" row for a file without audio tracks (shown in parentheses)
+msgid "none"
+msgstr "geen"
+
+msgid "Subtitle"
+msgstr "Ondertitel"
+
+msgid "Playlist"
+msgstr "Afspeellijst"
+
+msgid "File info"
+msgstr "Bestandsinfo"
+
+#, c-format
+msgid "Delete %s?"
+msgstr "%s verwijderen?"
+
+#, c-format
+msgid "Delete failed: %s"
+msgstr "Verwijderen mislukt: %s"
+
+msgid "Empty or unreadable playlist"
+msgstr "Afspeellijst leeg of onleesbaar"
+
+msgid "Cannot start playback"
+msgstr "Afspelen kan niet worden gestart"
+
+msgid "Hardware-accelerated video playback with VAAPI"
+msgstr "Hardwareversnelde videoweergave met VAAPI"
+
+msgid "on"
+msgstr "aan"
+
+msgid "off"
+msgstr "uit"
+
+msgid "stereo"
+msgstr "stereo"
+
+msgid "multichannel"
+msgstr "meerkanaals"
+
+msgid "auto (best available)"
+msgstr "auto (best mogelijk)"
+
+msgid "hardware: motion adaptive"
+msgstr "hardware: bewegingsadaptief"
+
+msgid "hardware: weave (fast)"
+msgstr "hardware: weave (snel)"
+
+msgid "hardware: bob (fastest)"
+msgstr "hardware: bob (snelst)"
+
+msgid "software: bwdif (best)"
+msgstr "software: bwdif (beste kwaliteit)"
+
+msgid "software: w3fdif (faster)"
+msgstr "software: w3fdif (sneller)"
+
+msgid "auto (hardware)"
+msgstr "auto (hardware)"
+
+msgid "software: light"
+msgstr "software: licht"
+
+msgid "software: medium"
+msgstr "software: gemiddeld"
+
+msgid "auto (hardware, HQ)"
+msgstr "auto (hardware, HQ)"
+
+msgid "hardware: fast"
+msgstr "hardware: snel"
+
+msgid "software: lanczos (HQ)"
+msgstr "software: lanczos (HQ)"
+
+msgid "software: bilinear (fast)"
+msgstr "software: bilineair (snel)"
+
+msgid "unlimited"
+msgstr "onbeperkt"

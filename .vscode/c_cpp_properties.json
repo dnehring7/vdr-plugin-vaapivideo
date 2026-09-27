@@ -6,7 +6,9 @@
                 "${workspaceFolder}/**",
                 "/usr/include/ffmpeg"
             ],
-            "defines": [],
+            "defines": [
+                "PLUGIN_NAME_I18N=\"vaapivideo\""
+            ],
             "compilerPath": "/usr/lib64/ccache/g++",
             "cStandard": "c17",
             "cppStandard": "gnu++20",

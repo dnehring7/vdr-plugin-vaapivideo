@@ -1,0 +1,192 @@
+# Italian translations for vdr-vaapivideo.
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+# This file is distributed under the same license as the vdr-vaapivideo package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: vdr-vaapivideo 1.9.0\n"
+"Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
+"POT-Creation-Date: 2026-09-27 23:50+0200\n"
+"PO-Revision-Date: 2026-09-27 23:30+0200\n"
+"Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
+"Language-Team: Italian <vdr@linuxtv.org>\n"
+"Language: it\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "VAAPI Video"
+msgstr "VAAPI Video"
+
+msgid "Audio"
+msgstr "Audio"
+
+msgid "Audio passthrough"
+msgstr "Passthrough audio"
+
+msgid "PCM channels"
+msgstr "Canali PCM"
+
+msgid "PCM audio latency (ms)"
+msgstr "Latenza audio PCM (ms)"
+
+msgid "Passthrough audio latency (ms)"
+msgstr "Latenza audio passthrough (ms)"
+
+msgid "Video"
+msgstr "Video"
+
+msgid "Deinterlacing"
+msgstr "Deinterlacciamento"
+
+msgid "Denoising"
+msgstr "Riduzione rumore"
+
+msgid "Scaling"
+msgstr "Ridimensionamento"
+
+msgid "Sharpening"
+msgstr "Nitidezza"
+
+msgid "HDR passthrough"
+msgstr "Passthrough HDR"
+
+msgid "Display mode"
+msgstr "Modalità schermo"
+
+msgid "Match refresh rate"
+msgstr "Adatta frequenza di aggiornamento"
+
+msgid "Match resolution"
+msgstr "Adatta risoluzione"
+
+msgid "Minimum resolution"
+msgstr "Risoluzione minima"
+
+msgid "Maximum refresh rate"
+msgstr "Frequenza di aggiornamento massima"
+
+msgid "Switch for live TV"
+msgstr "Cambio modalità in TV in diretta"
+
+msgid "Switch for recordings"
+msgstr "Cambio modalità nelle registrazioni"
+
+msgid "Switch for mediaplayer"
+msgstr "Cambio modalità nel lettore multimediale"
+
+msgid "Zoom (in 0.1% steps)"
+msgstr "Zoom (passi da 0,1%)"
+
+#, c-format
+msgid "Zoom level %d"
+msgstr "Livello zoom %d"
+
+msgid "General"
+msgstr "Generale"
+
+msgid "Clear display on channel switch"
+msgstr "Schermo nero al cambio canale"
+
+msgid "VAAPI device not ready"
+msgstr "Dispositivo VAAPI non pronto"
+
+msgid "Mediaplayer"
+msgstr "Lettore multimediale"
+
+msgid "Zoom"
+msgstr "Zoom"
+
+msgid "VDR with vaapivideo is getting ready..."
+msgstr "VDR con vaapivideo si sta avviando..."
+
+msgid "Title"
+msgstr "Titolo"
+
+msgid "Duration"
+msgstr "Durata"
+
+#. TRANSLATORS: value of the file-info "Audio" row for a file without audio tracks (shown in parentheses)
+msgid "none"
+msgstr "nessuno"
+
+msgid "Subtitle"
+msgstr "Sottotitolo"
+
+msgid "Playlist"
+msgstr "Playlist"
+
+msgid "File info"
+msgstr "Info file"
+
+#, c-format
+msgid "Delete %s?"
+msgstr "Eliminare %s?"
+
+#, c-format
+msgid "Delete failed: %s"
+msgstr "Eliminazione non riuscita: %s"
+
+msgid "Empty or unreadable playlist"
+msgstr "Playlist vuota o illeggibile"
+
+msgid "Cannot start playback"
+msgstr "Impossibile avviare la riproduzione"
+
+msgid "Hardware-accelerated video playback with VAAPI"
+msgstr "Riproduzione video con accelerazione hardware VAAPI"
+
+msgid "on"
+msgstr "attivo"
+
+msgid "off"
+msgstr "disattivo"
+
+msgid "stereo"
+msgstr "stereo"
+
+msgid "multichannel"
+msgstr "multicanale"
+
+msgid "auto (best available)"
+msgstr "automatico (migliore disponibile)"
+
+msgid "hardware: motion adaptive"
+msgstr "hardware: adattivo al movimento"
+
+msgid "hardware: weave (fast)"
+msgstr "hardware: weave (veloce)"
+
+msgid "hardware: bob (fastest)"
+msgstr "hardware: bob (il più veloce)"
+
+msgid "software: bwdif (best)"
+msgstr "software: bwdif (qualità migliore)"
+
+msgid "software: w3fdif (faster)"
+msgstr "software: w3fdif (più veloce)"
+
+msgid "auto (hardware)"
+msgstr "automatico (hardware)"
+
+msgid "software: light"
+msgstr "software: leggero"
+
+msgid "software: medium"
+msgstr "software: medio"
+
+msgid "auto (hardware, HQ)"
+msgstr "automatico (hardware, HQ)"
+
+msgid "hardware: fast"
+msgstr "hardware: veloce"
+
+msgid "software: lanczos (HQ)"
+msgstr "software: lanczos (HQ)"
+
+msgid "software: bilinear (fast)"
+msgstr "software: bilineare (veloce)"
+
+msgid "unlimited"
+msgstr "nessun limite"

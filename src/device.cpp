@@ -462,8 +462,8 @@ auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
 /// when the name is missing), so both notices read consistently. Caller must hold LOCK_CHANNELS_READ.
 [[nodiscard]] auto FormatChannelLine(const cChannel &channel) -> std::string {
     const char *name = channel.Name();
-    return (name != nullptr && *name != '\0') ? std::format("{} {} - {}", tr("Channel"), channel.Number(), name)
-                                              : std::format("{} {}", tr("Channel"), channel.Number());
+    return (name != nullptr && *name != '\0') ? std::format("{} {} - {}", trVDR("Channel"), channel.Number(), name)
+                                              : std::format("{} {}", trVDR("Channel"), channel.Number());
 }
 
 } // namespace
@@ -619,7 +619,7 @@ auto cVaapiDevice::ShowEncryptedScreen() -> void {
             dsyslog("vaapivideo/device: encrypted watchdog -- channel %d decrypts (vpid=%d), skipping", number, vpid);
             return;
         }
-        text = std::format("{}\n{}", FormatChannelLine(*channel), tr("encrypted"));
+        text = std::format("{}\n{}", FormatChannelLine(*channel), trVDR("encrypted"));
     }
     isyslog("vaapivideo/device: channel %d encrypted/undecodable -- showing notice", number);
     // Take ownership of the screen: stop the radio poll repainting its splash over the notice.
@@ -2194,16 +2194,52 @@ auto cVaapiDevice::ResetZoom() -> void {
     }
 }
 
-[[nodiscard]] auto cVaapiDevice::ZoomStatusLabel() const -> std::string {
+[[nodiscard]] auto cVaapiDevice::ZoomStatusLabel(bool localized) -> std::string {
+    // Static: reads only vaapiConfig, so the quick menu can show it without a device. SVDRP replies stay
+    // English because scripts may parse them.
+    const char *zoom = localized ? tr("Zoom") : "Zoom";
     const int stop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
-    if (stop < 1 || stop > CONFIG_ZOOM_PRESET_COUNT) {
-        return "Zoom: off";
-    }
-    const int level = vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed);
+    const int level = (stop >= 1 && stop <= CONFIG_ZOOM_PRESET_COUNT)
+                          ? vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed)
+                          : 0;
     if (level <= 0) {
-        return "Zoom: off";
+        return std::format("{}: {}", zoom, localized ? TrLabel("off") : "off");
     }
-    return std::format("Zoom {}: +{:.1f}%", stop, static_cast<double>(level) / 10.0);
+    return std::format("{} {}: +{:.1f}%", zoom, stop, static_cast<double>(level) / 10.0);
+}
+
+[[nodiscard]] auto cVaapiDevice::TogglePassthrough() -> PassthroughMode {
+    // Off <-> the mode it was switched off from, so a forced On survives a round trip; a session that started Off
+    // turns on to Auto. CAS like CycleZoom(): two callers must not both flip from the same state. Runtime only --
+    // setup.conf keeps the startup default, the way the zoom stop resets while the levels persist.
+    const auto flipped = [this](PassthroughMode mode) -> PassthroughMode {
+        return mode == PassthroughMode::Off ? passthroughResumeMode.load(std::memory_order_relaxed)
+                                            : PassthroughMode::Off;
+    };
+    PassthroughMode current = vaapiConfig.passthroughMode.load(std::memory_order_relaxed);
+    PassthroughMode next = flipped(current);
+    while (!vaapiConfig.passthroughMode.compare_exchange_weak(current, next, std::memory_order_relaxed)) {
+        next = flipped(current); // compare_exchange_weak refreshed `current`
+    }
+    isyslog("vaapivideo/device: audio passthrough %s -> %s (toggle)", PassthroughModeName(current),
+            PassthroughModeName(next));
+    RefreshPassthrough(current);
+    return next;
+}
+
+auto cVaapiDevice::RefreshPassthrough(PassthroughMode previous) -> void {
+    // The setup page reports its changes here too, so switching Off there also remembers what the toggle restores.
+    if (previous != PassthroughMode::Off) {
+        passthroughResumeMode.store(previous, std::memory_order_relaxed);
+    }
+    if (HardwareReady() && audioProcessor) { // acquire-gate the audioProcessor read against an in-flight ATTA
+        audioProcessor->RequestPassthroughRecheck();
+    }
+}
+
+[[nodiscard]] auto cVaapiDevice::PassthroughStatusLabel() -> std::string {
+    return std::format("{}: {}", tr("Audio passthrough"),
+                       TrLabel(PassthroughModeName(vaapiConfig.passthroughMode.load(std::memory_order_relaxed))));
 }
 
 auto cVaapiDevice::SetAudioTrackDevice(eTrackType /*Type*/) -> void {
@@ -2364,6 +2400,11 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
 }
 
 auto cVaapiDevice::SetVolumeDevice(int Volume) -> void {
+    // Cache first: VDR sends the volume only on a change, so a renderer created by a later ATTA
+    // (e.g. after an external player's DETA) would otherwise play at unity until the next key. The lock
+    // pairs with AttachHardware()'s publish: either that applies this value, or this sees the device ready.
+    const cMutexLock volumeLock(&audioVolumeMutex);
+    audioVolume.store(Volume, std::memory_order_relaxed);
     // HardwareReady()-gated: VDR-core volume path runs on the main thread during an in-flight ATTA.
     if (HardwareReady() && audioProcessor) [[likely]] {
         audioProcessor->SetVolume(Volume);
@@ -3391,7 +3432,14 @@ auto cVaapiDevice::FlushForSeek() -> void {
     osdHeight = static_cast<int>(display->GetOutputHeight());
     dsyslog("vaapivideo/device: OSD size %dx%d (pre-cached)", osdWidth, osdHeight);
 
-    initState.store(2, std::memory_order_release);
+    {
+        // Volume and publish in one step under SetVolumeDevice()'s lock: a volume key during the attach either
+        // lands in the cache before this read or finds HardwareReady() and reaches the renderer itself. Nothing
+        // writes audio before the publish, so this is still ahead of the first sample.
+        const cMutexLock volumeLock(&audioVolumeMutex);
+        audioProcessor->SetVolume(audioVolume.load(std::memory_order_relaxed));
+        initState.store(2, std::memory_order_release);
+    }
     ResetZoom(); // Fresh hardware (plugin start or SVDRP ATTA) always begins at Off.
     isyslog("vaapivideo/device: attached -- DRM=%s audio=%s", drmPath.c_str(), audioDevice.c_str());
 

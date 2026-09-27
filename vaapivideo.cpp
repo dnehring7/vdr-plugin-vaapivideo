@@ -64,6 +64,17 @@ extern "C" {
 
 namespace {
 
+// cMenuEditStraItem shows its strings verbatim, so the setup page hands it translated copies of the English
+// label arrays. Both catalogs return pointers that outlive the page.
+template <size_t N>
+[[nodiscard]] auto TranslatedLabels(const std::array<const char *, N> &labels) -> std::array<const char *, N> {
+    std::array<const char *, N> out{};
+    for (size_t i = 0; i < N; ++i) {
+        out.at(i) = TrLabel(labels.at(i));
+    }
+    return out;
+}
+
 // ============================================================================
 // === cMenuSetupVaapi ===
 // ============================================================================
@@ -104,6 +115,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     // cMenuEditItem strdup()s its label, so the temporary cString labels are safe.
     auto BuildMenu() -> void {
         Clear();
+        const char *const off = TrLabel("off");
+        const char *const on = TrLabel("on");
         // Non-selectable section header (VDR core idiom, cf. menu.c). Groups the page into
         // Audio / Video / Zoom / General; entries are sorted within each group.
         const auto addHeader = [this](const char *label) -> void {
@@ -112,45 +125,45 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 
         // --- Audio ---
         addHeader(tr("Audio"));
-        Add(new cMenuEditStraItem(tr("Audio Passthrough"), &editPassthroughMode, kPassthroughModeCount,
-                                  kPassthroughModeLabels.data()));
+        Add(new cMenuEditStraItem(tr("Audio passthrough"), &editPassthroughMode, kPassthroughModeCount,
+                                  passthroughModeLabels.data()));
         // Decoded-PCM channel policy (ignored while passthrough is active). Auto follows the sink's
         // ELD PCM channel cap; takes effect on the next decoded frame (decode-driven, no codec reopen).
-        Add(new cMenuEditStraItem(tr("PCM Channels"), &editPcmChannelMode, kPcmChannelModeCount,
-                                  kPcmChannelModeLabels.data()));
+        Add(new cMenuEditStraItem(tr("PCM channels"), &editPcmChannelMode, kPcmChannelModeCount,
+                                  pcmChannelModeLabels.data()));
         // Separate A/V offsets for PCM and IEC61937 passthrough paths; bounds from config.h
         // keep the menu and setup.conf parser in sync.
-        Add(new cMenuEditIntItem(tr("PCM Audio Latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
+        Add(new cMenuEditIntItem(tr("PCM audio latency (ms)"), &editPcmLatency, CONFIG_AUDIO_LATENCY_MIN_MS,
                                  CONFIG_AUDIO_LATENCY_MAX_MS));
-        Add(new cMenuEditIntItem(tr("Passthrough Audio Latency (ms)"), &editPassthroughLatency,
+        Add(new cMenuEditIntItem(tr("Passthrough audio latency (ms)"), &editPassthroughLatency,
                                  CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
 
         // --- Video ---
         // Post-processing policies: a sw-* deinterlace/sharpen or sw-quality scale routes the whole
         // post-process through one hwdownload->SW->hwupload block (see filter.cpp); decode stays HW.
         addHeader(tr("Video"));
-        Add(new cMenuEditStraItem(tr("Deinterlace"), &editDeinterlaceMode, kDeinterlaceCount,
-                                  kDeinterlaceLabels.data()));
-        Add(new cMenuEditStraItem(tr("Denoise"), &editDenoiseMode, kDenoiseCount, kDenoiseLabels.data()));
-        Add(new cMenuEditStraItem(tr("Scaling"), &editScaleMode, kScaleCount, kScaleLabels.data()));
-        Add(new cMenuEditStraItem(tr("Sharpen"), &editSharpenMode, kSharpenCount, kSharpenLabels.data()));
-        Add(new cMenuEditStraItem(tr("HDR Passthrough"), &editHdrMode, kHdrModeCount, kHdrModeLabels.data()));
+        Add(new cMenuEditStraItem(tr("Deinterlacing"), &editDeinterlaceMode, kDeinterlaceCount,
+                                  deinterlaceLabels.data()));
+        Add(new cMenuEditStraItem(tr("Denoising"), &editDenoiseMode, kDenoiseCount, denoiseLabels.data()));
+        Add(new cMenuEditStraItem(tr("Scaling"), &editScaleMode, kScaleCount, scaleLabels.data()));
+        Add(new cMenuEditStraItem(tr("Sharpening"), &editSharpenMode, kSharpenCount, sharpenLabels.data()));
+        Add(new cMenuEditStraItem(tr("HDR passthrough"), &editHdrMode, kHdrModeCount, hdrModeLabels.data()));
 
         // --- Display ---
         // Runtime CRTC mode switching. The two match policies say WHAT to track; the three source
         // switches say WHEN it is allowed to happen. Everything defaults to off, so leaving this
         // group untouched keeps the fixed --resolution mode. Each switch costs an HDMI link retrain
         // (about a second of black) when it fires, which is why live TV is opt-in separately.
-        addHeader(tr("Display Mode"));
-        Add(new cMenuEditBoolItem(tr("Match refresh rate"), &editMatchRefreshRate, tr("off"), tr("on")));
-        Add(new cMenuEditBoolItem(tr("Match resolution"), &editMatchResolution, tr("off"), tr("on")));
+        addHeader(tr("Display mode"));
+        Add(new cMenuEditBoolItem(tr("Match refresh rate"), &editMatchRefreshRate, off, on));
+        Add(new cMenuEditBoolItem(tr("Match resolution"), &editMatchResolution, off, on));
         Add(new cMenuEditStraItem(tr("Minimum resolution"), &editMinResolution, kMinResolutionCount,
-                                  kMinResolutionLabels.data()));
+                                  minResolutionLabels.data()));
         Add(new cMenuEditStraItem(tr("Maximum refresh rate"), &editMaxRefreshRate, kMaxRefreshCount,
-                                  kMaxRefreshLabels.data()));
-        Add(new cMenuEditBoolItem(tr("Switch for live TV"), &editModeSwitchLiveTv, tr("off"), tr("on")));
-        Add(new cMenuEditBoolItem(tr("Switch for recordings"), &editModeSwitchReplay, tr("off"), tr("on")));
-        Add(new cMenuEditBoolItem(tr("Switch for mediaplayer"), &editModeSwitchMediaplayer, tr("off"), tr("on")));
+                                  maxRefreshLabels.data()));
+        Add(new cMenuEditBoolItem(tr("Switch for live TV"), &editModeSwitchLiveTv, off, on));
+        Add(new cMenuEditBoolItem(tr("Switch for recordings"), &editModeSwitchReplay, off, on));
+        Add(new cMenuEditBoolItem(tr("Switch for mediaplayer"), &editModeSwitchMediaplayer, off, on));
 
         // --- Zoom ---
         // Manual zoom levels: each is a zoom-in factor in tenths-of-% (344 == +34.4% enlargement),
@@ -165,8 +178,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // --- General ---
         addHeader(tr("General"));
         // Use "off"/"on" labels to match the string-select items above; default is "no"/"yes".
-        Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, tr("off"),
-                                  tr("on")));
+        Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, off, on));
 
         // Index 0 is the Audio header (non-selectable); start the cursor on the first real entry.
         SetCurrent(Get(1));
@@ -194,7 +206,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 
         vaapiConfig.pcmLatency.store(editPcmLatency, std::memory_order_relaxed);
         vaapiConfig.passthroughLatency.store(editPassthroughLatency, std::memory_order_relaxed);
-        vaapiConfig.passthroughMode.store(static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
+        const PassthroughMode previousPassthrough = vaapiConfig.passthroughMode.exchange(
+            static_cast<PassthroughMode>(editPassthroughMode), std::memory_order_relaxed);
         vaapiConfig.pcmChannelMode.store(static_cast<PcmChannelMode>(editPcmChannelMode), std::memory_order_relaxed);
         vaapiConfig.hdrMode.store(static_cast<HdrMode>(editHdrMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
@@ -270,6 +283,12 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         if (displayModeChanged) {
             if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
                 device->ReevaluateDisplayMode();
+            }
+        }
+        // Passthrough applies to the running stream too; before, it waited for the next channel switch.
+        if (static_cast<int>(previousPassthrough) != editPassthroughMode) {
+            if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
+                device->RefreshPassthrough(previousPassthrough);
             }
         }
         // SetupParse() runs only at startup, so a live setup change would otherwise leave no trace --
@@ -359,6 +378,20 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     static constexpr int kMaxRefreshCount = static_cast<int>(kMaxRefreshLabels.size());
     static_assert(kMaxRefreshCount == CONFIG_MAX_REFRESH_MODE_COUNT, "menu labels out of sync with enum");
 
+    // What the menu items point at: the arrays above, translated. Plain members, so they are built before
+    // the ctor body runs BuildMenu() and live exactly as long as the items that reference them.
+    std::array<const char *, kDeinterlaceLabels.size()> deinterlaceLabels{TranslatedLabels(kDeinterlaceLabels)};
+    std::array<const char *, kDenoiseLabels.size()> denoiseLabels{TranslatedLabels(kDenoiseLabels)};
+    std::array<const char *, kHdrModeLabels.size()> hdrModeLabels{TranslatedLabels(kHdrModeLabels)};
+    std::array<const char *, kMaxRefreshLabels.size()> maxRefreshLabels{TranslatedLabels(kMaxRefreshLabels)};
+    std::array<const char *, kMinResolutionLabels.size()> minResolutionLabels{TranslatedLabels(kMinResolutionLabels)};
+    std::array<const char *, kPassthroughModeLabels.size()> passthroughModeLabels{
+        TranslatedLabels(kPassthroughModeLabels)};
+    std::array<const char *, kPcmChannelModeLabels.size()> pcmChannelModeLabels{
+        TranslatedLabels(kPcmChannelModeLabels)};
+    std::array<const char *, kScaleLabels.size()> scaleLabels{TranslatedLabels(kScaleLabels)};
+    std::array<const char *, kSharpenLabels.size()> sharpenLabels{TranslatedLabels(kSharpenLabels)};
+
     // Scratch copies of the vaapiConfig fields of the same name, edited in place by the menu items
     // above and committed only in Store() -- so leaving the page with Back discards everything.
     // All int because that is what cMenuEdit*Item binds to: a bool is 0/1, an enum an index into
@@ -387,10 +420,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 // === cVaapiQuickMenu ===
 // ============================================================================
 
-/// The plugin's main menu: a two-line menu always showing both entries. OK on line 1 cycles the zoom
-/// one stop and closes the OSD immediately (flash the new stop on the skin) -- a one-shot toggle, no
-/// lingering menu; OK on line 2 opens the mediaplayer. This is how the single @vaapivideo main-menu
-/// hook reaches both actions.
+/// The plugin's main menu, three fixed lines. OK on line 1 cycles the zoom one stop and OK on line 3 toggles
+/// audio passthrough; both close the OSD at once and flash the new state -- one-shot actions, no lingering
+/// menu. OK on line 2 opens the mediaplayer. VDR gives a plugin a single main-menu hook, so key macros reach
+/// each action by position (@vaapivideo Ok / Down Ok / Down Down Ok); new lines go at the end.
 class cVaapiQuickMenu : public cOsdMenu {
   public:
     cVaapiQuickMenu(cVaapiDevice *device, std::string mediaDir)
@@ -401,17 +434,27 @@ class cVaapiQuickMenu : public cOsdMenu {
     [[nodiscard]] auto ProcessKey(eKeys key) -> eOSState override {
         const eOSState state = cOsdMenu::ProcessKey(key); // handles Up/Down/Back
         if (state == osUnknown && (key & ~k_Repeat) == kOk) {
-            if (Current() == 0) { // Zoom line: cycle one stop and leave the menu
-                if (device_ == nullptr || !device_->IsReady()) {
-                    Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
-                } else {
-                    (void)device_->CycleZoom();
-                    const std::string label = device_->ZoomStatusLabel();
-                    Skins.QueueMessage(mtInfo, label.c_str());
-                }
-                return osEnd;
+            switch (Current()) {
+                case 0: // Zoom: cycle one stop and leave the menu
+                    if (device_ == nullptr || !device_->IsReady()) {
+                        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+                    } else {
+                        (void)device_->CycleZoom();
+                        Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
+                    }
+                    return osEnd;
+                case 1: // Mediaplayer
+                    return AddSubMenu(new cVaapiFileBrowser(mediaDir_));
+                default: // Audio passthrough: toggle and leave the menu. A detached device just keeps the new
+                         // mode for its next audio open, so only a missing device is refused.
+                    if (device_ == nullptr) {
+                        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+                    } else {
+                        (void)device_->TogglePassthrough();
+                        Skins.QueueMessage(mtInfo, cVaapiDevice::PassthroughStatusLabel().c_str());
+                    }
+                    return osEnd;
             }
-            return AddSubMenu(new cVaapiFileBrowser(mediaDir_)); // Mediaplayer line
         }
         return state;
     }
@@ -420,12 +463,13 @@ class cVaapiQuickMenu : public cOsdMenu {
     auto AddItems() -> void {
         const int currentItem = Current();
         Clear();
-        Add(new cOsdItem(device_ != nullptr ? device_->ZoomStatusLabel().c_str() : "Zoom: off"));
+        Add(new cOsdItem(cVaapiDevice::ZoomStatusLabel().c_str()));
         Add(new cOsdItem(tr("Mediaplayer")));
+        Add(new cOsdItem(cVaapiDevice::PassthroughStatusLabel().c_str()));
         SetCurrent(Get(currentItem < 0 ? 0 : currentItem));
     }
 
-    cVaapiDevice *device_; ///< Borrowed; for CycleZoom() / ZoomStatusLabel().
+    cVaapiDevice *device_; ///< Borrowed; for CycleZoom() / TogglePassthrough().
     std::string mediaDir_; ///< Browser root for the mediaplayer item.
 };
 
@@ -445,7 +489,7 @@ class cVaapiVideoPlugin : public cPlugin {
 
     // VDR plugin API -- called in the order documented at the top of this file
     [[nodiscard]] auto CommandLineHelp() -> const char * override;
-    [[nodiscard]] auto Description() -> const char * override { return PLUGIN_DESCRIPTION; }
+    [[nodiscard]] auto Description() -> const char * override { return tr(PLUGIN_DESCRIPTION); }
     auto Housekeeping() -> void override;
     [[nodiscard]] auto Initialize() -> bool override;
     [[nodiscard]] auto MainMenuEntry() -> const char * override;
@@ -952,10 +996,9 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
         // Flash the new stop on the OSD too: live-TV zoom is driven via this command (a key bound to
         // `svdrpsend ... ZOOM next`), so the SVDRP reply alone would leave the viewer no feedback.
         // QueueMessage is the thread-safe, deferred variant -- safe to call from the SVDRP thread.
-        const std::string label = vaapiDevice->ZoomStatusLabel();
-        Skins.QueueMessage(mtInfo, label.c_str());
+        Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
         replyCode = 900;
-        return cString::sprintf("%s", label.c_str());
+        return cString::sprintf("%s", cVaapiDevice::ZoomStatusLabel(/*localized=*/false).c_str());
     }
 
     replyCode = 500;

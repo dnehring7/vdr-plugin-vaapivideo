@@ -152,9 +152,9 @@ SOFILE = libvdr-$(PLUGIN).so
 HEADERS = $(wildcard src/*.h)
 
 # Build Targets
-.PHONY: all clean install dist indent lint docs check-docs-defaults probe
+.PHONY: all clean install install-lib install-i18n i18n dist indent lint docs check-docs-defaults probe
 
-all: $(SOFILE)
+all: $(SOFILE) i18n
 
 $(SOFILE): $(OBJECTS)
 	$(CXX) $(SO_LDFLAGS) $(OBJECTS) -o $@ $(LDLIBS)
@@ -165,6 +165,36 @@ $(SOFILE): $(OBJECTS)
 # translation units while reporting bogus ones where a happens-before edge went unobserved.
 %.o: %.cpp $(HEADERS) Makefile
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ------------------------------------------------------------
+# Internationalization (VDR newplugin template)
+# ------------------------------------------------------------
+# The .pot is extracted from every source AND header: config.h/common.h carry trNOOP() labels.
+# Building refreshes po/*.po against it (msgmerge), as in every VDR plugin.
+PODIR    = po
+I18Npo   = $(wildcard $(PODIR)/*.po)
+I18Nmo   = $(I18Npo:.po=.mo)
+I18Nmsgs = $(addprefix $(DESTDIR)$(LOCDIR)/,$(addsuffix /LC_MESSAGES/vdr-$(PLUGIN).mo,$(notdir $(basename $(I18Npo)))))
+I18Npot  = $(PODIR)/$(PLUGIN).pot
+
+%.mo: %.po
+	msgfmt -c -o $@ $<
+
+$(I18Npot): $(SOURCES) $(HEADERS)
+	xgettext -C -cTRANSLATORS --no-wrap --no-location -k -ktr -ktrNOOP --from-code=UTF-8 \
+		--package-name=vdr-$(PLUGIN) --package-version=$(VERSION) \
+		--msgid-bugs-address='https://github.com/dnehring7/vdr-plugin-$(PLUGIN)/issues' -o $@ $^
+
+%.po: $(I18Npot)
+	msgmerge -U --no-wrap --no-location --backup=none -q -N $@ $<
+	@touch $@
+
+$(I18Nmsgs): $(DESTDIR)$(LOCDIR)/%/LC_MESSAGES/vdr-$(PLUGIN).mo: $(PODIR)/%.mo
+	install -D -m644 $< $@
+
+i18n: $(I18Nmo) $(I18Npot)
+
+install-i18n: $(I18Nmsgs)
 
 # Standalone VAAPI capability prober
 PROBE_BIN = vaapivideo-probe
@@ -181,7 +211,7 @@ $(PROBE_BIN): $(PROBE_SRC) Makefile
 	$(CXX) -MM $(CXXFLAGS) $(SOURCES) > $@
 
 # Include Dependencies (only for build targets, skip for clean/dist/docs/etc)
-ifeq ($(filter clean dist docs check-docs-defaults lint indent,$(MAKECMDGOALS)),)
+ifeq ($(filter clean dist docs check-docs-defaults lint indent i18n,$(MAKECMDGOALS)),)
 -include .deps
 endif
 
@@ -199,8 +229,11 @@ clean:
 	@-rm -f $(OBJECTS) $(SOFILE) $(PROBE_BIN) .deps compile_commands.json
 	@-rm -f *.so *.tgz core* *~ src/*~
 	@-rm -rf docs .lint
+	@-rm -f $(PODIR)/*.mo $(PODIR)/*.pot
 
-install: $(SOFILE)
+install: install-lib install-i18n
+
+install-lib: $(SOFILE)
 	install -D $< $(DESTDIR)$(LIBDIR)/$<.$(APIVERSION)
 
 dist: clean

@@ -270,17 +270,17 @@ another application at boot.
 | Setting                          | Range            | Description                                                                                          |
 |----------------------------------|------------------|------------------------------------------------------------------------------------------------------|
 | **Audio** | | |
-| `Audio Passthrough`              | auto / on / off  | IEC61937 passthrough policy (see [Audio settings](#audio-settings))                                  |
-| `PCM Channels`                   | auto / stereo / multichannel | Decoded-PCM channel layout (see [Audio settings](#audio-settings))                        |
-| `PCM Audio Latency (ms)`         | −200 … 200       | A/V offset applied when audio is decoded to PCM                                                      |
-| `Passthrough Audio Latency (ms)` | −200 … 200       | A/V offset applied when audio is forwarded as IEC61937                                               |
+| `Audio passthrough`              | auto / on / off  | IEC61937 passthrough policy (see [Audio settings](#audio-settings))                                  |
+| `PCM channels`                   | auto / stereo / multichannel | Decoded-PCM channel layout (see [Audio settings](#audio-settings))                        |
+| `PCM audio latency (ms)`         | −200 … 200       | A/V offset applied when audio is decoded to PCM                                                      |
+| `Passthrough audio latency (ms)` | −200 … 200       | A/V offset applied when audio is forwarded as IEC61937                                               |
 | **Video** | | |
-| `Deinterlace`                    | auto / hardware: motion adaptive / weave / bob / software: bwdif / w3fdif | Deinterlacer policy (see [Post-processing](#post-processing)) |
-| `Denoise`                        | auto (hardware) / off / software: light / strong | Denoise policy                                                                       |
-| `Scaling`                        | auto (hardware, HQ) / hardware: fast / software: HQ / software: fast | Scaler selection                                                 |
-| `Sharpen`                        | auto (hardware) / off / software: mild / medium | Sharpen policy                                                                        |
-| `HDR Passthrough`                | auto / on / off  | HDR10 / HLG output policy (see [HDR](#hdr))                                                          |
-| **Display Mode** — all off by default | | |
+| `Deinterlacing`                  | auto / hardware: motion adaptive / weave / bob / software: bwdif / w3fdif | Deinterlacer policy (see [Post-processing](#post-processing)) |
+| `Denoising`                      | auto (hardware) / off / software: light / medium | Denoise policy                                                                       |
+| `Scaling`                        | auto (hardware, HQ) / hardware: fast / software: lanczos (HQ) / bilinear (fast) | Scaler selection                                      |
+| `Sharpening`                     | auto (hardware) / off / software: light / medium | Sharpen policy                                                                       |
+| `HDR passthrough`                | auto / on / off  | HDR10 / HLG output policy (see [HDR](#hdr))                                                          |
+| **Display mode** — all off by default | | |
 | `Match refresh rate`             | off / on         | Track the source frame rate with the display refresh rate                                            |
 | `Match resolution`               | off / on         | Track the source coded size with the display resolution                                              |
 | `Minimum resolution`             | 576p / 720p / 1080p / 2160p | Floor for the resolution search; set to the panel's native height to pin the resolution |
@@ -295,7 +295,7 @@ another application at boot.
 
 ### Audio settings
 
-**`Audio Passthrough`** — `auto` (default) reads the HDMI sink's ELD at startup
+**`Audio passthrough`** — `auto` (default) reads the HDMI sink's ELD at startup
 and forwards a compressed codec as IEC61937 only when the sink advertises
 support for it; everything else is decoded to PCM. If the ELD is unreadable at
 that point (AVR asleep, TV off), the probe repeats on the next codec change, so
@@ -305,9 +305,15 @@ every wrappable codec (AC-3, E-AC-3, TrueHD, DTS, AC-4, MPEG-H 3D) and ignores
 the ELD — for topologies where the probed capabilities are wrong, typically an
 AVR behind a TV whose EDID masks the AVR's real decoders. Make sure the
 downstream device really decodes the codec: ALSA cannot detect a silent decode
-failure at the sink, you will simply hear nothing. `off` always decodes to PCM.
-Changes take effect when the audio device is reopened — switch channels once
-after leaving the setup menu.
+failure at the sink, you will simply hear nothing. `off` always decodes to PCM,
+so VDR's volume control applies (a bitstream bypasses it). A change applies to
+what is playing at once, with a short audio gap while the output reopens.
+
+The third line of the plugin menu toggles passthrough without the setup page:
+`off` ⇄ the mode it was switched off from (`auto` if VDR started with `off`),
+bindable to one key (see [Manual zoom](#manual-zoom)). The toggle lasts until
+VDR restarts; the setup value stays the startup default. Typical use: `off` for
+TV on the TV speakers, one key press for bitstream when the AVR is switched on.
 
 Passthrough also flips the IEC 60958-3 "non-audio" bit (AES0 bit 1) that tells
 the sink a bitstream, not PCM, is coming, and clears it again on every PCM open
@@ -325,7 +331,7 @@ already armed, not that the bit was skipped. If the log instead reports
 does not) and the bit is left alone — passthrough still works on sinks that key
 off the IEC61937 preamble alone.
 
-**`PCM Channels`** — applies whenever audio is decoded to PCM (no passthrough,
+**`PCM channels`** — applies whenever audio is decoded to PCM (no passthrough,
 or a codec without IEC61937 framing such as AAC or MP2):
 
 - **auto** (default): native multichannel up to the sink's advertised PCM
@@ -358,16 +364,16 @@ HDR, UHD, and trick play. Slow motion keeps the chain it starts from: it
 continues the paused stream, and a rebuild would lose the pictures the
 deinterlacer still holds.
 
-- **Deinterlace** — `auto` picks the best mode the driver advertises
+- **Deinterlacing** — `auto` picks the best mode the driver advertises
   (motion-compensated when present). `hardware:` requests a specific VAAPI
   mode, clamped to what the driver offers. `software: bwdif` is the quality
   choice for interlaced broadcast on GPUs with a weak hardware deinterlacer
   (notably AMD/Mesa, which leaves visible combing); `software: w3fdif` is a
   lighter alternative for slower CPUs.
-- **Denoise** — `auto (hardware)` is the codec-tuned VAAPI denoiser; `off`
-  skips it; `software: light / strong` are `hqdn3d` presets.
-- **Sharpen** — `auto (hardware)` is the codec-tuned VAAPI sharpener; `off`
-  skips it; `software: mild / medium` are `unsharp` presets.
+- **Denoising** — `auto (hardware)` is the codec-tuned VAAPI denoiser; `off`
+  skips it; `software: light / medium` are `hqdn3d` presets.
+- **Sharpening** — `auto (hardware)` is the codec-tuned VAAPI sharpener; `off`
+  skips it; `software: light / medium` are `unsharp` presets.
 - **Scaling** — `auto (hardware, HQ)` is high-quality GPU scaling and the right
   choice almost always; the alternatives are niche fallbacks for GPUs whose
   scaler is suspect.
@@ -441,12 +447,13 @@ never written to `setup.conf` — only the five level definitions persist.
 
 - **Mediaplayer replay** — the **Blue** key cycles zoom.
 - **Live TV** — VDR routes no live-TV keypresses to output plugins, so the
-  plugin's main-menu hook (`@vaapivideo`) opens a two-line menu (**Zoom** /
-  **Mediaplayer**). Bind it in `keymacros.conf`; VDR can append follow-up
-  keypresses for one-key actions:
+  plugin's main-menu hook (`@vaapivideo`) opens a three-line menu (**Zoom** /
+  **Mediaplayer** / **Audio passthrough**). Bind it in `keymacros.conf`; VDR
+  can append follow-up keypresses for one-key actions:
 
-      Blue      @vaapivideo Ok          # cycle zoom, menu closes itself
-      Yellow    @vaapivideo Down Ok     # open the mediaplayer browser
+      Blue      @vaapivideo Ok             # cycle zoom, menu closes itself
+      Yellow    @vaapivideo Down Ok        # open the mediaplayer browser
+      User3     @vaapivideo Down Down Ok   # toggle audio passthrough
 
 - **Scripting** — `svdrpsend PLUG vaapivideo ZOOM [next|0-5]`.
 
@@ -462,7 +469,9 @@ deinterlacing, and IEC61937 audio passthrough work identically.
 
 - **Main menu → Mediaplayer** — file browser rooted at `--media-dir`
   (default `/`). Directories enter on `OK`; m3u files launch as playlists;
-  media files play directly. The browser lists
+  media files play directly. `Yellow` deletes the file or playlist under the
+  cursor after a confirmation; directories and anything outside `--media-dir`
+  are never deleted. The browser lists
   `.mp4 .mkv .avi .mov .ts .m4v .webm` plus `.m3u/.m3u8`.
 - **SVDRP** — `PLUG vaapivideo PLAY <uri>` accepts any URI libavformat can
   open (a video stream is required — audio-only formats are not supported).
@@ -528,7 +537,8 @@ manifests are forwarded to libavformat rather than parsed locally.
 The player keeps a single resume bookmark in `setup.conf`, updated whenever
 playback stops. Restarting the bookmarked local file resumes at the saved
 position; playing to the end resets it. After playback the browser reopens
-with the cursor on the last-played file.
+with the cursor on the last-played file, so `Stop`, `Yellow`, `OK` deletes a
+watched file.
 
 ### Frame-rate handling
 
@@ -549,7 +559,7 @@ scans out BT.2020, and the connector carries the stream's HDR metadata to the
 sink. SDR streams run the BT.709 pipeline unchanged, and every transition is
 atomic — a stream change never leaves stale HDR signaling on the wire.
 
-**`HDR Passthrough`** in the setup menu:
+**`HDR passthrough`** in the setup menu:
 
 - **auto** (default) — engage only when stream, GPU, and display all support
   it, including the sink's EDID advertising the stream's EOTF.
@@ -693,15 +703,15 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Startup | No video output                      | Check group membership (`video`, `render`); run `vainfo`   |
 | Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
 | Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Sharing the seat](#sharing-the-seat-with-an-x-server-or-compositor)) |
-| Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlace = software: bwdif` (or `w3fdif`) |
-| Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoise = off`       |
+| Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlacing = software: bwdif` (or `w3fdif`) |
+| Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoising = off`     |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
 | Audio   | Multichannel plays as stereo / wrong speakers | Use a direct `hw:`/`plughw:CARD,DEV`, not `default` |
-| Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough Audio Latency` (see [AVSYNC.md](AVSYNC.md)) |
+| Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough audio latency` (see [AVSYNC.md](AVSYNC.md)) |
 | Audio   | Short dropout shortly after a channel switch | ALSA ring ran dry — the log reports `ALSA … recovered -- N xrun(s)`; check `state:`/`avail_max` in `/proc/asound/card0/pcm3p/sub0/status` and see [AVSYNC.md](AVSYNC.md#ring-cushion) |
 | Perf    | AMD iGPU stutters / drops            | GPU pinned `low` DPM — `power_dpm_force_performance_level=auto` |
-| Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlace = auto` |
+| Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlacing = auto` |
 | Perf    | High CPU on encrypted HD             | Software CSA descrambling (CAM/softcam), not the plugin — a CI+ CAM offloads it |
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
@@ -793,16 +803,21 @@ threading, buffering, correction regimes, diagnostics — is documented in
 
 ### Build targets
 
-| Target         | Description                                     |
-|----------------|-------------------------------------------------|
-| `make`         | Release build (`-O3`, LTO, strip)               |
-| `make install` | Install plugin to VDR plugin directory          |
-| `make clean`   | Remove build artifacts                          |
-| `make dist`    | Create source tarball                           |
-| `make indent`  | Format sources with clang-format                |
-| `make lint`    | Static analysis with clang-tidy (requires bear) |
-| `make docs`    | Generate Doxygen HTML documentation             |
-| `make probe`   | Build the `vaapivideo-probe` diagnostic tool    |
+| Target         | Description                                      |
+|----------------|--------------------------------------------------|
+| `make`         | Release build (`-O3`, LTO, strip) + translations |
+| `make install` | Install plugin and translations                  |
+| `make i18n`    | Refresh `po/*.po` from the sources, build `.mo`  |
+| `make clean`   | Remove build artifacts                           |
+| `make dist`    | Create source tarball                            |
+| `make indent`  | Format sources with clang-format                 |
+| `make lint`    | Static analysis with clang-tidy (requires bear)  |
+| `make docs`    | Generate Doxygen HTML documentation              |
+| `make probe`   | Build the `vaapivideo-probe` diagnostic tool     |
+
+OSD texts are translated through VDR's gettext catalogs (`po/`: Dutch,
+Finnish, French, German, Italian, Spanish); log messages and SVDRP replies stay
+English.
 
 For debug builds, uncomment the matching sanitizer block in the Makefile
 (ASan + UBSan **or** TSan — mutually exclusive); the Makefile comments document

@@ -580,7 +580,8 @@ class cVaapiFileBrowser final : public cOsdMenu {
     auto operator=(const cVaapiFileBrowser &) -> cVaapiFileBrowser & = delete;
     auto operator=(cVaapiFileBrowser &&) noexcept -> cVaapiFileBrowser & = delete;
 
-    /// cOsdMenu hook: kOk enters a directory or starts playback, kBack pops to the parent.
+    /// cOsdMenu hook: kOk enters a directory or starts playback, kYellow deletes the file under the
+    /// cursor, kBack pops to the parent.
     [[nodiscard]] auto ProcessKey(eKeys Key) -> eOSState override;
 
   private:
@@ -599,11 +600,20 @@ class cVaapiFileBrowser final : public cOsdMenu {
     [[nodiscard]] auto SelectEntryByName(std::string_view name) -> bool;
     /// Entry under the cursor, or nullptr for an empty listing.
     [[nodiscard]] auto SelectedEntry() const -> const BrowserEntry *;
+    /// Entry under the cursor if it is a file or playlist inside mediaRoot, else nullptr. Directories are
+    /// never deletable (the delete would be recursive), and ".." is not a file.
+    [[nodiscard]] auto SelectedDeletable() const -> const BrowserEntry *;
     /// Absolute path of @p entry, i.e. currentDir joined with its name.
     [[nodiscard]] auto BuildFullPath(const BrowserEntry &entry) const -> std::string;
+    /// Confirm, then unlink the file or playlist under the cursor and relist; the cursor stays on its row.
+    auto DeleteSelected() -> void;
+    /// Show the Yellow "Delete" button only on a deletable row.
+    auto SetHelpKeys() -> void;
 
+    std::string mediaRoot;             ///< Canonical --media-dir (empty if unresolvable); Delete stays inside it
     std::string currentDir;            ///< Directory being listed; the base for BuildFullPath()
     std::vector<BrowserEntry> entries; ///< Rows in display order; index matches the cOsdMenu item index
+    int helpKeys{-1};                  ///< Help-button set on screen (-1 = none yet); SetHelp() repaints
 };
 
 #endif // VDR_VAAPIVIDEO_MEDIAPLAYER_H

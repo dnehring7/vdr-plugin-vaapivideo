@@ -1007,6 +1007,15 @@ auto cAudioProcessor::Action() -> void {
             generationAtDequeue = clearGeneration.load(std::memory_order_relaxed);
         }
 
+        // A runtime passthrough change reopens the output here, on the only consumer thread, before this packet is
+        // processed -- the channel reopen below uses the same spot. The queue survives, so the gap is just the ALSA
+        // ring; the packet's mode snapshot is re-read so it takes the new path. An EOS drain keeps its tail, and a
+        // pause defers the reopen to the first packet after the resume.
+        if (!drainNow && passthroughRecheckPending.exchange(false, std::memory_order_acquire)) {
+            ApplyPassthroughMode();
+            passthrough = alsaPassthroughActive.load(std::memory_order_relaxed);
+        }
+
         // Drop stale-era packets before they touch pcmNextPts or the 5-s jump path.
         // An old-era PTS would silently anchor the new-era timeline, causing
         // WritePcmToAlsa() to publish a bogus playbackPts on the next valid packet.
@@ -1291,6 +1300,34 @@ auto cAudioProcessor::QueryDeviceChannelOrder(snd_pcm_t *handle, unsigned channe
     }
     channelReorder.store(packed, std::memory_order_release);
     isyslog("vaapivideo/audio: %uch device channel order differs from swr; remapping output to match", channels);
+}
+
+auto cAudioProcessor::ApplyPassthroughMode() -> void {
+    const cMutexLock lock(mutex.get());
+    if (alsaHandle == nullptr || streamParams.codecId == AV_CODEC_ID_NONE) {
+        return; // nothing open: the next open reads the mode anyway
+    }
+    ProbeSinkCaps(); // as on an open: retries an ELD read that failed then (AVR asleep), a no-op once cached
+    const bool wantPassthrough = CanPassthrough(streamParams.codecId);
+    if (wantPassthrough == alsaPassthroughActive.load(std::memory_order_relaxed)) {
+        return; // decision unchanged: AAC/MP2 decode either way, Auto on a sink without support stays PCM
+    }
+
+    isyslog("vaapivideo/audio: passthrough mode %s -- reopening %s as %s",
+            PassthroughModeName(vaapiConfig.passthroughMode.load(std::memory_order_relaxed)),
+            avcodec_get_name(streamParams.codecId), wantPassthrough ? "passthrough" : "PCM");
+
+    // Same reopen as ReconfigurePcmOutput(): no clearGeneration bump, the queued packets belong to this stream.
+    // The decoder stays open in both modes (SetStreamParams() opens it for passthrough too), so the PCM side
+    // needs no rebuild; OpenAlsaDevice() sets the IEC958 non-audio bit and the muxer for the new mode.
+    (void)snd_pcm_drop(alsaHandle);
+    snd_pcm_close(alsaHandle);
+    alsaHandle = nullptr;
+    ResetResampler();
+    ResetPlaybackClock();
+    if (!OpenAlsaDevice()) {
+        esyslog("vaapivideo/audio: reopen after passthrough change failed");
+    }
 }
 
 auto cAudioProcessor::ReconfigurePcmOutput() -> void {

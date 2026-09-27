@@ -1,0 +1,192 @@
+# Finnish translations for vdr-vaapivideo.
+# Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
+# This file is distributed under the same license as the vdr-vaapivideo package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: vdr-vaapivideo 1.9.0\n"
+"Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
+"POT-Creation-Date: 2026-09-27 23:50+0200\n"
+"PO-Revision-Date: 2026-09-27 23:30+0200\n"
+"Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
+"Language-Team: Finnish <vdr@linuxtv.org>\n"
+"Language: fi\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "VAAPI Video"
+msgstr "VAAPI Video"
+
+msgid "Audio"
+msgstr "Ääni"
+
+msgid "Audio passthrough"
+msgstr "Äänen läpivienti"
+
+msgid "PCM channels"
+msgstr "PCM-kanavat"
+
+msgid "PCM audio latency (ms)"
+msgstr "PCM-äänen viive (ms)"
+
+msgid "Passthrough audio latency (ms)"
+msgstr "Läpivientiäänen viive (ms)"
+
+msgid "Video"
+msgstr "Kuva"
+
+msgid "Deinterlacing"
+msgstr "Lomituksen poisto"
+
+msgid "Denoising"
+msgstr "Kohinanpoisto"
+
+msgid "Scaling"
+msgstr "Skaalaus"
+
+msgid "Sharpening"
+msgstr "Terävöinti"
+
+msgid "HDR passthrough"
+msgstr "HDR-läpivienti"
+
+msgid "Display mode"
+msgstr "Näyttötila"
+
+msgid "Match refresh rate"
+msgstr "Sovita virkistystaajuus"
+
+msgid "Match resolution"
+msgstr "Sovita resoluutio"
+
+msgid "Minimum resolution"
+msgstr "Pienin resoluutio"
+
+msgid "Maximum refresh rate"
+msgstr "Suurin virkistystaajuus"
+
+msgid "Switch for live TV"
+msgstr "Tilanvaihto suorissa lähetyksissä"
+
+msgid "Switch for recordings"
+msgstr "Tilanvaihto tallenteissa"
+
+msgid "Switch for mediaplayer"
+msgstr "Tilanvaihto mediasoittimessa"
+
+msgid "Zoom (in 0.1% steps)"
+msgstr "Zoomaus (0,1 %:n askelin)"
+
+#, c-format
+msgid "Zoom level %d"
+msgstr "Zoomaustaso %d"
+
+msgid "General"
+msgstr "Yleiset"
+
+msgid "Clear display on channel switch"
+msgstr "Musta kuva kanavanvaihdossa"
+
+msgid "VAAPI device not ready"
+msgstr "VAAPI-laite ei ole valmis"
+
+msgid "Mediaplayer"
+msgstr "Mediasoitin"
+
+msgid "Zoom"
+msgstr "Zoomaus"
+
+msgid "VDR with vaapivideo is getting ready..."
+msgstr "VDR ja vaapivideo käynnistyvät..."
+
+msgid "Title"
+msgstr "Nimi"
+
+msgid "Duration"
+msgstr "Kesto"
+
+#. TRANSLATORS: value of the file-info "Audio" row for a file without audio tracks (shown in parentheses)
+msgid "none"
+msgstr "ei ääniraitoja"
+
+msgid "Subtitle"
+msgstr "Tekstitys"
+
+msgid "Playlist"
+msgstr "Soittolista"
+
+msgid "File info"
+msgstr "Tiedoston tiedot"
+
+#, c-format
+msgid "Delete %s?"
+msgstr "Poistetaanko %s?"
+
+#, c-format
+msgid "Delete failed: %s"
+msgstr "Poisto epäonnistui: %s"
+
+msgid "Empty or unreadable playlist"
+msgstr "Soittolista on tyhjä tai lukukelvoton"
+
+msgid "Cannot start playback"
+msgstr "Toistoa ei voi aloittaa"
+
+msgid "Hardware-accelerated video playback with VAAPI"
+msgstr "Laitteistokiihdytetty videontoisto VAAPI:lla"
+
+msgid "on"
+msgstr "päällä"
+
+msgid "off"
+msgstr "pois päältä"
+
+msgid "stereo"
+msgstr "stereo"
+
+msgid "multichannel"
+msgstr "monikanava"
+
+msgid "auto (best available)"
+msgstr "auto (paras mahdollinen)"
+
+msgid "hardware: motion adaptive"
+msgstr "laitteisto: liikeadaptiivinen"
+
+msgid "hardware: weave (fast)"
+msgstr "laitteisto: weave (nopea)"
+
+msgid "hardware: bob (fastest)"
+msgstr "laitteisto: bob (nopein)"
+
+msgid "software: bwdif (best)"
+msgstr "ohjelmisto: bwdif (paras laatu)"
+
+msgid "software: w3fdif (faster)"
+msgstr "ohjelmisto: w3fdif (nopeampi)"
+
+msgid "auto (hardware)"
+msgstr "auto (laitteisto)"
+
+msgid "software: light"
+msgstr "ohjelmisto: kevyt"
+
+msgid "software: medium"
+msgstr "ohjelmisto: keskivahva"
+
+msgid "auto (hardware, HQ)"
+msgstr "auto (laitteisto, HQ)"
+
+msgid "hardware: fast"
+msgstr "laitteisto: nopea"
+
+msgid "software: lanczos (HQ)"
+msgstr "ohjelmisto: lanczos (HQ)"
+
+msgid "software: bilinear (fast)"
+msgstr "ohjelmisto: bilineaarinen (nopea)"
+
+msgid "unlimited"
+msgstr "ei rajoitusta"

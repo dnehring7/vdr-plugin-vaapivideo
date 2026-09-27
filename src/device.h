@@ -225,8 +225,14 @@ class cVaapiDevice : public cDevice {
     auto RefreshVideoFilters()
         -> void; ///< Rebuild VPP for policy-only setup changes (post-processing policies); leaves zoom/rect
     auto ResetZoom() -> void; ///< Force back to Off; the new stream's graph rebuild picks it up
-    [[nodiscard]] auto ZoomStatusLabel() const
-        -> std::string; ///< Human-readable active-zoom label for OSD/SVDRP feedback (e.g. "Zoom 2: +12.5%")
+    [[nodiscard]] static auto ZoomStatusLabel(bool localized = true)
+        -> std::string; ///< Active-zoom label (e.g. "Zoom 2: +12.5%"); translated for the OSD, English for SVDRP
+    // === Audio passthrough (runtime; setup.conf keeps the startup default) ===
+    [[nodiscard]] auto TogglePassthrough()
+        -> PassthroughMode; ///< Off <-> the last other mode (Auto if the session started Off); applies now
+    auto RefreshPassthrough(PassthroughMode previous)
+        -> void; ///< Apply a changed PassthroughMode to the running stream; @p previous feeds the toggle's memory
+    [[nodiscard]] static auto PassthroughStatusLabel() -> std::string; ///< e.g. "Audio passthrough: off", translated
     auto SetPrimary(bool On) -> void { MakePrimaryDevice(On); } ///< Public accessor for protected MakePrimaryDevice()
     auto StillPicture(const uchar *Data, int Length)
         -> void override;                                      ///< Decode and hold a single PES frame as a still image
@@ -459,6 +465,9 @@ class cVaapiDevice : public cDevice {
     std::atomic<AVCodecID> audioCodecId{AV_CODEC_ID_NONE}; ///< Active audio codec
     std::string audioDevice;                               ///< ALSA device name
     std::unique_ptr<cAudioProcessor> audioProcessor;       ///< Threaded ALSA renderer
+    cMutex audioVolumeMutex;                               ///< Orders SetVolumeDevice() against attach publication
+    std::atomic<int> audioVolume{255};                     ///< Last SetVolumeDevice() value; outlives a DETA so
+                                                           ///< the next attach's fresh renderer starts at it
     uint32_t connectorId{};                                ///< DRM connector ID
     std::string connectorName;                             ///< Selected connector: -c or auto-latched; empty = auto
     bool connectorUserSupplied{false};                     ///< connectorName came from -c (sticky); auto-latched
@@ -535,6 +544,8 @@ class cVaapiDevice : public cDevice {
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
     std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
+    std::atomic<PassthroughMode> passthroughResumeMode{PassthroughMode::Auto}; ///< What TogglePassthrough() turns
+                                                                               ///< back on: the mode it last left
 #if APIVERSNUM >= 30014
     /// DrainDevice() cycle: 0 = none, DEVICE_EOS_DRAIN_REPORTED = requested and drained, else cTimeMs::Now() of the
     /// request. One RequestEosDrain() per cycle; Clear() and SetPlayMode() cancel it. A single atomic, so the

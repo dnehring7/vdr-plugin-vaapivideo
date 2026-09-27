@@ -108,9 +108,16 @@ extern "C" {
 // ============================================================================
 
 /// Shown by "vdr -h" and in VDR's plugin list.
-inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
+inline constexpr const char *PLUGIN_DESCRIPTION = trNOOP("Hardware-accelerated video playback with VAAPI");
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
 inline constexpr const char *PLUGIN_VERSION = "1.9.0";   ///< Reported to VDR; "make dist" greps this line.
+
+/// Translate a label: the plugin catalog first, then VDR's. So "auto" (unmarked) comes from VDR, and a word the
+/// plugin translates itself still falls back to VDR in languages the plugin does not ship.
+[[nodiscard]] inline auto TrLabel(const char *label) -> const char * {
+    const char *translated = tr(label);
+    return translated != label ? translated : trVDR(label);
+}
 
 // ============================================================================
 // === TRACE LOGGING ===

@@ -13,6 +13,12 @@
 #include <cstdint>
 #include <string>
 
+// VDR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/i18n.h>
+#pragma GCC diagnostic pop
+
 // ============================================================================
 // === CONSTANTS ===
 // ============================================================================
@@ -67,15 +73,18 @@ enum class PassthroughMode : uint8_t {
 inline constexpr int CONFIG_PASSTHROUGH_MODE_COUNT = static_cast<int>(PassthroughMode::Off) + 1;
 
 /// Lowercase wire-format label for a PassthroughMode. These *ModeName() functions are the single source
-/// of truth shared by config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels).
+/// of truth shared by config.cpp (setup.conf parse/log) and vaapivideo.cpp (setup-menu labels). The log
+/// stays English; the setup menu translates. Every word is trNOOP()-marked for xgettext except the bare "auto",
+/// which VDR's catalog translates well. "on" / "off" are the plugin's own: VDR leaves them English in Italian
+/// and Spanish, and its feminine French forms mismatch "Zoom" and "Passthrough".
 [[nodiscard]] constexpr auto PassthroughModeName(PassthroughMode mode) noexcept -> const char * {
     switch (mode) {
         case PassthroughMode::Auto:
             return "auto";
         case PassthroughMode::On:
-            return "on";
+            return trNOOP("on");
         case PassthroughMode::Off:
-            return "off";
+            return trNOOP("off");
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
 }
@@ -102,9 +111,9 @@ inline constexpr int CONFIG_PCM_CHANNEL_MODE_COUNT = static_cast<int>(PcmChannel
         case PcmChannelMode::Auto:
             return "auto";
         case PcmChannelMode::Stereo:
-            return "stereo";
+            return trNOOP("stereo");
         case PcmChannelMode::Multichannel:
-            return "multichannel";
+            return trNOOP("multichannel");
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
 }
@@ -130,9 +139,9 @@ inline constexpr int CONFIG_HDR_MODE_COUNT = static_cast<int>(HdrMode::Off) + 1;
         case HdrMode::Auto:
             return "auto";
         case HdrMode::On:
-            return "on";
+            return trNOOP("on");
         case HdrMode::Off:
-            return "off";
+            return trNOOP("off");
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
 }
@@ -201,17 +210,17 @@ inline constexpr int CONFIG_DEINTERLACE_MODE_COUNT = static_cast<int>(Deinterlac
 [[nodiscard]] constexpr auto DeinterlaceModeName(DeinterlaceMode mode) noexcept -> const char * {
     switch (mode) {
         case DeinterlaceMode::Auto:
-            return "auto (best available)";
+            return trNOOP("auto (best available)");
         case DeinterlaceMode::HwMotionAdaptive:
-            return "hardware: motion adaptive";
+            return trNOOP("hardware: motion adaptive");
         case DeinterlaceMode::HwWeave:
-            return "hardware: weave (fast)";
+            return trNOOP("hardware: weave (fast)");
         case DeinterlaceMode::HwBob:
-            return "hardware: bob (fastest)";
+            return trNOOP("hardware: bob (fastest)");
         case DeinterlaceMode::SwBwdif:
-            return "software: bwdif (best)";
+            return trNOOP("software: bwdif (best)");
         case DeinterlaceMode::SwW3fdif:
-            return "software: w3fdif (faster)";
+            return trNOOP("software: w3fdif (faster)");
     }
     return "?";
 }
@@ -223,7 +232,7 @@ enum class DenoiseMode : uint8_t {
     Auto = 0,       ///< HW denoise_vaapi (codec-tuned); no SW fallback
     Off = 1,        ///< No denoise
     SwMinimal = 2,  ///< Software hqdn3d (light) -> forces SW block
-    SwEnhanced = 3, ///< Software hqdn3d (strong) -> forces SW block
+    SwEnhanced = 3, ///< Software hqdn3d (medium) -> forces SW block
 };
 
 /// Derived from the last enumerator so it cannot drift
@@ -233,13 +242,13 @@ inline constexpr int CONFIG_DENOISE_MODE_COUNT = static_cast<int>(DenoiseMode::S
 [[nodiscard]] constexpr auto DenoiseModeName(DenoiseMode mode) noexcept -> const char * {
     switch (mode) {
         case DenoiseMode::Auto:
-            return "auto (hardware)";
+            return trNOOP("auto (hardware)");
         case DenoiseMode::Off:
-            return "off";
+            return trNOOP("off");
         case DenoiseMode::SwMinimal:
-            return "software: light";
+            return trNOOP("software: light");
         case DenoiseMode::SwEnhanced:
-            return "software: strong";
+            return trNOOP("software: medium");
     }
     return "?";
 }
@@ -248,7 +257,7 @@ inline constexpr int CONFIG_DENOISE_MODE_COUNT = static_cast<int>(DenoiseMode::S
 enum class SharpenMode : uint8_t {
     Auto = 0,     ///< Codec-tuned HW sharpness
     Off = 1,      ///< No sharpening
-    SwMild = 2,   ///< Software unsharp (mild) -> forces SW block
+    SwMild = 2,   ///< Software unsharp (light) -> forces SW block
     SwMedium = 3, ///< Software unsharp (medium) -> forces SW block
 };
 
@@ -259,13 +268,13 @@ inline constexpr int CONFIG_SHARPEN_MODE_COUNT = static_cast<int>(SharpenMode::S
 [[nodiscard]] constexpr auto SharpenModeName(SharpenMode mode) noexcept -> const char * {
     switch (mode) {
         case SharpenMode::Auto:
-            return "auto (hardware)";
+            return trNOOP("auto (hardware)");
         case SharpenMode::Off:
-            return "off";
+            return trNOOP("off");
         case SharpenMode::SwMild:
-            return "software: mild";
+            return trNOOP("software: light");
         case SharpenMode::SwMedium:
-            return "software: medium";
+            return trNOOP("software: medium");
     }
     return "?";
 }
@@ -286,13 +295,13 @@ inline constexpr int CONFIG_SCALE_MODE_COUNT = static_cast<int>(ScaleMode::SwFas
 [[nodiscard]] constexpr auto ScaleModeName(ScaleMode mode) noexcept -> const char * {
     switch (mode) {
         case ScaleMode::Auto:
-            return "auto (hardware, HQ)";
+            return trNOOP("auto (hardware, HQ)");
         case ScaleMode::HwFast:
-            return "hardware: fast";
+            return trNOOP("hardware: fast");
         case ScaleMode::SwQuality:
-            return "software: HQ (lanczos)";
+            return trNOOP("software: lanczos (HQ)");
         case ScaleMode::SwFast:
-            return "software: fast (bilinear)";
+            return trNOOP("software: bilinear (fast)");
     }
     return "?";
 }
@@ -377,7 +386,7 @@ inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT = static_cast<int>(MaxRefresh
         case MaxRefreshMode::Hz120:
             return "120 Hz";
         case MaxRefreshMode::Unlimited:
-            return "unlimited";
+            return trNOOP("unlimited");
     }
     return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
 }

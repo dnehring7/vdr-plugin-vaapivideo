@@ -130,6 +130,10 @@ class cAudioProcessor : public cThread {
     auto Shutdown() -> void; ///< Stops the processing thread and closes ALSA + decoder + parser. Idempotent;
                              ///< called by the destructor. Initialize()'s device-swap path calls CloseDevice()
                              ///< directly instead, keeping the thread alive across the swap.
+    auto RequestPassthroughRecheck() noexcept -> void {
+        passthroughRecheckPending.store(true, std::memory_order_release);
+    } ///< PassthroughMode changed at runtime: the worker reopens the output in the new mode before its next packet,
+      ///< so the change applies to the running stream instead of at the next codec open.
     [[nodiscard]] auto TakeCodecRedetectRequest() noexcept -> bool {
         return codecRedetectRequested.exchange(false, std::memory_order_acq_rel);
     } ///< Consumes the sink's "wrong codec" verdict (true once, after AUDIO_CASCADE_RECOVERY_LIMIT
@@ -189,6 +193,9 @@ class cAudioProcessor : public cThread {
         -> unsigned; ///< PCM output channel count for an input of @p inChannels, per PcmChannelMode + sink caps
                      ///< snapshot. Never upmixes; snaps to a standard HDMI layout (2 / 5.1 / 7.1). Lock-free
                      ///< (reads only the sinkElded / sinkMaxPcmChannels atomics), so the decode thread may call it.
+    auto ApplyPassthroughMode()
+        -> void; ///< Action()-thread: reopens the ALSA output when the current PassthroughMode flips the passthrough
+                 ///< decision for the open codec. Keeps the packet queue; takes the mutex.
     auto ReconfigurePcmOutput()
         -> void; ///< Action()-thread: reopens the ALSA PCM device at the channel count DecodeToPcm() chose once the
                  ///< stream's true layout became known, and frees the swr context bound to the old geometry. Takes
@@ -256,6 +263,7 @@ class cAudioProcessor : public cThread {
                                              ///< then the authoritative frame->ch_layout once decoding starts
     std::atomic<bool> outputChannelsChangePending{false}; ///< DecodeToPcm() saw the stream's true layout imply a
                                                           ///< different PCM output count; Action() reopens ALSA
+    std::atomic<bool> passthroughRecheckPending{false};   ///< RequestPassthroughRecheck() -> ApplyPassthroughMode()
     std::atomic<unsigned> pcmChannelCeiling{8};           ///< Learned PCM channel ceiling: dropped to the count the
                                                           ///< device actually accepts if a wider reopen fails, so
                                                           ///< ChooseOutputChannels() converges and never reopen-loops.

@@ -17,6 +17,7 @@ URL:            https://github.com/dnehring7/vdr-plugin-%{pname}
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
 BuildRequires:  gcc-c++
+BuildRequires:  gettext
 BuildRequires:  make
 BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(libavcodec) >= 61
@@ -48,12 +49,13 @@ service, or fully headless.
 install -Dpm 755 vaapivideo-probe %{buildroot}%{_bindir}/vaapivideo-probe
 install -Dpm 644 %{name}.conf \
   %{buildroot}%{_sysconfdir}/sysconfig/vdr-plugins.d/%{pname}.conf
+%find_lang %{name}
 
 %check
 nm -D --defined-only %{buildroot}%{vdr_libdir}/libvdr-%{pname}.so.%{vdr_apiversion} | grep -q ' VDRPluginCreator$'
 ./vaapivideo-probe --help
 
-%files
+%files -f %{name}.lang
 %license LICENSE
 %doc README.md
 %{_bindir}/vaapivideo-probe
