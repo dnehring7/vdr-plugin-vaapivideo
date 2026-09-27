@@ -5,10 +5,10 @@
  * @brief DRM atomic-modeset display: VAAPI->PRIME import and page-flip pacing.
  *
  * Threading model:
- *   Producer (decoder):    SubmitFrame() under bufferMutex; pushes onto pendingFrames (DISPLAY_PRERENDER_SLOTS deep).
- *   Consumer (Action()):   map -> commit -> drain page-flip event.
- *   Stream-switch (main):  BeginStreamSwitch() holds importMutex while codec tears down.
- *   OSD (any thread):      SetOsd() under osdMutex; bundled into next video commit.
+ *   Producer (decoder):    SubmitFrame() under bufferMutex; pushes onto pendingFrames (DISPLAY_PRERENDER_CAPACITY
+ * deep). Consumer (Action()):   map -> commit -> drain page-flip event. Stream-switch (main):  BeginStreamSwitch()
+ * holds importMutex while codec tears down. OSD (any thread):      SetOsd() under osdMutex; bundled into next video
+ * commit.
  *
  * Lock order: importMutex -> vaDriverMutex (frame import); importMutex -> bufferMutex ->
  * vaDriverMutex (releasing a DrmFramebuffer / clearing pendingFrames can drop the last
@@ -82,7 +82,7 @@ extern "C" {
 namespace {
 
 // --- Prerender queue ---
-constexpr size_t DISPLAY_PRERENDER_SLOTS =
+constexpr size_t DISPLAY_PRERENDER_CAPACITY =
     8; ///< Decoder->display handoff queue depth (= 160 ms tolerance @ 50 fps). Sized to absorb a
        ///< single UHD VPP/memory-bandwidth spike (observed ~80 ms in replay) AND the per-frame
        ///< variance of CPU-side SW decoders (libdav1d 1080p50 spikes 30-40 ms on complex frames)
@@ -96,9 +96,9 @@ constexpr size_t DISPLAY_PRERENDER_SLOTS =
 constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
 constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
     200; ///< Stuck-flip watchdog: force-clear isFlipPending if the kernel swallows the page-flip event.
-constexpr int DISPLAY_MAX_DRAIN_ITERATIONS =
+constexpr int DISPLAY_DRAIN_ITERATION_LIMIT =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
-constexpr uint32_t PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+constexpr uint32_t DISPLAY_PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 constexpr int DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS = 1000; ///< Commit-failure log rate limit (retry path ~200 Hz)
 
 // --- Runtime mode change ---
@@ -115,13 +115,13 @@ constexpr uint64_t DISPLAY_UNDERRUN_IDLE_MAX_MS =
            ///< the past, and the recovery log on resume would otherwise scream a multi-hour "queue refilled"
            ///< event. inTrick / inSyncSleep catch the explicit pause paths; this is the catch-all.
 constexpr int DISPLAY_UNDERRUN_LOG_INTERVAL_MS = 2000; ///< Min interval between underrun-onset dsyslog lines.
-constexpr auto DISPLAY_UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_SLOTS + 2);
+constexpr auto DISPLAY_UNDERRUN_THRESHOLD_VSYNCS = static_cast<unsigned>(DISPLAY_PRERENDER_CAPACITY + 2);
 ///< Empty-VSync streak that trips an underrun log (thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs).
-///< SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_SLOTS:
+///< SLOTS + 2 is tightly coupled to DISPLAY_PRERENDER_CAPACITY:
 ///<   SLOTS -> one missed VSync inside a freshly-drained queue (queue absorbs it, no log)
 ///<   + 1   -> grace VSync for the decoder to catch up (single hiccup, no log)
 ///<   + 1   -> one more sample so the trigger fires on sustained gaps, not transients
-///< Revisit the +2 margin if you change DISPLAY_PRERENDER_SLOTS -- the relationship doesn't scale linearly:
+///< Revisit the +2 margin if you change DISPLAY_PRERENDER_CAPACITY -- the relationship doesn't scale linearly:
 ///< at slots=1 you'd want +3 (more noise), at slots=8 +2 is plenty.
 constexpr int DISPLAY_WARMUP_ACTIVE_WINDOW_MS =
     500; ///< Min idle gap on a fresh commit that arms the warmup grace (does not gate the underrun log).
@@ -497,7 +497,7 @@ auto cVaapiDisplay::GetOutputGeometry(uint32_t &width, uint32_t &height) const n
     GetOutputGeometry(width, height);
     const AspectRatio par = GetOutputPixelAspect();
     if (height == 0 || par.den == 0) [[unlikely]] {
-        return DISPLAY_DEFAULT_ASPECT_RATIO;
+        return CONFIG_DISPLAY_ASPECT_DEFAULT;
     }
     return (static_cast<double>(width) * par.num) / (static_cast<double>(height) * par.den);
 }
@@ -656,7 +656,7 @@ auto cVaapiDisplay::Shutdown() -> void {
     // consumer has exited -- a wedged consumer may still be inside drmHandleEvent, and a
     // second concurrent reader on the DRM fd is forbidden (see the file-header DRM fd rule).
     if (hasExited.load(std::memory_order_acquire)) {
-        for (int i = 0; i < DISPLAY_MAX_DRAIN_ITERATIONS && DrainDrmEvents(0); ++i) {
+        for (int i = 0; i < DISPLAY_DRAIN_ITERATION_LIMIT && DrainDrmEvents(0); ++i) {
         }
     } else {
         esyslog("vaapivideo/display: skipping residual DRM event drain -- display thread still running");
@@ -747,7 +747,7 @@ auto cVaapiDisplay::Shutdown() -> void {
     const cMutexLock lock(&bufferMutex);
 
     // VSync-paced backpressure: block when the prerender queue is full.
-    if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS) {
+    if (pendingFrames.size() >= DISPLAY_PRERENDER_CAPACITY) {
         if (timeoutMs == 0) {
             return false;
         }
@@ -755,7 +755,7 @@ auto cVaapiDisplay::Shutdown() -> void {
         // timeoutMs < 0 blocks until a slot opens; per-slice isClearing/ready checks keep an
         // "infinite" wait from outliving a stream switch or shutdown.
         const cTimeMs deadline(timeoutMs > 0 ? timeoutMs : 0);
-        while (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS && ready.load(std::memory_order_relaxed)) {
+        while (pendingFrames.size() >= DISPLAY_PRERENDER_CAPACITY && ready.load(std::memory_order_relaxed)) {
             if (isClearing.load(std::memory_order_relaxed) || modesetActive.load(std::memory_order_relaxed)) {
                 return false;
             }
@@ -765,7 +765,7 @@ auto cVaapiDisplay::Shutdown() -> void {
             frameSlotCond.TimedWait(bufferMutex, 10);
         }
 
-        if (pendingFrames.size() >= DISPLAY_PRERENDER_SLOTS) [[unlikely]] {
+        if (pendingFrames.size() >= DISPLAY_PRERENDER_CAPACITY) [[unlikely]] {
             return false;
         }
     }
@@ -1092,7 +1092,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     //   osdHdrCommit fallback below) OSD-over-HDR frames on GPUs that need a CDCLK bump for them.
     //   Display thread blocks until applied.
     // ATOMIC_ASYNC is unused -- it requires linear buffers, our VAAPI surfaces are tiled.
-    const uint32_t commitFlags = (flags == 0) ? PAGE_FLIP_COMMIT_FLAGS : flags;
+    const uint32_t commitFlags = (flags == 0) ? DISPLAY_PAGE_FLIP_COMMIT_FLAGS : flags;
     if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, this) == 0) {
         if ((commitFlags & DRM_MODE_PAGE_FLIP_EVENT) != 0) {
             flipPendingSinceMs.store(cTimeMs::Now(), std::memory_order_release);

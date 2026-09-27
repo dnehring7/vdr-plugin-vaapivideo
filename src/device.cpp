@@ -113,7 +113,7 @@ extern "C" {
 namespace {
 
 // AUDIO_QUEUE_HIGHWATER paces dvbplayer/PES replay (PlayAudio/Poll); AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER
-// paces the single-cursor mediaplayer demux. MEDIAPLAYER_MAX_LOOKAHEAD_90K is the coarser PTS-distance
+// paces the single-cursor mediaplayer demux. MEDIAPLAYER_LOOKAHEAD_MAX_90K is the coarser PTS-distance
 // brake (so a TS mux interleave offset can't over-fill the decoder jitterBuf after a seek).
 
 // Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock is
@@ -125,46 +125,43 @@ namespace {
 // only user, so it stays coupled to the buffer it protects and below the cap by construction. The
 // static_assert must trip before the decode-ahead reserve hits its hard cap (else the drop-oldest runaway
 // guard fires first and the demuxer never throttles).
-constexpr size_t MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES = (DECODER_RESERVE_HARD_CAP * 3) / 4;
-static_assert(MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES < DECODER_RESERVE_HARD_CAP,
+constexpr size_t DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES = (DECODER_RESERVE_CAPACITY * 3) / 4;
+static_assert(DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES < DECODER_RESERVE_CAPACITY,
               "mediaplayer backpressure must engage below the reserve cap");
 
 /// How often the decoder tick re-checks the present EPG event while a radio splash is on screen.
 /// Program boundaries land on minute scales, so a couple of seconds is responsive without taxing
 /// the Schedules read-lock on the decoder thread.
-constexpr int RADIO_SPLASH_POLL_MS = 2000;
+constexpr int DEVICE_RADIO_SPLASH_POLL_MS = 2000;
 
 /// radioSplashEventId cache sentinels. DVB event ids are 16-bit, so top-of-range uint32 values can
 /// never collide with a real id. EMPTY_TEXT = "a blank frame is queued" (distinct from EPG event 0,
 /// so a blank->caption transition still repaints). DIRTY = "force a repaint next poll" -- published
 /// before a forced submit so that, if the submit fails, the poll retries instead of matching the key.
-constexpr uint32_t RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
-constexpr uint32_t RADIO_SPLASH_DIRTY_ID = RADIO_SPLASH_EMPTY_TEXT_ID - 1;
+constexpr uint32_t DEVICE_RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
+constexpr uint32_t DEVICE_RADIO_SPLASH_DIRTY_ID = DEVICE_RADIO_SPLASH_EMPTY_TEXT_ID - 1;
 
 /// Grace period after a channel switch before a video stream that never decodes is declared
 /// encrypted/undecodable and the on-screen notice is shown. Also the radio black-frame delay:
 /// SetPlayMode arms both watchdogs from this constant so the two graces cannot drift apart.
-constexpr int ENCRYPTED_NOTICE_DELAY_MS = 3000;
+constexpr int DEVICE_ENCRYPTED_NOTICE_DELAY_MS = 3000;
 
 /// Fallback ES window for DetectAudioCodec(), used only when a single payload is inconclusive.
 /// Sized for AAC-LATM alone: its AudioMuxElements span PES boundaries, so the LOAS sync chains
 /// only across payloads and needs ~2 frames (~1 KB) visible at once. ADTS/MP2/AC-3 resolve on one
 /// payload and must NOT reach here -- the window's front-erase lands mid-frame and a ~1.5 KB AC-3
 /// frame can't fit a corroborating pair in 2 KB.
-constexpr size_t AUDIO_DETECT_WINDOW = 2048;
+constexpr size_t DEVICE_AUDIO_DETECT_WINDOW_BYTES = 2048;
 
 #if APIVERSNUM >= 30014
 /// eosDrainSinceMs once the drain has been reported: still latched (no second RequestEosDrain()), no longer pending.
-constexpr uint64_t EOS_DRAIN_REPORTED = std::numeric_limits<uint64_t>::max();
+constexpr uint64_t DEVICE_EOS_DRAIN_REPORTED = std::numeric_limits<uint64_t>::max();
 #endif
-
-/// ISO 13818-1 private_stream_1 -- the PES stream id every DVB dolby track (AC-3, E-AC-3, DTS) rides in.
-constexpr uchar PES_PRIVATE_STREAM_1 = 0xBD;
 
 /// How long PlayAudio() may drop non-private_stream_1 PES after a dolby-entry track switch before it accepts
 /// whatever the mux delivers. Two PES periods of headroom for the switch to land (AC-3 frames one PES ~32 ms,
 /// MPEG audio up to ~192 ms), and short enough that an unusual mux costs a hiccup, not the audio.
-constexpr uint64_t AUDIO_TRACK_SWITCH_GRACE_MS = 500;
+constexpr uint64_t DEVICE_AUDIO_TRACK_SWITCH_GRACE_MS = 500;
 
 /// Total length of every non-final PES chunk VDR's cTsToPes makes of an oversized picture (remux.c GetPes:
 /// body `l = min(remaining, MAXPESLENGTH=0xFFF0)` + 6-byte header). The TOTAL length is the only sound
@@ -172,7 +169,7 @@ constexpr uint64_t AUDIO_TRACK_SWITCH_GRACE_MS = 500;
 /// slice with a PTS, 3 on continuations), so a payload-size test would read a continued slice as final and
 /// cut the access unit. `Length <` this is deliberately conservative -- it forgoes the early release only
 /// for a final continuation slice of exactly 65526..65528 bytes, costing latency, never correctness.
-constexpr int VDR_MAX_PES_CHUNK = 0xFFF0 + 6;
+constexpr int VDR_PES_CHUNK_BYTES = 0xFFF0 + 6;
 
 // --- Stream-start trace milestones (cVaapiDevice::startTrace; see StreamStartTrace in common.h) ---
 constexpr uint32_t TRACE_AUDIO_PES = 1U << 0;   ///< First audio PES reached PlayAudio()
@@ -184,25 +181,25 @@ constexpr uint32_t TRACE_DEVICE_ALL =
     TRACE_AUDIO_PES | TRACE_AUDIO_CODEC | TRACE_VIDEO_PES | TRACE_VIDEO_KEY | TRACE_VIDEO_CODEC;
 
 // --- Runtime display-mode switching (stability / rate-limit / matcher tolerances) ---
-constexpr uint64_t DISPLAY_MODE_STABLE_MS =
+constexpr uint64_t DEVICE_DISPLAY_MODE_STABLE_MS =
     1500; ///< How long a reactively observed format must hold before it may drive a modeset.
           ///< Live-TV formats churn faster than this while the tuner settles, so only the one the
           ///< viewer actually landed on gets through.
-constexpr uint64_t DISPLAY_MODE_MIN_INTERVAL_MS =
+constexpr uint64_t DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS =
     3000; ///< Minimum gap between two applied changes. Each modeset costs an HDMI link retrain
           ///< (~0.5-1 s of black), so back-to-back switches must be impossible even if the
           ///< stability gate is somehow satisfied twice in a row.
-constexpr uint64_t DISPLAY_MODE_IDLE_RESTORE_MS =
+constexpr uint64_t DEVICE_DISPLAY_MODE_IDLE_RESTORE_MS =
     5000; ///< No stream format published for this long after a stop: hand the output back to the
           ///< default. Playback can end into a source that never decodes anything (radio,
           ///< scrambled, no free tuner), where nothing else would move the mode off the one the
           ///< previous stream installed.
-constexpr uint32_t DISPLAY_MODE_EXACT_TOLERANCE_PPM =
+constexpr uint32_t DEVICE_DISPLAY_MODE_EXACT_TOLERANCE_PPM =
     200; ///< Tier-A rate tolerance (0.02%): rounding noise only. Keeps 59.94 and 60 distinct.
-constexpr uint32_t DISPLAY_MODE_LOOSE_TOLERANCE_PPM =
+constexpr uint32_t DEVICE_DISPLAY_MODE_LOOSE_TOLERANCE_PPM =
     5000; ///< Tier-B rate tolerance (0.5%): only consulted when tier A finds nothing. Lets 59.94
           ///< content land on a 60 Hz-only panel and 23.976 on a 24 Hz-only panel.
-constexpr uint32_t DISPLAY_MODE_MAX_RATE_MULTIPLE = 8; ///< Highest k considered in the k*source refresh search.
+constexpr uint32_t DEVICE_DISPLAY_MODE_RATE_MULTIPLE_MAX = 8; ///< Highest k considered in the k*source refresh search.
 
 // === VT helpers =============================================================
 // Startup + ATTA: foreground VDR's VT (stdin) so the kernel delivers keypresses
@@ -215,12 +212,12 @@ constexpr uint32_t DISPLAY_MODE_MAX_RATE_MULTIPLE = 8; ///< Highest k considered
 // VT_ACTIVATE/VT_WAITACTIVE work on any VT fd, so STDIN_FILENO is used directly
 // (set up by TTYPath=) and /dev/tty0 is left alone -- no udev rule needed.
 
-constexpr int VT_SWITCH_TIMEOUT_MS = 1500;          ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
-                                                    ///< that refuse to release would otherwise block startup forever
-                                                    ///< and look like a 60 s "plugin hang" until the watchdog fires.
-constexpr int DRM_MASTER_ACQUIRE_TIMEOUT_MS = 1500; ///< OpenDrmAsMaster() retry window: logind revokes the other
-                                                    ///< session's master asynchronously after the VT switch.
-constexpr int DRM_MASTER_ACQUIRE_POLL_MS = 50;      ///< Reopen cadence while another master is still there.
+constexpr int DEVICE_VT_SWITCH_TIMEOUT_MS = 1500;  ///< Cap on VT_WAITACTIVE polling. VT_PROCESS-mode owners
+                                                   ///< that refuse to release would otherwise block startup forever
+                                                   ///< and look like a 60 s "plugin hang" until the watchdog fires.
+constexpr int DEVICE_DRM_MASTER_TIMEOUT_MS = 1500; ///< OpenDrmAsMaster() retry window: logind revokes the other
+                                                   ///< session's master asynchronously after the VT switch.
+constexpr int DEVICE_DRM_MASTER_POLL_MS = 50;      ///< Reopen cadence while another master is still there.
 
 std::atomic<bool> capWarned{false}, noVtHinted{false};
 
@@ -256,7 +253,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     }
     // Poll VT_GETSTATE instead of blocking on VT_WAITACTIVE: the latter can hang forever in
     // VT_PROCESS mode if the owning process never releases. Bounded wait keeps startup non-fatal.
-    const cTimeMs timeout(VT_SWITCH_TIMEOUT_MS);
+    const cTimeMs timeout(DEVICE_VT_SWITCH_TIMEOUT_MS);
     while (!timeout.TimedOut()) {
         if (ActiveVt() == vt) {
             return true;
@@ -265,7 +262,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     }
 
     isyslog("vaapivideo/device: VT%d activation timed out after %d ms -- continuing without waiting", vt,
-            VT_SWITCH_TIMEOUT_MS);
+            DEVICE_VT_SWITCH_TIMEOUT_MS);
     return false;
 }
 
@@ -314,7 +311,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
 /// logind revoke the other session's. Names the cause on timeout -- left to the first modeset, EACCES
 /// would surface as a bogus "rejected mode".
 [[nodiscard]] auto OpenDrmAsMaster(const std::string &path) -> int {
-    const cTimeMs deadline(DRM_MASTER_ACQUIRE_TIMEOUT_MS);
+    const cTimeMs deadline(DEVICE_DRM_MASTER_TIMEOUT_MS);
     while (true) {
         const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
         if (fd < 0) [[unlikely]] {
@@ -328,7 +325,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
         if (deadline.TimedOut()) {
             break;
         }
-        cCondWait::SleepMs(DRM_MASTER_ACQUIRE_POLL_MS);
+        cCondWait::SleepMs(DEVICE_DRM_MASTER_POLL_MS);
     }
     esyslog("vaapivideo/device: '%s' opened, but another DRM client holds the display -- an X server or "
             "compositor whose VT is active -- vaapivideo needs none",
@@ -390,8 +387,8 @@ DrmDevices::~DrmDevices() noexcept {
 
 namespace {
 
-constexpr uint8_t SPLASH_LUMA_BLACK = 16;  ///< NV12 TV-range black (matches SubmitBlackFrame fill).
-constexpr uint8_t SPLASH_LUMA_WHITE = 235; ///< NV12 TV-range white for fully-covered glyph pixels.
+constexpr uint8_t DEVICE_SPLASH_LUMA_BLACK = 16;  ///< NV12 TV-range black (matches SubmitBlackFrame fill).
+constexpr uint8_t DEVICE_SPLASH_LUMA_WHITE = 235; ///< NV12 TV-range white for fully-covered glyph pixels.
 
 /// Bake optional centered caption text into NV12 luma (chroma stays neutral, so glyphs render gray);
 /// '\n' splits into block-centered lines. CPU-only. Safe off the main thread (radio/encrypted paths):
@@ -447,8 +444,9 @@ auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
                     if (alpha == 0) {
                         continue;
                     }
-                    row[startX + gx] = static_cast<uint8_t>(SPLASH_LUMA_BLACK +
-                                                            ((alpha * (SPLASH_LUMA_WHITE - SPLASH_LUMA_BLACK)) / 255));
+                    row[startX + gx] =
+                        static_cast<uint8_t>(DEVICE_SPLASH_LUMA_BLACK +
+                                             ((alpha * (DEVICE_SPLASH_LUMA_WHITE - DEVICE_SPLASH_LUMA_BLACK)) / 255));
                 }
             }
         }
@@ -514,12 +512,12 @@ auto cVaapiDevice::RefreshRadioSplash(bool force) -> void {
     // serialized internally via vaDriverMutex.
     uint32_t presentEventId = 0;
     const std::string text = BuildRadioText(presentEventId);
-    const uint32_t splashEventId = text.empty() ? RADIO_SPLASH_EMPTY_TEXT_ID : presentEventId;
+    const uint32_t splashEventId = text.empty() ? DEVICE_RADIO_SPLASH_EMPTY_TEXT_ID : presentEventId;
     if (force) {
         // Publish DIRTY (never equal to any real splashEventId) so that if this forced submit fails,
         // the next poll still repaints instead of matching the key and returning early.
         radioSplashActive.store(true, std::memory_order_relaxed);
-        radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
+        radioSplashEventId.store(DEVICE_RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
     } else if (splashEventId == radioSplashEventId.load(std::memory_order_relaxed)) {
         return; // nothing changed since the last paint
     }
@@ -576,7 +574,7 @@ auto cVaapiDevice::CheckRadioSplash() -> void {
             } else {
                 isyslog("vaapivideo/device: no video stream detected -- radio mode, showing black frame");
                 RefreshRadioSplash(/*force=*/true);
-                radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+                radioSplashPoll.Set(DEVICE_RADIO_SPLASH_POLL_MS);
             }
         }
     }
@@ -586,7 +584,7 @@ auto cVaapiDevice::CheckRadioSplash() -> void {
     // the moment a channel starts sending video -- the decoder then owns the scanout.
     if (radioSplashActive.load(std::memory_order_relaxed) &&
         videoCodecId.load(std::memory_order_relaxed) == AV_CODEC_ID_NONE && radioSplashPoll.TimedOut()) [[unlikely]] {
-        radioSplashPoll.Set(RADIO_SPLASH_POLL_MS);
+        radioSplashPoll.Set(DEVICE_RADIO_SPLASH_POLL_MS);
         RefreshRadioSplash(/*force=*/false);
     }
 }
@@ -673,7 +671,7 @@ auto cVaapiDevice::ResetNoVideoMonitors() noexcept -> void {
     radioBlackPending.store(false, std::memory_order_relaxed);
     radioCheckPending.store(false, std::memory_order_relaxed);
     radioSplashActive.store(false, std::memory_order_relaxed);
-    radioSplashEventId.store(RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
+    radioSplashEventId.store(DEVICE_RADIO_SPLASH_DIRTY_ID, std::memory_order_relaxed);
     // Plain store, not CAS: a lifecycle boundary means disarm WHATEVER is armed, by design.
     encryptedDeadlineMs.store(0, std::memory_order_relaxed);
 }
@@ -1013,8 +1011,8 @@ auto cVaapiDevice::Clear() -> void {
     if (PendingPlayoutDepth() != 0) {
         return false;
     }
-    if (sinceMs != EOS_DRAIN_REPORTED &&
-        eosDrainSinceMs.compare_exchange_strong(sinceMs, EOS_DRAIN_REPORTED, std::memory_order_relaxed)) {
+    if (sinceMs != DEVICE_EOS_DRAIN_REPORTED &&
+        eosDrainSinceMs.compare_exchange_strong(sinceMs, DEVICE_EOS_DRAIN_REPORTED, std::memory_order_relaxed)) {
         dsyslog("vaapivideo/device: EOS drained -- last frame on screen %llums after the request",
                 static_cast<unsigned long long>(cTimeMs::Now() - sinceMs));
     }
@@ -1044,18 +1042,10 @@ auto cVaapiDevice::Freeze() -> void {
     cDevice::Freeze();
     paused.store(true, std::memory_order_relaxed);
 
-    // Drop queued packets so un-pause shows the user's intended frame, not stale lookahead.
-    // Does NOT reset sync EMA: that would cause a reseed transient on resume.
+    // Nothing queued is dropped: both players resume from their read position, so every delivered packet
+    // is still to be shown. The sync EMA survives too (a reset would reseed on resume).
     if (decoder) [[likely]] {
-        // Not during an EOS drain: the queue holds the stream's last packets, which no player feeds again.
-        if (!decoder->IsCodecDrainPending()) {
-            decoder->DrainQueue();
-        }
-        // Hold the drain so the jitterBuf head's PTS doesn't drift during the pause: ALSA is
-        // dropped below and WritePcmToAlsa stops, GetClock() goes stale within ~1 s, and the
-        // decoder's no-clock-freerun would otherwise submit frames at vsync rate -- leaving the
-        // head hundreds of ms ahead of the re-anchored audio clock on resume and triggering the
-        // post-resume drain-stall loop.
+        // Hold the drain: presenting on against the stopped clock would drift the head ahead of it.
         decoder->SetDevicePaused(true);
     }
     // Suppress the display's underrun ("queue empty Nms") log: with the decoder holding the drain,
@@ -1066,15 +1056,10 @@ auto cVaapiDevice::Freeze() -> void {
         display->SetDevicePaused(true);
     }
 
-    // Drop ALSA buffers: ~100-200 ms of audio is already queued in the sink and would
-    // continue playing past the freeze without an explicit drain. DropOutput preserves
-    // playbackPts; pauseClock=true additionally pins GetClock() so it does not extrapolate
-    // through ALSA silence (a short pause < AUDIO_CLOCK_STALE_MS would otherwise produce a
-    // fake-advanced clock on resume -> SkipStaleJitterFrames silently drops the preserved
-    // jitterBuf head = playback-position skip on un-pause). The pin lifts on the next ALSA
-    // write inside WritePcmToAlsa().
+    // Pause the ring instead of dropping it (its ~800 ms are part of the stream) and pin the clock at the
+    // DAC, so resume continues exactly where the pause began.
     if (audioProcessor) [[likely]] {
-        audioProcessor->DropOutput(/*pauseClock=*/true);
+        audioProcessor->PauseOutput();
     }
 }
 
@@ -1197,8 +1182,8 @@ namespace {
 /// multi-gigabyte scale allocation (remote OOM via an exposed SVDRP port). Oversize requests are
 /// rejected outright -- silently clamping would return an image the caller did not ask for. The
 /// per-axis caps also bound the pixel count (<= 8192*4320) with no separate area check needed.
-constexpr int GRAB_MAX_WIDTH = 8192;
-constexpr int GRAB_MAX_HEIGHT = 4320;
+constexpr int DEVICE_GRAB_WIDTH_MAX = 8192;
+constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
 
 /// One-shot filter graph: feed @p in, pull a single frame whose pixel format is enforced
 /// by appending `,format=<outFmt>` to @p chainPrefix. Caller-supplied chain stages
@@ -1411,10 +1396,10 @@ constexpr int GRAB_MAX_HEIGHT = 4320;
     }
 
     // Reject oversize requests up front, before the (expensive) surface grab and HDR tonemap --
-    // see GRAB_MAX_WIDTH/GRAB_MAX_HEIGHT for why VDR core does not bound these itself.
-    if (SizeX > GRAB_MAX_WIDTH || SizeY > GRAB_MAX_HEIGHT) [[unlikely]] {
+    // see DEVICE_GRAB_WIDTH_MAX/DEVICE_GRAB_HEIGHT_MAX for why VDR core does not bound these itself.
+    if (SizeX > DEVICE_GRAB_WIDTH_MAX || SizeY > DEVICE_GRAB_HEIGHT_MAX) [[unlikely]] {
         esyslog("vaapivideo/device: GrabImage -- requested size %dx%d exceeds limit %dx%d", SizeX, SizeY,
-                GRAB_MAX_WIDTH, GRAB_MAX_HEIGHT);
+                DEVICE_GRAB_WIDTH_MAX, DEVICE_GRAB_HEIGHT_MAX);
         return nullptr;
     }
 
@@ -1590,7 +1575,9 @@ auto cVaapiDevice::Mute() -> void {
     // DropOutput, not Clear(): the picture holds until the ring refills and re-anchors the clock, where a
     // Clear() would arm freerun and underrun the display. Persistent mute is SetVolumeDevice(0) (the mute
     // key's path). HardwareReady()-gated: skins can mute on menu open/close during an in-flight ATTA.
-    if (HardwareReady() && audioProcessor) [[likely]] {
+    // Not while paused: the output is silent already, and the paused ring and queue are the stream Play()
+    // resumes. A trick entered from the pause drops them in TrickSpeed().
+    if (HardwareReady() && audioProcessor && !paused.load(std::memory_order_relaxed)) [[likely]] {
         audioProcessor->DropOutput();
     }
 }
@@ -1608,10 +1595,10 @@ auto cVaapiDevice::Play() -> void {
     }
 
     paused.store(false, std::memory_order_relaxed);
-    // Lift Freeze()'s clock pin before releasing the drain hold: normally the next write would, but at
-    // EOS none follows and the video tail would wait forever.
+    // Restart the ring and the clock before releasing the drain hold, so the held frames are paced
+    // against a clock that moves on from the pause position.
     if (HardwareReady() && audioProcessor) [[likely]] {
-        audioProcessor->ResumeClock();
+        audioProcessor->ResumeOutput();
     }
     if (decoder) [[likely]] {
         decoder->SetDevicePaused(false);
@@ -1672,7 +1659,7 @@ auto cVaapiDevice::Play() -> void {
     // stream id must neither time the gate out nor be logged against it.
     if (const uint64_t awaitUntil = audioAwaitDolbyUntilMs.load(std::memory_order_relaxed); awaitUntil != 0)
         [[unlikely]] {
-        if (Id == PES_PRIVATE_STREAM_1) {
+        if (Id == PES_STREAM_ID_PRIVATE) {
             audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed); // the switch landed
         } else if (cTimeMs::Now() < awaitUntil) {
             return Length;
@@ -1682,7 +1669,7 @@ auto cVaapiDevice::Play() -> void {
             audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed);
             dsyslog("vaapivideo/device: no private_stream_1 within %llu ms of the dolby track switch -- "
                     "accepting stream id 0x%02x",
-                    static_cast<unsigned long long>(AUDIO_TRACK_SWITCH_GRACE_MS), Id);
+                    static_cast<unsigned long long>(DEVICE_AUDIO_TRACK_SWITCH_GRACE_MS), Id);
         }
     }
 
@@ -1744,17 +1731,17 @@ auto cVaapiDevice::Play() -> void {
         }
 
         // Payload-first: AC-3/MP2/ADTS carry whole frames per PES payload, so one is decisive and
-        // the window would only hurt them (see AUDIO_DETECT_WINDOW). Only AAC-LATM, whose frames
+        // the window would only hurt them (see DEVICE_AUDIO_DETECT_WINDOW_BYTES). Only AAC-LATM, whose frames
         // span PES boundaries, needs the cross-payload window -- reached solely on a NONE here.
         AudioDetection detected = ::DetectAudioCodec({pes.payload, pes.payloadSize});
         bool detectedFromWindow = false;
         if (detected.codecId == AV_CODEC_ID_NONE) {
             audioDetectBuffer.insert(audioDetectBuffer.end(), pes.payload, pes.payload + pes.payloadSize);
-            if (audioDetectBuffer.size() > AUDIO_DETECT_WINDOW) {
+            if (audioDetectBuffer.size() > DEVICE_AUDIO_DETECT_WINDOW_BYTES) {
                 audioDetectBuffer.erase(
                     audioDetectBuffer.begin(),
                     audioDetectBuffer.begin() +
-                        static_cast<std::ptrdiff_t>(audioDetectBuffer.size() - AUDIO_DETECT_WINDOW));
+                        static_cast<std::ptrdiff_t>(audioDetectBuffer.size() - DEVICE_AUDIO_DETECT_WINDOW_BYTES));
             }
             detected = ::DetectAudioCodec({audioDetectBuffer.data(), audioDetectBuffer.size()});
             detectedFromWindow = true;
@@ -2018,12 +2005,12 @@ auto cVaapiDevice::Play() -> void {
     }
 
     // Replay backpressure: return 0 so VDR retries via Poll(). Live: never block.
-    // Trick mode caps queue to DECODER_TRICK_QUEUE_DEPTH for immediate keyframe visibility.
+    // Trick mode caps queue to DECODER_TRICK_QUEUE_CAPACITY for immediate keyframe visibility.
     if (!isLive) [[unlikely]] {
         const int currentSpeed = trickSpeed.load(std::memory_order_relaxed);
 
         if (currentSpeed != 0) {
-            if (!decoder->IsReadyForNextTrickFrame() || decoder->GetQueueSize() >= DECODER_TRICK_QUEUE_DEPTH) {
+            if (!decoder->IsReadyForNextTrickFrame() || decoder->GetQueueSize() >= DECODER_TRICK_QUEUE_CAPACITY) {
                 return 0;
             }
         } else if (decoder->IsQueueFull()) {
@@ -2035,7 +2022,7 @@ auto cVaapiDevice::Play() -> void {
     // First keyframe after a live codec open: the parser holds an AU back until the NEXT AU's start code,
     // which for the very first picture means waiting for the next PES (a frame period on DVB, a delivery
     // burst on IPTV). In a TS the PES boundary IS the AU boundary and VDR chunks an oversized picture into
-    // PES of exactly VDR_MAX_PES_CHUNK bytes, so a shorter PES ends the picture: release the AU now. A PES
+    // PES of exactly VDR_PES_CHUNK_BYTES bytes, so a shorter PES ends the picture: release the AU now. A PES
     // carrying a PTS is already the next picture (the parser emits the keyframe by itself): disarm only.
     if (firstAuReleasePending.load(std::memory_order_relaxed)) [[unlikely]] {
         const bool opensAu = pes.pts != AV_NOPTS_VALUE;
@@ -2044,7 +2031,7 @@ auto cVaapiDevice::Play() -> void {
             firstAuReleasePending.store(false, std::memory_order_relaxed);
         } else {
             decoder->EnqueueData(pes.payload, pes.payloadSize, pes.pts);
-            if (Length < VDR_MAX_PES_CHUNK) {
+            if (Length < VDR_PES_CHUNK_BYTES) {
                 firstAuReleasePending.store(false, std::memory_order_relaxed);
                 decoder->ReleasePendingAccessUnit();
             }
@@ -2064,7 +2051,7 @@ auto cVaapiDevice::Play() -> void {
         if (!IsPlayingVideo()) {
             return decoder->IsReadyForNextTrickFrame();
         }
-        return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
+        return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_CAPACITY;
     }
     return !decoder->IsQueueFull() && (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
 }
@@ -2283,9 +2270,9 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     // Blue/Stop -> SetPlayMode(pmNone) WITHOUT a prior Play(), so without this the drain hold
     // set by Freeze() (decoder->devicePaused, display->devicePaused) stays asserted across the
     // SetPlayMode transition. The next live-TV / replay session then feeds packets into the
-    // decoder, jitterBuf grows to DECODER_RESERVE_HARD_CAP, and every subsequent frame overflows
+    // decoder, jitterBuf grows to DECODER_RESERVE_CAPACITY, and every subsequent frame overflows
     // (visible as "jitterBuf overflow -- dropped N" spam at ~50 fps with no picture on screen).
-    // Audio's clockPaused is cleared by the Clear() path below via ResetPlaybackClock().
+    // Audio's pause (clock pin, output hold) is released by the Clear() path below.
     paused.store(false, std::memory_order_relaxed);
     if (decoder) [[likely]] {
         decoder->SetDevicePaused(false);
@@ -2338,7 +2325,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             Clear();
             // Encrypted radio: arm the watchdog too, so a scrambled audio-only channel that never
             // decodes gets the "encrypted" notice instead of a silent radio splash.
-            encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
+            encryptedDeadlineMs.store(cTimeMs::Now() + DEVICE_ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
             // Poll deadline is left to the decoder tick (which owns radioSplashPoll); its first
             // refresh after entry recomputes the same event and no-ops, then arms the 2 s cadence.
             RefreshRadioSplash(/*force=*/true);
@@ -2354,13 +2341,13 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             Clear();
             // Shared grace: if no video arrives, PlayAudio() flags it and the decoder tick paints
             // black (radio channel). Release publishes radioBlackTimer's deadline to that thread:
-            radioBlackTimer.Set(ENCRYPTED_NOTICE_DELAY_MS);
+            radioBlackTimer.Set(DEVICE_ENCRYPTED_NOTICE_DELAY_MS);
             radioBlackPending.store(true, std::memory_order_release);
             // Same grace for the encrypted-channel notice: armed unconditionally, it self-cancels
             // when a codec opens and only paints if the channel turns out encrypted with a video PID.
-            encryptedDeadlineMs.store(cTimeMs::Now() + ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
+            encryptedDeadlineMs.store(cTimeMs::Now() + DEVICE_ENCRYPTED_NOTICE_DELAY_MS, std::memory_order_relaxed);
             dsyslog("vaapivideo/device: pmAudioVideo -- armed no-video watchdogs (grace %d ms)",
-                    ENCRYPTED_NOTICE_DELAY_MS);
+                    DEVICE_ENCRYPTED_NOTICE_DELAY_MS);
             armStartTrace = true;
             break;
         default:
@@ -2461,6 +2448,9 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
 
     if (decoder) [[likely]] {
         decoder->SetTrickSpeed(Speed, Forward, isFast);
+        // Slow motion from the pause moves the picture again. `paused` stays set (it marks slow mode above);
+        // the bare Freeze() that pauses slow motion sets the hold again.
+        decoder->SetDevicePaused(false);
     }
 
     // Drop audio explicitly: VDR usually calls Mute() too but timing varies, and the
@@ -2692,7 +2682,7 @@ auto cVaapiDevice::ArmModeCandidateLocked(const StreamModeRequest &request, uint
     modeCandidateSinceMs = nowMs;
     // Publish a non-zero due time last so PollPendingDisplayMode()'s lock-free probe never sees an
     // armed window before the payload behind it. (+1 guards the theoretical nowMs==0 tick.)
-    modeCandidateDueMs.store(nowMs + DISPLAY_MODE_STABLE_MS + 1, std::memory_order_release);
+    modeCandidateDueMs.store(nowMs + DEVICE_DISPLAY_MODE_STABLE_MS + 1, std::memory_order_release);
 }
 
 auto cVaapiDevice::ClearModeCandidateLocked() -> void {
@@ -2711,8 +2701,8 @@ auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, Play
     // the candidate STILL ARMED -- PollPendingDisplayMode() re-enters at the cooldown boundary the
     // due time is pushed to, so a throttled switch is deferred rather than dropped. Leaving the
     // due time in the past would instead have the poll take this mutex on every decode tick.
-    if (lastModeChangeMs != 0 && nowMs - lastModeChangeMs < DISPLAY_MODE_MIN_INTERVAL_MS) {
-        modeCandidateDueMs.store(lastModeChangeMs + DISPLAY_MODE_MIN_INTERVAL_MS, std::memory_order_release);
+    if (lastModeChangeMs != 0 && nowMs - lastModeChangeMs < DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS) {
+        modeCandidateDueMs.store(lastModeChangeMs + DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS, std::memory_order_release);
         return;
     }
 
@@ -2814,7 +2804,7 @@ auto cVaapiDevice::EvaluateDisplayMode(const StreamModeRequest &request, Playbac
         ArmModeCandidateLocked(request, nowMs);
         return;
     }
-    if (nowMs - modeCandidateSinceMs < DISPLAY_MODE_STABLE_MS) {
+    if (nowMs - modeCandidateSinceMs < DEVICE_DISPLAY_MODE_STABLE_MS) {
         return;
     }
     ApplyDisplayModePolicy(request, source, nowMs);
@@ -2853,7 +2843,7 @@ auto cVaapiDevice::PollPendingDisplayMode() -> void {
 
     // Re-check under the lock: another thread may have disarmed or re-armed since the probe.
     if (modeCandidateSinceMs != 0 && modeCandidate.IsValid() &&
-        nowMs - modeCandidateSinceMs >= DISPLAY_MODE_STABLE_MS) {
+        nowMs - modeCandidateSinceMs >= DEVICE_DISPLAY_MODE_STABLE_MS) {
         // Re-check the gates: the operator may have changed a setting while the candidate aged.
         const auto policy = SnapshotModePolicy(defaultMode);
         if (!ModeSwitchEnabledFor(lastRequestSource) || (!policy.matchRefresh && !policy.matchResolution)) {
@@ -2904,7 +2894,7 @@ auto cVaapiDevice::ScheduleIdleModeRestore() -> void {
     // display thread finished PROGRAMMING, so a stop landing inside an in-flight switch would see
     // the outgoing mode and leave the incoming one unwatched. A spurious arm costs one no-op poll --
     // RestoreDefaultModeLocked() early-outs when the mode really is the default.
-    modeIdleRestoreDueMs.store(cTimeMs::Now() + DISPLAY_MODE_IDLE_RESTORE_MS, std::memory_order_release);
+    modeIdleRestoreDueMs.store(cTimeMs::Now() + DEVICE_DISPLAY_MODE_IDLE_RESTORE_MS, std::memory_order_release);
 }
 
 auto cVaapiDevice::ReevaluateDisplayMode() -> void {
@@ -3150,7 +3140,7 @@ namespace {
     // rebuild the cushion -> sustained "decoder unable to keep up"). The PES path is immune: it feeds
     // video via a separate PlayVideo() call, so video fills the reserve to the cap independent of this
     // audio gate. Matching the audio read-ahead to AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER (~1 s) lets the
-    // shared cursor pull video ~1 s ahead too, so the reserve fills toward DECODER_RESERVE_HARD_CAP
+    // shared cursor pull video ~1 s ahead too, so the reserve fills toward DECODER_RESERVE_CAPACITY
     // exactly like the live/dvbplayer paths. (This is mediaplayer-only: PlayAudio() keeps the shallow
     // real-time gate.)
     if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER) {
@@ -3268,7 +3258,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // jitterBuf stays full -> backpressure stays asserted. That positive-feedback starvation is
     // the "stutters after a long seek and never recovers" bug. With a live clock the lookahead
     // throttle (audio-referenced, self-releasing at the audio 1x consumption rate) is the correct
-    // and sufficient gate; DECODER_RESERVE_HARD_CAP remains the ultimate overflow backstop.
+    // and sufficient gate; DECODER_RESERVE_CAPACITY remains the ultimate overflow backstop.
     //
     // Audio-reanchor escape: pause -> Play() drains the audio queue but preserves jitterBuf
     // (decoder hold). On resume jitterFull would block the demuxer just when audio packets MUST
@@ -3281,7 +3271,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
     const bool audioCanReanchor = audioOpen && audioDepth < AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER;
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
-                            decoder->GetDecodedReserveSize() >= MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES;
+                            decoder->GetDecodedReserveSize() >= DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;
 }
 
@@ -3292,7 +3282,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Not HasFeedSpace(): its IsPlayingVideo() branch keys off VDR's PES track state, which the
     // mediaplayer bypasses (always false here) -- that dropped the depth check and let the slow-
     // motion preroll flood the 1-deep trick queue into overflow drops (lost reference frames).
-    return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_DEPTH;
+    return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_CAPACITY;
 }
 
 [[nodiscard]] auto cVaapiDevice::GetAudioClock() const noexcept -> int64_t {
@@ -3505,7 +3495,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     // at most one stale PES exists -- covered by the 2-of-2 rule. In-session only: a fresh stream has no
     // leftovers, and arming would gate every dolby channel's initial track assignment. Store before the
     // reset so no PES slips through in between.
-    audioAwaitDolbyUntilMs.store(enteringDolby && inSession ? cTimeMs::Now() + AUDIO_TRACK_SWITCH_GRACE_MS : 0,
+    audioAwaitDolbyUntilMs.store(enteringDolby && inSession ? cTimeMs::Now() + DEVICE_AUDIO_TRACK_SWITCH_GRACE_MS : 0,
                                  std::memory_order_relaxed);
     ResetAudioCodecState();
     ResetReplayAudioEofBaseline();
@@ -3648,7 +3638,7 @@ auto cVaapiDevice::NoteDataAfterEosDrain() noexcept -> void {
 #if APIVERSNUM >= 30014
 auto cVaapiDevice::CancelEosDrain(const char *by) noexcept -> void {
     if (const uint64_t sinceMs = eosDrainSinceMs.exchange(0, std::memory_order_relaxed);
-        sinceMs != 0 && sinceMs != EOS_DRAIN_REPORTED) {
+        sinceMs != 0 && sinceMs != DEVICE_EOS_DRAIN_REPORTED) {
         tsyslog("vaapivideo/device: EOS drain cancelled by %s -- depth %zu", by, PendingPlayoutDepth());
     }
 }
@@ -3720,7 +3710,7 @@ namespace {
 
 /// Refresh stage, restricted to candidates already at the target resolution.
 ///
-/// Two tiers over k = 1..DISPLAY_MODE_MAX_RATE_MULTIPLE. Tier A absorbs rounding only, so 59.94
+/// Two tiers over k = 1..DEVICE_DISPLAY_MODE_RATE_MULTIPLE_MAX. Tier A absorbs rounding only, so 59.94
 /// and 60 stay distinct and a genuine 59.94 mode wins when the panel has both. Tier B is the
 /// 0.5% net that lets 59.94 content settle on a 60-Hz-only panel. Within a tier the HIGHEST k at
 /// or below the cap wins -- that is what turns 25p into 50 Hz and 29.97 into 59.94 -- while k==1
@@ -3762,7 +3752,7 @@ namespace {
                 preferred = &candidate;
             }
             if (exactDefault == nullptr && RateErrorPpm(candidate.refreshMilliHz, policy.defaultRefreshMilliHz) <=
-                                               DISPLAY_MODE_EXACT_TOLERANCE_PPM) {
+                                               DEVICE_DISPLAY_MODE_EXACT_TOLERANCE_PPM) {
                 exactDefault = &candidate;
             }
             if (candidate.refreshMilliHz <= policy.maxRefreshMilliHz &&
@@ -3785,11 +3775,12 @@ namespace {
         return pickFallback("source rate unknown");
     }
 
-    for (const uint32_t tolerancePpm : {DISPLAY_MODE_EXACT_TOLERANCE_PPM, DISPLAY_MODE_LOOSE_TOLERANCE_PPM}) {
+    for (const uint32_t tolerancePpm :
+         {DEVICE_DISPLAY_MODE_EXACT_TOLERANCE_PPM, DEVICE_DISPLAY_MODE_LOOSE_TOLERANCE_PPM}) {
         const DisplayModeCandidate *best = nullptr;
         uint32_t bestK = 0;
         uint32_t bestErrorPpm = UINT32_MAX;
-        for (uint32_t k = 1; k <= DISPLAY_MODE_MAX_RATE_MULTIPLE; ++k) {
+        for (uint32_t k = 1; k <= DEVICE_DISPLAY_MODE_RATE_MULTIPLE_MAX; ++k) {
             const uint64_t target = static_cast<uint64_t>(request.rateMilliHz) * k;
             if (target > UINT32_MAX) {
                 break;
@@ -3821,10 +3812,11 @@ namespace {
         }
         if (best != nullptr) {
             return {.index = indexOf(best),
-                    .reason = describe(std::format("{} x{}, {} ppm",
-                                                   tolerancePpm == DISPLAY_MODE_EXACT_TOLERANCE_PPM ? "exact" : "near",
-                                                   bestK, bestErrorPpm),
-                                       *best)};
+                    .reason =
+                        describe(std::format("{} x{}, {} ppm",
+                                             tolerancePpm == DEVICE_DISPLAY_MODE_EXACT_TOLERANCE_PPM ? "exact" : "near",
+                                             bestK, bestErrorPpm),
+                                 *best)};
         }
     }
 
@@ -3855,7 +3847,7 @@ namespace {
     // which silently reduced the 576p "Minimum resolution" setting to a duplicate of 720p.
     const double referenceAspect = (defaultMode.hdisplay > 0 && defaultMode.vdisplay > 0)
                                        ? ModePictureAspect(defaultMode)
-                                       : DISPLAY_DEFAULT_ASPECT_RATIO;
+                                       : CONFIG_DISPLAY_ASPECT_DEFAULT;
     constexpr double kAspectTolerance = 0.02;
 
     uint16_t index = 0;
@@ -4000,7 +3992,7 @@ namespace {
             continue;
         }
         const uint32_t errorPpm = RateErrorPpm(ModeRefreshMilliHz(mode), targetRate * 1000U);
-        if (errorPpm > DISPLAY_MODE_LOOSE_TOLERANCE_PPM) {
+        if (errorPpm > DEVICE_DISPLAY_MODE_LOOSE_TOLERANCE_PPM) {
             continue;
         }
         const bool preferred = (mode.type & DRM_MODE_TYPE_PREFERRED) != 0;

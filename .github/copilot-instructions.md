@@ -14,6 +14,7 @@ Build `make DEV_WARNINGS=1` (strict `-Werror`; plain `make` is the lenient packa
 
 ## Conventions
 - Constants: file/namespace scope is `UPPERCASE` (headers `inline constexpr`; `.cpp` `constexpr` in the anonymous namespace); function-local `constexpr` is `kCamelCase`.
+  Name = defining-module prefix (`DECODER_`, `DEVICE_`, ...; spec tables keep `EDID_`/`CEA_`/`PES_`..., VDR mirrors `VDR_` + VDR's name) + unit suffix (`_MS`, `_90K`, `_BYTES`, ...); `_MIN`/`_MAX`/`_DEFAULT` right before the unit; sizes `_CAPACITY`, budgets `_LIMIT`. Full rules: AVSYNC.md "Constants".
 - File-local helpers (free fns, types): anonymous namespace, co-located with use (multiple per file ok); no new file-scope `static`. Exported symbols stay global (`c`-prefix; no project namespace).
 - Logging `"vaapivideo/<basename>: <msg>"`, never hot paths. Errors: FFmpeg `AvErr(ret).data()`, DRM/VAAPI `%m`/`strerror(errno)`.
 - Members: trailing `///<`, brace-init; alphabetical within groups, but lifetime/lock order wins where it matters (e.g. a thread member declared last). Section rulers `// === LABEL ===`.

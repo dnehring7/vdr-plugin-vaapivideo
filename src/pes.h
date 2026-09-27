@@ -17,6 +17,10 @@
 // === PES PACKET ===
 // ============================================================================
 
+/// private_stream_1 (ISO 13818-1): DVB carries AC-3/E-AC-3/DTS/AAC in it. Shared with the device, which keys
+/// the dolby track switch on it.
+inline constexpr uint8_t PES_STREAM_ID_PRIVATE = 0xBD;
+
 /// Non-owning view into the input buffer passed to ParsePes(); lifetime is bounded by that buffer.
 struct PesPacket {
     bool isAudio{};              ///< stream_id 0xC0--0xDF or private_stream_1 (0xBD, DVB AC-3/DTS)

@@ -227,7 +227,7 @@ class cVaapiDisplay : public cThread {
     /// underrun detector ignores re-presents -- a short pause would otherwise spam "queue empty"
     /// before the idle catch-all kicks in.
     auto SetDevicePaused(bool enable) noexcept -> void { devicePaused.store(enable, std::memory_order_relaxed); }
-    /// Hand a decoded frame to the display thread (DISPLAY_PRERENDER_SLOTS-deep queue).
+    /// Hand a decoded frame to the display thread (DISPLAY_PRERENDER_CAPACITY-deep queue).
     /// timeoutMs: -1 = block until a slot opens (VSync backpressure), 0 = non-blocking, >0 = ms.
     [[nodiscard]] auto SubmitFrame(std::unique_ptr<VaapiFrame> frame, int timeoutMs = -1) -> bool;
     /// Lock-free pendingFrames depth poll. Decoder uses depth==0 to decide whether to pre-submit
@@ -493,7 +493,8 @@ class cVaapiDisplay : public cThread {
     /// Active display size, packed as (width << 32) | height -- one atomic so GetOutputGeometry()
     /// can take both from a single load and never observe a new width beside an old height. The
     /// single-value getters load independently, so pairing THOSE is still racy.
-    std::atomic<uint64_t> outputGeometry{(static_cast<uint64_t>(DISPLAY_DEFAULT_WIDTH) << 32) | DISPLAY_DEFAULT_HEIGHT};
+    std::atomic<uint64_t> outputGeometry{(static_cast<uint64_t>(CONFIG_DISPLAY_WIDTH_DEFAULT) << 32) |
+                                         CONFIG_DISPLAY_HEIGHT_DEFAULT};
     /// Scanout pixel aspect of the active mode, packed as (num << 32) | den. 1:1 on every
     /// square-pixel timing; GetAspectRatio() derives the picture aspect from it and the geometry.
     /// Published before the geometry -- see PublishOutputGeometry().
@@ -501,7 +502,7 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> geometryChanged{false}; ///< Set by ChangeDisplayMode; consumed once by the decoder via
                                               ///< TakeGeometryChange() to trigger a VPP rebuild for the new size.
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
-    /// Up to DISPLAY_PRERENDER_SLOTS frames awaiting MapVaapiFrame (guarded by bufferMutex).
+    /// Up to DISPLAY_PRERENDER_CAPACITY frames awaiting MapVaapiFrame (guarded by bufferMutex).
     std::deque<std::unique_ptr<VaapiFrame>> pendingFrames;
     std::atomic<bool> frameInFlight{false}; ///< A popped frame has not flipped yet (set before pendingDepth drops,
                                             ///< cleared once the flip gate passes); see HasFrameInFlight().
@@ -509,14 +510,16 @@ class cVaapiDisplay : public cThread {
                                             ///< on every push/pop/clear, polled by the decoder via PendingDepth().
     /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
     /// reports no clock.
-    std::atomic<uint32_t> outputRefreshMilliHz{DISPLAY_DEFAULT_REFRESH_RATE * 1000};
+    std::atomic<uint32_t> outputRefreshMilliHz{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000};
     uint32_t videoPlaneId{};    ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{}; ///< Cached atomic prop IDs for the video plane
     /// Requested rect (next VPP build target).
-    cRect targetVideoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH), static_cast<int>(DISPLAY_DEFAULT_HEIGHT)};
+    cRect targetVideoRect{0, 0, static_cast<int>(CONFIG_DISPLAY_WIDTH_DEFAULT),
+                          static_cast<int>(CONFIG_DISPLAY_HEIGHT_DEFAULT)};
     /// Active scanout rect; matches the current fb 1:1. Advances to targetVideoRect once a matching fb arrives,
     /// so old frames keep painting during a rebuild.
-    cRect videoRect{0, 0, static_cast<int>(DISPLAY_DEFAULT_WIDTH), static_cast<int>(DISPLAY_DEFAULT_HEIGHT)};
+    cRect videoRect{0, 0, static_cast<int>(CONFIG_DISPLAY_WIDTH_DEFAULT),
+                    static_cast<int>(CONFIG_DISPLAY_HEIGHT_DEFAULT)};
     mutable cMutex videoRectMutex; ///< Guards targetVideoRect and videoRect.
 
     // Last-committed plane property caches. Sentinel ~0 forces a write on the first commit after

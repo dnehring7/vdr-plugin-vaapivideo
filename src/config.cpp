@@ -35,8 +35,8 @@ namespace {
 
 // Audio latency bounds live in config.h (CONFIG_AUDIO_LATENCY_{MIN,MAX}_MS) so the parse path
 // here and the setup-menu UI share one source of truth -- keep them in lockstep.
-constexpr uint32_t CONFIG_MAX_VIDEO_HEIGHT = 2160U; ///< 4K UHD ceiling for ParseResolution() (px)
-constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for ParseResolution() (px)
+constexpr uint32_t CONFIG_VIDEO_HEIGHT_MAX = 2160U; ///< 4K UHD ceiling for ParseResolution() (px)
+constexpr uint32_t CONFIG_VIDEO_WIDTH_MAX = 3840U;  ///< 4K UHD ceiling for ParseResolution() (px)
 
 } // namespace
 
@@ -46,7 +46,7 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
 
 [[nodiscard]] auto DisplayConfig::GetAspectRatio() const noexcept -> double {
     if (outputHeight == 0) [[unlikely]] {
-        return DISPLAY_DEFAULT_ASPECT_RATIO;
+        return CONFIG_DISPLAY_ASPECT_DEFAULT;
     }
     return static_cast<double>(outputWidth) / static_cast<double>(outputHeight);
 }
@@ -103,12 +103,12 @@ constexpr uint32_t CONFIG_MAX_VIDEO_WIDTH = 3840U;  ///< 4K UHD ceiling for Pars
     // slack; 4K / 120 Hz is the ceiling the VAAPI/DRM stack is exercised against. Anything
     // outside is almost certainly a typo and would just propagate to a confusing modeset
     // failure later.
-    if (width < 640 || width > CONFIG_MAX_VIDEO_WIDTH) [[unlikely]] {
-        esyslog("vaapivideo/config: width %u outside valid range [640, %u]", width, CONFIG_MAX_VIDEO_WIDTH);
+    if (width < 640 || width > CONFIG_VIDEO_WIDTH_MAX) [[unlikely]] {
+        esyslog("vaapivideo/config: width %u outside valid range [640, %u]", width, CONFIG_VIDEO_WIDTH_MAX);
         return false;
     }
-    if (height < 480 || height > CONFIG_MAX_VIDEO_HEIGHT) [[unlikely]] {
-        esyslog("vaapivideo/config: height %u outside valid range [480, %u]", height, CONFIG_MAX_VIDEO_HEIGHT);
+    if (height < 480 || height > CONFIG_VIDEO_HEIGHT_MAX) [[unlikely]] {
+        esyslog("vaapivideo/config: height %u outside valid range [480, %u]", height, CONFIG_VIDEO_HEIGHT_MAX);
         return false;
     }
     if (rate < 23 || rate > 120) [[unlikely]] {

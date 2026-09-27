@@ -31,14 +31,15 @@ struct VaapiContext;
 // ============================================================================
 
 /// Depth-1: Poll() throttles the producer; overflow drops incoming.
-inline constexpr size_t DECODER_TRICK_QUEUE_DEPTH = 1;
-inline constexpr int DECODER_TRICK_HOLD_MS = 20; ///< Base hold per frame for slow trick (~= one field period @ 50 Hz).
+inline constexpr size_t DECODER_TRICK_QUEUE_CAPACITY = 1;
+inline constexpr int DECODER_TRICK_HOLD_DEFAULT_MS = 20; ///< Fast-trick hold for a step without two PTS (~= one field
+                                                         ///< period @ 50 Hz). Slow forward paces on content instead.
 /// Cap on the decode-ahead reserve (handoffQueue + jitterBuf, ~1.3 s @ 50 fps total): the decode thread backpressures
 /// when the published total reaches it (or handoffQueue alone does), and each stage also drop-oldest-trims past it as a
 /// runaway guard. Caps GPU surface retention (~64 4K NV12 surfaces ~= 0.8 GB GTT) while still dwarfing the <40 ms VPP
 /// variance and the 8-slot display prerender. In decoder.h (not the .cpp) so the mediaplayer's backpressure gate can be
 /// statically checked against it (see device.cpp).
-inline constexpr size_t DECODER_RESERVE_HARD_CAP = 64;
+inline constexpr size_t DECODER_RESERVE_CAPACITY = 64;
 
 // ============================================================================
 // === STRUCTURES ===
@@ -161,12 +162,10 @@ class cVaapiDecoder : public cThread {
                  ///< live TV and recordings, where no frame rate is known until FFmpeg has parsed the VUI. Must be
                  ///< set before Initialize() starts the thread.
     auto SetDevicePaused(bool paused) noexcept
-        -> void; ///< Mirror cVaapiDevice::Freeze() / Play() into the drain loop. While paused the drain HOLDS
-                 ///< the jitterBuf (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift while
-                 ///< the audio master clock is genuinely frozen (ALSA dropped). Without this the decoder's
-                 ///< no-clock-freerun fires when GetClock() goes stale and submits frames at vsync rate during
-                 ///< pause, leaving the head hundreds of ms ahead of the audio clock on resume -> persistent
-                 ///< video-ahead drain-stall loop that never recovers.
+        -> void; ///< Presentation hold: Freeze() sets it, Play() and TrickSpeed() clear it (VDR's paused flag
+                 ///< stays set through slow motion). While set the drain holds the jitterBuf: every held frame is
+                 ///< still to be shown and the master clock is pinned; a clock-less pause would otherwise freerun
+                 ///< at vsync rate and resume far ahead of audio -> a drain-stall loop that never recovers.
     auto SetLiveMode(bool live) -> void; ///< true = live TV (jitter buffer active); false = replay.
     auto RequestCodecDrain() -> void;    ///< Ask decode thread to drain B-frame reorder buffer (e.g. before still).
     [[nodiscard]] auto IsCodecDrainPending() const noexcept -> bool {
@@ -262,11 +261,15 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto SubmitIfCurrent(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Submit unless clearEpoch raced this iteration; stale-epoch frames are dropped silently
                  ///< (returns true so callers don't count it as a submit failure).
+    [[nodiscard]] auto IsSeekingTrick() const noexcept
+        -> bool; ///< FF or reverse (non-contiguous feed): outputs get synthetic stamps + the ghost-field drop.
     [[nodiscard]] auto SubmitTrickFrame(std::unique_ptr<VaapiFrame> frame)
-        -> bool; ///< Pacing: wait deadline, skip reverse-GOP duplicates, arm next deadline; then submit.
+        -> bool; ///< Pacing: wait deadline, skip reverse-GOP duplicates, hold through a pause, arm next
+                 ///< deadline; then submit.
     [[nodiscard]] auto TrickHoldMsFor(int64_t pts, int64_t prevPts) const noexcept
-        -> uint64_t; ///< Per-step hold for the current trick mode. Fast: |pts - prevPts| / trickMultiplier,
-                     ///< clamped. Slow (multiplier 0) or unusable PTS: the precomputed trickHoldMs.
+        -> uint64_t; ///< Per-step hold from the content covered: fast = |pts - prevPts| / multiplier, slow =
+                     ///< |pts - prevPts| * slowdown. Without two PTS: trickHoldMs, or one output frame * slowdown
+                     ///< in slow forward.
     [[nodiscard]] auto SyncAndSubmitFrame(std::unique_ptr<VaapiFrame> frame)
         -> bool; ///< Audio-master A/V sync gate (four regimes; see decoder.cpp file comment and AVSYNC.md).
     [[nodiscard]] auto SyncLatency90k(const cAudioProcessor *ap) const noexcept
@@ -424,9 +427,7 @@ class cVaapiDecoder : public cThread {
                                            ///< epoch of its own: it stamps producedEpoch from clearEpoch while holding
                                            ///< codecMutex for the producing decode/drain operation.
     std::atomic<bool> liveMode{false};     ///< Hard-ahead policy: replay blocks via WaitForAudioCatchUp, live sleeps.
-    std::atomic<bool> devicePaused{false}; ///< Mirrors cVaapiDevice::Freeze()/Play(). When true the drain loop holds
-                                           ///< (no submit, no stall-watchdog re-arm) so the head's PTS doesn't drift
-                                           ///< while ALSA is dropped and the audio master clock is genuinely frozen.
+    std::atomic<bool> devicePaused{false}; ///< Presentation hold; see SetDevicePaused().
     std::atomic<bool> ready{false};        ///< Set by Initialize(); gate for OpenCodec() and EnqueueData().
     std::atomic<int> trickSpeed{0};        ///< 0 = normal; >0 = trick mode (speed value mirrors VDR TrickSpeed).
     // Debounced rebuild request (ScaleVideo / zoom), written by RequestFilterRebuild(), consumed
@@ -449,9 +450,10 @@ class cVaapiDecoder : public cThread {
     std::atomic<bool> isTrickFastForward{false}; ///< FF mode: only keyframes enqueued; first field of a pair dropped.
     std::atomic<bool> isTrickReverse{false};     ///< REW: GOPs arrive backward; skip frames with rising PTS in a GOP.
     std::atomic<uint64_t> nextTrickFrameDue{0};  ///< cTimeMs::Now() deadline for next submission; enforces pacing.
-    std::atomic<int64_t> prevTrickPts{AV_NOPTS_VALUE}; ///< Source PTS of previous trick frame; detects field pairs.
-    /// Hold per frame in slow mode = speed * DECODER_TRICK_HOLD_MS. Zero-init to match the normal-play
-    /// state both trick-exit paths publish, so a SetTrickSpeed(0) no-op is not mistaken for a change.
+    std::atomic<int64_t> prevTrickPts{AV_NOPTS_VALUE}; ///< PTS of the previous paced trick frame (hold distance).
+    /// Fallback hold for a step without two PTS: fast trick's base hold, slow reverse's nominal stride at
+    /// 1/speed. 0 in slow forward (falls back to one output frame). Zero-init to match the normal-play state
+    /// both trick-exit paths publish, so a SetTrickSpeed(0) no-op is not mistaken for a change.
     std::atomic<uint64_t> trickHoldMs{0};
     std::atomic<uint64_t> trickMultiplier{0}; ///< Fast-mode PTS-derived hold divisor (2/4/8x). 0 = slow mode.
 
@@ -512,7 +514,7 @@ class cVaapiDecoder : public cThread {
     /// fires; cleared by ResetSmoothedDelta. Presentation thread only.
     int64_t stableDelta90k{AV_NOPTS_VALUE};
     uint64_t stableDeltaCapturedMs{}; ///< cTimeMs::Now() of the most recent stableDelta90k capture. Paired with
-                                      ///< DECODER_SYNC_HINT_MAX_AGE_MS so an old snapshot from a single past
+                                      ///< DECODER_SYNC_HINT_AGE_MAX_MS so an old snapshot from a single past
                                       ///< correction cannot dominate seeks long after the pipeline has settled at
                                       ///< a different offset. 0 = no capture yet; reset by ResetSmoothedDelta.
     int hardAheadDebounce{};          ///< Consecutive rawDelta > HARD_THRESHOLD; 2-sample debounce before action.
@@ -545,7 +547,7 @@ class cVaapiDecoder : public cThread {
     // === JITTER BUFFER ===
     // ========================================================================
     /// Decode->present handoff. Producer: decode thread (push under handoffMutex). Consumer: present thread
-    /// (splice under handoffMutex). FIFO; bounded by DECODER_RESERVE_HARD_CAP with producer backpressure
+    /// (splice under handoffMutex). FIFO; bounded by DECODER_RESERVE_CAPACITY with producer backpressure
     /// via handoffNotFull.
     std::deque<std::unique_ptr<VaapiFrame>> handoffQueue;
     /// Decoded frames pending display. Presentation thread only (spliced from handoffQueue each present

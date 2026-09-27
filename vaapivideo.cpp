@@ -548,7 +548,7 @@ auto cVaapiVideoPlugin::CommandLineHelp() -> const char * {
                     "WIDTHxHEIGHT@RATE (default: {}x{}@{})\n"
                     "  -t, --trace                 Enable A/V-sync and stream-start tracing "
                     "(needs 'vdr -l 3')\n",
-                    DISPLAY_DEFAULT_WIDTH, DISPLAY_DEFAULT_HEIGHT, DISPLAY_DEFAULT_REFRESH_RATE);
+                    CONFIG_DISPLAY_WIDTH_DEFAULT, CONFIG_DISPLAY_HEIGHT_DEFAULT, CONFIG_DISPLAY_REFRESH_DEFAULT_HZ);
     return kHelp.c_str();
 }
 

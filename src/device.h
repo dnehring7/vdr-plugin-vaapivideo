@@ -190,7 +190,7 @@ class cVaapiDevice : public cDevice {
     [[nodiscard]] auto DeviceType() const -> cString override; ///< Returns "VAAPI"
     [[nodiscard]] auto Flush(int TimeoutMs = 0)
         -> bool override;           ///< Wait until packet queue drains; returns true when empty
-    auto Freeze() -> void override; ///< Pause output: drain queue and stop audio
+    auto Freeze() -> void override; ///< Pause output, keeping every queued packet and the ALSA ring
     auto GetOsdSize(int &Width, int &Height, double &PixelAspect)
         -> void override;                            ///< Return display framebuffer dimensions for OSD allocation
     [[nodiscard]] auto GetSTC() -> int64_t override; ///< Return presentation clock in VDR 90 kHz ticks
@@ -490,9 +490,9 @@ class cVaapiDevice : public cDevice {
                                        ///< reached from the decode thread, the player thread and the main thread
     StreamModeRequest modeCandidate{}; ///< Format currently accumulating toward the stability gate
     uint64_t modeCandidateSinceMs{};   ///< When modeCandidate was first observed (0 = none pending)
-    /// Lock-free mirror of modeCandidateSinceMs + DISPLAY_MODE_STABLE_MS; 0 = nothing armed. PollPendingDisplayMode()
-    /// runs on every decode-loop iteration, so the (overwhelmingly common) no-candidate case must not cost a mutex
-    /// acquisition.
+    /// Lock-free mirror of modeCandidateSinceMs + DEVICE_DISPLAY_MODE_STABLE_MS; 0 = nothing armed.
+    /// PollPendingDisplayMode() runs on every decode-loop iteration, so the (overwhelmingly common) no-candidate case
+    /// must not cost a mutex acquisition.
     std::atomic<uint64_t> modeCandidateDueMs{0};
     /// Wall clock at which an idle output on a non-default mode is handed back to defaultMode; 0 = disarmed. Covers
     /// playback ending into a source that decodes nothing (radio, scrambled, no free tuner), where no format is ever
@@ -504,8 +504,8 @@ class cVaapiDevice : public cDevice {
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount{0};                 ///< Confirmation count for audioCodecCandidate
     std::vector<uint8_t> audioDetectBuffer; ///< AAC-LATM fallback window for DetectAudioCodec() (see
-                                            ///< AUDIO_DETECT_WINDOW). Owned solely by the PlayAudio feed thread;
-                                            ///< the reset paths never touch it (see audioDetectGen).
+                                            ///< DEVICE_AUDIO_DETECT_WINDOW_BYTES). Owned solely by the PlayAudio feed
+                                            ///< thread; the reset paths never touch it (see audioDetectGen).
     std::vector<uint8_t> audioHeldPayload;  ///< The 1-of-2 candidate PES, held until its codec confirms and then
                                             ///< fed ahead of the confirming PES so detection costs no audio.
                                             ///< Feed-thread-owned; invalidated through audioDetectGen.
@@ -536,7 +536,7 @@ class cVaapiDevice : public cDevice {
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
     std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
 #if APIVERSNUM >= 30014
-    /// DrainDevice() cycle: 0 = none, EOS_DRAIN_REPORTED = requested and drained, else cTimeMs::Now() of the
+    /// DrainDevice() cycle: 0 = none, DEVICE_EOS_DRAIN_REPORTED = requested and drained, else cTimeMs::Now() of the
     /// request. One RequestEosDrain() per cycle; Clear() and SetPlayMode() cancel it. A single atomic, so the
     /// main thread never sees a torn request/start pair.
     std::atomic<uint64_t> eosDrainSinceMs{0};

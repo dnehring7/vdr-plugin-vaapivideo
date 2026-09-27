@@ -64,19 +64,21 @@ namespace {
 // === LOCAL CONSTANTS ===
 // ============================================================================
 
-constexpr int64_t DEFAULT_CUE_DURATION_90K = 270000;     ///< 3 s fallback when a cue carries no duration.
-constexpr int64_t MAX_CUE_DURATION_90K = 90000LL * 3600; ///< 1 h window ceiling: even a non-overflowing end far in
-                                                         ///< the future would wedge the queue front unpruneably.
-constexpr uint32_t MAX_CUE_START_DELAY_MS = 60000; ///< start_display_time sanity bound (decoders emit ~0); a corrupt
-                                                   ///< huge delay would break the queue's ascending-start order.
-constexpr size_t SUBTITLE_QUEUE_CAPACITY = 256;    ///< Bound future cues from a malformed / front-loaded stream.
-constexpr int SUBTITLE_SHUTDOWN_TIMEOUT_S = 2;     ///< Action() join timeout in Shutdown().
-constexpr int SUBTITLE_TICK_MS = 50;               ///< Pacing cadence: how often Action() re-checks the cue vs clock.
-constexpr int DVB_SUBTITLE_CANVAS_W = 720;         ///< SD PAL canvas fallback when a DVB stream omits a display
-constexpr int DVB_SUBTITLE_CANVAS_H = 576;         ///< definition segment (so the decoder reports no size).
-constexpr int DVB_SUBTITLE_MAX_COLORS = 256;       ///< 8 bpp palette ceiling for a DVB region bitmap.
-constexpr int DVB_SUBTITLE_MAX_DIM = 4096;         ///< Region w/h ceiling (UHD canvas is 3840x2160): the 16-bit
-                                                   ///< DVB fields allow 65535, which overflows cBitmap's int w*h.
+constexpr int64_t SUBTITLE_CUE_DURATION_DEFAULT_90K = 270000; ///< 3 s fallback when a cue carries no duration.
+constexpr int64_t SUBTITLE_CUE_DURATION_MAX_90K =
+    90000LL * 3600; ///< 1 h window ceiling: even a non-overflowing end far in
+                    ///< the future would wedge the queue front unpruneably.
+constexpr uint32_t SUBTITLE_CUE_START_DELAY_MAX_MS =
+    60000;                                       ///< start_display_time sanity bound (decoders emit ~0); a corrupt
+                                                 ///< huge delay would break the queue's ascending-start order.
+constexpr size_t SUBTITLE_QUEUE_CAPACITY = 256;  ///< Bound future cues from a malformed / front-loaded stream.
+constexpr int SUBTITLE_SHUTDOWN_TIMEOUT_S = 2;   ///< Action() join timeout in Shutdown().
+constexpr int SUBTITLE_TICK_MS = 50;             ///< Pacing cadence: how often Action() re-checks the cue vs clock.
+constexpr int SUBTITLE_DVB_CANVAS_WIDTH = 720;   ///< SD PAL canvas fallback when a DVB stream omits a display
+constexpr int SUBTITLE_DVB_CANVAS_HEIGHT = 576;  ///< definition segment (so the decoder reports no size).
+constexpr int SUBTITLE_DVB_COLORS_MAX = 256;     ///< 8 bpp palette ceiling for a DVB region bitmap.
+constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD canvas is 3840x2160): the 16-bit
+                                                 ///< DVB fields allow 65535, which overflows cBitmap's int w*h.
 
 /// Scale @p sourceAlpha by VDR's subtitle transparency (0..10), the mapping cDvbSubtitleConverter uses.
 [[nodiscard]] auto SubtitleAlpha(uint8_t sourceAlpha, int transparency) noexcept -> uint8_t {
@@ -315,8 +317,8 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
     // nb_colors <= 0 would cast to a huge span size; linesize < width would run the row subspan
     // off the pixel buffer (and guarantees stride > 0 for the overflow check below). The dimension
     // ceiling keeps cBitmap::SetSize's int w*h from overflowing into an undersized allocation.
-    if (rect == nullptr || rect->w <= 0 || rect->h <= 0 || rect->w > DVB_SUBTITLE_MAX_DIM ||
-        rect->h > DVB_SUBTITLE_MAX_DIM || rect->linesize[0] < rect->w || rect->nb_colors <= 0 ||
+    if (rect == nullptr || rect->w <= 0 || rect->h <= 0 || rect->w > SUBTITLE_DVB_DIMENSION_MAX ||
+        rect->h > SUBTITLE_DVB_DIMENSION_MAX || rect->linesize[0] < rect->w || rect->nb_colors <= 0 ||
         rect->data[0] == nullptr || rect->data[1] == nullptr) {
         return nullptr;
     }
@@ -334,7 +336,7 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
         const uint32_t alpha = SubtitleAlpha(static_cast<uint8_t>((argb >> 24) & 0xFFU), transparency);
         return static_cast<tColor>((alpha << 24) | (argb & 0x00FFFFFFU));
     };
-    const auto colors = static_cast<size_t>(std::min(rect->nb_colors, DVB_SUBTITLE_MAX_COLORS));
+    const auto colors = static_cast<size_t>(std::min(rect->nb_colors, SUBTITLE_DVB_COLORS_MAX));
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- C-API: data[1] is a packed uint32 ARGB palette
     const std::span<const uint32_t> palette{reinterpret_cast<const uint32_t *>(rect->data[1]), colors};
     int index = 0;
@@ -463,7 +465,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // start_display_time is ~always 0 (an offset from the packet pts); a corrupt huge delay (incl.
     // an all-ones sentinel) would schedule the cue days ahead, breaking the queue's ascending-start
     // invariant and wedging Action()'s scan behind a far-future front cue.
-    if (sub.start_display_time > MAX_CUE_START_DELAY_MS) [[unlikely]] {
+    if (sub.start_display_time > SUBTITLE_CUE_START_DELAY_MAX_MS) [[unlikely]] {
         avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
         return;
     }
@@ -471,7 +473,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // and a saturated INT64_MAX would masquerade as a real (unpruneable) timestamp. The display-time
     // products themselves can't overflow (uint32 ms * 90 < 2^39).
     const auto startOpt = CheckedAdd90k(packetPts90k, static_cast<int64_t>(sub.start_display_time) * PTS_TICKS_PER_MS);
-    const auto defaultEndOpt = CheckedAdd90k(packetPts90k, DEFAULT_CUE_DURATION_90K);
+    const auto defaultEndOpt = CheckedAdd90k(packetPts90k, SUBTITLE_CUE_DURATION_DEFAULT_90K);
     if (!startOpt || !defaultEndOpt) [[unlikely]] {
         avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
         return;
@@ -507,8 +509,8 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // Action() never matches the clock, so it would silently never appear. Then cap the window: even
     // a checked, non-overflowing end far in the future would park an unpruneable cue at the queue
     // front for the rest of playback.
-    const auto fallbackEndOpt = CheckedAdd90k(start90k, DEFAULT_CUE_DURATION_90K);
-    const auto maxEndOpt = CheckedAdd90k(start90k, MAX_CUE_DURATION_90K);
+    const auto fallbackEndOpt = CheckedAdd90k(start90k, SUBTITLE_CUE_DURATION_DEFAULT_90K);
+    const auto maxEndOpt = CheckedAdd90k(start90k, SUBTITLE_CUE_DURATION_MAX_90K);
     if (!fallbackEndOpt || !maxEndOpt) [[unlikely]] {
         avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
         return;
@@ -539,8 +541,8 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // Canvas = the DVB display-definition segment, which the decoder reports on the codec context
     // after decode; fall back to SD PAL when the stream omits a DDS.
     if (!cue.regions.empty()) {
-        cue.canvasW = codecCtx_->width > 0 ? codecCtx_->width : DVB_SUBTITLE_CANVAS_W;
-        cue.canvasH = codecCtx_->height > 0 ? codecCtx_->height : DVB_SUBTITLE_CANVAS_H;
+        cue.canvasW = codecCtx_->width > 0 ? codecCtx_->width : SUBTITLE_DVB_CANVAS_WIDTH;
+        cue.canvasH = codecCtx_->height > 0 ? codecCtx_->height : SUBTITLE_DVB_CANVAS_HEIGHT;
     }
     avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
 
@@ -789,8 +791,8 @@ auto cSubtitleConverter::ShowBitmapCue(const Cue &cue) -> bool {
     if (osdWidth <= 0 || osdHeight <= 0) {
         return false;
     }
-    const int canvasW = cue.canvasW > 0 ? cue.canvasW : DVB_SUBTITLE_CANVAS_W;
-    const int canvasH = cue.canvasH > 0 ? cue.canvasH : DVB_SUBTITLE_CANVAS_H;
+    const int canvasW = cue.canvasW > 0 ? cue.canvasW : SUBTITLE_DVB_CANVAS_WIDTH;
+    const int canvasH = cue.canvasH > 0 ? cue.canvasH : SUBTITLE_DVB_CANVAS_HEIGHT;
 
     // Region bounding box (pre-scale) so the OSD covers only the painted area. Clip each region to the
     // canvas first: a malformed off-canvas region would otherwise oversize the bbox and OSD. The visible

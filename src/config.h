@@ -21,11 +21,13 @@
 /// relationship. Kept literal here so config.h stays free of vdr/remux.h.
 inline constexpr int64_t PTS_TICKS_PER_MS = 90;
 /// Fallback aspect ratio when display height is zero
-inline constexpr double DISPLAY_DEFAULT_ASPECT_RATIO = 16.0 / 9.0;
-inline constexpr uint32_t DISPLAY_DEFAULT_HEIGHT = 1080;     ///< Default display height before a mode is selected (px)
-inline constexpr uint32_t DISPLAY_DEFAULT_WIDTH = 1920;      ///< Default display width before a mode is selected (px)
-inline constexpr uint32_t DISPLAY_DEFAULT_REFRESH_RATE = 50; ///< Default refresh rate before a mode is selected (Hz)
-// DISPLAY_PRERENDER_SLOTS (decoder->display handoff queue depth) lives in display.cpp, its only user,
+inline constexpr double CONFIG_DISPLAY_ASPECT_DEFAULT = 16.0 / 9.0;
+inline constexpr uint32_t CONFIG_DISPLAY_HEIGHT_DEFAULT =
+    1080; ///< Default display height before a mode is selected (px)
+inline constexpr uint32_t CONFIG_DISPLAY_WIDTH_DEFAULT = 1920; ///< Default display width before a mode is selected (px)
+inline constexpr uint32_t CONFIG_DISPLAY_REFRESH_DEFAULT_HZ =
+    50; ///< Default refresh rate before a mode is selected (Hz)
+// DISPLAY_PRERENDER_CAPACITY (decoder->display handoff queue depth) lives in display.cpp, its only user,
 // next to the DISPLAY_UNDERRUN_THRESHOLD_VSYNCS margin that is derived from it.
 
 // ============================================================================
@@ -35,12 +37,12 @@ inline constexpr uint32_t DISPLAY_DEFAULT_REFRESH_RATE = 50; ///< Default refres
 /// Desired display output parameters; populated once from the --resolution CLI argument.
 /// Not thread-safe after init -- all writes happen before any thread reads these fields.
 struct DisplayConfig {
-    uint32_t outputHeight{DISPLAY_DEFAULT_HEIGHT};      ///< Active display height (px)
-    uint32_t outputWidth{DISPLAY_DEFAULT_WIDTH};        ///< Active display width (px)
-    uint32_t refreshRate{DISPLAY_DEFAULT_REFRESH_RATE}; ///< Active refresh rate (Hz)
+    uint32_t outputHeight{CONFIG_DISPLAY_HEIGHT_DEFAULT};    ///< Active display height (px)
+    uint32_t outputWidth{CONFIG_DISPLAY_WIDTH_DEFAULT};      ///< Active display width (px)
+    uint32_t refreshRate{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ}; ///< Active refresh rate (Hz)
 
     [[nodiscard]] auto GetAspectRatio() const noexcept
-        -> double; ///< width/height ratio; falls back to DISPLAY_DEFAULT_ASPECT_RATIO when height is zero
+        -> double; ///< width/height ratio; falls back to CONFIG_DISPLAY_ASPECT_DEFAULT when height is zero
     [[nodiscard]] auto GetHeight() const noexcept -> uint32_t { return outputHeight; }     ///< Height (px)
     [[nodiscard]] auto GetRefreshRate() const noexcept -> uint32_t { return refreshRate; } ///< Refresh rate (Hz)
     [[nodiscard]] auto GetWidth() const noexcept -> uint32_t { return outputWidth; }       ///< Width (px)

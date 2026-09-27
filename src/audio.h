@@ -46,7 +46,7 @@ static_assert(AUDIO_QUEUE_HIGHWATER < AUDIO_QUEUE_CAPACITY, "the active gate mus
 /// (~320 ms) starves heavy interlaced 4K (deinterlace doubles to 50 fps; ~16 frames can't absorb the
 /// decode bursts -> choppy), while progressive 4K survives. dvbplayer/live feed video and audio
 /// through SEPARATE PES calls, so video fills its decoder queue deeply regardless -- hence smooth.
-/// A deeper allowance lets the reserve reach DECODER_RESERVE_HARD_CAP (~1.3 s @ 50 fps), matching
+/// A deeper allowance lets the reserve reach DECODER_RESERVE_CAPACITY (~1.3 s @ 50 fps), matching
 /// the PES path. Only IsMediaPlayerBackpressured() honors it; the PES feed keeps the shallow gate.
 inline constexpr size_t AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER = 32;
 static_assert(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER < AUDIO_QUEUE_CAPACITY,
@@ -80,23 +80,19 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === PUBLIC API ===
     // ========================================================================
-    auto Clear() -> void; ///< Drops buffered audio and resets the playback clock; call on seek or channel change
-    auto DropOutput(bool pauseClock = false)
-        -> void; ///< Silence playback fast: snd_pcm_drop + decode-queue flush, but DO NOT reset the
-                 ///< playback clock. Use from Mute/Freeze/SetTrickSpeed -- those are stream-preserving
-                 ///< events; a full Clear() would null GetClock(), force the decoder into freerun, and
-                 ///< cause a display underrun downstream. On position changes (FF/REW resume) the
-                 ///< Action()-thread >5s-jump guard re-anchors the clock automatically.
-                 ///< pauseClock=true pins GetClock() at the current playbackPts (no wall-clock
-                 ///< extrapolation) until the next ALSA write re-anchors it. Used by Freeze() so a
-                 ///< short pause does not advance the master clock through silence and silently shift
-                 ///< the preserved jitterBuf head on resume.
+    auto Clear() -> void;        ///< Drops buffered audio and resets the playback clock; call on seek or channel change
+    auto DropOutput() -> void;   ///< Silence now (snd_pcm_drop + queue flush) but keep the clock: Mute/SetTrickSpeed
+                                 ///< preserve the stream, and a Clear() would force freerun and underrun the display.
+                                 ///< The >5 s jump guard re-anchors after FF/REW. Ends a pause; the pin stays.
+    auto PauseOutput() -> void;  ///< Freeze(): the player resumes from its read position, so nothing is lost --
+                                 ///< snd_pcm_pause keeps the ring, the queue waits, the clock is pinned at the DAC.
+                                 ///< An in-flight packet finishes first; without hardware pause the ring is lost.
+    auto ResumeOutput() -> void; ///< Play() after PauseOutput(): ring and clock go on where they stopped; a stopped
+                                 ///< ring reads NOPTS until audio restarts (not over the EOS tail).
     auto Decode(const uint8_t *data, size_t size, int64_t pts)
         -> void; ///< Parses raw PES payload into access units and enqueues them for decoding/passthrough
     auto RequestDrain() -> void; ///< EOS: after the last packet, play out parser, codec, resampler and ring tails.
-                                 ///< Counted by GetPendingWorkSize(); Clear() cancels, DropOutput() (pause) keeps it.
-    auto ResumeClock() -> void;  ///< Play() after Freeze(): lift the pause pin now. The next write would, but at
-                                 ///< EOS none follows and the video tail would wait on a clock that never moves.
+                                 ///< Counted by GetPendingWorkSize(); Clear() cancels it, a pause defers it.
     [[nodiscard]] auto GetClock() const noexcept
         -> int64_t; ///< Estimated PTS at the DAC output in 90 kHz ticks; AV_NOPTS_VALUE while the DAC is not
                     ///< running (ring below its start threshold), when stale, or uninitialized
@@ -174,6 +170,9 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto EmitConvertedPcm(std::span<uint8_t> pcm, unsigned frames, unsigned outCh,
                                         uint32_t expectedGeneration)
         -> bool; ///< Device channel-order permute + WritePcmToAlsa() of swr output; false = write failed.
+    auto ApplyOutputPause() -> void;   ///< snd_pcm_pause (or drop) + clock pin, only while held and nothing is in
+                                       ///< flight; idempotent. From PauseOutput() or the worker's FinishPacket().
+    auto FinishPacket() -> void;       ///< Worker: clears packetInFlight; applies a pause that arrived meanwhile.
     auto FlushDecoderState() -> void;  ///< avcodec_flush_buffers + swr teardown + error counter reset
     auto RecreateParser() -> void;     ///< Close + re-init parser for the current codec; caller holds mutex.
     auto ResetPlaybackClock() -> void; ///< Zeroes playbackPts, lastClockUpdateMs, pcmNextPts under the seqlock.
@@ -241,6 +240,7 @@ class cAudioProcessor : public cThread {
     std::string alsaDeviceName;                         ///< ALSA PCM device name (e.g. "plughw:0,3")
     std::atomic<int> alsaErrorCount{0};                 ///< Consecutive snd_pcm_writei failures
     std::atomic<snd_pcm_uframes_t> alsaBufferFrames{0}; ///< Negotiated ring size in frames
+    bool alsaCanPause{false};                           ///< snd_pcm_pause supported (hw params; under mutex)
     std::atomic<size_t> alsaFrameBytes{0};              ///< Bytes per interleaved frame
     snd_pcm_t *alsaHandle{nullptr};                     ///< Open PCM device handle; nullptr when closed
     unsigned alsaIec958CtlDevice{0};                ///< Device field of the resolved IEC958 control (0 on iface=MIXER)
@@ -309,8 +309,9 @@ class cAudioProcessor : public cThread {
     std::atomic<int64_t> pcmNextPts{AV_NOPTS_VALUE};   ///< DVB-anchored 90 kHz PTS for next ALSA write
     std::atomic<int64_t> playbackPts{AV_NOPTS_VALUE};  ///< Estimated PTS at DAC output
     std::atomic<bool> outputDropped{false};            ///< snd_pcm_drop emptied ALSA but pcmNextPts/playbackPts were
-                                                       ///< kept (Mute/Freeze/trick). Stops GetPendingWorkSize() from
-                                                       ///< reading that preserved clock as a phantom ALSA tail.
+                                                       ///< kept (mute, trick, pause without hardware pause). Stops
+                                                       ///< GetPendingWorkSize() reading that preserved clock as a
+                                                       ///< phantom ALSA tail.
                                                        ///< Cleared by ResetPlaybackClock() / next WritePcmToAlsa().
     mutable std::atomic<bool> clockStaleLogged{false}; ///< Edge-trigger flag for the GetClock() stale-age diagnostic;
                                                        ///< set when GetClock() first returns NOPTS due to age, cleared
@@ -318,10 +319,15 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> eosClockHold{false};             ///< Set once the EOS drain ran: GetClock() keeps extrapolating
                                                        ///< past AUDIO_CLOCK_STALE_MS so the video tail after the last
                                                        ///< sample stays paced. Cleared by the next write / reset.
-    std::atomic<bool> clockPaused{false};              ///< Set by DropOutput(pauseClock=true) (Freeze()); cleared by
-                                                       ///< Clear() / ResetPlaybackClock() / the next WritePcmToAlsa.
-                                                       ///< While set, GetClock() returns playbackPts verbatim instead
-                                                       ///< of extrapolating against wall-clock through ALSA silence.
+    std::atomic<bool> clockPaused{false};              ///< Set by ApplyOutputPause(); cleared by ResumeOutput() /
+                                                       ///< ResetPlaybackClock() / the next write. While set,
+                                                       ///< GetClock() returns playbackPts verbatim instead of
+                                                       ///< extrapolating against wall-clock through the pause.
+                                                       ///< Part of the clockSequence seqlock tuple (written under it).
+    std::atomic<bool> outputHeld{false};               ///< PauseOutput() .. ResumeOutput() / DropOutput() / Clear():
+                                                       ///< the worker pops nothing, so the queue survives the pause
+                                                       ///< (under queueMutex, like packetInFlight's clear, so
+                                                       ///< PauseOutput() and FinishPacket() agree who applies it).
     StreamStartTrace startTrace;                       ///< Stream-start milestones (first write / DAC running)
 
     // ========================================================================

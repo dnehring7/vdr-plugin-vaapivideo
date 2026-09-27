@@ -110,7 +110,7 @@ extern "C" {
 /// Shown by "vdr -h" and in VDR's plugin list.
 inline constexpr const char *PLUGIN_DESCRIPTION = "Hardware-accelerated video playback with VAAPI";
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.8.3";   ///< Reported to VDR; "make dist" greps this line.
+inline constexpr const char *PLUGIN_VERSION = "1.9.0";   ///< Reported to VDR; "make dist" greps this line.
 
 // ============================================================================
 // === TRACE LOGGING ===
@@ -127,6 +127,18 @@ inline constexpr const char *PLUGIN_VERSION = "1.8.3";   ///< Reported to VDR; "
 // ============================================================================
 
 inline constexpr int SHUTDOWN_TIMEOUT_MS = 5000; ///< Thread shutdown timeout (ms)
+
+// --- VDR trick-speed model (vdr/dvbplayer.c, under its own names) ---
+// The mediaplayer reproduces it and the decoder decodes the TrickSpeed() values it yields, so both must
+// agree with VDR: fast 12/speed = 6/3/1, slow forward the bare slowdown 2/4/8, slow reverse slowdown * 12
+// = 24/48/96, clamped to 63.
+inline constexpr int VDR_MAX_SPEEDS = 3;   ///< Notches from normal to the extreme in either direction
+inline constexpr int VDR_NORMAL_SPEED = 4; ///< Index of the normal-speed '1' entry in VDR_SPEEDS
+/// Notch table: >0 fast divisors, <0 slowdowns, the 0 sentinels saturate.
+inline constexpr std::array<int, 9> VDR_SPEEDS{0, -2, -4, -8, 1, 2, 4, 12, 0};
+static_assert(VDR_SPEEDS.at(VDR_NORMAL_SPEED) == 1);
+inline constexpr int VDR_SPEED_MULT = 12;           ///< TrickSpeed() numerator; slow forward passes the bare slowdown
+inline constexpr int VDR_MAX_VIDEO_SLOWMOTION = 63; ///< Clamp on the TrickSpeed() value; only reverse /8 (96) hits it
 
 // ============================================================================
 // === HDR STREAM CLASSIFICATION ===
@@ -273,7 +285,7 @@ struct AspectRatio {
 [[nodiscard]] inline auto ModePictureAspect(const drmModeModeInfo &mode) noexcept -> double {
     const AspectRatio aspect = ModePictureAspectRatio(mode);
     if (aspect.den == 0) [[unlikely]] {
-        return DISPLAY_DEFAULT_ASPECT_RATIO;
+        return CONFIG_DISPLAY_ASPECT_DEFAULT;
     }
     return static_cast<double>(aspect.num) / static_cast<double>(aspect.den);
 }

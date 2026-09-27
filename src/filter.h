@@ -77,7 +77,7 @@ struct FreeFilterGraphLocked {
 /// rendered it, and syncing the surface -- which av_hwframe_map() does on export -- reaches back
 /// into that context. FFmpeg refcounts the surface through the AVFrame, but nothing refcounts the
 /// context, so a graph freed while its frames are still queued (up to ~1.3 s of them:
-/// DECODER_RESERVE_HARD_CAP + display prerender) crashes the display thread on its next export.
+/// DECODER_RESERVE_CAPACITY + display prerender) crashes the display thread on its next export.
 /// Rapid ScaleVideo() rebuilds (skin menu open/close) hit exactly that window.
 /// Const: token holders extend the graph's lifetime, never touch it.
 using FilterGraphToken = std::shared_ptr<const AVFilterGraph>;

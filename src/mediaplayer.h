@@ -58,7 +58,7 @@ class cVaapiDevice;
 class cSubtitleConverter;
 
 // The MEDIAPLAYER_* pacing/seek/EOF-drain constants live in mediaplayer.cpp, their only user
-// (MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES, the pre-anchor video-depth gate, in device.cpp likewise).
+// (DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES, the pre-anchor video-depth gate, in device.cpp likewise).
 
 // ============================================================================
 // === PLAYLIST HELPERS ===
@@ -254,10 +254,6 @@ class cVaapiMediaSource final : public IMediaSource {
 // ============================================================================
 // === PLAYER ===
 // ============================================================================
-
-/// Index of the normal-speed ('1') entry in the trick-speed notch table (vdr/dvbplayer.c
-/// Speeds[]; the table itself lives in mediaplayer.cpp). Here only for member initialization.
-inline constexpr int MEDIAPLAYER_TRICK_NORMAL_IDX = 4;
 
 /// VDR cPlayer + private demux cThread. Owns the cVaapiMediaSource and walks the
 /// playlist. Action() runs the packet pump: pull one video + one audio packet
@@ -461,13 +457,13 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     std::vector<PlaylistEntry> playlist; ///< One entry for a single file/URL; expanded rows for an .m3u
     std::atomic<size_t> currentIndex{0}; ///< Index into playlist of the entry playing now
 
-    std::unique_ptr<cVaapiMediaSource> source;      ///< Current entry's demuxer; swapped under sourceMutex
-    std::unique_ptr<cSubtitleConverter> subtitles;  ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
-    std::atomic<State> state{State::Running};       ///< Lifecycle state; Eof/Stopped are what IsFinished() reports
-    std::atomic<PlayMode> playMode{PlayMode::Play}; ///< Play phase (see PlayMode); the demux loop parks while Pause
-    std::atomic<bool> trickForward{true};           ///< Trick direction; meaningful while playMode is Slow/Fast
-    std::atomic<int> trickSpeedIdx{MEDIAPLAYER_TRICK_NORMAL_IDX}; ///< Speed notch: index into the trick-speed table
-    std::atomic<TrickCommand> trickCommand{TrickCommand::None};   ///< Staged feed transition; consumed in Action()
+    std::unique_ptr<cVaapiMediaSource> source;        ///< Current entry's demuxer; swapped under sourceMutex
+    std::unique_ptr<cSubtitleConverter> subtitles;    ///< Subtitle decode + overlay; created lazily in OpenCurrentEntry
+    std::atomic<State> state{State::Running};         ///< Lifecycle state; Eof/Stopped are what IsFinished() reports
+    std::atomic<PlayMode> playMode{PlayMode::Play};   ///< Play phase (see PlayMode); the demux loop parks while Pause
+    std::atomic<bool> trickForward{true};             ///< Trick direction; meaningful while playMode is Slow/Fast
+    std::atomic<int> trickSpeedIdx{VDR_NORMAL_SPEED}; ///< Speed notch: index into the trick-speed table
+    std::atomic<TrickCommand> trickCommand{TrickCommand::None}; ///< Staged feed transition; consumed in Action()
     std::atomic<int> trickAnchorMs{-1}; ///< Shown position (ms) captured on the MAIN thread at the trick keypress,
                                         ///< BEFORE DeviceTrickSpeed()/DevicePlay() wipe the decoder's lastPts --
                                         ///< a demux-side position read races the flush and anchors at 0.

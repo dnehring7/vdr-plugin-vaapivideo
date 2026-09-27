@@ -5,7 +5,7 @@
  * @brief Standalone VAAPI capability prober for vdr-plugin-vaapivideo.
  *
  * Mirrors the probe matrix of the plugin runtime (src/caps.cpp ProbeGpuCaps +
- * src/stream.h VIDEO_BACKEND_TABLE) so an operator can predict which
+ * src/stream.h STREAM_VIDEO_BACKEND_TABLE) so an operator can predict which
  * codec/profile/bit-depth combinations will hardware-decode on a given GPU.
  *
  * Probed codecs:
@@ -82,7 +82,7 @@ struct DrmBlobDeleter {
 // pipeline is 4:2:0 only; non-4:2:0 profiles (VP9 Profile 1/3, AV1 Profile 1/2,
 // HEVC range extensions, JPEG, ...) are out of scope and not listed. The
 // plugin-consumed subset is determined by ProbeDecodeProfiles' switch below
-// (mirrors GpuCaps in src/caps.cpp + VIDEO_BACKEND_TABLE in src/stream.h).
+// (mirrors GpuCaps in src/caps.cpp + STREAM_VIDEO_BACKEND_TABLE in src/stream.h).
 //
 // Naming convention: where the same VAProfile shows up at two bit-depths
 // (AV1 Profile 0, VVC Main 10), the rows share the profile name and the
@@ -815,7 +815,7 @@ struct SinkHdrCaps {
     uint8_t maxLumaCode{}; ///< Desired content max luminance (CTA code; nits = 50 * 2^(code/32))
 };
 
-constexpr size_t EDID_BLOCK_SIZE = 128;
+constexpr size_t EDID_BLOCK_BYTES = 128;
 constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;
 constexpr size_t EDID_CHECKSUM_OFFSET = 127;
 
@@ -921,7 +921,7 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
 /// are exactly what the kernel folds into the connector's vrr_capable property.
 auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> void {
     // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- span is size-checked
-    if (base.size() < EDID_BLOCK_SIZE) {
+    if (base.size() < EDID_BLOCK_BYTES) {
         return;
     }
     constexpr size_t kFeatureOffset = 24;   // feature support byte; bit 0 = continuous frequency
@@ -950,19 +950,19 @@ auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> 
     }
     const std::unique_ptr<drmModePropertyBlobRes, DrmBlobDeleter> blob{
         drmModeGetPropertyBlob(fd, static_cast<uint32_t>(edidProp->value))};
-    if (!blob || blob->data == nullptr || blob->length < EDID_BLOCK_SIZE) {
+    if (!blob || blob->data == nullptr || blob->length < EDID_BLOCK_BYTES) {
         return false;
     }
     const std::span<const uint8_t> edid{static_cast<const uint8_t *>(blob->data), blob->length};
-    ParseBaseBlockForSink(edid.first(EDID_BLOCK_SIZE), caps);
+    ParseBaseBlockForSink(edid.first(EDID_BLOCK_BYTES), caps);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bounded by the size check
     const size_t extCount = edid[EDID_EXTENSION_COUNT_OFFSET];
     for (size_t i = 0; i < extCount; ++i) {
-        const size_t extOffset = EDID_BLOCK_SIZE * (i + 1);
-        if (extOffset + EDID_BLOCK_SIZE > edid.size()) {
+        const size_t extOffset = EDID_BLOCK_BYTES * (i + 1);
+        if (extOffset + EDID_BLOCK_BYTES > edid.size()) {
             break;
         }
-        ParseCtaExtensionForSink(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
+        ParseCtaExtensionForSink(edid.subspan(extOffset, EDID_BLOCK_BYTES), caps);
     }
     return true;
 }

@@ -37,18 +37,17 @@ extern "C" {
 namespace {
 
 // Byte offsets and sizes within a PES packet header (ISO 13818-1 sec.2.4.3.6/7).
-constexpr size_t PES_HEADER_MIN_SIZE = 6U;     ///< prefix(3) + stream_id(1) + PES_packet_length(2)
-constexpr size_t PES_OFFSET_FLAGS2 = 7U;       ///< Flags byte 2; PTS_DTS_flags in bits 7--6
-constexpr size_t PES_OFFSET_HDR_DATA_LEN = 8U; ///< PES_header_data_length field
-constexpr size_t PES_HEADER_EXT_OFFSET = 9U;   ///< First byte of the variable-length header extension
-constexpr size_t PES_TIMESTAMP_SIZE = 5U;      ///< 33-bit PTS/DTS on the wire: 3+1+2+1+2+1 bytes with marker bits
+constexpr size_t PES_HEADER_MIN_BYTES = 6U;          ///< prefix(3) + stream_id(1) + PES_packet_length(2)
+constexpr size_t PES_FLAGS2_OFFSET = 7U;             ///< Flags byte 2; PTS_DTS_flags in bits 7--6
+constexpr size_t PES_HEADER_DATA_LENGTH_OFFSET = 8U; ///< PES_header_data_length field
+constexpr size_t PES_HEADER_EXT_OFFSET = 9U;         ///< First byte of the variable-length header extension
+constexpr size_t PES_TIMESTAMP_BYTES = 5U;           ///< 33-bit PTS/DTS on the wire: 3+1+2+1+2+1 bytes with marker bits
 
 constexpr uint32_t PES_START_CODE_PREFIX = 0x000001U; ///< 24-bit start_code_prefix (sec.2.4.3.6)
 
 // stream_id ranges (sec.2.4.3.7). DVB carries AC-3/DTS/AAC in private_stream_1 (0xBD),
 // so it is treated as audio alongside the standard MPEG audio range 0xC0--0xDF.
 constexpr uint8_t PES_STREAM_ID_AUDIO_FIRST = 0xC0; ///< MPEG audio base; mask 0xE0 covers 0xC0--0xDF
-constexpr uint8_t PES_STREAM_ID_PRIVATE = 0xBD;     ///< private_stream_1 (DVB AC-3/DTS/AAC)
 constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< MPEG video base; mask 0xF0 covers 0xE0--0xEF
 
 // ============================================================================
@@ -81,7 +80,7 @@ auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket {
     PesPacket result{};
 
     const size_t size = data.size();
-    if (size < PES_HEADER_MIN_SIZE) [[unlikely]] {
+    if (size < PES_HEADER_MIN_BYTES) [[unlikely]] {
         return result;
     }
 
@@ -107,7 +106,7 @@ auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket {
         return result;
     }
 
-    const uint8_t headerExtLen = p[PES_OFFSET_HDR_DATA_LEN];
+    const uint8_t headerExtLen = p[PES_HEADER_DATA_LENGTH_OFFSET];
     const size_t headerSize = PES_HEADER_EXT_OFFSET + headerExtLen;
 
     if (headerSize > size) [[unlikely]] {
@@ -117,16 +116,16 @@ auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket {
     // PTS_DTS_flags (bits 7--6 of flags2): 0x80 = PTS only, 0xC0 = PTS+DTS, 0x00 = none.
     // 0x40 is illegal per spec. Only the two legal "has PTS" patterns are handled;
     // everything else leaves pts/dts as AV_NOPTS_VALUE.
-    const uint8_t ptsDtsFlags = p[PES_OFFSET_FLAGS2] & 0xC0;
+    const uint8_t ptsDtsFlags = p[PES_FLAGS2_OFFSET] & 0xC0;
 
     if (ptsDtsFlags == 0x80) [[likely]] {
-        if (headerExtLen >= PES_TIMESTAMP_SIZE) [[likely]] {
+        if (headerExtLen >= PES_TIMESTAMP_BYTES) [[likely]] {
             result.pts = ParseTimestamp(p + PES_HEADER_EXT_OFFSET);
         }
     } else if (ptsDtsFlags == 0xC0) [[unlikely]] {
-        if (headerExtLen >= PES_TIMESTAMP_SIZE * 2) [[likely]] {
+        if (headerExtLen >= PES_TIMESTAMP_BYTES * 2) [[likely]] {
             result.pts = ParseTimestamp(p + PES_HEADER_EXT_OFFSET);
-            result.dts = ParseTimestamp(p + PES_HEADER_EXT_OFFSET + PES_TIMESTAMP_SIZE);
+            result.dts = ParseTimestamp(p + PES_HEADER_EXT_OFFSET + PES_TIMESTAMP_BYTES);
         }
     }
 

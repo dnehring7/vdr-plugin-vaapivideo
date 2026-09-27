@@ -453,7 +453,7 @@ namespace {
 constexpr uint8_t EDID_EOTF_PQ = 1U << 2;
 constexpr uint8_t EDID_EOTF_HLG = 1U << 3;
 constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6;
-constexpr size_t EDID_BLOCK_SIZE = 128;             ///< Every EDID block is exactly 128 bytes
+constexpr size_t EDID_BLOCK_BYTES = 128;            ///< Every EDID block is exactly 128 bytes
 constexpr size_t EDID_CHECKSUM_OFFSET = 127;        ///< Byte 127 is the block checksum (not a data block)
 constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126; ///< Byte 126 of base block: number of extension blocks
 
@@ -500,18 +500,18 @@ auto ParseCtaExtension(std::span<const uint8_t> ext, DisplayCaps &caps) noexcept
 } // namespace
 
 auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) noexcept -> void {
-    if (edid.size() < EDID_BLOCK_SIZE) {
+    if (edid.size() < EDID_BLOCK_BYTES) {
         return;
     }
-    // Bounded by edid.size() >= EDID_BLOCK_SIZE (128) check above; the offset is < 128.
+    // Bounded by edid.size() >= EDID_BLOCK_BYTES (128) check above; the offset is < 128.
     const size_t extCount =
         edid[EDID_EXTENSION_COUNT_OFFSET]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     for (size_t i = 0; i < extCount; ++i) {
-        const size_t extOffset = EDID_BLOCK_SIZE * (i + 1);
-        if (extOffset + EDID_BLOCK_SIZE > edid.size()) {
+        const size_t extOffset = EDID_BLOCK_BYTES * (i + 1);
+        if (extOffset + EDID_BLOCK_BYTES > edid.size()) {
             break;
         }
-        ParseCtaExtension(edid.subspan(extOffset, EDID_BLOCK_SIZE), caps);
+        ParseCtaExtension(edid.subspan(extOffset, EDID_BLOCK_BYTES), caps);
     }
 }
 
@@ -543,8 +543,8 @@ auto AudioSinkCaps::Supports(AVCodecID codec) const noexcept -> bool {
 namespace {
 
 // CEA-861 ELD fixed-header length (bytes 0-19); see kernel sound/hda/hda_eld.c.
-constexpr unsigned ELD_FIXED_HEADER = 20;
-constexpr unsigned SAD_SIZE = 3; ///< Each CEA-861 Short Audio Descriptor is 3 bytes.
+constexpr unsigned ELD_HEADER_BYTES = 20;
+constexpr unsigned CEA_SAD_BYTES = 3; ///< Each CEA-861 Short Audio Descriptor is 3 bytes.
 
 // Audio Format Codes (AFC): CEA-861-D Table 37 / CTA-861-H Table 38. SAD byte 0 bits [6:3].
 constexpr uint8_t CEA_LPCM = 0x01;     ///< Linear PCM (carries the sink's PCM channel/rate caps)
@@ -569,7 +569,7 @@ constexpr uint8_t CEA_EXT_MPEGH_3D = 0x0B;      ///< MPEG-H 3D Audio
 constexpr uint8_t CEA_EXT_AC4 = 0x0C;           ///< Dolby AC-4
 
 // CEA-861 LPCM SAD byte 1: sample-rate support bitmap (bit -> Hz), ascending.
-constexpr std::array<std::pair<uint8_t, int>, 7> LPCM_RATE_BITS{{
+constexpr std::array<std::pair<uint8_t, int>, 7> CEA_LPCM_RATE_BITS{{
     {0x01, 32000},
     {0x02, 44100},
     {0x04, 48000},
@@ -582,7 +582,7 @@ constexpr std::array<std::pair<uint8_t, int>, 7> LPCM_RATE_BITS{{
 } // namespace
 
 auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<AudioSinkCaps> {
-    if (eld.size() < ELD_FIXED_HEADER) {
+    if (eld.size() < ELD_HEADER_BYTES) {
         return std::nullopt;
     }
     // An all-zero blob is a transient/disconnected ELD, not a real PCM-only sink (a valid ELD has a
@@ -595,8 +595,8 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
     AudioSinkCaps caps{};
     caps.elded = true;
 
-    // Every eld[] index below is bounds-checked: the size >= ELD_FIXED_HEADER gate above covers bytes
-    // 4/5/7; the sadOffset + sadCount*SAD_SIZE gate covers each SAD's 3 bytes.
+    // Every eld[] index below is bounds-checked: the size >= ELD_HEADER_BYTES gate above covers bytes
+    // 4/5/7; the sadOffset + sadCount*CEA_SAD_BYTES gate covers each SAD's 3 bytes.
     // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // ELD layout (kernel sound/hda/hda_eld.c):
@@ -609,17 +609,17 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
 
     const unsigned mnl = eld[4] & 0x1FU;
     const unsigned sadCount = (eld[5] >> 4) & 0x0FU;
-    const unsigned sadOffset = ELD_FIXED_HEADER + mnl;
+    const unsigned sadOffset = ELD_HEADER_BYTES + mnl;
 
     if (sadCount == 0) {
         return caps; // PCM-only sink: valid ELD, no compressed formats; baseline defaults stand.
     }
-    if (sadOffset + (sadCount * SAD_SIZE) > eld.size()) {
+    if (sadOffset + (sadCount * CEA_SAD_BYTES) > eld.size()) {
         return std::nullopt; // truncated ELD; let the caller fall back to defaults
     }
 
     for (unsigned i = 0; i < sadCount; ++i) {
-        const size_t sadAt = sadOffset + (i * SAD_SIZE);
+        const size_t sadAt = sadOffset + (i * CEA_SAD_BYTES);
         const uint8_t sadByte0 = eld[sadAt];     // [6:3] = format code (AFC), [2:0] = max channels - 1
         const uint8_t sadByte1 = eld[sadAt + 1]; // LPCM: sample-rate support bitmap
         const uint8_t formatCode = (sadByte0 >> 3) & 0x0FU;
@@ -630,7 +630,7 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
                 // Stays in the documented [2, 8] range by construction: the field starts at 2 and
                 // channels = (byte0 & 0x07) + 1 is at most 8, so no explicit clamp is needed.
                 caps.pcmMaxChannels = static_cast<uint8_t>(std::max<unsigned>(caps.pcmMaxChannels, channels));
-                for (const auto &[bit, hz] : LPCM_RATE_BITS) {
+                for (const auto &[bit, hz] : CEA_LPCM_RATE_BITS) {
                     if ((sadByte1 & bit) != 0) {
                         caps.pcmRates.push_back(hz);
                     }

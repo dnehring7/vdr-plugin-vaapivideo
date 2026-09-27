@@ -111,10 +111,13 @@ namespace {
 // === LOCAL CONSTANTS ===
 // ============================================================================
 
-constexpr int DEMUX_IDLE_SLEEP_MS = 5;       ///< Back-off when ReadPacket reports EAGAIN or no work is available.
-constexpr int DEMUX_PAUSE_WAKEUP_MS = 100;   ///< Periodic re-check while paused; safety net against a missed broadcast.
-constexpr int OSD_DEFAULT_TIMEOUT_S = 4;     ///< Auto-hide delay after a key event; matches VDR replay-control feel.
-constexpr int OSD_REFRESH_INTERVAL_MS = 500; ///< Replay-bar update cadence; ~2 Hz feels live without flicker.
+constexpr int MEDIAPLAYER_DEMUX_IDLE_SLEEP_MS = 5; ///< Back-off when ReadPacket reports EAGAIN or no work is available.
+constexpr int MEDIAPLAYER_DEMUX_PAUSE_WAKEUP_MS =
+    100; ///< Periodic re-check while paused; safety net against a missed broadcast.
+constexpr int MEDIAPLAYER_OSD_TIMEOUT_DEFAULT_S =
+    4; ///< Auto-hide delay after a key event; matches VDR replay-control feel.
+constexpr int MEDIAPLAYER_OSD_REFRESH_INTERVAL_MS =
+    500; ///< Replay-bar update cadence; ~2 Hz feels live without flicker.
 
 /// Demux thread back-off when the device queues are full or input stalls.
 constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
@@ -123,25 +126,15 @@ constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
 /// audio master clock before the demux throttles. libavformat reads files far faster than wall-clock, so
 /// without it the decoder queue + jitterBuf overrun their caps. Keyed off the audio tail only
 /// (latestAudioPts90k); the resulting video depth (audio_tail + per-file mux offset) is bounded instead by
-/// DECODER_RESERVE_HARD_CAP, where the excess lead waits COMPRESSED in the packetQueue. 1.5 s (not 1 s) so
+/// DECODER_RESERVE_CAPACITY, where the excess lead waits COMPRESSED in the packetQueue. 1.5 s (not 1 s) so
 /// the budget still reaches the ~1.3 s reserve cap when interlaced content deinterlaces to 50 fps.
-/// MEDIAPLAYER_JITTERBUF_BACKPRESSURE_FRAMES (the pre-anchor video-depth gate) lives in device.cpp, its
-/// only user, derived from DECODER_RESERVE_HARD_CAP so it stays coupled to the buffer it protects.
-constexpr int64_t MEDIAPLAYER_MAX_LOOKAHEAD_90K = 135000;
+/// DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES (the pre-anchor video-depth gate) lives in device.cpp, its
+/// only user, derived from DECODER_RESERVE_CAPACITY so it stays coupled to the buffer it protects.
+constexpr int64_t MEDIAPLAYER_LOOKAHEAD_MAX_90K = 135000;
 
 /// Default seek deltas applied by the key bindings (milliseconds).
 constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
-
-/// Trick-play notch table, verbatim from vdr/dvbplayer.c (Speeds[]): positive entries are fast
-/// divisors, negative slow multipliers, the 0 sentinels saturate silently. Kept verbatim so the
-/// derived device repeat counts (fast 6/3/1, slow fwd 2/4/8, slow rev 24/48/96->63) are exactly
-/// the values cVaapiDecoder::SetTrickSpeed()'s mapping is tuned for.
-constexpr std::array<int, 9> MEDIAPLAYER_TRICK_SPEEDS{0, -2, -4, -8, 1, 2, 4, 12, 0};
-static_assert(MEDIAPLAYER_TRICK_SPEEDS.at(MEDIAPLAYER_TRICK_NORMAL_IDX) == 1);
-constexpr int MEDIAPLAYER_TRICK_STEPS_MAX = 3;   ///< Notches from normal to the extreme in either direction.
-constexpr int MEDIAPLAYER_TRICK_SPEED_MULT = 12; ///< dvbplayer SPEED_MULT: repeat-count numerator (except slow-fwd).
-constexpr int MEDIAPLAYER_TRICK_DEVICE_SPEED_MAX = 63; ///< dvbplayer MAX_VIDEO_SLOWMOTION clamp on the repeat count.
 
 /// Reverse stepping: seek target offset below the last shown keyframe (1 ms -- av_seek_frame with
 /// AVSEEK_FLAG_BACKWARD then lands on the preceding keyframe), and the extra back-step applied when
@@ -303,19 +296,20 @@ extern "C" auto InterruptOnStop(void *opaque) -> int {
 // audio-only formats are intentionally absent because cVaapiMediaSource::Open requires a
 // video stream and would fail at open. Extend with care -- adding here implies the entire
 // decode path supports the format.
-constexpr std::array<std::string_view, 7> MEDIA_EXTENSIONS{{".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v", ".webm"}};
+constexpr std::array<std::string_view, 7> MEDIAPLAYER_MEDIA_EXTENSIONS{
+    {".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v", ".webm"}};
 
-constexpr std::array<std::string_view, 2> PLAYLIST_EXTENSIONS{{".m3u", ".m3u8"}};
+constexpr std::array<std::string_view, 2> MEDIAPLAYER_PLAYLIST_EXTENSIONS{{".m3u", ".m3u8"}};
 
 /// Cap on the in-memory playlist read. Real .m3u files are tiny; the browser filters only by
 /// extension, so a mislabeled huge file must not balloon VDR's memory.
-constexpr size_t MAX_PLAYLIST_BYTES = 8U * 1024U * 1024U;
+constexpr size_t MEDIAPLAYER_PLAYLIST_MAX_BYTES = 8U * 1024U * 1024U;
 
 // URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
 // HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
 // file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
 // instead of being mangled into "<playlist-dir>/file:///media/movie.mkv".
-constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "https://", "ftp://"}};
+constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "http://", "https://", "ftp://"}};
 
 [[nodiscard]] auto AsciiToLower(char c) noexcept -> char {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -335,7 +329,7 @@ constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "ht
 }
 
 [[nodiscard]] auto HasUrlScheme(std::string_view path) noexcept -> bool {
-    return std::ranges::any_of(URL_SCHEMES, [path](std::string_view scheme) noexcept -> bool {
+    return std::ranges::any_of(MEDIAPLAYER_URL_SCHEMES, [path](std::string_view scheme) noexcept -> bool {
         return path.size() >= scheme.size() && IEquals(path.substr(0, scheme.size()), scheme);
     });
 }
@@ -420,7 +414,7 @@ constexpr std::array<std::string_view, 4> URL_SCHEMES{{"file://", "http://", "ht
 ///   3. Profile heuristic -- last resort. Only honors profiles that are unambiguously
 ///      10-bit by spec: H.264 HIGH_10 and HEVC MAIN_10. REXT / HIGH_422 / HIGH_444 are
 ///      intentionally NOT special-cased: they straddle 8 / 10 / 12-bit and a bad guess
-///      sends the wrong row of VIDEO_BACKEND_TABLE to the decoder. Defaulting to k8 there
+///      sends the wrong row of STREAM_VIDEO_BACKEND_TABLE to the decoder. Defaulting to k8 there
 ///      sacrifices a HW open attempt to FFmpeg's get_format SW fallback, which is safe.
 ///
 /// >10-bit streams are reported as k10. The backend table has no row for 12-bit, so
@@ -492,9 +486,9 @@ auto ParseM3U(std::string_view playlistPath) -> std::vector<PlaylistEntry> {
     // implementations flag EOF on the full final read of an exact-multiple-sized file).
     while (std::feof(fp) == 0 && std::ferror(fp) == 0) {
         const size_t n = std::fread(chunk.data(), 1, chunk.size(), fp);
-        if (content.size() + n > MAX_PLAYLIST_BYTES) {
+        if (content.size() + n > MEDIAPLAYER_PLAYLIST_MAX_BYTES) {
             esyslog("vaapivideo/mediaplayer: playlist %s larger than %zu bytes -- rejected", canonical.c_str(),
-                    MAX_PLAYLIST_BYTES);
+                    MEDIAPLAYER_PLAYLIST_MAX_BYTES);
             readOk = false;
             break;
         }
@@ -569,7 +563,7 @@ auto IsMediaUri(std::string_view path) noexcept -> bool {
     if (HasUrlScheme(path)) {
         return true;
     }
-    return std::ranges::any_of(MEDIA_EXTENSIONS,
+    return std::ranges::any_of(MEDIAPLAYER_MEDIA_EXTENSIONS,
                                [path](std::string_view ext) noexcept -> bool { return HasExtension(path, ext); });
 }
 
@@ -578,7 +572,7 @@ auto IsPlaylistUri(std::string_view path) noexcept -> bool {
     if (HasUrlScheme(path)) {
         return false;
     }
-    return std::ranges::any_of(PLAYLIST_EXTENSIONS,
+    return std::ranges::any_of(MEDIAPLAYER_PLAYLIST_EXTENSIONS,
                                [path](std::string_view ext) noexcept -> bool { return HasExtension(path, ext); });
 }
 
@@ -1313,11 +1307,9 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
     if (vaapiDev == nullptr) {
         return AV_NOPTS_VALUE;
     }
-    // Outside normal play the reference is meaningless: during pause the demux loop is stopped and
-    // the audio clock extrapolates from its last anchor while ALSA is dropped (lastAudio - audioClock
-    // turns into a fake negative value); during trick modes no audio is fed at all, so a stale
-    // lastAudio would deadlock the throttle. Returning NOPTS skips both the throttle and the
-    // misleading status line.
+    // Outside normal play the reference is meaningless: a pause stops the demux loop (nothing to throttle),
+    // and trick modes feed no audio (a stale lastAudio would deadlock the throttle). NOPTS skips both the
+    // throttle and the misleading status line.
     if (playMode.load(std::memory_order_acquire) != PlayMode::Play) {
         return AV_NOPTS_VALUE;
     }
@@ -1531,7 +1523,7 @@ auto cVaapiPlayer::CycleTrick(bool towardForward) -> void {
             }
             [[fallthrough]]; // single-speed opposite fast: restart in the pressed direction
         case PlayMode::Play:
-            EnterTrick(PlayMode::Fast, towardForward, multiSpeed ? +1 : +MEDIAPLAYER_TRICK_STEPS_MAX);
+            EnterTrick(PlayMode::Fast, towardForward, multiSpeed ? +1 : +VDR_MAX_SPEEDS);
             return;
         case PlayMode::Slow:
             if (multiSpeed) {
@@ -1544,7 +1536,7 @@ auto cVaapiPlayer::CycleTrick(bool towardForward) -> void {
             }
             [[fallthrough]]; // single-speed opposite slow: restart in the pressed direction
         case PlayMode::Pause:
-            EnterTrick(PlayMode::Slow, towardForward, multiSpeed ? -1 : -MEDIAPLAYER_TRICK_STEPS_MAX);
+            EnterTrick(PlayMode::Slow, towardForward, multiSpeed ? -1 : -VDR_MAX_SPEEDS);
             return;
     }
 }
@@ -1563,7 +1555,7 @@ auto cVaapiPlayer::EnterTrick(PlayMode mode, bool forward, int firstStep) -> voi
     // which the demux-side transition could only fall back to the audio clock (stale in trick) or 0.
     trickAnchorMs.store(CurrentPositionMs(), std::memory_order_release);
     trickForward.store(forward, std::memory_order_release);
-    trickSpeedIdx.store(MEDIAPLAYER_TRICK_NORMAL_IDX, std::memory_order_release);
+    trickSpeedIdx.store(VDR_NORMAL_SPEED, std::memory_order_release);
     // Command BEFORE playMode: the demux gates its trick feed on "no pending command", so the mode
     // becoming visible must imply the command is visible too (release/acquire); otherwise a
     // mid-iteration mode snapshot runs the reverse feed on uninitialized step targets.
@@ -1585,10 +1577,10 @@ auto cVaapiPlayer::EnterTrick(PlayMode mode, bool forward, int firstStep) -> voi
 
 auto cVaapiPlayer::TrickSpeedStep(int increment) -> void {
     const int idx = trickSpeedIdx.load(std::memory_order_acquire) + increment;
-    if (idx < 0 || idx >= static_cast<int>(MEDIAPLAYER_TRICK_SPEEDS.size())) [[unlikely]] {
+    if (idx < 0 || idx >= static_cast<int>(VDR_SPEEDS.size())) [[unlikely]] {
         return; // outside the table; unreachable via the key state machine
     }
-    const int entry = MEDIAPLAYER_TRICK_SPEEDS.at(static_cast<size_t>(idx));
+    const int entry = VDR_SPEEDS.at(static_cast<size_t>(idx));
     if (entry == 0) {
         return; // sentinel: the speed saturates -- dvbplayer-style silent no-op, no device call
     }
@@ -1606,16 +1598,16 @@ auto cVaapiPlayer::TrickSpeedStep(int increment) -> void {
     const bool slow = playMode.load(std::memory_order_acquire) == PlayMode::Slow;
     // Repeat count exactly like cDvbPlayer::TrickSpeed(): Mult is 1 only for slow-forward (all
     // frames repeated 2/4/8 times); every stepping mode uses SPEED_MULT over the table entry.
-    const int mult = (slow && forward) ? 1 : MEDIAPLAYER_TRICK_SPEED_MULT;
-    const int speed = std::min(entry > 0 ? mult / entry : -entry * mult, MEDIAPLAYER_TRICK_DEVICE_SPEED_MAX);
+    const int mult = (slow && forward) ? 1 : VDR_SPEED_MULT;
+    const int speed = std::min(entry > 0 ? mult / entry : -entry * mult, VDR_MAX_VIDEO_SLOWMOTION);
     dsyslog("vaapivideo/mediaplayer: trick %s %s notch %d (device speed %d)", slow ? "slow" : "fast",
-            forward ? "forward" : "backward", std::abs(idx - MEDIAPLAYER_TRICK_NORMAL_IDX), speed);
+            forward ? "forward" : "backward", std::abs(idx - VDR_NORMAL_SPEED), speed);
     DeviceTrickSpeed(speed, forward);
 }
 
 auto cVaapiPlayer::EndTrick(PlayMode nextMode) -> void {
     trickForward.store(true, std::memory_order_release);
-    trickSpeedIdx.store(MEDIAPLAYER_TRICK_NORMAL_IDX, std::memory_order_release);
+    trickSpeedIdx.store(VDR_NORMAL_SPEED, std::memory_order_release);
     playMode.store(nextMode, std::memory_order_release);
     // Safe from either thread: DevicePlay() is atomics + decoder/display notifications only.
     DevicePlay();
@@ -1790,9 +1782,8 @@ auto cVaapiPlayer::ApplyStartPosition() -> void {
     Forward = !trick || trickForward.load(std::memory_order_acquire);
     Speed = -1;
     if (trick) {
-        Speed = Setup.MultiSpeedMode != 0
-                    ? std::abs(trickSpeedIdx.load(std::memory_order_acquire) - MEDIAPLAYER_TRICK_NORMAL_IDX)
-                    : 0;
+        Speed =
+            Setup.MultiSpeedMode != 0 ? std::abs(trickSpeedIdx.load(std::memory_order_acquire) - VDR_NORMAL_SPEED) : 0;
     }
     return true;
 }
@@ -1875,17 +1866,15 @@ auto cVaapiPlayer::PerformTrickTransition(TrickCommand cmd) -> void {
     if (!source) {
         return;
     }
-    // The anchor was captured on the main thread at the keypress; by now the trick flush has wiped
+    // The anchor was captured on the main thread at the keypress; by now a trick flush may have wiped
     // the decoder's lastPts, so reading the position HERE would fall back to the (trick-stale)
     // audio clock or 0. -1 = no capture (never staged without one; belt-and-braces fallback).
     const int anchorMs = trickAnchorMs.load(std::memory_order_acquire);
     const int posMs = anchorMs >= 0 ? anchorMs : CurrentPositionMs();
-    // Every transition re-anchors at the shown position via the jump-seek machinery. This is not
-    // optional, even for slow-forward: the decoder purges its decoded reserve on every trick
-    // generation boundary (clearEpoch bump in SetTrickSpeed) and Freeze() already dropped the
-    // packet queue, so continuing from the demux cursor would jump ~the reserve depth (1.5 s+)
-    // ahead. SeekToMs() also flushes the pre-trick audio queue (must never play into a trick)
-    // and re-arms the position fallback for the replay bar.
+    // Every transition re-anchors at the shown position via SeekToMs(): exits and fast/reverse entries
+    // purge the decoded reserve (clearEpoch bump in SetTrickSpeed), so the demux cursor would sit that far
+    // ahead; and every transition must flush the pre-trick audio queue (it must never play into a trick)
+    // and re-arm the replay bar's position fallback.
     if (!SeekToMs(posMs)) {
         // Fail closed on entry: trick mode without the re-anchor would run the wrong timeline
         // (and reverse would retry a seek that can never work). A failed Exit re-anchor just
@@ -2334,7 +2323,7 @@ auto cVaapiPlayer::Action() -> void {
                 !nextRequested.load(std::memory_order_acquire) &&
                 !audioSwitch.pending.load(std::memory_order_acquire) &&
                 !subtitleSwitch.pending.load(std::memory_order_acquire)) {
-                pauseCondition.TimedWait(pauseMutex, DEMUX_PAUSE_WAKEUP_MS);
+                pauseCondition.TimedWait(pauseMutex, MEDIAPLAYER_DEMUX_PAUSE_WAKEUP_MS);
             }
             continue;
         }
@@ -2342,7 +2331,7 @@ auto cVaapiPlayer::Action() -> void {
         // -- backpressure ---------------------------------------------------------
         auto *vaapiDev = FindPrimaryVaapiDevice();
         if (vaapiDev == nullptr) [[unlikely]] {
-            cCondWait::SleepMs(DEMUX_IDLE_SLEEP_MS);
+            cCondWait::SleepMs(MEDIAPLAYER_DEMUX_IDLE_SLEEP_MS);
             continue;
         }
         // Feed-mode snapshot: dvbplayer-style trick modes replace the normal audio-clock-paced pump.
@@ -2369,7 +2358,7 @@ auto cVaapiPlayer::Action() -> void {
                 continue;
             }
             if (!PerformReverseStep(vaapiDev, packet.get())) {
-                cCondWait::SleepMs(DEMUX_IDLE_SLEEP_MS);
+                cCondWait::SleepMs(MEDIAPLAYER_DEMUX_IDLE_SLEEP_MS);
             }
             continue;
         }
@@ -2403,7 +2392,7 @@ auto cVaapiPlayer::Action() -> void {
             // the audio clock advance -- a self-inflicted underrun. Retries fall straight through
             // to the submit block below.
             if (const int64_t lookahead = Lookahead90k(vaapiDev);
-                lookahead != AV_NOPTS_VALUE && lookahead > MEDIAPLAYER_MAX_LOOKAHEAD_90K) {
+                lookahead != AV_NOPTS_VALUE && lookahead > MEDIAPLAYER_LOOKAHEAD_MAX_90K) {
                 cCondWait::SleepMs(MEDIAPLAYER_BACKPRESSURE_SLEEP_MS);
                 continue;
             }
@@ -2465,7 +2454,7 @@ auto cVaapiPlayer::Action() -> void {
                 // interleave offset (hundreds of ms .. ~1.5 s). If this reference were the max of
                 // BOTH streams it would be dominated by the leading video PTS, so the lookahead
                 // (= reference - audioClock) would read mux_offset + audio_buffer_depth and trip
-                // MEDIAPLAYER_MAX_LOOKAHEAD_90K while the audio buffer is still tiny -- throttling
+                // MEDIAPLAYER_LOOKAHEAD_MAX_90K while the audio buffer is still tiny -- throttling
                 // the demuxer, starving the audio queue, stalling the master clock, and wedging
                 // the post-seek video-ahead drain in a re-arm-freerun loop that never converges.
                 // Keying off audio measures the real audio buffer depth, immune to the video lead.
@@ -2518,7 +2507,7 @@ auto cVaapiPlayer::Action() -> void {
         }
 
         if (!didWork) {
-            cCondWait::SleepMs(DEMUX_IDLE_SLEEP_MS);
+            cCondWait::SleepMs(MEDIAPLAYER_DEMUX_IDLE_SLEEP_MS);
         }
     }
 }
@@ -2578,7 +2567,7 @@ auto cVaapiControl::ShowReplayBar() -> void {
         displayReplay = Skins.Current()->DisplayReplay(false);
         barVisible = true;
     }
-    barTimeout.Set(OSD_DEFAULT_TIMEOUT_S * 1000);
+    barTimeout.Set(MEDIAPLAYER_OSD_TIMEOUT_DEFAULT_S * 1000);
     RefreshReplayBar();
 }
 
@@ -2669,7 +2658,7 @@ auto cVaapiControl::RefreshReplayBar() -> void {
     if (barVisible) {
         if (barTimeout.TimedOut()) {
             HideReplayBar();
-        } else if (lastBarRefresh.Elapsed() >= OSD_REFRESH_INTERVAL_MS) {
+        } else if (lastBarRefresh.Elapsed() >= MEDIAPLAYER_OSD_REFRESH_INTERVAL_MS) {
             RefreshReplayBar();
         }
     }

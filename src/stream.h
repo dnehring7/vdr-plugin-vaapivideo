@@ -82,7 +82,7 @@ struct AudioStreamInfo {
 
 /// One row in the backend selection table: (codec, profile, bit-depth) -> GpuCaps flag.
 /// profile == AV_PROFILE_UNKNOWN is a wildcard (matches any profile). First matching
-/// row in VIDEO_BACKEND_TABLE wins; rows must be ordered most-specific first.
+/// row in STREAM_VIDEO_BACKEND_TABLE wins; rows must be ordered most-specific first.
 /// Adding a codec: one row here + one case in ProbeGpuCaps.
 struct VideoBackendCap {
     AVCodecID codecId;   ///< Codec this row answers for
@@ -92,7 +92,7 @@ struct VideoBackendCap {
 };
 
 /// Codec/profile/depth -> GpuCaps flag lookup, most-specific row first (see VideoBackendCap).
-inline constexpr std::array<VideoBackendCap, 11> VIDEO_BACKEND_TABLE{{
+inline constexpr std::array<VideoBackendCap, 11> STREAM_VIDEO_BACKEND_TABLE{{
     {.codecId = AV_CODEC_ID_MPEG2VIDEO,
      .profile = AV_PROFILE_UNKNOWN,
      .bitDepth = BitDepth::k8,
@@ -131,7 +131,7 @@ inline constexpr std::array<VideoBackendCap, 11> VIDEO_BACKEND_TABLE{{
 /// Codecs this passthrough path can IEC61937-wrap. DTS-HD is intentionally absent:
 /// the ELD probe records it only as a sink capability for accepting DTS core.
 /// Sink availability (ELD check) is separate; use AudioSinkCaps::Supports (caps.h).
-inline constexpr std::array<AVCodecID, 6> AUDIO_PASSTHROUGH_TABLE{{
+inline constexpr std::array<AVCodecID, 6> STREAM_AUDIO_PASSTHROUGH_TABLE{{
     AV_CODEC_ID_AC3,
     AV_CODEC_ID_EAC3,
     AV_CODEC_ID_DTS,
@@ -145,11 +145,11 @@ inline constexpr std::array<AVCodecID, 6> AUDIO_PASSTHROUGH_TABLE{{
 
 // A null member-pointer in any row would silently make SelectVideoBackendCap return
 // nullptr for every query, disabling hardware decode without any runtime error.
-static_assert(std::ranges::all_of(VIDEO_BACKEND_TABLE,
+static_assert(std::ranges::all_of(STREAM_VIDEO_BACKEND_TABLE,
                                   [](const VideoBackendCap &c) constexpr noexcept -> bool {
                                       return c.flag != nullptr;
                                   }),
-              "VIDEO_BACKEND_TABLE has a row with a null GpuCaps flag pointer");
+              "STREAM_VIDEO_BACKEND_TABLE has a row with a null GpuCaps flag pointer");
 
 // ============================================================================
 // === CODEC DETECTION ===

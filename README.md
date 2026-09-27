@@ -354,7 +354,9 @@ where it runs: `auto` and `hardware:` choices stay on the GPU; any `software:`
 choice pulls the decoded frame to system memory once, runs the whole
 post-process in software, and uploads the result back for display. Decoding
 always stays on the GPU, and the software block is automatically bypassed for
-HDR, UHD, and trick play.
+HDR, UHD, and trick play. Slow motion keeps the chain it starts from: it
+continues the paused stream, and a rebuild would lose the pictures the
+deinterlacer still holds.
 
 - **Deinterlace** — `auto` picks the best mode the driver advertises
   (motion-compensated when present). `hardware:` requests a specific VAAPI
@@ -492,8 +494,9 @@ second or two early.
 `FastFwd` / `FastRew` follow VDR's dvbplayer semantics. From normal play they
 enter fast forward/rewind, stepping through keyframes at ×2/×4/×8 (repeated
 presses cycle the speed, shown in the replay bar as `1>>` … `3>>` / `<<1` …
-`<<3`); from pause they enter slow motion (`1|>` / `<|1`, audio muted), which
-resumes at the shown position.
+`<<3`); from pause they enter slow motion (`1|>` / `<|1`, audio muted) at
+½/¼/⅛ of real time in either direction, which resumes at the shown position.
+Slow rewind shows keyframes only, so at ⅛ each picture stays for seconds.
 With `Setup → Replay → Multi speed mode` on, pressing the opposite key winds
 an active mode back down through normal play/pause. With it off there is a
 single speed per mode: holding the key scans until release, and pressing the
