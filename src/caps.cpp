@@ -96,15 +96,9 @@ namespace {
 /// the class but substitute YV12/I010 for NV12/P010. scale_vaapi and the DRM
 /// plane require the exact FourCC, so the RT-class probe alone is insufficient.
 [[nodiscard]] auto CanCreateSurfaceFourcc(VADisplay display, unsigned int rtFormat, uint32_t fourcc) noexcept -> bool {
-    // NOLINTBEGIN(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
-    // VASurfaceAttrib::value is a tagged union (VAGenericValue) with no zero enumerator;
-    // brace-init zeroes it; the union is then overwritten. Union access is the only libva ABI to set a FourCC.
-    VASurfaceAttrib attrib{};
-    attrib.type = VASurfaceAttribPixelFormat;
-    attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
-    attrib.value.type = VAGenericValueTypeInteger;
-    attrib.value.value.i = static_cast<int>(fourcc);
-    // NOLINTEND(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
+    VASurfaceAttrib attrib{.type = VASurfaceAttribPixelFormat,
+                           .flags = VA_SURFACE_ATTRIB_SETTABLE,
+                           .value = {.type = VAGenericValueTypeInteger, .value = {.i = static_cast<int>(fourcc)}}};
 
     VASurfaceID surface = VA_INVALID_SURFACE;
     if (vaCreateSurfaces(display, rtFormat, 64, 64, &surface, 1, &attrib, 1) != VA_STATUS_SUCCESS) {
@@ -118,6 +112,7 @@ namespace {
 /// Destruction order: vaTerminate before close(fd), as libva requires.
 class ProbeVaDisplay {
   public:
+    /// Takes over @p display and its render node @p fd.
     ProbeVaDisplay(VADisplay display, int fd) noexcept : display_{display}, fd_{fd} {}
     ~ProbeVaDisplay() noexcept {
         if (display_) {
@@ -133,8 +128,8 @@ class ProbeVaDisplay {
     auto operator=(ProbeVaDisplay &&) -> ProbeVaDisplay & = delete;
 
   private:
-    VADisplay display_;
-    int fd_;
+    VADisplay display_; ///< Terminated first
+    int fd_;            ///< Render node; closed after vaTerminate()
 };
 
 } // namespace
@@ -214,10 +209,7 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
         // Driver bug guard: numProfiles > maxProfiles would walk past the buffer.
         const size_t validProfiles =
             (numProfiles > 0) ? std::min(static_cast<size_t>(numProfiles), profiles.size()) : size_t{0};
-        for (size_t i = 0; i < validProfiles; ++i) {
-            const VAProfile profile =
-                profiles[i]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                             // -- bounded by validProfiles (clamped against profiles.size())
+        for (const VAProfile profile : std::span{profiles}.first(validProfiles)) {
             switch (profile) {
                 case VAProfileMPEG2Simple:
                 case VAProfileMPEG2Main:
@@ -450,19 +442,18 @@ namespace {
 //   byte 1 = supported EOTFs bitmap: bit 0=SDR, bit 1=HDR gamma, bit 2=PQ, bit 3=HLG.
 // CTA-861-G sec.7.5.6 Colorimetry Data Block (extended tag 0x05):
 //   byte 1 = colorimetry flags: bit 6=BT.2020 YCC.
-constexpr uint8_t EDID_EOTF_PQ = 1U << 2;
-constexpr uint8_t EDID_EOTF_HLG = 1U << 3;
-constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6;
-constexpr size_t EDID_BLOCK_BYTES = 128;            ///< Every EDID block is exactly 128 bytes
-constexpr size_t EDID_CHECKSUM_OFFSET = 127;        ///< Byte 127 is the block checksum (not a data block)
-constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126; ///< Byte 126 of base block: number of extension blocks
+constexpr uint8_t EDID_EOTF_PQ = 1U << 2;                ///< EOTF bitmap: SMPTE ST 2084 (PQ)
+constexpr uint8_t EDID_EOTF_HLG = 1U << 3;               ///< EOTF bitmap: HLG
+constexpr uint8_t EDID_COLORIMETRY_BT2020_YCC = 1U << 6; ///< Colorimetry flags: BT.2020 YCC
+constexpr size_t EDID_BLOCK_BYTES = 128;                 ///< Every EDID block is exactly 128 bytes
+constexpr size_t EDID_CHECKSUM_OFFSET = 127;             ///< Byte 127 is the block checksum (not a data block)
+constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;      ///< Byte 126 of base block: number of extension blocks
 
 /// Parse one 128-byte CTA-861 extension block (tag byte 0x02) for HDR EOTF and BT.2020 YCC.
 /// Per CTA-861-G sec.7.3, a DTD offset of 0 means "no DTDs"; data blocks span [4, checksum).
 /// Malformed blocks are silently ignored. Results are OR'd into @p caps so multiple extension
 /// blocks accumulate rather than overwrite.
 auto ParseCtaExtension(std::span<const uint8_t> ext, DisplayCaps &caps) noexcept -> void {
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
     if (ext.size() < 4 || ext[0] != 0x02) {
         return;
     }
@@ -494,7 +485,6 @@ auto ParseCtaExtension(std::span<const uint8_t> ext, DisplayCaps &caps) noexcept
         }
         offset += 1 + payloadLen;
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
 } // namespace
@@ -504,8 +494,7 @@ auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) noexcept
         return;
     }
     // Bounded by edid.size() >= EDID_BLOCK_BYTES (128) check above; the offset is < 128.
-    const size_t extCount =
-        edid[EDID_EXTENSION_COUNT_OFFSET]; // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    const size_t extCount = edid[EDID_EXTENSION_COUNT_OFFSET];
     for (size_t i = 0; i < extCount; ++i) {
         const size_t extOffset = EDID_BLOCK_BYTES * (i + 1);
         if (extOffset + EDID_BLOCK_BYTES > edid.size()) {
@@ -542,7 +531,7 @@ auto AudioSinkCaps::Supports(AVCodecID codec) const noexcept -> bool {
 
 namespace {
 
-// CEA-861 ELD fixed-header length (bytes 0-19); see kernel sound/hda/hda_eld.c.
+/// CEA-861 ELD fixed-header length (bytes 0-19); see kernel sound/hda/hda_eld.c.
 constexpr unsigned ELD_HEADER_BYTES = 20;
 constexpr unsigned CEA_SAD_BYTES = 3; ///< Each CEA-861 Short Audio Descriptor is 3 bytes.
 
@@ -568,7 +557,7 @@ constexpr uint8_t CEA_EXT_MP4_AAC_LC_MS = 0x0A; ///< MPEG-4 AAC LC + MPEG Surrou
 constexpr uint8_t CEA_EXT_MPEGH_3D = 0x0B;      ///< MPEG-H 3D Audio
 constexpr uint8_t CEA_EXT_AC4 = 0x0C;           ///< Dolby AC-4
 
-// CEA-861 LPCM SAD byte 1: sample-rate support bitmap (bit -> Hz), ascending.
+/// CEA-861 LPCM SAD byte 1: sample-rate support bitmap (bit -> Hz), ascending.
 constexpr std::array<std::pair<uint8_t, int>, 7> CEA_LPCM_RATE_BITS{{
     {0x01, 32000},
     {0x02, 44100},
@@ -597,7 +586,6 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
 
     // Every eld[] index below is bounds-checked: the size >= ELD_HEADER_BYTES gate above covers bytes
     // 4/5/7; the sadOffset + sadCount*CEA_SAD_BYTES gate covers each SAD's 3 bytes.
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // ELD layout (kernel sound/hda/hda_eld.c):
     //   Byte 4 [4:0] = MNL (Monitor Name Length)
@@ -683,7 +671,6 @@ auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<Au
                 break;
         }
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // A sink may advertise several LPCM SADs (e.g. one per bit depth), repeating rates. Keep
     // pcmRates a sorted, duplicate-free set so it logs cleanly and tests deterministically.

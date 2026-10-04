@@ -63,6 +63,9 @@
 #include <vector>
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 // FFmpeg
@@ -134,16 +137,21 @@ constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
 /// only user, derived from DECODER_RESERVE_CAPACITY so it stays coupled to the buffer it protects.
 constexpr int64_t MEDIAPLAYER_LOOKAHEAD_MAX_90K = 135000;
 
+///@{
 /// Default seek deltas applied by the key bindings (milliseconds).
 constexpr int MEDIAPLAYER_SEEK_SHORT_MS = 10000;
 constexpr int MEDIAPLAYER_SEEK_LONG_MS = 60000;
+///@}
 
+///@{
 /// Reverse stepping: seek target offset below the last shown keyframe (1 ms -- av_seek_frame with
 /// AVSEEK_FLAG_BACKWARD then lands on the preceding keyframe), and the extra back-step applied when
 /// a container with coarse seek granularity lands on the already-shown keyframe again (0.5 s).
 constexpr int64_t MEDIAPLAYER_REVERSE_EPSILON_90K = 90;
 constexpr int64_t MEDIAPLAYER_REVERSE_RETRY_STEP_90K = 45000;
+///@}
 
+///@{
 /// End-of-stream tail drain (cVaapiPlayer::DrainTailAtEof): at EOF the decode queue (~4 s) and decoded
 /// reserve (~1.3 s) still hold unseen frames, so immediate teardown cuts playback seconds short (worst on
 /// video-only clips, where no audio clock throttles the demuxer). Flush that tail at real-time pace first.
@@ -151,6 +159,7 @@ constexpr int64_t MEDIAPLAYER_REVERSE_RETRY_STEP_90K = 45000;
 ///   - STALL_MS: bail when depth stops shrinking; must exceed one frame interval.
 constexpr int MEDIAPLAYER_EOF_DRAIN_TIMEOUT_MS = 20000;
 constexpr int MEDIAPLAYER_EOF_DRAIN_STALL_MS = 1500;
+///@}
 
 /// Convert the container's start_time (AV_TIME_BASE units) to 90 kHz. Returns AV_NOPTS_VALUE
 /// when the demuxer didn't populate start_time (typical for some streams + raw containers).
@@ -293,26 +302,28 @@ extern "C" auto InterruptOnStop(void *opaque) -> int {
     return (source != nullptr && source->IoInterrupted()) ? 1 : 0;
 }
 
-// File-browser extension whitelist. Lowercase, dot-prefixed. libavformat can autodetect
-// containers without an extension hint, but the browser filters the listing for the user;
-// audio-only formats are intentionally absent because cVaapiMediaSource::Open requires a
-// video stream and would fail at open. Extend with care -- adding here implies the entire
-// decode path supports the format.
+/// File-browser extension whitelist. Lowercase, dot-prefixed. libavformat can autodetect
+/// containers without an extension hint, but the browser filters the listing for the user;
+/// audio-only formats are intentionally absent because cVaapiMediaSource::Open requires a
+/// video stream and would fail at open. Extend with care -- adding here implies the entire
+/// decode path supports the format.
 constexpr std::array<std::string_view, 7> MEDIAPLAYER_MEDIA_EXTENSIONS{
     {".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v", ".webm"}};
 
+/// Listed as playlists; StartPlayback() expands them itself.
 constexpr std::array<std::string_view, 2> MEDIAPLAYER_PLAYLIST_EXTENSIONS{{".m3u", ".m3u8"}};
 
 /// Cap on the in-memory playlist read. Real .m3u files are tiny; the browser filters only by
 /// extension, so a mislabeled huge file must not balloon VDR's memory.
 constexpr size_t MEDIAPLAYER_PLAYLIST_MAX_BYTES = 8U * 1024U * 1024U;
 
-// URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
-// HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
-// file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
-// instead of being mangled into "<playlist-dir>/file:///media/movie.mkv".
+/// URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
+/// HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
+/// file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
+/// instead of being mangled into "<playlist-dir>/file:///media/movie.mkv".
 constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "http://", "https://", "ftp://"}};
 
+/// std::tolower() for a char: the unsigned char cast keeps bytes >= 0x80 out of undefined behaviour.
 [[nodiscard]] auto AsciiToLower(char c) noexcept -> char {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 }
@@ -323,6 +334,7 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
     return std::ranges::equal(a, b, [](char l, char r) noexcept -> bool { return AsciiToLower(l) == AsciiToLower(r); });
 }
 
+/// Case-insensitive suffix test: ".MKV" counts as ".mkv".
 [[nodiscard]] auto HasExtension(std::string_view path, std::string_view extension) noexcept -> bool {
     if (path.size() < extension.size()) {
         return false;
@@ -330,14 +342,15 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
     return IEquals(path.substr(path.size() - extension.size()), extension);
 }
 
+/// True for a URI handed to libavformat as is (see MEDIAPLAYER_URL_SCHEMES).
 [[nodiscard]] auto HasUrlScheme(std::string_view path) noexcept -> bool {
     return std::ranges::any_of(MEDIAPLAYER_URL_SCHEMES, [path](std::string_view scheme) noexcept -> bool {
         return path.size() >= scheme.size() && IEquals(path.substr(0, scheme.size()), scheme);
     });
 }
 
-// One canonical spelling for the bookmark identity (matches the browser's canonicalized currentDir).
-// URLs and unresolvable paths pass through, so an SVDRP "PLAY ../a.mkv" still plays.
+/// One canonical spelling for the bookmark identity (matches the browser's canonicalized currentDir).
+/// URLs and unresolvable paths pass through, so an SVDRP "PLAY ../a.mkv" still plays.
 [[nodiscard]] auto NormalizeBookmarkUri(std::string uri) -> std::string {
     if (uri.empty() || HasUrlScheme(uri)) {
         return uri;
@@ -355,6 +368,7 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
     return dynamic_cast<cVaapiDevice *>(primary);
 }
 
+/// Last path component; the whole string when it has no '/'.
 [[nodiscard]] auto Basename(std::string_view path) -> std::string {
     if (const auto pos = path.find_last_of('/'); pos != std::string_view::npos) {
         return std::string{path.substr(pos + 1)};
@@ -362,9 +376,9 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
     return std::string{path};
 }
 
+/// POSIX dirname(): "/media/x" -> "/media", "/media" -> "/", "x" -> ".". The browser walks up to "/" with it.
 [[nodiscard]] auto Dirname(std::string_view path) -> std::string {
-    // Strip trailing slashes first ("/media/" -> "/media", "foo/" -> "foo") so the split below
-    // matches POSIX dirname(); a lone "/" stays intact.
+    // Trailing slashes first ("/media/" -> "/media"); a lone "/" stays intact.
     while (path.size() > 1 && path.back() == '/') {
         path.remove_suffix(1);
     }
@@ -399,6 +413,7 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
     return cString::sprintf("%ju MB", mib);
 }
 
+/// @p s without surrounding whitespace; m3u lines may carry CRLF.
 [[nodiscard]] auto Trim(std::string_view s) -> std::string_view {
     constexpr std::string_view kWhitespace = " \t\r\n";
     const auto start = s.find_first_not_of(kWhitespace);
@@ -582,21 +597,21 @@ auto IsPlaylistUri(std::string_view path) noexcept -> bool {
 // === BOOKMARK PERSISTENCE ===
 // ============================================================================
 namespace {
-// Guards vaapiConfig.bookmark + BookmarkDirty(): SVDRP PLAY tears a control down on the SVDRP thread,
-// racing the main thread. Function-local static: lazy init stays off the throwing-static-init path.
+/// Guards vaapiConfig.bookmark + BookmarkDirty(): SVDRP PLAY tears a control down on the SVDRP thread,
+/// racing the main thread. Function-local static: lazy init stays off the throwing-static-init path.
 [[nodiscard]] auto BookmarkMutex() -> cMutex & {
     static cMutex mutex;
     return mutex;
 }
 
-// Set while vaapiConfig.bookmark differs from setup.conf on disk.
+/// Set while vaapiConfig.bookmark differs from setup.conf on disk.
 [[nodiscard]] auto BookmarkDirty() -> bool & {
     static bool dirty = false;
     return dirty;
 }
 
-// Stage, then flush inline on the main thread (survives the emergency-exit path that skips VDR's own
-// Setup.Save()) or defer to Housekeeping() for off-thread SVDRP teardown. Empty/unchanged URI: no-op.
+/// Stage, then flush inline on the main thread (survives the emergency-exit path that skips VDR's own
+/// Setup.Save()) or defer to Housekeeping() for off-thread SVDRP teardown. Empty/unchanged URI: no-op.
 auto PersistBookmark(const MediaBookmark &bm) -> void {
     if (bm.uri.empty()) [[unlikely]] {
         return;
@@ -691,9 +706,9 @@ auto StartPlayback(PlaylistEntry origin) -> StartPlaybackResult {
     return StartPlaybackResult::Started;
 }
 
-// One-shot "reopen the browser, not live TV" flag. Set on Stop/EOF, consumed by MainMenuAction() --
-// both main-thread, no lock. The browser reads the bookmark itself to place its cursor.
 namespace {
+/// One-shot "reopen the browser, not live TV" flag. Set on Stop/EOF, consumed by MainMenuAction() --
+/// both main-thread, no lock. The browser reads the bookmark itself to place its cursor.
 [[nodiscard]] auto PendingBrowserReopen() -> bool & {
     static bool pending = false;
     return pending;
@@ -2052,7 +2067,6 @@ auto cVaapiPlayer::RegisterAudioTracks() -> void {
     audioSwitch.menuIndex.store(current, std::memory_order_release);
     audioSwitch.trackCount.store(count, std::memory_order_release);
     if (current >= 0) {
-        // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- clamped to ttAudio range above
         (void)DeviceSetCurrentAudioTrack(static_cast<eTrackType>(static_cast<int>(ttAudioFirst) + current));
     }
 }
@@ -2772,6 +2786,201 @@ auto cVaapiControl::RefreshReplayBar() -> void {
 // === cVaapiFileBrowser ===
 // ============================================================================
 
+namespace {
+
+// --- Descriptor-relative delete ---
+// By descriptor, never by path: a path is resolved anew on every call, so a component swapped for a symlink or
+// covered by a mount after the listing would steer the delete out of the media root or onto another filesystem.
+
+/// openat2(2) by syscall number: older glibc has no wrapper for it.
+[[nodiscard]] auto OpenAt2(int dirFd, const char *path, unsigned flags, uint64_t resolve) noexcept -> int {
+    const open_how how{.flags = flags, .mode = 0, .resolve = resolve};
+    return static_cast<int>(::syscall(SYS_openat2, dirFd, path, &how, sizeof(how)));
+}
+
+/// Deleter for DIR (closedir; also closes the descriptor)
+struct CloseDir {
+    /// Nothing to do about a failed close of a stream that is done with.
+    auto operator()(DIR *dir) const noexcept -> void { (void)::closedir(dir); }
+};
+
+/// A directory being emptied.
+struct TreeLevel {
+    std::vector<std::string> entries;      ///< Names still to remove
+    int fd;                                ///< dirfd(stream)
+    std::string name;                      ///< Name in parentFd, for the final rmdir
+    int parentFd;                          ///< Borrowed: the previous level's fd, or the caller's
+    std::unique_ptr<DIR, CloseDir> stream; ///< Owns fd
+};
+
+/// Why folder @p name of @p parentFd must not be deleted, or empty. Same open RemoveTreeAt() descends with, so a
+/// mount point reports EBUSY before the prompt, and any doubt (e.g. no openat2) refuses rather than risks it.
+[[nodiscard]] auto FolderDeleteObstacle(int parentFd, const char *name) noexcept -> std::error_code {
+    const int fd = OpenAt2(parentFd, name, O_PATH | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS);
+    if (fd >= 0) {
+        (void)::close(fd);
+        return {};
+    }
+    // A symlink or file is unlinked, never entered.
+    if (errno == ELOOP || errno == ENOTDIR) {
+        return {};
+    }
+    return {errno == EXDEV ? EBUSY : errno, std::generic_category()};
+}
+
+/// Unlinks @p name of @p dirFd, or pushes it onto @p levels if it is a directory. RESOLVE_NO_XDEV stops at a
+/// mount point (bind mounts too) before its contents are touched; RESOLVE_NO_SYMLINKS never follows a link.
+auto RemoveOrEnter(int dirFd, const char *name, std::vector<TreeLevel> &levels, std::uintmax_t &removed,
+                   std::error_code &ec) -> void {
+    // Linux answers EISDIR for a directory, so one call both deletes and classifies.
+    if (::unlinkat(dirFd, name, 0) == 0) {
+        ++removed;
+        return;
+    }
+    if (errno == ENOENT) {
+        return; // gone meanwhile
+    }
+    if (errno != EISDIR) {
+        ec.assign(errno, std::generic_category());
+        return;
+    }
+    const int fd = OpenAt2(dirFd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS);
+    if (fd < 0) {
+        ec.assign(errno == EXDEV ? EBUSY : errno, std::generic_category());
+        return;
+    }
+    std::unique_ptr<DIR, CloseDir> stream{::fdopendir(fd)};
+    if (!stream) {
+        ec.assign(errno, std::generic_category());
+        (void)::close(fd); // fdopendir() takes the descriptor over only on success
+        return;
+    }
+    // Read in full before deleting: some network filesystems skip entries of a directory shrinking under readdir().
+    std::vector<std::string> entries;
+    while (true) {
+        errno = 0;
+        const dirent *child = ::readdir(stream.get());
+        if (child == nullptr) {
+            if (errno != 0) {
+                ec.assign(errno, std::generic_category());
+                return;
+            }
+            break;
+        }
+        if (const std::string_view childName{child->d_name}; childName != "." && childName != "..") {
+            entries.emplace_back(childName);
+        }
+    }
+    levels.push_back(
+        {.entries = std::move(entries), .fd = fd, .name = name, .parentFd = dirFd, .stream = std::move(stream)});
+}
+
+/// Removes @p name of @p parentFd with everything below it; returns the entries removed (0: already gone). Stays
+/// on one filesystem, follows no link (see RemoveOrEnter()). Not transactional: an error or @p stopping
+/// (ECANCELED) leaves removed entries removed. Iterative, so tree depth costs no stack.
+[[nodiscard]] auto RemoveTreeAt(int parentFd, const char *name, const std::atomic<bool> &stopping, std::error_code &ec)
+    -> std::uintmax_t {
+    std::uintmax_t removed = 0;
+    std::vector<TreeLevel> levels; // @p name down to the directory being emptied
+    RemoveOrEnter(parentFd, name, levels, removed, ec);
+    while (!ec && !levels.empty()) {
+        if (stopping.load(std::memory_order_acquire)) [[unlikely]] {
+            ec = std::make_error_code(std::errc::operation_canceled);
+            break;
+        }
+        if (TreeLevel &level = levels.back(); !level.entries.empty()) {
+            const std::string child = std::move(level.entries.back());
+            level.entries.pop_back();
+            RemoveOrEnter(level.fd, child.c_str(), levels, removed, ec); // may reallocate: `level` is dead now
+            continue;
+        }
+        TreeLevel done = std::move(levels.back());
+        levels.pop_back();
+        done.stream.reset();
+        if (::unlinkat(done.parentFd, done.name.c_str(), AT_REMOVEDIR) != 0) {
+            ec.assign(errno, std::generic_category());
+            break;
+        }
+        ++removed;
+    }
+    return removed;
+}
+
+// --- Background folder delete ---
+
+/// Removes one folder tree off the main thread: a big tree or a slow filesystem would stall VDR's main loop, the
+/// only place that re-arms its watchdog. Low priority, like VDR's deleted-recording cleanup; outlives the browser.
+class cTreeRemover final : public cThread {
+  public:
+    /// Takes over @p parentFd, the pinned directory holding @p entryName; @p logPath only labels the log.
+    cTreeRemover(int parentFd, std::string entryName, std::string logPath)
+        : cThread("vaapivideo/folder delete", true), fullPath(std::move(logPath)), name(std::move(entryName)) {
+        (void)parent.Open(parentFd);
+    }
+    ~cTreeRemover() noexcept override { Shutdown(); }
+    cTreeRemover(const cTreeRemover &) = delete;
+    cTreeRemover(cTreeRemover &&) = delete;
+    auto operator=(const cTreeRemover &) -> cTreeRemover & = delete;
+    auto operator=(cTreeRemover &&) -> cTreeRemover & = delete;
+
+    /// Action() is done: dropping the object no longer waits.
+    [[nodiscard]] auto HasExited() const noexcept -> bool { return hasExited.load(std::memory_order_acquire); }
+
+    /// Stops a running delete (the rest of the tree stays) and joins. Idempotent.
+    auto Shutdown() noexcept -> void {
+        if (stopping.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        Cancel(SHUTDOWN_TIMEOUT_MS / 1000); // prompt: RemoveTreeAt() polls `stopping` per entry
+    }
+
+  protected:
+    /// Runs the delete and reports the outcome: always logged, an error also on the OSD.
+    auto Action() -> void override {
+        std::error_code ec;
+        const std::uintmax_t removed = RemoveTreeAt(parent, name.c_str(), stopping, ec);
+        if (!ec && removed == 0) {
+            // Vanished during the prompt: the same ENOENT a file delete reports.
+            ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        }
+        if (!ec) {
+            isyslog("vaapivideo/mediaplayer: deleted %s (%ju entries)", fullPath.c_str(), removed);
+        } else if (ec == std::errc::operation_canceled) {
+            isyslog("vaapivideo/mediaplayer: delete %s stopped by shutdown after %ju entries", fullPath.c_str(),
+                    removed);
+        } else {
+            esyslog("vaapivideo/mediaplayer: delete %s: %s (%ju entries removed)", fullPath.c_str(),
+                    ec.message().c_str(), removed);
+            // QueueMessage: off the main thread, and the browser may be closed by now.
+            Skins.QueueMessage(mtError, cString::sprintf(tr("Delete failed: %s"), ec.message().c_str()));
+        }
+        hasExited.store(true, std::memory_order_release);
+    }
+
+  private:
+    std::string fullPath;               ///< Log label only
+    std::atomic<bool> hasExited{false}; ///< Action() is done; worker writes, main thread reads
+    std::string name;                   ///< Entry of `parent` to remove
+    cFile parent;                       ///< Pinned directory holding `name`
+    std::atomic<bool> stopping{false};  ///< Set by Shutdown(), polled by RemoveTreeAt()
+};
+
+/// The background folder delete, if any. Main thread only; the worker touches only its own members, so no lock.
+[[nodiscard]] auto FolderDelete() -> std::unique_ptr<cTreeRemover> & {
+    static std::unique_ptr<cTreeRemover> job;
+    return job;
+}
+
+/// True while a folder delete is still at work.
+[[nodiscard]] auto FolderDeleteRunning() -> bool {
+    const auto &job = FolderDelete();
+    return job && !job->HasExited();
+}
+
+} // namespace
+
+auto ShutdownFolderDelete() -> void { FolderDelete().reset(); }
+
 cVaapiFileBrowser::cVaapiFileBrowser(std::string startDir) : cOsdMenu("") {
     if (startDir.empty()) {
         startDir = "/";
@@ -2884,13 +3093,9 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
             esyslog("vaapivideo/mediaplayer: closedir(%s): %s", currentDir.c_str(), std::strerror(errno));
         }
 
-        // std::sort (not std::ranges::sort) because the latter trips some IDE/IntelliSense
-        // parsers on libstdc++'s sortable-concept resolution. clang-tidy modernize-use-ranges
-        // would prefer the ranges form; suppressed here for that reason.
-        const auto byName = [](const BrowserEntry &a, const BrowserEntry &b) -> bool { return a.name < b.name; };
-        std::sort(dirs.begin(), dirs.end(), byName);           // NOLINT(modernize-use-ranges)
-        std::sort(playlists.begin(), playlists.end(), byName); // NOLINT(modernize-use-ranges)
-        std::sort(files.begin(), files.end(), byName);         // NOLINT(modernize-use-ranges)
+        std::ranges::sort(dirs, {}, &BrowserEntry::name);
+        std::ranges::sort(playlists, {}, &BrowserEntry::name);
+        std::ranges::sort(files, {}, &BrowserEntry::name);
 
         for (auto &e : dirs) {
             entries.push_back(std::move(e));
@@ -2946,7 +3151,8 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
 }
 
 [[nodiscard]] auto cVaapiFileBrowser::SelectedDeletable() const -> const BrowserEntry * {
-    if (mediaRoot.empty()) {
+    // One at a time: a second delete could reach into the tree being emptied.
+    if (mediaRoot.empty() || FolderDeleteRunning()) {
         return nullptr;
     }
     // Component-wise, so /srv/mediafoo is not "inside" /srv/media; lexically_normal() folds any ".." a
@@ -2956,7 +3162,11 @@ auto cVaapiFileBrowser::LoadDirectory(const std::string &dir) -> void {
         return nullptr;
     }
     const auto *entry = SelectedEntry();
-    if (entry == nullptr || (entry->kind != EntryKind::File && entry->kind != EntryKind::Playlist)) {
+    if (entry == nullptr || entry->kind == EntryKind::Parent) {
+        return nullptr;
+    }
+    // Recursive, so not with root "/" (no --media-dir): the whole system would be in reach.
+    if (entry->kind == EntryKind::Directory && mediaRoot == "/") {
         return nullptr;
     }
     return entry;
@@ -2970,29 +3180,7 @@ auto cVaapiFileBrowser::SetHelpKeys() -> void {
     }
 }
 
-auto cVaapiFileBrowser::DeleteSelected() -> void {
-    const auto *entry = SelectedDeletable();
-    if (entry == nullptr) {
-        return;
-    }
-    const std::string name = entry->name;
-    const std::string fullPath = BuildFullPath(*entry);
-    // The file name goes into the prompt so the user sees what goes.
-    if (!Interface->Confirm(cString::sprintf(tr("Delete %s?"), name.c_str()))) {
-        return;
-    }
-    // unlink(), not std::filesystem::remove(): the entry may have changed while the prompt was up, and remove()
-    // would also delete an empty directory now at that path, and report a vanished file as nothing to do.
-    if (::unlink(fullPath.c_str()) != 0) {
-        const std::error_code ec(errno, std::generic_category());
-        esyslog("vaapivideo/mediaplayer: delete %s: %s", fullPath.c_str(), ec.message().c_str());
-        Skins.Message(mtError, cString::sprintf(tr("Delete failed: %s"), ec.message().c_str()));
-    } else {
-        isyslog("vaapivideo/mediaplayer: deleted %s", fullPath.c_str());
-    }
-
-    // Relist either way (a failure may mean the file is already gone) and keep the cursor on the same row
-    // (after a delete, the next file), as VDR's recordings menu does.
+auto cVaapiFileBrowser::ReloadKeepingRow() -> void {
     const int row = Current();
     LoadDirectory(currentDir);
     if (!entries.empty()) {
@@ -3002,7 +3190,78 @@ auto cVaapiFileBrowser::DeleteSelected() -> void {
     }
 }
 
+auto cVaapiFileBrowser::DeleteFailed(const std::string &fullPath, const std::error_code &ec) -> void {
+    esyslog("vaapivideo/mediaplayer: delete %s: %s", fullPath.c_str(), ec.message().c_str());
+    Skins.Message(mtError, cString::sprintf(tr("Delete failed: %s"), ec.message().c_str()));
+    ReloadKeepingRow(); // a failure may mean the entry is already gone
+}
+
+auto cVaapiFileBrowser::DeleteSelected() -> void {
+    const auto *entry = SelectedDeletable();
+    if (entry == nullptr) {
+        return;
+    }
+    const bool isDirectory = entry->kind == EntryKind::Directory;
+    const std::string name = entry->name;
+    const std::string fullPath = BuildFullPath(*entry);
+    // The name goes into the prompt so the user sees what goes.
+    const cString prompt = cString::sprintf(tr("Delete %s?"), name.c_str());
+
+    // Pinned before the prompt; the delete uses this descriptor, not the path. currentDir is canonical, so a
+    // symlink in it now was planted after the listing, and following it could leave the media root.
+    cFile parent;
+    if (!parent.Open(OpenAt2(AT_FDCWD, currentDir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_SYMLINKS))) {
+        DeleteFailed(fullPath, {errno, std::generic_category()});
+        return;
+    }
+    // Refused before the prompt: confirming would only lead to an error.
+    if (isDirectory) {
+        if (const std::error_code obstacle = FolderDeleteObstacle(parent, name.c_str()); obstacle) {
+            DeleteFailed(fullPath, obstacle);
+            return;
+        }
+    }
+    if (!Interface->Confirm(prompt)) {
+        return;
+    }
+
+    if (isDirectory) {
+        // Off the main thread (see cTreeRemover); ProcessKey() relists when it is done.
+        const int workerFd = ::fcntl(parent, F_DUPFD_CLOEXEC, 0);
+        if (workerFd < 0) {
+            DeleteFailed(fullPath, {errno, std::generic_category()});
+            return;
+        }
+        auto job = std::make_unique<cTreeRemover>(workerFd, name, fullPath);
+        if (!job->Start()) {
+            DeleteFailed(fullPath, std::make_error_code(std::errc::resource_unavailable_try_again));
+            return;
+        }
+        FolderDelete() = std::move(job);
+        SetNeedsFastResponse(true);
+        SetHelpKeys(); // no Delete button while it runs
+        return;
+    }
+
+    // Not std::filesystem::remove(): it would also delete an empty directory that took the name during the
+    // prompt, and report a vanished file as success.
+    if (::unlinkat(parent, name.c_str(), 0) != 0) {
+        DeleteFailed(fullPath, {errno, std::generic_category()});
+        return;
+    }
+    isyslog("vaapivideo/mediaplayer: deleted %s", fullPath.c_str());
+    ReloadKeepingRow();
+}
+
 [[nodiscard]] auto cVaapiFileBrowser::ProcessKey(eKeys Key) -> eOSState {
+    // Reap a finished folder delete. While one runs, NeedsFastResponse makes VDR call in every 10 ms instead of
+    // every second, so the relist follows at once.
+    if (auto &job = FolderDelete(); job && job->HasExited()) {
+        job.reset();
+        ReloadKeepingRow();
+    }
+    SetNeedsFastResponse(FolderDeleteRunning());
+
     // kBack must be intercepted BEFORE cOsdMenu::ProcessKey(): the base menu returns osBack
     // for kBack (osdbase.c), which would close the whole browser instead of letting us walk
     // up to the parent directory. Only fall back to osBack (pop the menu) when already at root.

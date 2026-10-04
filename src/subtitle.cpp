@@ -102,9 +102,6 @@ constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD ca
 // === TEXT PARSING ===
 // ============================================================================
 
-// NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- indices are bounded
-// by the explicit `< .size()` loop conditions.
-
 /// Resolve a few HTML/teletext color names common in broadcaster SRTs to 0xRRGGBB; -1 if unknown.
 [[nodiscard]] auto NamedColor(std::string_view name) -> int32_t {
     struct NamedRgb {
@@ -135,7 +132,7 @@ constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD ca
 }
 
 /// Parse @p hex (no leading '#'/'&H') as up to @p maxDigits hex digits. Returns the value, or -1
-/// if no digits. (8 digits for ASS &HAABBGGRR, 6 for #RRGGBB.)
+/// if no digits. (8 digits for ASS `&HAABBGGRR`, 6 for `#RRGGBB`.)
 [[nodiscard]] auto ParseHex(std::string_view hex, int maxDigits = 6) -> int64_t {
     int64_t value = 0;
     int digits = 0;
@@ -156,7 +153,7 @@ constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD ca
 /// ffmpeg subrip decoder emits `<font color>` in this form). ASS stores B,G,R; returns 0xRRGGBB or -1.
 [[nodiscard]] auto ParseAssColor(std::string_view block) -> int32_t {
     for (size_t p = block.find("c&H"); p != std::string_view::npos; p = block.find("c&H", p + 1)) {
-        const char prev = p > 0 ? block[p - 1] : '\0';
+        const char prev = p > 0 ? block.at(p - 1) : '\0';
         if (prev != '\\' && prev != '1') {
             continue; // skip \3c (outline) / \4c (shadow); we only want the primary fill color
         }
@@ -185,11 +182,11 @@ constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD ca
         return -1;
     }
     ++i;
-    while (i < tag.size() && (tag[i] == ' ' || tag[i] == '"' || tag[i] == '\'')) {
+    while (i < tag.size() && (tag.at(i) == ' ' || tag.at(i) == '"' || tag.at(i) == '\'')) {
         ++i;
     }
     size_t j = i;
-    while (j < tag.size() && tag[j] != '"' && tag[j] != '\'' && tag[j] != ' ' && tag[j] != '>') {
+    while (j < tag.size() && tag.at(j) != '"' && tag.at(j) != '\'' && tag.at(j) != ' ' && tag.at(j) != '>') {
         ++j;
     }
     const std::string_view value = tag.substr(i, j - i);
@@ -211,10 +208,10 @@ constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD ca
 /// "a < b", "</ >", a trailing '<' -- is literal cue text, not markup.
 [[nodiscard]] auto LooksLikeHtmlTagStart(std::string_view text, size_t pos) noexcept -> bool {
     size_t name = pos + 1;
-    if (name < text.size() && text[name] == '/') {
+    if (name < text.size() && text.at(name) == '/') {
         ++name;
     }
-    return name < text.size() && IsAsciiAlpha(text[name]);
+    return name < text.size() && IsAsciiAlpha(text.at(name));
 }
 
 /// Append @p text (already markup-bearing) to @p out as trimmed, non-empty lines, carrying the
@@ -240,7 +237,7 @@ auto AppendLinesFromMarkup(std::string_view text, std::vector<cSubtitleConverter
     };
 
     for (size_t i = 0; i < text.size();) {
-        const char c = text[i];
+        const char c = text.at(i);
         if (c == '{') { // ASS override block
             const size_t close = text.find('}', i + 1);
             if (close == std::string_view::npos) {
@@ -269,7 +266,7 @@ auto AppendLinesFromMarkup(std::string_view text, std::vector<cSubtitleConverter
             }
             i = close + 1;
         } else if (c == '\\' && i + 1 < text.size()) {
-            const char n = text[i + 1];
+            const char n = text.at(i + 1);
             if (n == 'N' || n == 'n') {
                 flush();
             } else if (n == 'h') {
@@ -298,13 +295,12 @@ auto AppendAssLines(const char *ass, std::vector<cSubtitleConverter::Line> &out)
     size_t pos = 0;
     int commas = 0;
     for (; pos < s.size() && commas < 8; ++pos) {
-        if (s[pos] == ',') {
+        if (s.at(pos) == ',') {
             ++commas;
         }
     }
     AppendLinesFromMarkup(commas == 8 ? s.substr(pos) : s, out);
 }
-// NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
 // ============================================================================
 // === BITMAP (DVB) DECODE ===
@@ -458,7 +454,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
         return;
     }
     if (gotSub == 0) {
-        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        avsubtitle_free(&sub);
         return;
     }
 
@@ -466,7 +462,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     // an all-ones sentinel) would schedule the cue days ahead, breaking the queue's ascending-start
     // invariant and wedging Action()'s scan behind a far-future front cue.
     if (sub.start_display_time > SUBTITLE_CUE_START_DELAY_MAX_MS) [[unlikely]] {
-        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        avsubtitle_free(&sub);
         return;
     }
     // All window arithmetic is checked, not saturated: pts/duration are unvalidated container data,
@@ -475,7 +471,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     const auto startOpt = CheckedAdd90k(packetPts90k, static_cast<int64_t>(sub.start_display_time) * PTS_TICKS_PER_MS);
     const auto defaultEndOpt = CheckedAdd90k(packetPts90k, SUBTITLE_CUE_DURATION_DEFAULT_90K);
     if (!startOpt || !defaultEndOpt) [[unlikely]] {
-        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        avsubtitle_free(&sub);
         return;
     }
     const int64_t start90k = *startOpt;
@@ -512,7 +508,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
     const auto fallbackEndOpt = CheckedAdd90k(start90k, SUBTITLE_CUE_DURATION_DEFAULT_90K);
     const auto maxEndOpt = CheckedAdd90k(start90k, SUBTITLE_CUE_DURATION_MAX_90K);
     if (!fallbackEndOpt || !maxEndOpt) [[unlikely]] {
-        avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+        avsubtitle_free(&sub);
         return;
     }
     if (end90k <= start90k) {
@@ -544,7 +540,7 @@ auto cSubtitleConverter::Convert(const AVPacket *packet) -> void {
         cue.canvasW = codecCtx_->width > 0 ? codecCtx_->width : SUBTITLE_DVB_CANVAS_WIDTH;
         cue.canvasH = codecCtx_->height > 0 ? codecCtx_->height : SUBTITLE_DVB_CANVAS_HEIGHT;
     }
-    avsubtitle_free(&sub); // NOLINT(clang-analyzer-unix.Malloc) -- C-API frees rects/owned bufs
+    avsubtitle_free(&sub);
 
     // Demux delivers packets in ascending start order, so a plain push_back keeps cues_ sorted -- which
     // Action()'s front-pruning and first-match scan rely on.

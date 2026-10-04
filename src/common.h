@@ -346,6 +346,12 @@ struct AspectRatio {
     return streamInterlaced || (frame->flags & AV_FRAME_FLAG_INTERLACED) != 0;
 }
 
+/// The AVHWFramesContext a hw_frames_ctx carries. The one home of FFmpeg's documented cast of AVBufferRef::data.
+[[nodiscard]] inline auto HwFramesContextOf(const AVBufferRef *ref) noexcept -> AVHWFramesContext * {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
+    return reinterpret_cast<AVHWFramesContext *>(ref->data);
+}
+
 // ============================================================================
 // === RAII CUSTOM DELETERS ===
 // ============================================================================

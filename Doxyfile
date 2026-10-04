@@ -6,7 +6,7 @@ PROJECT_NAME           = "VDR VAAPI Video Plugin"
 PROJECT_BRIEF          = "Zero-copy VAAPI decode, DRM atomic mode-setting, ALSA IEC61937 passthrough"
 OUTPUT_DIRECTORY       = docs
 
-INPUT                  = README.md AVSYNC.md vaapivideo.cpp src/
+INPUT                  = README.md AVSYNC.md vaapivideo.cpp vaapivideo-probe.cpp src/
 RECURSIVE              = YES
 USE_MDFILE_AS_MAINPAGE = README.md
 
@@ -22,6 +22,11 @@ EXTRACT_ALL            = NO
 WARN_IF_UNDOCUMENTED   = YES
 EXTRACT_PRIVATE        = YES
 EXTRACT_STATIC         = YES
+# Anonymous namespaces hold most of the implementation; without these two lines their undocumented
+# members would pass WARN_IF_UNDOCUMENTED silently.
+EXTRACT_ANON_NSPACES   = YES
+# A ///@{ ... ///@} group shares its first member's comment (rows of parallel members need just one).
+DISTRIBUTE_GROUP_DOC   = YES
 
 # @R appears in "-r WxH@R" in README.md -- not a Doxygen command
 ALIASES                = "R=R"

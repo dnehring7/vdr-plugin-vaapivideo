@@ -77,6 +77,7 @@ struct CodecEvidence {
     uint8_t seenMask{}; ///< Distinct strong-NAL type bits seen so far
     size_t lastPos{};   ///< Buffer offset of the most recent matching NAL (tie-break)
 
+    /// Note a strong NAL of type @p bit at offset @p pos.
     auto Record(uint8_t bit, size_t pos) noexcept -> void {
         seenMask |= bit;
         lastPos = pos;
@@ -105,10 +106,8 @@ struct CodecEvidence {
     constexpr std::array<uint32_t, 3> kMpeg1SampleRates{44100, 48000, 32000};
 
     const size_t isMpeg1 = versionBits == 3 ? 1 : 0;
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- indices range-checked above
-    const uint32_t bitrate = static_cast<uint32_t>(kBitrateKbps[isMpeg1][bitrateIdx - 1]) * 1000U;
-    const uint32_t sampleRate = kMpeg1SampleRates[samplerateIdx] / (isMpeg1 != 0 ? 1U : 2U); // LSF halves the rate
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    const uint32_t bitrate = static_cast<uint32_t>(kBitrateKbps.at(isMpeg1).at(bitrateIdx - 1)) * 1000U;
+    const uint32_t sampleRate = kMpeg1SampleRates.at(samplerateIdx) / (isMpeg1 != 0 ? 1U : 2U); // LSF halves the rate
     return (144U * bitrate / sampleRate) + padding; // Layer II is always 1152 samples -> coefficient 144
 }
 
@@ -133,8 +132,7 @@ struct CodecEvidence {
     }
     constexpr std::array<uint16_t, 19> kAc3Kbps{32,  40,  48,  56,  64,  80,  96,  112, 128, 160,
                                                 192, 224, 256, 320, 384, 448, 512, 576, 640};
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- frmsizecod <= 37 checked above
-    const uint32_t kbps = kAc3Kbps[frmsizecod >> 1];
+    const uint32_t kbps = kAc3Kbps.at(frmsizecod >> 1);
     uint32_t words = 0;
     if (fscod == 0) { // 48 kHz
         words = 2U * kbps;
@@ -502,7 +500,6 @@ namespace {
     std::vector<uint8_t> rbsp;
     rbsp.reserve(nal.size());
     const size_t n = nal.size();
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- guarded by i+3<n
     for (size_t i = 0; i < n; ++i) {
         // EPB is only valid followed by {0x00..0x03} (H.264 sec.7.4.1.1). Checking the next
         // byte disambiguates a real EPB from `00 00 03 <other>` in malformed input.
@@ -514,7 +511,6 @@ namespace {
             rbsp.push_back(nal[i]);
         }
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     return rbsp;
 }
 
@@ -522,6 +518,7 @@ namespace {
 /// the @c overran flag; callers check Overran() before committing parsed values.
 class BitReader {
   public:
+    /// Reads @p data, which must outlive the reader.
     explicit BitReader(std::span<const uint8_t> data) noexcept : data_{data} {}
 
     /// Read @p n bits (n in [0, 32]); returns 0 and sets overran on overrun.
@@ -536,7 +533,6 @@ class BitReader {
             const unsigned bitInByte = 7U - static_cast<unsigned>(bitPos_ % 8);
             // Promote the byte to unsigned BEFORE the shift so the result type stays unsigned;
             // the implicit int-promotion path triggers -Wsign-conversion when ANDed with 0x01U.
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bitPos_ just checked
             const uint32_t byteVal = data_[byteIdx];
             value = (value << 1U) | ((byteVal >> bitInByte) & 0x01U);
             ++bitPos_;
@@ -559,6 +555,7 @@ class BitReader {
         return (1U << leadingZeros) - 1U + suffix;
     }
 
+    /// Skip @p n bits; past the end only sets the overrun flag.
     auto Skip(int n) noexcept -> void {
         const auto step = static_cast<size_t>(n);
         if (bitPos_ + step > data_.size() * 8) [[unlikely]] {
@@ -568,12 +565,13 @@ class BitReader {
         bitPos_ += step;
     }
 
+    /// True once a read or skip ran past the end: values parsed since are garbage.
     [[nodiscard]] auto Overran() const noexcept -> bool { return overran_; }
 
   private:
-    std::span<const uint8_t> data_;
-    size_t bitPos_{0};
-    bool overran_{false};
+    std::span<const uint8_t> data_; ///< Bytes being read
+    size_t bitPos_{0};              ///< Next bit, counted from the MSB of data_[0]
+    bool overran_{false};           ///< Sticky: set by the first overrun
 };
 
 /// Returns a span over the NAL payload (after the header) for the first Annex-B
@@ -687,10 +685,8 @@ class BitReader {
     }
 
     // profile_idc | constraint_set_flags | level_idc are the first three byte-aligned fields.
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- size >= 3 checked above
     info.profile = static_cast<int>(sps[0]);
     info.level = static_cast<int>(sps[2]);
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     const std::vector<uint8_t> rbsp = StripEmulationPreventionBytes(sps.subspan(3));
     BitReader br{std::span<const uint8_t>{rbsp.data(), rbsp.size()}};
@@ -747,11 +743,10 @@ class BitReader {
     std::array<bool, 8> subProfilePresent{};
     std::array<bool, 8> subLevelPresent{};
     // HEVC spec caps maxSubLayersMinus1 at 6; clamp to 8 defensively for malformed input.
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- subLayerLimit <= 8
     const uint32_t subLayerLimit = std::min<uint32_t>(maxSubLayersMinus1, 8U);
     for (uint32_t i = 0; i < subLayerLimit; ++i) {
-        subProfilePresent[i] = br.ReadBits(1) != 0;
-        subLevelPresent[i] = br.ReadBits(1) != 0;
+        subProfilePresent.at(i) = br.ReadBits(1) != 0;
+        subLevelPresent.at(i) = br.ReadBits(1) != 0;
     }
     if (maxSubLayersMinus1 > 0) {
         for (uint32_t i = maxSubLayersMinus1; i < 8; ++i) {
@@ -759,14 +754,13 @@ class BitReader {
         }
     }
     for (uint32_t i = 0; i < subLayerLimit; ++i) {
-        if (subProfilePresent[i]) {
+        if (subProfilePresent.at(i)) {
             br.Skip(2 + 1 + 5 + 32 + 48); // profile_space + tier + profile_idc + compat_flags + constraints
         }
-        if (subLevelPresent[i]) {
+        if (subLevelPresent.at(i)) {
             br.Skip(8); // sub_layer_level_idc
         }
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
     // seq_parameter_set_rbsp() fields after profile_tier_level():
     (void)br.ReadUe(); // sps_seq_parameter_set_id

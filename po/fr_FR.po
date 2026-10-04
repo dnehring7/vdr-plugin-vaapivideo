@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vdr-vaapivideo 1.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
-"POT-Creation-Date: 2026-10-04 09:35+0200\n"
+"POT-Creation-Date: 2026-10-04 22:46+0200\n"
 "PO-Revision-Date: 2026-10-04 09:40+0200\n"
 "Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
 "Language-Team: French <vdr@linuxtv.org>\n"
@@ -124,12 +124,12 @@ msgid "File info"
 msgstr "Infos fichier"
 
 #, c-format
-msgid "Delete %s?"
-msgstr "Supprimer %s ?"
-
-#, c-format
 msgid "Delete failed: %s"
 msgstr "Échec de la suppression : %s"
+
+#, c-format
+msgid "Delete %s?"
+msgstr "Supprimer %s ?"
 
 msgid "Empty or unreadable playlist"
 msgstr "Liste de lecture vide ou illisible"

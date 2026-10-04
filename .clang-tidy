@@ -39,3 +39,9 @@ Checks: >
   -readability-identifier-length,
   -readability-implicit-bool-conversion,
   -readability-magic-numbers
+
+CheckOptions:
+  # std::span has no .at() before C++26. The option replaces the default list, hence the first three.
+  cppcoreguidelines-pro-bounds-avoid-unchecked-container-access.ExcludeClasses: '::std::map;::std::unordered_map;::std::flat_map;::std::span'
+  # Private glibc/kernel headers behind <getopt.h> and ESTRPIPE: no IWYU mapping to the public header.
+  misc-include-cleaner.IgnoreHeaders: 'getopt\.h;bits/getopt_.*\.h;asm-generic/errno\.h'

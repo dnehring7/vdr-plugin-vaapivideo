@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -116,15 +117,15 @@ namespace {
 // paces the single-cursor mediaplayer demux. MEDIAPLAYER_LOOKAHEAD_MAX_90K is the coarser PTS-distance
 // brake (so a TS mux interleave offset can't over-fill the decoder jitterBuf after a seek).
 
-// Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock is
-// NOPTS (the post-flush window before the first decoded sample anchors the clock). For AUDIO streams
-// AUDIO_QUEUE_HIGHWATER already covers this; it matters for VIDEO-ONLY streams (no audio clock ever), where
-// it is the sole video-depth gate stopping the file-read-speed demuxer from flooding. Once the clock
-// anchors, IsMediaPlayerBackpressured() drops it (a video gate on the single demux cursor would starve the
-// audio queue -- sustained-stutter-after-seek bug). Derived from the reserve cap (3/4) and kept here, the
-// only user, so it stays coupled to the buffer it protects and below the cap by construction. The
-// static_assert must trip before the decode-ahead reserve hits its hard cap (else the drop-oldest runaway
-// guard fires first and the demuxer never throttles).
+/// Jitter-buffer high-water that backpressures the mediaplayer demux ONLY while the audio master clock is
+/// NOPTS (the post-flush window before the first decoded sample anchors the clock). For AUDIO streams
+/// AUDIO_QUEUE_HIGHWATER already covers this; it matters for VIDEO-ONLY streams (no audio clock ever), where
+/// it is the sole video-depth gate stopping the file-read-speed demuxer from flooding. Once the clock
+/// anchors, IsMediaPlayerBackpressured() drops it (a video gate on the single demux cursor would starve the
+/// audio queue -- sustained-stutter-after-seek bug). Derived from the reserve cap (3/4) and kept here, the
+/// only user, so it stays coupled to the buffer it protects and below the cap by construction. The
+/// static_assert must trip before the decode-ahead reserve hits its hard cap (else the drop-oldest runaway
+/// guard fires first and the demuxer never throttles).
 constexpr size_t DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES = (DECODER_RESERVE_CAPACITY * 3) / 4;
 static_assert(DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES < DECODER_RESERVE_CAPACITY,
               "mediaplayer backpressure must engage below the reserve cap");
@@ -134,12 +135,14 @@ static_assert(DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES < DECODER_RESERVE_CAPACITY,
 /// the Schedules read-lock on the decoder thread.
 constexpr int DEVICE_RADIO_SPLASH_POLL_MS = 2000;
 
+///@{
 /// radioSplashEventId cache sentinels. DVB event ids are 16-bit, so top-of-range uint32 values can
 /// never collide with a real id. EMPTY_TEXT = "a blank frame is queued" (distinct from EPG event 0,
 /// so a blank->caption transition still repaints). DIRTY = "force a repaint next poll" -- published
 /// before a forced submit so that, if the submit fails, the poll retries instead of matching the key.
 constexpr uint32_t DEVICE_RADIO_SPLASH_EMPTY_TEXT_ID = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t DEVICE_RADIO_SPLASH_DIRTY_ID = DEVICE_RADIO_SPLASH_EMPTY_TEXT_ID - 1;
+///@}
 
 /// Grace period after a channel switch before a video stream that never decodes is declared
 /// encrypted/undecodable and the on-screen notice is shown. Also the radio black-frame delay:
@@ -177,6 +180,7 @@ constexpr uint32_t TRACE_AUDIO_CODEC = 1U << 1; ///< Audio codec confirmed and o
 constexpr uint32_t TRACE_VIDEO_PES = 1U << 2;   ///< First video PES reached PlayVideo()
 constexpr uint32_t TRACE_VIDEO_KEY = 1U << 3;   ///< First keyframe PES (the first one the codec detector accepts)
 constexpr uint32_t TRACE_VIDEO_CODEC = 1U << 4; ///< Video codec opened; the decoder takes over from here
+/// All of the above: the milestones a switch arms.
 constexpr uint32_t TRACE_DEVICE_ALL =
     TRACE_AUDIO_PES | TRACE_AUDIO_CODEC | TRACE_VIDEO_PES | TRACE_VIDEO_KEY | TRACE_VIDEO_CODEC;
 
@@ -219,8 +223,10 @@ constexpr int DEVICE_DRM_MASTER_TIMEOUT_MS = 1500; ///< OpenDrmAsMaster() retry 
                                                    ///< session's master asynchronously after the VT switch.
 constexpr int DEVICE_DRM_MASTER_POLL_MS = 50;      ///< Reopen cadence while another master is still there.
 
-std::atomic<bool> capWarned{false}, noVtHinted{false};
+std::atomic<bool> capWarned{false};  ///< VT_ACTIVATE denial logged at INFO once; repeats go to debug
+std::atomic<bool> noVtHinted{false}; ///< "stdin is not a VT" logged once
 
+/// VDR's own VT (the tty on stdin), or 0 when stdin is not a VT.
 [[nodiscard]] auto OwnVt() -> int {
     // TTY major=4, minor=N for /dev/ttyN (N=1..63); minor 0 is the current-VT alias.
     struct stat st{};
@@ -231,11 +237,13 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     return (vt >= 1 && vt <= 63) ? vt : 0;
 }
 
+/// The foreground VT, or -1 when it cannot be queried.
 [[nodiscard]] auto ActiveVt() -> int {
     vt_stat state{};
     return ioctl(STDIN_FILENO, VT_GETSTATE, &state) == 0 ? static_cast<int>(state.v_active) : -1;
 }
 
+/// Bring @p vt to the foreground and wait, bounded, until it is; false when denied or timed out.
 [[nodiscard]] auto SwitchToVt(int vt) -> bool {
     if (ActiveVt() == vt) {
         return true; // already foreground: skip an ioctl needing CAP_SYS_TTY_CONFIG we may not have
@@ -266,6 +274,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     return false;
 }
 
+/// Startup and ATTA: foreground VDR's VT. Without a VT there is nothing to do, which counts as success.
 [[nodiscard]] auto ActivateOwnVt() -> bool {
     const int vt = OwnVt();
     if (vt == 0) {
@@ -282,6 +291,7 @@ std::atomic<bool> capWarned{false}, noVtHinted{false};
     return true;
 }
 
+/// DETA: hand the screen to tty1 (VDR_CONSOLE_TTY overrides), unless the user already switched away.
 [[nodiscard]] auto LeaveOwnVt() -> bool {
     const int ownVt = OwnVt();
     if (ownVt == 0) {
@@ -690,15 +700,12 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
         return false;
     }
 
-    std::unique_ptr<AVBufferRef, FreeAVBufferRef> framesRef{av_hwframe_ctx_alloc(vaapi.hwDeviceRef)};
+    const std::unique_ptr<AVBufferRef, FreeAVBufferRef> framesRef{av_hwframe_ctx_alloc(vaapi.hwDeviceRef)};
     if (!framesRef) [[unlikely]] {
         esyslog("vaapivideo/device: black frame hw_frames_ctx alloc failed");
         return false;
     }
-    // FFmpeg ABI: AVBufferRef::data points to a typed payload (here AVHWFramesContext) per the
-    // hwframe context contract -- the cast is the documented access pattern.
-    auto *ctx = reinterpret_cast<AVHWFramesContext *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        framesRef->data);
+    auto *ctx = HwFramesContextOf(framesRef.get());
     ctx->format = AV_PIX_FMT_VAAPI;
     ctx->sw_format = AV_PIX_FMT_NV12;
     ctx->width = w;
@@ -759,9 +766,8 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
     auto frame = std::make_unique<VaapiFrame>();
     frame->avFrame = hwFrame.release();
     frame->synthetic = true; // not the stream's first picture: the display keeps its start trace armed
-    // FFmpeg VAAPI ABI: data[3] holds the VASurfaceID directly, cast through uintptr_t.
-    frame->vaSurfaceId = static_cast<VASurfaceID>(
-        reinterpret_cast<uintptr_t>(frame->avFrame->data[3])); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    // FFmpeg VAAPI ABI: data[3] carries the VASurfaceID as pointer bits, not an address.
+    frame->vaSurfaceId = static_cast<VASurfaceID>(std::bit_cast<uintptr_t>(frame->avFrame->data[3]));
     // Stage SDR with the commit (only now that a frame is ready): the decoder's normal SDR staging is
     // bypassed here, so without this an HDR-left connector would read this NV12 black as BT.2020
     // PQ/HLG (crushed blacks). The display thread applies the staged state atomically with this frame.
@@ -791,13 +797,14 @@ auto cVaapiDevice::SubmitBlackFrame(std::string_view centerText) -> bool {
 
 namespace {
 
-// VDR attaches a launched player only from its main loop, and cTransfer::Receive() discards the TS until
-// then. That pass comes late: after a key zap the skin draws the channel display first (signal bars block
-// in FE_GET_PROPERTY), after an SVDRP/plugin switch the loop sleeps in cRemote::Get(1000). ChannelSwitch()
-// fires right after cControl::Launch() inside SetChannel(), so attaching there lets the stream flow at
-// once; the main loop's Attach() becomes a no-op. Lock order is VDR's own (mutexChannel -> cControl).
+/// VDR attaches a launched player only from its main loop, and cTransfer::Receive() discards the TS until
+/// then. That pass comes late: after a key zap the skin draws the channel display first (signal bars block
+/// in FE_GET_PROPERTY), after an SVDRP/plugin switch the loop sleeps in cRemote::Get(1000). ChannelSwitch()
+/// fires right after cControl::Launch() inside SetChannel(), so attaching there lets the stream flow at
+/// once; the main loop's Attach() becomes a no-op. Lock order is VDR's own (mutexChannel -> cControl).
 class cVaapiSwitchAttacher : public cStatus {
   public:
+    /// Registers with VDR's cStatus list; reacts to switches of @p ownerDevice only.
     explicit cVaapiSwitchAttacher(const cVaapiDevice *ownerDevice) : owner(ownerDevice) {}
     ~cVaapiSwitchAttacher() noexcept override = default;
     cVaapiSwitchAttacher(const cVaapiSwitchAttacher &) = delete;
@@ -806,6 +813,7 @@ class cVaapiSwitchAttacher : public cStatus {
     auto operator=(cVaapiSwitchAttacher &&) noexcept -> cVaapiSwitchAttacher & = delete;
 
   protected:
+    /// Attaches the transfer player launched by a live switch on our primary device, if it is one.
     auto ChannelSwitch(const cDevice *device, int channelNumber, bool liveView) -> void override;
 
   private:
@@ -1177,6 +1185,7 @@ auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) ->
 
 namespace {
 
+///@{
 /// Upper bounds on GRAB's requested output dimensions (DCI-8K width, 8K UHD height). VDR's SVDRP
 /// CmdGRAB forwards SizeX/SizeY with only a numeric check, so an absurd request must not drive a
 /// multi-gigabyte scale allocation (remote OOM via an exposed SVDRP port). Oversize requests are
@@ -1184,6 +1193,7 @@ namespace {
 /// per-axis caps also bound the pixel count (<= 8192*4320) with no separate area check needed.
 constexpr int DEVICE_GRAB_WIDTH_MAX = 8192;
 constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
+///@}
 
 /// One-shot filter graph: feed @p in, pull a single frame whose pixel format is enforced
 /// by appending `,format=<outFmt>` to @p chainPrefix. Caller-supplied chain stages
@@ -1285,9 +1295,9 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
     return out;
 }
 
-// Reproduce on-screen geometry inside the grab canvas. The VPP filter has already DAR-fitted the
-// fb to videoRect (no DRM scaler), so frame dimensions equal placement dimensions and the only
-// remaining step is a pad to full output size when videoRect is a sub-rect (skin thumbnail mode).
+/// Reproduce on-screen geometry inside the grab canvas. The VPP filter has already DAR-fitted the
+/// fb to videoRect (no DRM scaler), so frame dimensions equal placement dimensions and the only
+/// remaining step is a pad to full output size when videoRect is a sub-rect (skin thumbnail mode).
 [[nodiscard]] auto BuildGrabLayoutChain(const AVFrame *frame, const cVaapiDisplay &display) -> std::string {
     if (!frame || frame->width <= 0 || frame->height <= 0) [[unlikely]] {
         return {};
@@ -1303,6 +1313,11 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
     return std::format("pad={}:{}:{}:{}:color=black", outW, outH, placement.destX, placement.destY);
 }
 
+/// GrabImage() buffer: VDR free()s it, hence malloc.
+[[nodiscard]] auto AllocGrabBuffer(size_t bytes) noexcept -> uchar * {
+    return static_cast<uchar *>(std::malloc(bytes)); // NOLINT(cppcoreguidelines-no-malloc) -- VDR free()s it
+}
+
 /// Serialize an RGB24 AVFrame as a P6 PNM byte stream into a malloc()'d buffer.
 /// PNM = trivial text header + raw RGB; no codec required.
 [[nodiscard]] auto MakePnm(const AVFrame *rgb24, int &outSize) -> uchar * {
@@ -1311,15 +1326,12 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
     const size_t pixelBytes = rowBytes * static_cast<size_t>(rgb24->height);
     const size_t total = header.size() + pixelBytes;
 
-    // VDR's SVDRP code free()s the returned pointer, so malloc -- not new[].
-    auto *buf = static_cast<uchar *>(std::malloc(total)); // NOLINT(cppcoreguidelines-no-malloc)
+    uchar *buf = AllocGrabBuffer(total);
     if (!buf) [[unlikely]] {
         return nullptr;
     }
 
-    // NOLINTNEXTLINE(bugprone-not-null-terminated-result) -- header is a sized blob, not a C string
-    std::memcpy(buf, header.data(), header.size());
-    uchar *dst = buf + header.size();
+    uchar *dst = std::ranges::copy(header, buf).out;
     const uint8_t *src = rgb24->data[0];
     for (int y = 0; y < rgb24->height; ++y) {
         std::memcpy(dst, src, rowBytes); // skip linesize padding
@@ -1377,8 +1389,7 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
         return nullptr;
     }
 
-    auto *buf =
-        static_cast<uchar *>(std::malloc(static_cast<size_t>(pkt->size))); // NOLINT(cppcoreguidelines-no-malloc)
+    uchar *buf = AllocGrabBuffer(static_cast<size_t>(pkt->size));
     if (!buf) [[unlikely]] {
         return nullptr;
     }
@@ -2131,8 +2142,8 @@ auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
 }
 
 namespace {
-// Next cycle stop after `current`, skipping disabled (level 0) presets. Off (stop 0) is always a
-// valid stop, so the loop always terminates; returns `current` only when every level is disabled.
+/// Next cycle stop after `current`, skipping disabled (level 0) presets. Off (stop 0) is always a
+/// valid stop, so the loop always terminates; returns `current` only when every level is disabled.
 auto NextZoomStop(int current) -> int {
     for (int step = 1; step <= CONFIG_ZOOM_PRESET_COUNT + 1; ++step) {
         const int cand = (current + step) % (CONFIG_ZOOM_PRESET_COUNT + 1);
@@ -3478,7 +3489,6 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
         // fall back to ttNone -- the reset still fires and PlayAudio() re-detects.
         // Enum casts are valid per VDR's IS_DOLBY_TRACK range (vdr/device.h).
         for (int offset = 0; offset <= ttDolbyLast - ttDolbyFirst; ++offset) {
-            // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- VDR API range
             const auto candidateType = static_cast<eTrackType>(static_cast<int>(ttDolbyFirst) + offset);
             const tTrackId *candidate = GetTrack(candidateType);
             if (candidate == nullptr || candidate->id == 0) {

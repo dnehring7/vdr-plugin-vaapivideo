@@ -21,7 +21,7 @@
 #include "src/osd.h"
 
 // POSIX
-#include <getopt.h> // NOLINT(misc-include-cleaner) -- clang-tidy cannot map getopt_long/option/optind/optarg back to this header
+#include <getopt.h>
 #include <strings.h>
 #include <unistd.h>
 
@@ -64,11 +64,13 @@ extern "C" {
 
 namespace {
 
-// cMenuEditStraItem shows its strings verbatim, so the setup page hands it translated copies of the English
-// label arrays. Both catalogs return pointers that outlive the page.
-template <size_t N>
-[[nodiscard]] auto TranslatedLabels(const std::array<const char *, N> &labels) -> std::array<const char *, N> {
-    std::array<const char *, N> out{};
+/// Label array of a cMenuEditStraItem.
+template <size_t N> using MenuLabels = std::array<const char *, N>;
+
+/// cMenuEditStraItem shows its strings verbatim, so the setup page hands it translated copies of the English
+/// label arrays. Both catalogs return pointers that outlive the page.
+template <size_t N> [[nodiscard]] auto TranslatedLabels(const MenuLabels<N> &labels) -> MenuLabels<N> {
+    MenuLabels<N> out{};
     for (size_t i = 0; i < N; ++i) {
         out.at(i) = TrLabel(labels.at(i));
     }
@@ -112,8 +114,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     }
 
   protected:
-    // Build the item list from the scratch values once at construction (VDR draws it).
-    // cMenuEditItem strdup()s its label, so the temporary cString labels are safe.
+    /// Build the item list from the scratch values once at construction (VDR draws it).
+    /// cMenuEditItem strdup()s its label, so the temporary cString labels are safe.
     auto BuildMenu() -> void {
         Clear();
         const char *const off = TrLabel("off");
@@ -187,6 +189,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SetCurrent(Get(1));
     }
 
+    /// Commit the scratch values and apply what changed to the running stream at once.
     auto Store() -> void override {
         // Detect whether any post-processing policy actually changed BEFORE overwriting the atomics, so a
         // bare setup OK doesn't trigger a (glitchy) live filter rebuild.
@@ -302,9 +305,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     }
 
   private:
-    // Labels derived from PassthroughModeName() -- keeps enum, setup.conf, and menu in sync.
-    // Order must match enum numeric values; cMenuEditStraItem stores the index, which is
-    // round-tripped through setup.conf as PassthroughMode(int).
+    ///@{
+    /// Labels derived from PassthroughModeName() -- keeps enum, setup.conf, and menu in sync.
+    /// Order must match enum numeric values; cMenuEditStraItem stores the index, which is
+    /// round-tripped through setup.conf as PassthroughMode(int).
     static constexpr std::array kPassthroughModeLabels{
         PassthroughModeName(PassthroughMode::Auto),
         PassthroughModeName(PassthroughMode::On),
@@ -312,8 +316,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kPassthroughModeCount = static_cast<int>(kPassthroughModeLabels.size());
     static_assert(kPassthroughModeCount == CONFIG_PASSTHROUGH_MODE_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // Same pattern as kPassthroughModeLabels; rooted in PcmChannelModeName().
+    ///@{
+    /// Same pattern as kPassthroughModeLabels; rooted in PcmChannelModeName().
     static constexpr std::array kPcmChannelModeLabels{
         PcmChannelModeName(PcmChannelMode::Auto),
         PcmChannelModeName(PcmChannelMode::Stereo),
@@ -321,8 +327,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kPcmChannelModeCount = static_cast<int>(kPcmChannelModeLabels.size());
     static_assert(kPcmChannelModeCount == CONFIG_PCM_CHANNEL_MODE_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // Same pattern as kPassthroughModeLabels; rooted in HdrModeName().
+    ///@{
+    /// Same pattern as kPassthroughModeLabels; rooted in HdrModeName().
     static constexpr std::array kHdrModeLabels{
         HdrModeName(HdrMode::Auto),
         HdrModeName(HdrMode::On),
@@ -330,10 +338,12 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kHdrModeCount = static_cast<int>(kHdrModeLabels.size());
     static_assert(kHdrModeCount == CONFIG_HDR_MODE_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // Post-processing straight-item labels, derived from the *ModeName() functions in config.h so the
-    // menu and the log summary share one source (same pattern as kPassthroughModeLabels). Order matches
-    // each enum's numeric values; the index is round-tripped through setup.conf.
+    ///@{
+    /// Post-processing straight-item labels, derived from the *ModeName() functions in config.h so the
+    /// menu and the log summary share one source (same pattern as kPassthroughModeLabels). Order matches
+    /// each enum's numeric values; the index is round-tripped through setup.conf.
     static constexpr std::array kDeinterlaceLabels{
         DeinterlaceModeName(DeinterlaceMode::Auto),    DeinterlaceModeName(DeinterlaceMode::HwMotionAdaptive),
         DeinterlaceModeName(DeinterlaceMode::HwWeave), DeinterlaceModeName(DeinterlaceMode::HwBob),
@@ -365,8 +375,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kScaleCount = static_cast<int>(kScaleLabels.size());
     static_assert(kScaleCount == CONFIG_SCALE_MODE_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // Display-mode straight-item labels; same enum/setup.conf/menu single-source pattern.
+    ///@{
+    /// Display-mode straight-item labels; same enum/setup.conf/menu single-source pattern.
     static constexpr std::array kMinResolutionLabels{
         MinResolutionModeName(MinResolutionMode::P576),
         MinResolutionModeName(MinResolutionMode::P720),
@@ -382,8 +394,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kMaxRefreshCount = static_cast<int>(kMaxRefreshLabels.size());
     static_assert(kMaxRefreshCount == CONFIG_MAX_REFRESH_MODE_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // Same pattern as kPassthroughModeLabels; rooted in QuickActionName().
+    ///@{
+    /// Same pattern as kPassthroughModeLabels; rooted in QuickActionName().
     static constexpr std::array kQuickActionLabels{
         QuickActionName(QuickAction::Off),
         QuickActionName(QuickAction::Zoom),
@@ -392,26 +406,28 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     };
     static constexpr int kQuickActionCount = static_cast<int>(kQuickActionLabels.size());
     static_assert(kQuickActionCount == CONFIG_QUICK_ACTION_COUNT, "menu labels out of sync with enum");
+    ///@}
 
-    // What the menu items point at: the arrays above, translated. Plain members, so they are built before
-    // the ctor body runs BuildMenu() and live exactly as long as the items that reference them.
-    std::array<const char *, kDeinterlaceLabels.size()> deinterlaceLabels{TranslatedLabels(kDeinterlaceLabels)};
-    std::array<const char *, kDenoiseLabels.size()> denoiseLabels{TranslatedLabels(kDenoiseLabels)};
-    std::array<const char *, kHdrModeLabels.size()> hdrModeLabels{TranslatedLabels(kHdrModeLabels)};
-    std::array<const char *, kMaxRefreshLabels.size()> maxRefreshLabels{TranslatedLabels(kMaxRefreshLabels)};
-    std::array<const char *, kMinResolutionLabels.size()> minResolutionLabels{TranslatedLabels(kMinResolutionLabels)};
-    std::array<const char *, kPassthroughModeLabels.size()> passthroughModeLabels{
-        TranslatedLabels(kPassthroughModeLabels)};
-    std::array<const char *, kPcmChannelModeLabels.size()> pcmChannelModeLabels{
-        TranslatedLabels(kPcmChannelModeLabels)};
-    std::array<const char *, kQuickActionLabels.size()> quickActionLabels{TranslatedLabels(kQuickActionLabels)};
-    std::array<const char *, kScaleLabels.size()> scaleLabels{TranslatedLabels(kScaleLabels)};
-    std::array<const char *, kSharpenLabels.size()> sharpenLabels{TranslatedLabels(kSharpenLabels)};
+    ///@{
+    /// What the menu items point at: the arrays above, translated. Plain members, so they are built before
+    /// the ctor body runs BuildMenu() and live exactly as long as the items that reference them.
+    MenuLabels<kDeinterlaceLabels.size()> deinterlaceLabels{TranslatedLabels(kDeinterlaceLabels)};
+    MenuLabels<kDenoiseLabels.size()> denoiseLabels{TranslatedLabels(kDenoiseLabels)};
+    MenuLabels<kHdrModeLabels.size()> hdrModeLabels{TranslatedLabels(kHdrModeLabels)};
+    MenuLabels<kMaxRefreshLabels.size()> maxRefreshLabels{TranslatedLabels(kMaxRefreshLabels)};
+    MenuLabels<kMinResolutionLabels.size()> minResolutionLabels{TranslatedLabels(kMinResolutionLabels)};
+    MenuLabels<kPassthroughModeLabels.size()> passthroughModeLabels{TranslatedLabels(kPassthroughModeLabels)};
+    MenuLabels<kPcmChannelModeLabels.size()> pcmChannelModeLabels{TranslatedLabels(kPcmChannelModeLabels)};
+    MenuLabels<kQuickActionLabels.size()> quickActionLabels{TranslatedLabels(kQuickActionLabels)};
+    MenuLabels<kScaleLabels.size()> scaleLabels{TranslatedLabels(kScaleLabels)};
+    MenuLabels<kSharpenLabels.size()> sharpenLabels{TranslatedLabels(kSharpenLabels)};
+    ///@}
 
-    // Scratch copies of the vaapiConfig fields of the same name, edited in place by the menu items
-    // above and committed only in Store() -- so leaving the page with Back discards everything.
-    // All int because that is what cMenuEdit*Item binds to: a bool is 0/1, an enum an index into
-    // the k<Name>Labels array, an int the value itself.
+    ///@{
+    /// Scratch copies of the vaapiConfig fields of the same name, edited in place by the menu items
+    /// above and committed only in Store() -- so leaving the page with Back discards everything.
+    /// All int because that is what cMenuEdit*Item binds to: a bool is 0/1, an enum an index into
+    /// the `k<Name>Labels` array, an int the value itself.
     int editClearOnChannelSwitch;
     int editDeinterlaceMode;
     int editDenoiseMode;
@@ -430,6 +446,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editQuickAction;
     int editScaleMode;
     int editSharpenMode;
+    ///@}
     int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Per-preset zoom level (tenths-of-%).
 };
 
@@ -439,6 +456,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 
 // One-shot actions shared by the quick menu and a direct main-menu hook (setup "Quick action"). Each flashes
 // the new state; the caller closes the OSD. QueueMessage, not Message: MainMenuAction() must not block.
+
+/// Cycle the zoom one stop; refused while the device is not attached.
 auto CycleZoomAction(cVaapiDevice *device) -> void {
     if (device == nullptr || !device->IsReady()) {
         Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
@@ -448,7 +467,8 @@ auto CycleZoomAction(cVaapiDevice *device) -> void {
     Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
 }
 
-// A detached device just keeps the new mode for its next audio open, so only a missing device is refused.
+/// Toggle audio passthrough. A detached device just keeps the new mode for its next audio open, so only a
+/// missing device is refused.
 auto TogglePassthroughAction(cVaapiDevice *device) -> void {
     if (device == nullptr) {
         Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
@@ -465,15 +485,17 @@ auto TogglePassthroughAction(cVaapiDevice *device) -> void {
 /// The plugin's main menu, three fixed lines. OK on line 1 cycles the zoom one stop and OK on line 3 toggles
 /// audio passthrough; both close the OSD at once and flash the new state -- one-shot actions, no lingering
 /// menu. OK on line 2 opens the mediaplayer. VDR gives a plugin a single main-menu hook, so key macros reach
-/// each action by position (@vaapivideo Ok / Down Ok / Down Down Ok); new lines go at the end. A setup
+/// each action by position (`@vaapivideo Ok` / `Down Ok` / `Down Down Ok`); new lines go at the end. A setup
 /// "Quick action" other than off bypasses this menu: the hook then runs that one action directly.
 class cVaapiQuickMenu : public cOsdMenu {
   public:
+    /// @p device may be null (no device); @p mediaDir is the mediaplayer's browser root.
     cVaapiQuickMenu(cVaapiDevice *device, std::string mediaDir)
         : cOsdMenu(tr("VAAPI Video")), device_(device), mediaDir_(std::move(mediaDir)) {
         AddItems();
     }
 
+    /// OK on a line runs its action; the base menu handles the rest.
     [[nodiscard]] auto ProcessKey(eKeys key) -> eOSState override {
         const eOSState state = cOsdMenu::ProcessKey(key); // handles Up/Down/Back
         if (state == osUnknown && (key & ~k_Repeat) == kOk) {
@@ -492,6 +514,7 @@ class cVaapiQuickMenu : public cOsdMenu {
     }
 
   private:
+    /// (Re)build the three lines; the zoom and passthrough lines show the current state.
     auto AddItems() -> void {
         const int currentItem = Current();
         Clear();
@@ -519,7 +542,8 @@ class cVaapiVideoPlugin : public cPlugin {
     auto operator=(const cVaapiVideoPlugin &) -> cVaapiVideoPlugin & = delete;
     auto operator=(cVaapiVideoPlugin &&) -> cVaapiVideoPlugin & = delete;
 
-    // VDR plugin API -- called in the order documented at the top of this file
+    ///@{
+    /// VDR plugin API (see VDR's PLUGINS.html), called in the order documented at the top of this file.
     [[nodiscard]] auto CommandLineHelp() -> const char * override;
     [[nodiscard]] auto Description() -> const char * override { return tr(PLUGIN_DESCRIPTION); }
     auto Housekeeping() -> void override;
@@ -535,6 +559,7 @@ class cVaapiVideoPlugin : public cPlugin {
     [[nodiscard]] auto SVDRPCommand(const char *command, const char *option, int &replyCode) -> cString override;
     [[nodiscard]] auto SVDRPHelpPages() -> const char ** override;
     [[nodiscard]] auto Version() -> const char * override { return PLUGIN_VERSION; }
+    ///@}
 
   private:
     /// Resolves the DRM device path: explicit arg > /dev/dri/card0 > libdrm enumeration.
@@ -699,8 +724,6 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
 }
 
 auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
-    // NOLINTBEGIN(misc-include-cleaner) -- getopt symbols (option, getopt_long, optind, optarg,
-    // required_argument, no_argument) come from <getopt.h>, but clang-tidy's IWYU doesn't track them.
     static constexpr std::array<option, 8> kLongOptions = {
         {{.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
@@ -773,7 +796,6 @@ auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
         }
     }
     return true;
-    // NOLINTEND(misc-include-cleaner)
 }
 
 // Inter-plugin service API. data==nullptr is a capability probe; non-null fills the typed result.
@@ -857,6 +879,8 @@ auto cVaapiVideoPlugin::Start() -> bool {
 }
 
 auto cVaapiVideoPlugin::Stop() -> void {
+    // The worker logs and queues OSD messages: end it before VDR tears those down.
+    ShutdownFolderDelete();
     // Do not delete vaapiDevice: cDevice::Shutdown() (called from main() after all Stop()s) owns it.
     if (vaapiDevice) {
         // cVaapiOsdProvider holds a raw pointer to cVaapiDisplay; detach before VDR destroys
@@ -1075,7 +1099,7 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         nullptr};
     // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
     // both pointee levels are read-only at the call site, so stripping the inner const is safe.
-    return const_cast<const char **>(kHelpPages); // NOLINT(cppcoreguidelines-pro-type-const-cast)
+    return const_cast<const char **>(kHelpPages);
 }
 
 // ============================================================================

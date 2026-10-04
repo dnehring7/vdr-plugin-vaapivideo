@@ -65,37 +65,42 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-// Small enough to avoid wasting VRAM; large enough that no driver rejects it as
-// below its minimum surface alignment (typically 16 px).
+/// Small enough to avoid wasting VRAM; large enough that no driver rejects it as
+/// below its minimum surface alignment (typically 16 px).
 constexpr int PROBE_SURFACE_SIZE = 64;
 
 namespace {
+/// Deleter for drmDevice (drmFreeDevice). The probe stays free of src/common.h, which pulls in FFmpeg and VDR.
 struct DrmDeviceDeleter {
+    /// drmFreeDevice() takes the pointer's address.
     auto operator()(drmDevice *dev) const noexcept -> void { drmFreeDevice(&dev); }
 };
+/// Deleter for drmModePropertyBlobRes (drmModeFreePropertyBlob)
 struct DrmBlobDeleter {
+    /// Frees the blob and its data.
     auto operator()(drmModePropertyBlobRes *blob) const noexcept -> void { drmModeFreePropertyBlob(blob); }
 };
 } // namespace
 
-// Every (profile, required RT surface format) combination worth reporting. The
-// pipeline is 4:2:0 only; non-4:2:0 profiles (VP9 Profile 1/3, AV1 Profile 1/2,
-// HEVC range extensions, JPEG, ...) are out of scope and not listed. The
-// plugin-consumed subset is determined by ProbeDecodeProfiles' switch below
-// (mirrors GpuCaps in src/caps.cpp + STREAM_VIDEO_BACKEND_TABLE in src/stream.h).
-//
-// Naming convention: where the same VAProfile shows up at two bit-depths
-// (AV1 Profile 0, VVC Main 10), the rows share the profile name and the
-// right column ("8-bit 4:2:0" vs "10-bit 4:2:0") disambiguates them. Where
-// the bit-depth is part of the official VAProfile name (H.264 High 10, HEVC
-// Main 10/12), it stays in the name.
 namespace {
+/// One row of the decode matrix.
 struct DecodeProbe {
-    VAProfile profile;
-    unsigned int rtFormat;
-    const char *name;
+    VAProfile profile;     ///< Profile asked for a VLD entrypoint
+    unsigned int rtFormat; ///< VA_RT_FORMAT_* surface class the row needs
+    const char *name;      ///< Report label
 };
 } // namespace
+/// Every (profile, required RT surface format) combination worth reporting. The
+/// pipeline is 4:2:0 only; non-4:2:0 profiles (VP9 Profile 1/3, AV1 Profile 1/2,
+/// HEVC range extensions, JPEG, ...) are out of scope and not listed. The
+/// plugin-consumed subset is determined by ProbeDecodeProfiles' switch below
+/// (mirrors GpuCaps in src/caps.cpp + STREAM_VIDEO_BACKEND_TABLE in src/stream.h).
+///
+/// Naming convention: where the same VAProfile shows up at two bit-depths
+/// (AV1 Profile 0, VVC Main 10), the rows share the profile name and the
+/// right column ("8-bit 4:2:0" vs "10-bit 4:2:0") disambiguates them. Where
+/// the bit-depth is part of the official VAProfile name (H.264 High 10, HEVC
+/// Main 10/12), it stays in the name.
 constexpr DecodeProbe DECODE_PROBES[] = {
     // MPEG-2
     {.profile = VAProfileMPEG2Simple, .rtFormat = VA_RT_FORMAT_YUV420, .name = "MPEG-2 Simple"},
@@ -122,8 +127,8 @@ constexpr DecodeProbe DECODE_PROBES[] = {
     {.profile = VAProfileVVCMain10, .rtFormat = VA_RT_FORMAT_YUV420_10, .name = "VVC / H.266 Main 10"},
 };
 
-// General VPP filter types. Deinterlacing and HDR tone mapping are probed
-// separately because they require capability structs beyond a simple yes/no.
+/// General VPP filter types. Deinterlacing and HDR tone mapping are probed
+/// separately because they require capability structs beyond a simple yes/no.
 constexpr struct {
     VAProcFilterType type;
     const char *name;
@@ -136,7 +141,7 @@ constexpr struct {
     {.type = VAProcFilterHVSNoiseReduction, .name = "HVS Noise Reduction"},
 };
 
-// Listed highest-quality first so the first supported entry is the preferred choice.
+/// Listed highest-quality first so the first supported entry is the preferred choice.
 constexpr struct {
     VAProcDeinterlacingType type;
     const char *name;
@@ -149,6 +154,7 @@ constexpr struct {
 
 namespace {
 
+/// True if the driver offers full hardware decode (the VLD entrypoint) for @p profile.
 [[nodiscard]] auto SupportsVldEntrypoint(VADisplay display, VAProfile profile) -> bool {
     const int maxEntrypoints = vaMaxNumEntrypoints(display);
     if (maxEntrypoints <= 0) {
@@ -168,6 +174,7 @@ namespace {
     return std::ranges::find(valid, VAEntrypointVLD) != valid.end();
 }
 
+/// True if @p profile's VLD config accepts surfaces of class @p rtFormat.
 [[nodiscard]] auto SupportsRtFormat(VADisplay display, VAProfile profile, unsigned int rtFormat) -> bool {
     VAConfigAttrib attrib{};
     attrib.type = VAConfigAttribRTFormat;
@@ -177,6 +184,7 @@ namespace {
     return (attrib.value & rtFormat) != 0;
 }
 
+/// Render node of the card behind @p drmFd, which VAAPI opens like the plugin does; empty if there is none.
 [[nodiscard]] auto ResolveRenderNode(int drmFd) -> std::string {
     ::drmDevicePtr rawDev = nullptr;
     if (drmGetDevice2(drmFd, 0, &rawDev) != 0 || !rawDev) {
@@ -190,12 +198,13 @@ namespace {
     return dev->nodes[DRM_NODE_RENDER];
 }
 
+/// One report row: @p label, then a green yes or a red no.
 auto PrintCapability(const char *label, bool supported) -> void {
     std::printf("  %-44s %s\n", label, supported ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
 }
 
-// Human-readable label for each VA_RT_FORMAT class, used to annotate probe
-// rows with the surface layout required by each codec/profile.
+/// Human-readable label for each VA_RT_FORMAT class, used to annotate probe
+/// rows with the surface layout required by each codec/profile.
 [[nodiscard]] auto RtFormatLabel(unsigned int rtFormat) -> const char * {
     switch (rtFormat) {
         case VA_RT_FORMAT_YUV420:
@@ -209,14 +218,15 @@ auto PrintCapability(const char *label, bool supported) -> void {
     }
 }
 
-// Build a fixed-width "Name  (N-bit 4:X:X)" label for one probe row.
-// Thread-local buffer avoids heap allocation inside the probe loop.
+/// Build a fixed-width "Name  (N-bit 4:X:X)" label for one probe row.
+/// Thread-local buffer avoids heap allocation inside the probe loop.
 [[nodiscard]] auto FormatProbeLabel(const DecodeProbe &row) -> const char * {
     static thread_local std::array<char, 64> buf{};
     (void)std::snprintf(buf.data(), buf.size(), "%-29s (%s)", row.name, RtFormatLabel(row.rtFormat));
     return buf.data();
 }
 
+/// True if the driver allocates a surface of class @p rtFormat.
 [[nodiscard]] auto CanCreateSurface(VADisplay display, unsigned int rtFormat) -> bool {
     VASurfaceID surface = VA_INVALID_SURFACE;
     if (vaCreateSurfaces(display, rtFormat, PROBE_SURFACE_SIZE, PROBE_SURFACE_SIZE, &surface, 1, nullptr, 0) !=
@@ -227,22 +237,16 @@ auto PrintCapability(const char *label, bool supported) -> void {
     return true;
 }
 
-// Probe a specific FourCC, not just an RT_FORMAT class.  VA_RT_FORMAT_YUV420
-// covers any 8-bit 4:2:0 layout (NV12, YV12, IYUV, ...); a class-only probe can
-// succeed while the driver allocates a FourCC the pipeline cannot consume.
-// The plugin's VPP (scale_vaapi) output and the DRM video plane both require
-// NV12 for 8-bit and P010 for 10-bit.  Some older Intel drivers accept the
-// class but reject the explicit FourCC -- this catches that regression.
+/// Probe a specific FourCC, not just an RT_FORMAT class.  VA_RT_FORMAT_YUV420
+/// covers any 8-bit 4:2:0 layout (NV12, YV12, IYUV, ...); a class-only probe can
+/// succeed while the driver allocates a FourCC the pipeline cannot consume.
+/// The plugin's VPP (scale_vaapi) output and the DRM video plane both require
+/// NV12 for 8-bit and P010 for 10-bit.  Some older Intel drivers accept the
+/// class but reject the explicit FourCC -- this catches that regression.
 [[nodiscard]] auto CanCreateSurfaceFourcc(VADisplay display, unsigned int rtFormat, uint32_t fourcc) -> bool {
-    // NOLINTBEGIN(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
-    // VAGenericValue has no zero-valued enumerator, so brace-init triggers a
-    // clang-tidy warning; the union access is mandated by the libva ABI.
-    VASurfaceAttrib attrib{};
-    attrib.type = VASurfaceAttribPixelFormat;
-    attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
-    attrib.value.type = VAGenericValueTypeInteger;
-    attrib.value.value.i = static_cast<int>(fourcc);
-    // NOLINTEND(bugprone-invalid-enum-default-initialization, cppcoreguidelines-pro-type-union-access)
+    VASurfaceAttrib attrib{.type = VASurfaceAttribPixelFormat,
+                           .flags = VA_SURFACE_ATTRIB_SETTABLE,
+                           .value = {.type = VAGenericValueTypeInteger, .value = {.i = static_cast<int>(fourcc)}}};
 
     VASurfaceID surface = VA_INVALID_SURFACE;
     if (vaCreateSurfaces(display, rtFormat, PROBE_SURFACE_SIZE, PROBE_SURFACE_SIZE, &surface, 1, &attrib, 1) !=
@@ -253,8 +257,8 @@ auto PrintCapability(const char *label, bool supported) -> void {
     return true;
 }
 
-// Mirrors GpuCaps (src/caps.h): one flag per codec/bit-depth the plugin uses.
-// Populated by ProbeDecodeProfiles; consumed by PrintColorConversions.
+/// Mirrors GpuCaps (src/caps.h): one flag per codec/bit-depth the plugin uses.
+/// Populated by ProbeDecodeProfiles; consumed by PrintColorConversions.
 struct DecodeSupport {
     bool mpeg2 = false;       ///< MPEG-2 Simple or Main (8-bit)
     bool h264 = false;        ///< H.264 CBP / Main / High (8-bit)
@@ -269,6 +273,7 @@ struct DecodeSupport {
     bool vvcMain10 = false;   ///< VVC Main 10 at YUV420_10 (10-bit)
 };
 
+/// Print the decode matrix (DECODE_PROBES) and return the rows the plugin consumes.
 [[nodiscard]] auto ProbeDecodeProfiles(VADisplay display) -> DecodeSupport {
     std::printf("\n--- Hardware Decode (VLD + required RT format) ---\n");
 
@@ -361,17 +366,18 @@ struct DecodeSupport {
     return result;
 }
 
-// Per-direction tone-mapping support for the directions a broadcast pipeline uses
-// (SDR->HDR is deliberately excluded: no broadcast source requires it).  Not printed
-// directly; the results are surfaced through PrintColorConversions so the operator
-// sees them alongside the codec/surface context that makes them actionable.  The VPP
-// filter list already shows whether VAProcFilterHighDynamicRangeToneMapping is
-// advertised at all.
+/// Per-direction tone-mapping support for the directions a broadcast pipeline uses
+/// (SDR->HDR is deliberately excluded: no broadcast source requires it).  Not printed
+/// directly; the results are surfaced through PrintColorConversions so the operator
+/// sees them alongside the codec/surface context that makes them actionable.  The VPP
+/// filter list already shows whether VAProcFilterHighDynamicRangeToneMapping is
+/// advertised at all.
 struct HdrToneMapCaps {
     bool toHdr10{}; ///< VA_TONE_MAPPING_HDR_TO_HDR: HDR input (PQ or HLG) re-mastered to HDR10 output
     bool toSdr{};   ///< VA_TONE_MAPPING_HDR_TO_SDR: HDR input rendered down to SDR
 };
 
+/// HDR tone-mapping directions the VPP offers for HDR10 metadata; all false without the filter in @p filters.
 [[nodiscard]] auto ProbeHdrToneMapping(VADisplay display, VAContextID vppContext,
                                        std::span<const VAProcFilterType> filters) -> HdrToneMapCaps {
     HdrToneMapCaps result;
@@ -399,6 +405,7 @@ struct HdrToneMapCaps {
     return result;
 }
 
+/// Print which deinterlacers the VPP advertises, best first.
 auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
     std::printf("\n--- Deinterlacing Algorithms ---\n");
 
@@ -417,6 +424,7 @@ auto ProbeDeinterlacing(VADisplay display, VAContextID vppContext) -> void {
     }
 }
 
+/// Print the conversion paths the plugin can take with what was probed (10 -> 8 bit, HDR -> SDR, ...).
 auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12, const HdrToneMapCaps &toneMap)
     -> void {
     std::printf("\n--- Color Conversion Paths ---\n");
@@ -450,6 +458,7 @@ auto PrintColorConversions(const DecodeSupport &dec, bool hasP010, bool hasNV12,
 
 namespace {
 
+/// Report label for a DRM connector type.
 [[nodiscard]] auto ConnectorTypeName(uint32_t t) -> const char * {
     switch (t) {
         case DRM_MODE_CONNECTOR_HDMIA:
@@ -483,6 +492,7 @@ namespace {
     }
 }
 
+/// Report label for a DRM plane type.
 [[nodiscard]] auto PlaneTypeName(uint64_t t) -> const char * {
     switch (t) {
         case DRM_PLANE_TYPE_PRIMARY:
@@ -496,6 +506,7 @@ namespace {
     }
 }
 
+/// One row for a driver cap and its value.
 auto PrintDrmCap(int fd, const char *name, uint64_t cap) -> void {
     uint64_t value = 0;
     const bool hasCap = drmGetCap(fd, cap, &value) == 0;
@@ -506,6 +517,7 @@ auto PrintDrmCap(int fd, const char *name, uint64_t cap) -> void {
     std::printf("  %-44s %s%s\n", name, enabled ? "\033[32myes\033[0m" : "\033[31mno\033[0m", detail.c_str());
 }
 
+/// One row for a client cap: whether the driver lets the plugin set it.
 auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     // Probe is non-destructive: setting these caps for the duration of the process is fine,
     // the runtime sets the same caps itself.
@@ -513,7 +525,7 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     std::printf("  %-44s %s\n", name, ok ? "\033[32myes\033[0m" : "\033[31mno\033[0m");
 }
 
-// Friendly vendor name for the common GPU PCI vendor IDs.
+/// Friendly vendor name for the common GPU PCI vendor IDs.
 [[nodiscard]] auto PciVendorName(uint16_t vendorId) -> const char * {
     switch (vendorId) {
         case 0x8086:
@@ -529,9 +541,9 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     }
 }
 
-// First parsable unsigned value among candidate sysfs paths. Kernels moved the i915
-// frequency knobs from card<N>/gt_*_freq_mhz to card<N>/gt/gt0/rps_*_freq_mhz, so both
-// layouts are tried in order. from_chars keeps the parse locale-independent.
+/// First parsable unsigned value among candidate sysfs paths. Kernels moved the i915
+/// frequency knobs from card<N>/gt_*_freq_mhz to card<N>/gt/gt0/rps_*_freq_mhz, so both
+/// layouts are tried in order. from_chars keeps the parse locale-independent.
 [[nodiscard]] auto ReadSysfsUint(std::span<const std::string> paths) -> std::optional<uint64_t> {
     for (const auto &path : paths) {
         std::ifstream file(path);
@@ -549,9 +561,9 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return std::nullopt;
 }
 
-// Resolve the sysfs class directory (/sys/class/drm/cardN) from a DRM device's libdrm
-// primary-node path -- robust across primary/render nodes and symlinks, unlike deriving
-// it from the opened fd's minor number. Empty if no primary node is advertised.
+/// Resolve the sysfs class directory (/sys/class/drm/cardN) from a DRM device's libdrm
+/// primary-node path -- robust across primary/render nodes and symlinks, unlike deriving
+/// it from the opened fd's minor number. Empty if no primary node is advertised.
 [[nodiscard]] auto DrmSysfsCardDir(const ::drmDevice &dev) -> std::string {
     if ((dev.available_nodes & (1 << DRM_NODE_PRIMARY)) == 0 || dev.nodes[DRM_NODE_PRIMARY] == nullptr) {
         return {};
@@ -561,8 +573,8 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return "/sys/class/drm/" + nodePath.substr(slashPos == std::string::npos ? 0 : slashPos + 1);
 }
 
-// One i915 GETPARAM integer (e.g. EU / subslice topology). nullopt on a non-i915
-// driver or an unsupported parameter.
+/// One i915 GETPARAM integer (e.g. EU / subslice topology). nullopt on a non-i915
+/// driver or an unsupported parameter.
 [[nodiscard]] auto I915GetParam(int fd, int param) -> std::optional<int> {
     int value = 0;
     drm_i915_getparam_t gp{};
@@ -574,8 +586,8 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return value;
 }
 
-// Parse a leading base-16 id from a null-terminated line span [first, last). On success
-// returns the value and the past-the-digits pointer; nullopt if no hex digits lead.
+/// Parse a leading base-16 id from a null-terminated line span [first, last). On success
+/// returns the value and the past-the-digits pointer; nullopt if no hex digits lead.
 [[nodiscard]] auto ParseHexPrefix(const char *first, const char *last)
     -> std::optional<std::pair<unsigned, const char *>> {
     unsigned value = 0;
@@ -588,10 +600,10 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return std::make_pair(value, ptr);
 }
 
-// Marketing name for a PCI vendor:device pair from the system pci.ids database (the
-// source lspci uses), e.g. 1002:1681 -> "Rembrandt [Radeon 680M]". Empty if the file
-// or the entry is absent. Layout: vendor lines start in column 0, device lines are
-// indented one tab, both "<hex-id>  <name>"; entries are sorted by id.
+/// Marketing name for a PCI vendor:device pair from the system pci.ids database (the
+/// source lspci uses), e.g. 1002:1681 -> "Rembrandt [Radeon 680M]". Empty if the file
+/// or the entry is absent. Layout: vendor lines start in column 0, device lines are
+/// indented one tab, both "<hex-id>  <name>"; entries are sorted by id.
 [[nodiscard]] auto LookupPciDeviceName(uint16_t vendorId, uint16_t deviceId) -> std::string {
     static constexpr std::array<const char *, 3> kPciIdsPaths{"/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                                                               "/usr/share/pci.ids"};
@@ -628,8 +640,8 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return {};
 }
 
-// amdgpu engine-clock (sclk) range from the DPM state table device/pp_dpm_sclk, whose
-// lines read "<idx>: <freq>Mhz [*]". Returns (min, max) in MHz, nullopt if unreadable.
+/// amdgpu engine-clock (sclk) range from the DPM state table device/pp_dpm_sclk, whose
+/// lines read "<idx>: <freq>Mhz [*]". Returns (min, max) in MHz, nullopt if unreadable.
 [[nodiscard]] auto ReadAmdgpuSclkRange(const std::string &cardDir) -> std::optional<std::pair<uint64_t, uint64_t>> {
     std::ifstream file(cardDir + "/device/pp_dpm_sclk");
     if (!file) {
@@ -661,9 +673,9 @@ auto PrintDrmClientCap(int fd, const char *name, uint64_t cap) -> void {
     return std::make_pair(lo, hi);
 }
 
-// PCI identity, execution-unit topology, and GPU clock range. PCI fields come from
-// libdrm and work on any PCI GPU; EU/subslice counts and the clock range are read via
-// Intel i915 GETPARAM + sysfs (the plugin's target) and silently skipped elsewhere.
+/// PCI identity, execution-unit topology, and GPU clock range. PCI fields come from
+/// libdrm and work on any PCI GPU; EU/subslice counts and the clock range are read via
+/// Intel i915 GETPARAM + sysfs (the plugin's target) and silently skipped elsewhere.
 auto PrintGpuHardware(int fd, const char *driverName) -> void {
     std::printf("\n--- GPU Hardware ---\n");
 
@@ -726,6 +738,7 @@ auto PrintGpuHardware(int fd, const char *driverName) -> void {
     }
 }
 
+/// Print the driver, the GPU hardware and the device and client caps the plugin relies on.
 auto ProbeDrmDeviceCaps(int fd) -> void {
     std::printf("\n--- DRM Driver ---\n");
     std::string driverName;
@@ -754,11 +767,13 @@ auto ProbeDrmDeviceCaps(int fd) -> void {
     PrintDrmClientCap(fd, "ASPECT_RATIO     (mode aspect)", DRM_CLIENT_CAP_ASPECT_RATIO);
 }
 
+/// One property of a DRM object.
 struct PropEntry {
-    uint64_t value;
-    std::string name;
+    uint64_t value;   ///< Current value
+    std::string name; ///< Property name, as the kernel spells it
 };
 
+/// All properties of a DRM object; empty when it has none or they cannot be read.
 [[nodiscard]] auto LoadObjectProps(int fd, uint32_t objectId, uint32_t objectType) -> std::vector<PropEntry> {
     std::vector<PropEntry> out;
     drmModeObjectProperties *props = drmModeObjectGetProperties(fd, objectId, objectType);
@@ -777,6 +792,7 @@ struct PropEntry {
     return out;
 }
 
+/// The property called @p name, or nullptr.
 [[nodiscard]] auto FindProp(const std::vector<PropEntry> &props, const char *name) -> const PropEntry * {
     for (const auto &p : props) {
         if (p.name == name) {
@@ -786,10 +802,10 @@ struct PropEntry {
     return nullptr;
 }
 
-// What the sink advertises in its EDID CTA-861 blocks -- the display half of the HDR decision (the
-// plugin's auto gate needs PQ + BT.2020 Y'CbCr). Mirrors src/display.cpp plus luminance, the
-// dynamic-HDR systems DVB broadcasts use (HDR10+, SL-HDR, Dolby Vision), and the HDMI 2.1
-// game-VRR range from the HDMI Forum VSDB.
+/// What the sink advertises in its EDID CTA-861 blocks -- the display half of the HDR decision (the
+/// plugin's auto gate needs PQ + BT.2020 Y'CbCr). Mirrors src/caps.cpp plus luminance, the
+/// dynamic-HDR systems DVB broadcasts use (HDR10+, SL-HDR, Dolby Vision), and the HDMI 2.1
+/// game-VRR range from the HDMI Forum VSDB.
 struct SinkHdrCaps {
     bool eotfSdr{};        ///< HDR Static Metadata EOTF bit 0 (traditional gamma SDR)
     bool eotfHdrGamma{};   ///< EOTF bit 1 (traditional gamma HDR)
@@ -815,18 +831,17 @@ struct SinkHdrCaps {
     uint8_t maxLumaCode{}; ///< Desired content max luminance (CTA code; nits = 50 * 2^(code/32))
 };
 
-constexpr size_t EDID_BLOCK_BYTES = 128;
-constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126;
-constexpr size_t EDID_CHECKSUM_OFFSET = 127;
+constexpr size_t EDID_BLOCK_BYTES = 128;            ///< One EDID block
+constexpr size_t EDID_EXTENSION_COUNT_OFFSET = 126; ///< Base-block byte: number of extension blocks
+constexpr size_t EDID_CHECKSUM_OFFSET = 127;        ///< Last byte of every block: its checksum
 
 /// Desired-content-luminance EDID code -> cd/m^2 (CTA-861-G sec.7.5.13).
 [[nodiscard]] auto LuminanceCodeToNits(uint8_t code) -> double { return 50.0 * std::pow(2.0, code / 32.0); }
 
 /// Parse one 128-byte CTA-861 extension block (tag 0x02). OR results into @p caps so multiple
-/// extension blocks accumulate. Mirrors src/display.cpp ParseCtaExtension plus the dynamic-HDR
+/// extension blocks accumulate. Mirrors src/caps.cpp ParseCtaExtension plus the dynamic-HDR
 /// blocks and luminance.
 auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -> void {
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- spans are size-checked
     if (ext.size() < 4 || ext[0] != 0x02) {
         return;
     }
@@ -913,14 +928,12 @@ auto ParseCtaExtensionForSink(std::span<const uint8_t> ext, SinkHdrCaps &caps) -
         }
         offset += 1 + payloadLen;
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
 /// Parse the EDID base block for the VRR-relevant bits: the continuous-frequency feature flag and
 /// the range-limits descriptor's vertical rate span (VESA EDID 1.4 sec.3.10.3.3). On DP/eDP these
 /// are exactly what the kernel folds into the connector's vrr_capable property.
 auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> void {
-    // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- span is size-checked
     if (base.size() < EDID_BLOCK_BYTES) {
         return;
     }
@@ -939,7 +952,6 @@ auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> 
         caps.rangeMaxHz = static_cast<uint16_t>(base[off + 6] + (((flags & 0x02U) != 0) ? 255U : 0U));
         break;
     }
-    // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 }
 
 /// Read and parse a connector's EDID blob into @p caps. Returns false if no usable EDID was found.
@@ -955,7 +967,6 @@ auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> 
     }
     const std::span<const uint8_t> edid{static_cast<const uint8_t *>(blob->data), blob->length};
     ParseBaseBlockForSink(edid.first(EDID_BLOCK_BYTES), caps);
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access) -- bounded by the size check
     const size_t extCount = edid[EDID_EXTENSION_COUNT_OFFSET];
     for (size_t i = 0; i < extCount; ++i) {
         const size_t extOffset = EDID_BLOCK_BYTES * (i + 1);
@@ -967,6 +978,7 @@ auto ParseBaseBlockForSink(std::span<const uint8_t> base, SinkHdrCaps &caps) -> 
     return true;
 }
 
+/// Print what the sink's EDID advertises (see SinkHdrCaps).
 auto PrintSinkHdrCaps(int fd, const std::vector<PropEntry> &props) -> void {
     SinkHdrCaps caps;
     if (!ParseConnectorEdid(fd, props, caps)) {
@@ -1015,8 +1027,8 @@ auto PrintSinkHdrCaps(int fd, const std::vector<PropEntry> &props) -> void {
     }
 }
 
-// The connector only carries its mode *list*; the mode actually scanning out lives on the
-// CRTC reached through the connector's active encoder.
+/// The connector only carries its mode *list*; the mode actually scanning out lives on the
+/// CRTC reached through the connector's active encoder.
 auto PrintCurrentConnectorMode(int fd, const drmModeConnector *c) -> void {
     uint32_t crtcId = 0;
     if (c->encoder_id != 0) {
@@ -1048,6 +1060,7 @@ auto PrintCurrentConnectorMode(int fd, const drmModeConnector *c) -> void {
     }
 }
 
+/// Print each connected connector: modes, HDR/VRR properties, sink EDID. Disconnected ones are only counted.
 auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
     std::printf("\n--- DRM Connectors ---\n");
     uint32_t disconnected = 0;
@@ -1092,6 +1105,7 @@ auto ProbeDrmConnectors(int fd, drmModeRes *res) -> void {
     }
 }
 
+/// The facts about one plane that decide the plugin's video and OSD plane choice.
 struct PlaneSummary {
     uint32_t id;            ///< DRM plane object ID
     uint64_t type;          ///< DRM_PLANE_TYPE_* or ~0 if absent
@@ -1102,7 +1116,7 @@ struct PlaneSummary {
     uint64_t colorEncoding; ///< current value, ~0 if property absent
 };
 
-// Collapse one plane's IN_FORMATS / properties to a few yes/no flags.
+/// Collapse one plane's IN_FORMATS / properties to a few yes/no flags.
 [[nodiscard]] auto SummarizePlane(int fd, drmModePlane *plane, const std::vector<PropEntry> &props) -> PlaneSummary {
     PlaneSummary s{
         .id = plane->plane_id,
@@ -1133,10 +1147,9 @@ struct PlaneSummary {
         const auto formatsOffset = static_cast<size_t>(formatsHeader->formats_offset);
         const auto formatsBytes = static_cast<size_t>(formatsHeader->count_formats) * sizeof(uint32_t);
         if (formatsOffset <= blob->length && formatsBytes <= blob->length - formatsOffset) {
-            const auto *blobBytes = static_cast<const uint8_t *>(blob->data) + formatsOffset;
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- mandated by DRM blob layout
-            const auto *formatData = reinterpret_cast<const uint32_t *>(blobBytes);
-            formats = {formatData, formatsHeader->count_formats};
+            // formats_offset is a byte offset into the blob (DRM ABI).
+            const void *formatsStart = static_cast<const uint8_t *>(blob->data) + formatsOffset;
+            formats = {static_cast<const uint32_t *>(formatsStart), formatsHeader->count_formats};
         }
     }
     if (formats.empty()) {
@@ -1157,6 +1170,7 @@ struct PlaneSummary {
     return s;
 }
 
+/// Print plane counts by type and format, and any plane left with a non-default COLOR_ENCODING.
 auto ProbeDrmPlanes(int fd) -> void {
     std::printf("\n--- DRM Planes ---\n");
     drmModePlaneRes *planeRes = drmModeGetPlaneResources(fd);
@@ -1230,6 +1244,7 @@ auto ProbeDrmPlanes(int fd) -> void {
     drmModeFreePlaneResources(planeRes);
 }
 
+/// The DRM half of the report for @p devicePath: driver, resources, connectors, planes.
 auto ProbeDrm(const char *devicePath) -> void {
     std::printf("\n================================================\n"
                 "DRM Capability Trace (%s)\n"
@@ -1258,6 +1273,7 @@ auto ProbeDrm(const char *devicePath) -> void {
 
 } // namespace
 
+/// `vaapivideo-probe [/dev/dri/cardN]`: print the VAAPI and DRM capability report for that card.
 auto main(int argc, char *argv[]) -> int {
     if (argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0)) {
         std::printf("Usage: %s [/dev/dri/cardN]  (default: /dev/dri/card0)\n", argv[0]);

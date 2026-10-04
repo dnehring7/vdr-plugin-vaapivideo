@@ -54,6 +54,7 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< MPEG video base; mask 0
 // === INTERNAL HELPERS ===
 // ============================================================================
 
+/// The 33-bit PTS/DTS in the 5 bytes at @p bytes; AV_NOPTS_VALUE when a marker bit is missing.
 [[nodiscard]] inline auto ParseTimestamp(const uint8_t *bytes) noexcept -> int64_t {
     // 33-bit value packed as three fragments (3+15+15 bits), each word ending with a
     // mandatory marker bit (sec.2.4.3.7). All three marker bits must be 1; a missing marker

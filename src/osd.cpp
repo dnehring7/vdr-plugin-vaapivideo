@@ -54,12 +54,13 @@ cOsdProvider *osdProvider = nullptr;
 
 namespace {
 
-// cOsd's 3-arg constructor is protected and only befriended to cOsdProvider, so
-// `new cOsd(...)` is not callable directly. This thin subclass exposes it so CreateOsd() can
-// return a safe no-op object when the display is not yet attached (inheriting cOsd's default
-// behavior: no painting, level=999, not active).
+/// cOsd's 3-arg constructor is protected and only befriended to cOsdProvider, so
+/// `new cOsd(...)` is not callable directly. This thin subclass exposes it so CreateOsd() can
+/// return a safe no-op object when the display is not yet attached (inheriting cOsd's default
+/// behavior: no painting, level=999, not active).
 class cVaapiDummyOsd : public cOsd {
   public:
+    /// Forwards to cOsd's protected constructor.
     cVaapiDummyOsd(int leftArg, int topArg, uint levelArg) : cOsd(leftArg, topArg, levelArg) {}
 };
 

@@ -476,9 +476,12 @@ deinterlacing, and IEC61937 audio passthrough work identically.
 
 - **Main menu → Mediaplayer** — file browser rooted at `--media-dir`
   (default `/`). Directories enter on `OK`; m3u files launch as playlists;
-  media files play directly. `Yellow` deletes the file or playlist under the
-  cursor after a confirmation; directories and anything outside `--media-dir`
-  are never deleted. The browser lists
+  media files play directly. `Yellow` deletes the file, playlist or folder
+  under the cursor after a confirmation; a folder goes with everything in it,
+  hidden files included, in the background. Nothing outside `--media-dir` is
+  deleted, and folders only with an explicit `--media-dir`, since the default
+  `/` would put the whole system in reach. Symlinks are removed, never
+  followed, and a delete stops at a mount point. The browser lists
   `.mp4 .mkv .avi .mov .ts .m4v .webm` plus `.m3u/.m3u8`.
 - **SVDRP** — `PLUG vaapivideo PLAY <uri>` accepts any URI libavformat can
   open (a video stream is required — audio-only formats are not supported).
@@ -808,20 +811,24 @@ threading, buffering, correction regimes, diagnostics — is documented in
 | `src/caps.cpp`        | GPU / display / audio-sink capability probing (VAAPI, EDID, ELD)                      |
 | `src/config.cpp`      | Resolution parsing, `setup.conf` storage                                              |
 | `src/common.h`        | RAII deleters, `AvErr()` helper, version/API guards                                   |
+| `vaapivideo-probe.cpp`| Standalone capability prober (`make probe`); shares no code with the plugin           |
+
+Each `src/*.cpp` has a header of the same name holding its interface.
 
 ### Build targets
 
-| Target         | Description                                      |
-|----------------|--------------------------------------------------|
-| `make`         | Release build (`-O3`, LTO, strip) + translations |
-| `make install` | Install plugin and translations                  |
-| `make i18n`    | Refresh `po/*.po` from the sources, build `.mo`  |
-| `make clean`   | Remove build artifacts                           |
-| `make dist`    | Create source tarball                            |
-| `make indent`  | Format sources with clang-format                 |
-| `make lint`    | Static analysis with clang-tidy (requires bear)  |
-| `make docs`    | Generate Doxygen HTML documentation              |
-| `make probe`   | Build the `vaapivideo-probe` diagnostic tool     |
+| Target                | Description                                                            |
+|-----------------------|------------------------------------------------------------------------|
+| `make`                | Plugin + translations with VDR's compiler flags (fallback: `-O3`, LTO) |
+| `make DEV_WARNINGS=1` | The same with strict warnings as errors — the development build        |
+| `make install`        | Install plugin and translations                                        |
+| `make i18n`           | Refresh `po/*.po` from the sources, build `.mo`                        |
+| `make clean`          | Remove build artifacts                                                 |
+| `make dist`           | Create source tarball                                                  |
+| `make indent`         | Format sources with clang-format                                       |
+| `make lint`           | Static analysis with clang-tidy (requires bear)                        |
+| `make docs`           | Doxygen HTML; fails on any undocumented entity, the probe included     |
+| `make probe`          | Build the `vaapivideo-probe` diagnostic tool                           |
 
 OSD texts are translated through VDR's gettext catalogs (`po/`: Dutch,
 Finnish, French, German, Italian, Spanish); log messages and SVDRP replies stay

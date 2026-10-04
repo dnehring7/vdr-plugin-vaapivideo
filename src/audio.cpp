@@ -80,10 +80,10 @@ static_assert(PTS_TICKS_PER_MS == PTSTICKS / 1000, "PTS_TICKS_PER_MS must equal 
 
 namespace {
 
-// Shared AV cushion: the ring stays near-full in steady state, so the audio clock lags
-// real time by ~this much. The video due-gate accumulates the matching frame count in
-// jitterBuf so audio and video share one cushion and lip-sync is preserved. This is a
-// floor; ALSA may negotiate slightly larger. See AVSYNC.md.
+/// Shared AV cushion: the ring stays near-full in steady state, so the audio clock lags
+/// real time by ~this much. The video due-gate accumulates the matching frame count in
+/// jitterBuf so audio and video share one cushion and lip-sync is preserved. This is a
+/// floor; ALSA may negotiate slightly larger. See AVSYNC.md.
 constexpr int AUDIO_ALSA_BUFFER_MS = 800;
 
 /// Ring fill the DAC starts at = the cushion the stream keeps for good (the 1x feed never grows it
@@ -107,8 +107,8 @@ constexpr int AUDIO_ALSA_EAGAIN_WAIT_LIMIT = 400; // ~2 s
     return static_cast<snd_pcm_sframes_t>(static_cast<uint64_t>(rate) * AUDIO_ALSA_BUFFER_MS * 2 / 1000);
 }
 
-// After this age GetClock() returns AV_NOPTS_VALUE to force video freerun instead of
-// drifting against a frozen audio clock (channel switch, dead ALSA device).
+/// After this age GetClock() returns AV_NOPTS_VALUE to force video freerun instead of
+/// drifting against a frozen audio clock (channel switch, dead ALSA device).
 constexpr uint64_t AUDIO_CLOCK_STALE_MS = 1000;
 
 constexpr int AUDIO_DECODER_DRAIN_TIMEOUT_MS =
@@ -854,7 +854,7 @@ auto cAudioProcessor::DrainAtEos(uint32_t generation, bool passthrough) -> void 
     }
     int parserTailBytes = 0;
     if (parserCtx && decoder) {
-        uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
+        uint8_t *parsedData = nullptr;
         int parsedSize = 0;
         const int parsed = av_parser_parse2(parserCtx.get(), decoder.get(), &parsedData, &parsedSize, nullptr, 0,
                                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
@@ -1245,6 +1245,13 @@ namespace {
         default:
             return AV_CHAN_NONE;
     }
+}
+
+/// PCM bytes as S16 samples, in place. Sound: the output is locked to S16 (ConfigureAlsaParams()), and the
+/// callers' vector storage is int16_t-aligned.
+[[nodiscard]] auto S16Samples(std::span<uint8_t> pcm) noexcept -> std::span<int16_t> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- S16 by contract, see above
+    return {reinterpret_cast<int16_t *>(pcm.data()), pcm.size() / sizeof(int16_t)};
 }
 
 } // namespace
@@ -1655,9 +1662,9 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         const int maxOutSamples = std::max(estimatedOut, frame->nb_samples) + 128;
         std::vector<uint8_t> convertedBuffer(static_cast<size_t>(maxOutSamples) * outCh * 2);
 
-        // outPtr cannot be const: swr_convert writes through &outPtr.
-        uint8_t *outPtr = convertedBuffer.data(); // NOLINT(misc-const-correctness)
-        const int converted = swr_convert(swrCtx, &outPtr, maxOutSamples, frame->data, frame->nb_samples);
+        // Interleaved S16 is a single plane.
+        const std::array<uint8_t *, 1> outPlanes{convertedBuffer.data()};
+        const int converted = swr_convert(swrCtx, outPlanes.data(), maxOutSamples, frame->data, frame->nb_samples);
 
         if (converted < 0) [[unlikely]] {
             esyslog("vaapivideo/audio: swr_convert failed");
@@ -1696,8 +1703,8 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
             if (const int pendingOut = swr_get_out_samples(swrCtx, 0); pendingOut > 0) {
                 const auto outCh = static_cast<unsigned>(swrOutChannels);
                 std::vector<uint8_t> tail(static_cast<size_t>(pendingOut + 128) * outCh * 2);
-                uint8_t *outPtr = tail.data(); // NOLINT(misc-const-correctness)
-                const int converted = swr_convert(swrCtx, &outPtr, pendingOut + 128, nullptr, 0);
+                const std::array<uint8_t *, 1> outPlanes{tail.data()};
+                const int converted = swr_convert(swrCtx, outPlanes.data(), pendingOut + 128, nullptr, 0);
                 if (converted > 0 && clearGeneration.load(std::memory_order_acquire) == expectedGeneration) {
                     (void)EmitConvertedPcm(std::span<uint8_t>(tail), static_cast<unsigned>(converted), outCh,
                                            expectedGeneration);
@@ -1718,8 +1725,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
     // No-op when the packed count is 0 (device matches swr / order unreadable). The count guard also drops a
     // torn read against an in-flight reopen -- the caller's generation check drops such frames anyway.
     if (const uint64_t packed = channelReorder.load(std::memory_order_acquire); (packed & 0xFU) == outCh && outCh > 2) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): pcm holds S16_LE by contract.
-        auto *samples = reinterpret_cast<int16_t *>(pcm.data());
+        int16_t *const samples = S16Samples(pcm).data();
         std::array<int16_t, 8> slotSamples{};
         for (unsigned f = 0; f < frames; ++f) {
             int16_t *base = samples + (static_cast<size_t>(f) * outCh);
@@ -1737,7 +1743,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
 }
 
 namespace {
-// AVIO write callback for the spdif muxer: appends IEC61937 burst bytes to spdifOutputBuf.
+/// AVIO write callback for the spdif muxer: appends IEC61937 burst bytes to spdifOutputBuf.
 auto SpdifWriteCallback(void *opaque, const uint8_t *buf, int bufSize) -> int {
     auto &output = *static_cast<std::vector<uint8_t> *>(opaque);
     output.insert(output.end(), buf, buf + bufSize);
@@ -1770,8 +1776,8 @@ auto cAudioProcessor::OpenSpdifMuxer(AVCodecID codecId, int sampleRate) -> bool 
         return false;
     }
 
-    // stream pointee cannot be const: codecpar fields are mutated below.
-    AVStream *const stream = avformat_new_stream(spdifMuxCtx, nullptr); // NOLINT(misc-const-correctness)
+    // const: the writes below go through its codecpar pointer.
+    const AVStream *const stream = avformat_new_stream(spdifMuxCtx, nullptr);
     if (!stream) {
         CloseSpdifMuxer();
         return false;
@@ -1842,6 +1848,7 @@ constexpr unsigned AUDIO_IEC958_CTL_SCAN_LIMIT = 16;
 /// ELD index sweep bound: multi-port HDMI cards expose one ELD per physical port.
 constexpr unsigned AUDIO_ELD_SCAN_LIMIT = 8;
 
+/// True if the card has control @p name at @p device / @p index; queried via its info, never opened.
 [[nodiscard]] auto CtlElemExists(snd_ctl_t *ctl, snd_ctl_elem_iface_t iface, const char *name, unsigned device,
                                  unsigned index) noexcept -> bool {
     snd_ctl_elem_id_t *id = nullptr;
@@ -1857,6 +1864,7 @@ constexpr unsigned AUDIO_ELD_SCAN_LIMIT = 8;
     return snd_ctl_elem_info(ctl, info) == 0;
 }
 
+/// True if a PCM's name marks a digital output: the fallback for cards that expose no ELD control.
 [[nodiscard]] auto IsDigitalPcmName(const char *name) noexcept -> bool {
     if (name == nullptr) [[unlikely]] {
         return false;
@@ -2505,17 +2513,10 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
         scaledBuffer.assign(data.size(), 0);
         data = std::span<const uint8_t>(scaledBuffer.data(), scaledBuffer.size());
     } else if (!passthrough && currentVolume != 255) {
-        // PCM partial attenuation. Format is always S16LE (ConfigureAlsaParams() locks it), so the
-        // int16_t reinterpret is safe. Passthrough is never scaled (only muted, handled above).
-        scaledBuffer.resize(data.size());
-        const auto *src =
-            reinterpret_cast<const int16_t *>(data.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        auto *dst =
-            reinterpret_cast<int16_t *>(scaledBuffer.data()); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        const size_t samples = data.size() / sizeof(int16_t);
-
-        for (size_t i = 0; i < samples; ++i) {
-            dst[i] = static_cast<int16_t>((src[i] * currentVolume) / 255);
+        // PCM partial attenuation, on a copy: `data` is the caller's. Passthrough is only ever muted (above).
+        scaledBuffer.assign(data.begin(), data.end());
+        for (int16_t &sample : S16Samples(scaledBuffer)) {
+            sample = static_cast<int16_t>((sample * currentVolume) / 255);
         }
         data = std::span<const uint8_t>(scaledBuffer.data(), scaledBuffer.size());
     }
@@ -2593,9 +2594,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
             eagainWaits = 0;
         }
 
-        // ESTRPIPE arrives via <alsa/asoundlib.h>; clang-tidy's IWYU misses that path.
-        if ((err == -EINTR || err == -EPIPE || err == -ESTRPIPE) && // NOLINT(misc-include-cleaner)
-            snd_pcm_recover(alsaHandle, err, 1) >= 0) {
+        if ((err == -EINTR || err == -EPIPE || err == -ESTRPIPE) && snd_pcm_recover(alsaHandle, err, 1) >= 0) {
             // Only -EPIPE is an underrun, and only an underrun is audible (ring ran dry; DAC silent until
             // the start threshold refills) -- EINTR/ESTRPIPE recover gapless and must not inflate the
             // dropout diagnostic. Silent recovery used to hide underruns entirely (visible only in

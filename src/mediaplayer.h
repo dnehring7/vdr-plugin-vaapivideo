@@ -43,6 +43,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 // VDR
@@ -103,6 +104,9 @@ auto RequestBrowserReopen() -> void;
 /// Flush a bookmark staged off-thread (SVDRP teardown) to setup.conf; no-op when nothing is pending.
 /// Called from the plugin's Housekeeping(). VDR main thread only.
 auto FlushPendingBookmarkSave() -> void;
+
+/// Stop a running background folder delete and join it; the rest of its tree stays. Plugin Stop(), main thread.
+auto ShutdownFolderDelete() -> void;
 
 // ============================================================================
 // === MEDIA SOURCE ===
@@ -581,8 +585,8 @@ class cVaapiFileBrowser final : public cOsdMenu {
     auto operator=(const cVaapiFileBrowser &) -> cVaapiFileBrowser & = delete;
     auto operator=(cVaapiFileBrowser &&) noexcept -> cVaapiFileBrowser & = delete;
 
-    /// cOsdMenu hook: kOk enters a directory or starts playback, kYellow deletes the file under the
-    /// cursor, kBack pops to the parent.
+    /// cOsdMenu hook: kOk enters a directory or starts playback, kYellow deletes the file, playlist or
+    /// folder under the cursor, kBack pops to the parent.
     [[nodiscard]] auto ProcessKey(eKeys Key) -> eOSState override;
 
   private:
@@ -601,13 +605,18 @@ class cVaapiFileBrowser final : public cOsdMenu {
     [[nodiscard]] auto SelectEntryByName(std::string_view name) -> bool;
     /// Entry under the cursor, or nullptr for an empty listing.
     [[nodiscard]] auto SelectedEntry() const -> const BrowserEntry *;
-    /// Entry under the cursor if it is a file or playlist inside mediaRoot, else nullptr. Directories are
-    /// never deletable (the delete would be recursive), and ".." is not a file.
+    /// Entry under the cursor if it may be deleted, else nullptr: inside mediaRoot, never "..", no folder while
+    /// mediaRoot is "/", nothing while a folder delete runs.
     [[nodiscard]] auto SelectedDeletable() const -> const BrowserEntry *;
     /// Absolute path of @p entry, i.e. currentDir joined with its name.
     [[nodiscard]] auto BuildFullPath(const BrowserEntry &entry) const -> std::string;
-    /// Confirm, then unlink the file or playlist under the cursor and relist; the cursor stays on its row.
+    /// Confirm, then unlink the entry under the cursor, or hand a folder to a background thread. Works on
+    /// currentDir pinned before the prompt; never crosses a mount, never follows a link.
     auto DeleteSelected() -> void;
+    /// Log and show why deleting @p fullPath failed, then relist.
+    auto DeleteFailed(const std::string &fullPath, const std::error_code &ec) -> void;
+    /// Relist currentDir, cursor kept on its row: after a delete the next entry, as in VDR's recordings menu.
+    auto ReloadKeepingRow() -> void;
     /// Show the Yellow "Delete" button only on a deletable row.
     auto SetHelpKeys() -> void;
 

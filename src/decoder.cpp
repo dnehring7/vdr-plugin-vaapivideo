@@ -53,6 +53,7 @@
 // C++ Standard Library
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -423,7 +424,7 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
     int64_t currentPts = pts;
 
     while (parseSize > 0) {
-        uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
+        uint8_t *parsedData = nullptr;
         int parsedSize = 0;
 
         const int parsed = av_parser_parse2(parserCtx.get(), codecCtx.get(), &parsedData, &parsedSize, parseData,
@@ -617,7 +618,7 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
         return;
     }
 
-    uint8_t *parsedData = nullptr; // NOLINT(misc-const-correctness) -- av_parser_parse2 out-param
+    uint8_t *parsedData = nullptr;
     int parsedSize = 0;
     const int parsed = av_parser_parse2(parserCtx.get(), codecCtx.get(), &parsedData, &parsedSize, nullptr, 0,
                                         AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
@@ -914,8 +915,8 @@ namespace {
     return nullptr;
 }
 
-// AVCodecContext::get_format callback: pin decode output to VAAPI surfaces. Without this FFmpeg may
-// silently fall back to SW frames. Free function (not a lambda) so it reads as the C callback it is.
+/// AVCodecContext::get_format callback: pin decode output to VAAPI surfaces. Without this FFmpeg may
+/// silently fall back to SW frames. Free function (not a lambda) so it reads as the C callback it is.
 [[nodiscard]] auto SelectVaapiPixelFormat(AVCodecContext * /*ctx*/, const AVPixelFormat *formats) -> AVPixelFormat {
     for (const AVPixelFormat *fmt = formats; *fmt != AV_PIX_FMT_NONE; ++fmt) {
         if (*fmt == AV_PIX_FMT_VAAPI) {
@@ -1437,9 +1438,9 @@ auto cVaapiDecoder::Shutdown() -> void {
 // ============================================================================
 
 namespace {
-// The chain's EOF flush extrapolates the last field's stamp: deinterlace_vaapi keeps prev_pts in an int
-// (truncates past 2^31, i.e. 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
-// drop the last picture as stale. Only the flush outputs are repaired: at EOS no real jump can occur.
+/// The chain's EOF flush extrapolates the last field's stamp: deinterlace_vaapi keeps prev_pts in an int
+/// (truncates past 2^31, i.e. 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
+/// drop the last picture as stale. Only the flush outputs are repaired: at EOS no real jump can occur.
 auto RepairEosFlushPts(std::vector<std::unique_ptr<VaapiFrame>> &frames, size_t firstFlushIndex, int64_t refPts,
                        int64_t frameDur90k) noexcept -> void {
     constexpr int64_t kMaxStep90k = 10 * 1000 * PTS_TICKS_PER_MS; // 10 s
@@ -2037,20 +2038,18 @@ auto cVaapiDecoder::PresentAction() -> void {
 
     // FFmpeg VAAPI ABI: data[3] encodes the VASurfaceID directly as a uintptr_t, not a pointer.
     // Never dereference it; surface lifetime is governed by the AVFrame refcount.
-    vaapiFrame->vaSurfaceId =
-        static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-            vaapiFrame->avFrame->data[3]));
+    vaapiFrame->vaSurfaceId = static_cast<VASurfaceID>(std::bit_cast<uintptr_t>(vaapiFrame->avFrame->data[3]));
     vaapiFrame->pts = src->pts;
 
     return vaapiFrame;
 }
 
 namespace {
-// DVB streams routinely omit color_description. Tag the matrix the resolution implies so scale_vaapi's
-// BT.709/tv conversion neither desaturates the color nor washes out the levels: SD (<=576 lines) is
-// BT.601 (BT.470BG PAL, by DVB convention), HD/UHD is BT.709 -- limited (MPEG) range either way. Only
-// UNSPECIFIED fields are filled, so an explicit bitstream/container value always wins; without this an
-// untagged buffersrc leaves scale_vaapi's input->BT.709 conversion driver-dependent.
+/// DVB streams routinely omit color_description. Tag the matrix the resolution implies so scale_vaapi's
+/// BT.709/tv conversion neither desaturates the color nor washes out the levels: SD (<=576 lines) is
+/// BT.601 (BT.470BG PAL, by DVB convention), HD/UHD is BT.709 -- limited (MPEG) range either way. Only
+/// UNSPECIFIED fields are filled, so an explicit bitstream/container value always wins; without this an
+/// untagged buffersrc leaves scale_vaapi's input->BT.709 conversion driver-dependent.
 auto ApplyColorDefaults(AVFrame *frame) noexcept -> void {
     if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
         frame->colorspace = frame->height > 576 ? AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
@@ -2060,10 +2059,10 @@ auto ApplyColorDefaults(AVFrame *frame) noexcept -> void {
     }
 }
 
-// Normal play and slow forward keep the chain's own stamps: a temporal deinterlacer emits frame N only once
-// N+1 arrived, so the input PTS would label 1080i one frame late, and slow forward paces on the stamps.
-// Fast and reverse stamp sourcePts + i*frameDur: they pace on source strides, and the ghost-field drop
-// finds pts == sourcePts.
+/// Normal play and slow forward keep the chain's own stamps: a temporal deinterlacer emits frame N only once
+/// N+1 arrived, so the input PTS would label 1080i one frame late, and slow forward paces on the stamps.
+/// Fast and reverse stamp sourcePts + i*frameDur: they pace on source strides, and the ghost-field drop
+/// finds pts == sourcePts.
 auto StampFilterOutputs(std::vector<std::unique_ptr<VaapiFrame>> &outFrames, size_t prevOutCount, int64_t sourcePts,
                         bool trick, int64_t frameDurMs) noexcept -> void {
     if (!trick) {

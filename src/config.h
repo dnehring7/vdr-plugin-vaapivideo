@@ -416,7 +416,7 @@ inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT = static_cast<int>(MaxRefresh
 // === QUICK ACTION ===
 // ============================================================================
 
-/// What the plugin's single main-menu hook (@vaapivideo) does. Off keeps the main-menu entry and its
+/// What the plugin's single main-menu hook (`@vaapivideo`) does. Off keeps the main-menu entry and its
 /// three-line quick menu; any other value hides the entry and runs that one action directly, so a key
 /// macro needs no trailing navigation keys. Numeric values are part of the setup.conf wire format --
 /// do not renumber.

@@ -82,9 +82,7 @@ auto ResolveSwPixFmt(const AVFrame *frame) noexcept -> AVPixelFormat {
     if (!frame->hw_frames_ctx) {
         return AV_PIX_FMT_NONE;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
-    const auto *framesCtx = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
-    return framesCtx->sw_format;
+    return HwFramesContextOf(frame->hw_frames_ctx)->sw_format;
 }
 
 auto FrameBitDepthAtLeast(const AVFrame *frame, int minBits) noexcept -> bool {
@@ -187,20 +185,26 @@ namespace {
     }
 }
 
-// SW deinterlacers, field-rate (2x, matching deinterlace_vaapi=rate=field). deint=interlaced acts per
-// frame on the picture's flag: MPEG-2 toggles progressive_frame per-GOP, so a fixed verdict would comb
-// progressive frames or needlessly double-rate them. mode/parity stay at their field-rate defaults;
-// w3fdif filter=simple (3-tap) is lighter than the default complex (9-tap) with little loss on broadcast.
+///@{
+/// SW deinterlacers, field-rate (2x, matching deinterlace_vaapi=rate=field). deint=interlaced acts per
+/// frame on the picture's flag: MPEG-2 toggles progressive_frame per-GOP, so a fixed verdict would comb
+/// progressive frames or needlessly double-rate them. mode/parity stay at their field-rate defaults;
+/// w3fdif filter=simple (3-tap) is lighter than the default complex (9-tap) with little loss on broadcast.
 inline constexpr const char *SW_DEINT_BWDIF = "bwdif=deint=interlaced";
 inline constexpr const char *SW_DEINT_W3FDIF = "w3fdif=filter=simple:deint=interlaced";
+///@}
 
-// Software denoise (hqdn3d luma_spatial:chroma_spatial:luma_tmp:chroma_tmp) presets.
+///@{
+/// Software denoise (hqdn3d luma_spatial:chroma_spatial:luma_tmp:chroma_tmp) presets.
 inline constexpr const char *SW_DENOISE_MINIMAL = "hqdn3d=1.0:1.0:2.0:2.0";
 inline constexpr const char *SW_DENOISE_ENHANCED = "hqdn3d=2.0:1.5:4.0:3.5";
+///@}
 
-// Software sharpen (unsharp) presets.
+///@{
+/// Software sharpen (unsharp) presets.
 inline constexpr const char *SW_SHARPEN_MILD = "unsharp=3:3:0.25:3:3:0.0";
 inline constexpr const char *SW_SHARPEN_MEDIUM = "unsharp=5:5:0.5:5:5:0.0";
+///@}
 
 } // namespace
 

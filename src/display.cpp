@@ -98,6 +98,7 @@ constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
     200; ///< Stuck-flip watchdog: force-clear isFlipPending if the kernel swallows the page-flip event.
 constexpr int DISPLAY_DRAIN_ITERATION_LIMIT =
     10; ///< Safety bound on post-shutdown DRM event drain (guards against infinite loops)
+/// Every page-flip commit: nonblocking, with the event the display thread waits for.
 constexpr uint32_t DISPLAY_PAGE_FLIP_COMMIT_FLAGS = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 constexpr int DISPLAY_ATOMIC_FAILURE_LOG_INTERVAL_MS = 1000; ///< Commit-failure log rate limit (retry path ~200 Hz)
 
@@ -135,6 +136,7 @@ constexpr uint32_t TRACE_FIRST_COMMIT = 1U << 0; ///< First fresh frame committe
 // === HELPER FUNCTIONS ===
 // ============================================================================
 
+/// Log label for a DRM plane type.
 [[nodiscard]] auto GetPlaneTypeName(uint32_t type) -> const char * {
     switch (type) {
         case DRM_PLANE_TYPE_OVERLAY:
@@ -148,7 +150,7 @@ constexpr uint32_t TRACE_FIRST_COMMIT = 1U << 0; ///< First fresh frame committe
     }
 }
 
-// Read a DRM device cap, returning 0 if unsupported. Used only by the one-time init diagnostic.
+/// Read a DRM device cap, returning 0 if unsupported. Used only by the one-time init diagnostic.
 [[nodiscard]] auto GetDrmCap(int drmFd, uint64_t cap) noexcept -> uint64_t {
     uint64_t value = 0;
     return drmGetCap(drmFd, cap, &value) == 0 ? value : uint64_t{0};
@@ -1873,6 +1875,7 @@ namespace {
     return RoundU16(av_q2d(r) * 50000.0);
 }
 
+/// Field-wise, no reduction: the question is whether the metadata changed, not its value.
 [[nodiscard]] auto AvRationalEqual(AVRational x, AVRational y) noexcept -> bool {
     return x.num == y.num && x.den == y.den;
 }
@@ -1883,10 +1886,9 @@ namespace {
     return AvRationalEqual(a[0], b[0]) && AvRationalEqual(a[1], b[1]);
 }
 
+/// Field-wise, not memcmp: the struct's padding is not copied by its assignment operator.
 [[nodiscard]] auto MasteringEqual(const AVMasteringDisplayMetadata &a, const AVMasteringDisplayMetadata &b) noexcept
     -> bool {
-    // Field-by-field: memcmp would compare implementation-defined padding bytes that
-    // AVMasteringDisplayMetadata's trivial assignment operator does NOT copy.
     if (a.has_primaries != b.has_primaries || a.has_luminance != b.has_luminance) {
         return false;
     }
@@ -1907,6 +1909,7 @@ namespace {
     return true;
 }
 
+/// True if @p a and @p b program the same HDR infoframe: an unchanged state skips the property commit.
 [[nodiscard]] auto HdrOutputStateEqual(const HdrStreamInfo &a, const HdrStreamInfo &b) noexcept -> bool {
     if (a.kind != b.kind || a.hasMasteringDisplay != b.hasMasteringDisplay || a.hasContentLight != b.hasContentLight) {
         return false;
@@ -1922,8 +1925,8 @@ namespace {
 }
 
 // HDMI EOTF codes per CTA-861.3 / HDMI 2.0a.
-constexpr uint8_t HDMI_EOTF_SMPTE_ST_2084 = 2; // HDR10 PQ
-constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
+constexpr uint8_t HDMI_EOTF_SMPTE_ST_2084 = 2; ///< HDR10 (PQ)
+constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
 
 /// Populate a Static Metadata Type 1 infoframe from a stream's HDR side-data. Missing
 /// mastering / content-light side-data leaves the corresponding fields zero, which per
@@ -1931,7 +1934,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
 [[nodiscard]] auto BuildHdrMetadataInfoframe(const HdrStreamInfo &info) noexcept -> hdr_output_metadata {
     hdr_output_metadata meta{};
     meta.metadata_type = 0; // HDMI_STATIC_METADATA_TYPE1
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access) -- DRM ABI requires union access
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access) -- DRM ABI union
     auto &m = meta.hdmi_metadata_type1;
     m.metadata_type = 0;
     m.eotf = (info.kind == StreamHdrKind::Hlg) ? HDMI_EOTF_ARIB_STD_B67 : HDMI_EOTF_SMPTE_ST_2084;
@@ -1959,7 +1962,6 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
         m.max_cll = static_cast<uint16_t>(std::min(info.contentLight.MaxCLL, kLightMax));
         m.max_fall = static_cast<uint16_t>(std::min(info.contentLight.MaxFALL, kLightMax));
     }
-    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
     return meta;
 }
 
@@ -2115,12 +2117,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  // HLG
     // combination with the exported modifier (seen on iHD 25.x), producing spurious AddFB2
     // EINVAL on plain SDR NV12 scanout.
     uint32_t format = DRM_FORMAT_NV12;
-    if (srcFrame->hw_frames_ctx) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
-        const auto *framesCtx = reinterpret_cast<const AVHWFramesContext *>(srcFrame->hw_frames_ctx->data);
-        if (framesCtx->sw_format == AV_PIX_FMT_P010) {
-            format = DRM_FORMAT_P010;
-        }
+    if (srcFrame->hw_frames_ctx && HwFramesContextOf(srcFrame->hw_frames_ctx)->sw_format == AV_PIX_FMT_P010) {
+        format = DRM_FORMAT_P010;
     }
     const auto width = static_cast<uint32_t>(srcFrame->width);
     const auto height = static_cast<uint32_t>(srcFrame->height);
