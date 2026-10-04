@@ -6,8 +6,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vdr-vaapivideo 1.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
-"POT-Creation-Date: 2026-09-27 23:50+0200\n"
-"PO-Revision-Date: 2026-09-27 23:30+0200\n"
+"POT-Creation-Date: 2026-10-04 09:35+0200\n"
+"PO-Revision-Date: 2026-10-04 09:40+0200\n"
 "Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
 "Language-Team: Finnish <vdr@linuxtv.org>\n"
 "Language: fi\n"
@@ -88,6 +88,9 @@ msgstr "Yleiset"
 
 msgid "Clear display on channel switch"
 msgstr "Musta kuva kanavanvaihdossa"
+
+msgid "Quick action"
+msgstr "Pikatoiminto"
 
 msgid "VAAPI device not ready"
 msgstr "VAAPI-laite ei ole valmis"
@@ -190,3 +193,12 @@ msgstr "ohjelmisto: bilineaarinen (nopea)"
 
 msgid "unlimited"
 msgstr "ei rajoitusta"
+
+msgid "zoom"
+msgstr "zoomaus"
+
+msgid "mediaplayer"
+msgstr "mediasoitin"
+
+msgid "audio passthrough"
+msgstr "äänen läpivienti"

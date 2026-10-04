@@ -15,6 +15,7 @@
  *
  * Entry points:
  *   - main menu     -> cVaapiQuickMenu -> cVaapiFileBrowser
+ *   - quick action  -> MainMenuAction opens cVaapiFileBrowser directly (setup "Quick action" = mediaplayer)
  *   - replay stop   -> MainMenuAction reopens cVaapiFileBrowser (cursor on the persistent bookmark)
  *   - SVDRP PLAY    -> StartPlayback(...) launches cVaapiControl
  *

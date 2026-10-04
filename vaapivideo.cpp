@@ -101,6 +101,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
           editPassthroughMode(static_cast<int>(vaapiConfig.passthroughMode.load(std::memory_order_relaxed))),
           editPcmChannelMode(static_cast<int>(vaapiConfig.pcmChannelMode.load(std::memory_order_relaxed))),
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
+          editQuickAction(static_cast<int>(vaapiConfig.quickAction.load(std::memory_order_relaxed))),
           editScaleMode(static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed))),
           editSharpenMode(static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed))) {
         SetSection(tr("VAAPI Video"));
@@ -179,6 +180,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         addHeader(tr("General"));
         // Use "off"/"on" labels to match the string-select items above; default is "no"/"yes".
         Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, off, on));
+        // Anything but off hides the main-menu entry; VDR rebuilds the main menu on every open, so no live apply.
+        Add(new cMenuEditStraItem(tr("Quick action"), &editQuickAction, kQuickActionCount, quickActionLabels.data()));
 
         // Index 0 is the Audio header (non-selectable); start the cursor on the first real entry.
         SetCurrent(Get(1));
@@ -211,6 +214,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         vaapiConfig.pcmChannelMode.store(static_cast<PcmChannelMode>(editPcmChannelMode), std::memory_order_relaxed);
         vaapiConfig.hdrMode.store(static_cast<HdrMode>(editHdrMode), std::memory_order_relaxed);
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
+        vaapiConfig.quickAction.store(static_cast<QuickAction>(editQuickAction), std::memory_order_relaxed);
         vaapiConfig.deinterlaceMode.store(static_cast<DeinterlaceMode>(editDeinterlaceMode), std::memory_order_relaxed);
         vaapiConfig.denoiseMode.store(static_cast<DenoiseMode>(editDenoiseMode), std::memory_order_relaxed);
         vaapiConfig.scaleMode.store(static_cast<ScaleMode>(editScaleMode), std::memory_order_relaxed);
@@ -221,6 +225,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         SetupStore("PcmChannelMode", editPcmChannelMode);
         SetupStore("HdrMode", editHdrMode);
         SetupStore("ClearOnChannelSwitch", editClearOnChannelSwitch);
+        SetupStore("QuickAction", editQuickAction);
         // Post-processing policies; applied by the filter rebuild below, or any later rebuild.
         SetupStore("DeinterlaceMode", editDeinterlaceMode);
         SetupStore("DenoiseMode", editDenoiseMode);
@@ -378,6 +383,16 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     static constexpr int kMaxRefreshCount = static_cast<int>(kMaxRefreshLabels.size());
     static_assert(kMaxRefreshCount == CONFIG_MAX_REFRESH_MODE_COUNT, "menu labels out of sync with enum");
 
+    // Same pattern as kPassthroughModeLabels; rooted in QuickActionName().
+    static constexpr std::array kQuickActionLabels{
+        QuickActionName(QuickAction::Off),
+        QuickActionName(QuickAction::Zoom),
+        QuickActionName(QuickAction::Mediaplayer),
+        QuickActionName(QuickAction::Passthrough),
+    };
+    static constexpr int kQuickActionCount = static_cast<int>(kQuickActionLabels.size());
+    static_assert(kQuickActionCount == CONFIG_QUICK_ACTION_COUNT, "menu labels out of sync with enum");
+
     // What the menu items point at: the arrays above, translated. Plain members, so they are built before
     // the ctor body runs BuildMenu() and live exactly as long as the items that reference them.
     std::array<const char *, kDeinterlaceLabels.size()> deinterlaceLabels{TranslatedLabels(kDeinterlaceLabels)};
@@ -389,6 +404,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         TranslatedLabels(kPassthroughModeLabels)};
     std::array<const char *, kPcmChannelModeLabels.size()> pcmChannelModeLabels{
         TranslatedLabels(kPcmChannelModeLabels)};
+    std::array<const char *, kQuickActionLabels.size()> quickActionLabels{TranslatedLabels(kQuickActionLabels)};
     std::array<const char *, kScaleLabels.size()> scaleLabels{TranslatedLabels(kScaleLabels)};
     std::array<const char *, kSharpenLabels.size()> sharpenLabels{TranslatedLabels(kSharpenLabels)};
 
@@ -411,10 +427,36 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editPassthroughMode;
     int editPcmChannelMode;
     int editPcmLatency;
+    int editQuickAction;
     int editScaleMode;
     int editSharpenMode;
     int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Per-preset zoom level (tenths-of-%).
 };
+
+// ============================================================================
+// === Quick actions ===
+// ============================================================================
+
+// One-shot actions shared by the quick menu and a direct main-menu hook (setup "Quick action"). Each flashes
+// the new state; the caller closes the OSD. QueueMessage, not Message: MainMenuAction() must not block.
+auto CycleZoomAction(cVaapiDevice *device) -> void {
+    if (device == nullptr || !device->IsReady()) {
+        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+        return;
+    }
+    (void)device->CycleZoom();
+    Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
+}
+
+// A detached device just keeps the new mode for its next audio open, so only a missing device is refused.
+auto TogglePassthroughAction(cVaapiDevice *device) -> void {
+    if (device == nullptr) {
+        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
+        return;
+    }
+    (void)device->TogglePassthrough();
+    Skins.QueueMessage(mtInfo, cVaapiDevice::PassthroughStatusLabel().c_str());
+}
 
 // ============================================================================
 // === cVaapiQuickMenu ===
@@ -423,7 +465,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
 /// The plugin's main menu, three fixed lines. OK on line 1 cycles the zoom one stop and OK on line 3 toggles
 /// audio passthrough; both close the OSD at once and flash the new state -- one-shot actions, no lingering
 /// menu. OK on line 2 opens the mediaplayer. VDR gives a plugin a single main-menu hook, so key macros reach
-/// each action by position (@vaapivideo Ok / Down Ok / Down Down Ok); new lines go at the end.
+/// each action by position (@vaapivideo Ok / Down Ok / Down Down Ok); new lines go at the end. A setup
+/// "Quick action" other than off bypasses this menu: the hook then runs that one action directly.
 class cVaapiQuickMenu : public cOsdMenu {
   public:
     cVaapiQuickMenu(cVaapiDevice *device, std::string mediaDir)
@@ -436,23 +479,12 @@ class cVaapiQuickMenu : public cOsdMenu {
         if (state == osUnknown && (key & ~k_Repeat) == kOk) {
             switch (Current()) {
                 case 0: // Zoom: cycle one stop and leave the menu
-                    if (device_ == nullptr || !device_->IsReady()) {
-                        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
-                    } else {
-                        (void)device_->CycleZoom();
-                        Skins.QueueMessage(mtInfo, cVaapiDevice::ZoomStatusLabel().c_str());
-                    }
+                    CycleZoomAction(device_);
                     return osEnd;
                 case 1: // Mediaplayer
                     return AddSubMenu(new cVaapiFileBrowser(mediaDir_));
-                default: // Audio passthrough: toggle and leave the menu. A detached device just keeps the new
-                         // mode for its next audio open, so only a missing device is refused.
-                    if (device_ == nullptr) {
-                        Skins.QueueMessage(mtWarning, tr("VAAPI device not ready"));
-                    } else {
-                        (void)device_->TogglePassthrough();
-                        Skins.QueueMessage(mtInfo, cVaapiDevice::PassthroughStatusLabel().c_str());
-                    }
+                default: // Audio passthrough: toggle and leave the menu
+                    TogglePassthroughAction(device_);
                     return osEnd;
             }
         }
@@ -600,7 +632,10 @@ auto cVaapiVideoPlugin::Housekeeping() -> void {
     FlushPendingBookmarkSave(); // flush a bookmark staged off-thread (SVDRP teardown); else a no-op
 }
 
-auto cVaapiVideoPlugin::MainMenuEntry() -> const char * { return tr("VAAPI Video"); }
+auto cVaapiVideoPlugin::MainMenuEntry() -> const char * {
+    // A quick action hides the entry; VDR still routes @vaapivideo key macros to MainMenuAction().
+    return vaapiConfig.quickAction.load(std::memory_order_relaxed) == QuickAction::Off ? tr("VAAPI Video") : nullptr;
+}
 
 auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
     // The dir falls back to "/" if empty.
@@ -610,7 +645,20 @@ auto cVaapiVideoPlugin::MainMenuAction() -> cOsdObject * {
     if (TakeBrowserReopen()) {
         return new cVaapiFileBrowser(std::move(dir));
     }
-    // Otherwise the quick menu (line 1 zoom, line 2 mediaplayer); one @vaapivideo hook exposes both.
+    // A quick action runs directly: a NULL return closes the OSD, so one key macro needs no navigation keys.
+    switch (vaapiConfig.quickAction.load(std::memory_order_relaxed)) {
+        case QuickAction::Zoom:
+            CycleZoomAction(vaapiDevice);
+            return nullptr;
+        case QuickAction::Mediaplayer:
+            return new cVaapiFileBrowser(std::move(dir));
+        case QuickAction::Passthrough:
+            TogglePassthroughAction(vaapiDevice);
+            return nullptr;
+        case QuickAction::Off:
+            break;
+    }
+    // Otherwise the quick menu (zoom / mediaplayer / passthrough); one @vaapivideo hook exposes all three.
     return new cVaapiQuickMenu(vaapiDevice, std::move(dir));
 }
 

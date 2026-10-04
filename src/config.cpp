@@ -170,13 +170,14 @@ constexpr uint32_t CONFIG_VIDEO_WIDTH_MAX = 3840U;  ///< 4K UHD ceiling for Pars
         MinResolutionModeName(minResolution.load(std::memory_order_relaxed)),
         MaxRefreshModeName(maxRefreshRate.load(std::memory_order_relaxed)), modeScope.empty() ? "none" : modeScope);
     return std::format("PCM Latency: {}ms, Passthrough Latency: {}ms, Passthrough: {}, PCM channels: {}, HDR: {}, "
-                       "Clear on channel switch: {}, Trace: {}, Post-proc: {}, Mode switch: {}, "
+                       "Clear on channel switch: {}, Quick action: {}, Trace: {}, Post-proc: {}, Mode switch: {}, "
                        "Zoom levels (0=off): {}, Bookmark: {}",
                        pcmLatency.load(std::memory_order_relaxed), passthroughLatency.load(std::memory_order_relaxed),
                        PassthroughModeName(passthroughMode.load(std::memory_order_relaxed)),
                        PcmChannelModeName(pcmChannelMode.load(std::memory_order_relaxed)),
                        HdrModeName(hdrMode.load(std::memory_order_relaxed)),
                        clearOnChannelSwitch.load(std::memory_order_relaxed) ? "on" : "off",
+                       QuickActionName(quickAction.load(std::memory_order_relaxed)),
                        trace.load(std::memory_order_relaxed) ? "on" : "off", postProc, modeSwitch, zoom, mark);
 }
 
@@ -287,6 +288,10 @@ auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &targ
     }
     if (strcasecmp(name, "ClearOnChannelSwitch") == 0) {
         ParseBoolValue("ClearOnChannelSwitch", value, clearOnChannelSwitch);
+        return true;
+    }
+    if (strcasecmp(name, "QuickAction") == 0) {
+        ParseEnumValue("QuickAction", value, quickAction, CONFIG_QUICK_ACTION_COUNT);
         return true;
     }
     if (strcasecmp(name, "BookmarkUri") == 0) {

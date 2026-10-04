@@ -6,8 +6,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vdr-vaapivideo 1.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
-"POT-Creation-Date: 2026-09-27 23:50+0200\n"
-"PO-Revision-Date: 2026-09-27 23:30+0200\n"
+"POT-Creation-Date: 2026-10-04 09:35+0200\n"
+"PO-Revision-Date: 2026-10-04 09:40+0200\n"
 "Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
 "Language-Team: Spanish <vdr@linuxtv.org>\n"
 "Language: es\n"
@@ -88,6 +88,9 @@ msgstr "General"
 
 msgid "Clear display on channel switch"
 msgstr "Pantalla negra al cambiar de canal"
+
+msgid "Quick action"
+msgstr "Acción rápida"
 
 msgid "VAAPI device not ready"
 msgstr "Dispositivo VAAPI no preparado"
@@ -190,3 +193,12 @@ msgstr "software: bilineal (rápido)"
 
 msgid "unlimited"
 msgstr "sin límite"
+
+msgid "zoom"
+msgstr "zoom"
+
+msgid "mediaplayer"
+msgstr "reproductor multimedia"
+
+msgid "audio passthrough"
+msgstr "passthrough de audio"

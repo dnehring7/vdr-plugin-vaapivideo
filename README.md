@@ -292,6 +292,7 @@ another application at boot.
 | `Zoom level N`                   | 0 … 499          | Zoom-in factor of level N (1–5) in tenths-of-% (`344` = +34.4%); 0 disables the level                |
 | **General** | | |
 | `Clear display on channel switch`| off / on         | Paint a black frame on channel switch instead of keeping the previous channel's last frame           |
+| `Quick action`                   | off / zoom / mediaplayer / audio passthrough | Hide the main-menu entry and let `@vaapivideo` run this one action directly (see [Manual zoom](#manual-zoom)) |
 
 ### Audio settings
 
@@ -455,6 +456,12 @@ never written to `setup.conf` — only the five level definitions persist.
       Yellow    @vaapivideo Down Ok        # open the mediaplayer browser
       User3     @vaapivideo Down Down Ok   # toggle audio passthrough
 
+  To keep the main menu free of the entry, set **Quick action** in the setup
+  to one of the three. The entry disappears and `@vaapivideo` runs that action
+  straight away, without menu or follow-up keys (`Blue @vaapivideo`). VDR
+  gives a plugin only one hook, so the other two actions lose their key macro
+  (zoom stays on SVDRP `ZOOM` and `Blue` in the mediaplayer).
+
 - **Scripting** — `svdrpsend PLUG vaapivideo ZOOM [next|0-5]`.
 
 
@@ -475,8 +482,9 @@ deinterlacing, and IEC61937 audio passthrough work identically.
   `.mp4 .mkv .avi .mov .ts .m4v .webm` plus `.m3u/.m3u8`.
 - **SVDRP** — `PLUG vaapivideo PLAY <uri>` accepts any URI libavformat can
   open (a video stream is required — audio-only formats are not supported).
-- **Remote key** — bind `@vaapivideo Down Ok` to a key in `keymacros.conf`
-  (see [Manual zoom](#manual-zoom)).
+- **Remote key** — bind `@vaapivideo Down Ok` to a key in `keymacros.conf`,
+  or just `@vaapivideo` with **Quick action** set to `mediaplayer`, which
+  also hides the main-menu entry (see [Manual zoom](#manual-zoom)).
 
 ### Replay controls
 

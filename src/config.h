@@ -413,6 +413,39 @@ inline constexpr int CONFIG_MAX_REFRESH_MODE_COUNT = static_cast<int>(MaxRefresh
 // matcher tolerances) live in device.cpp, their only user.
 
 // ============================================================================
+// === QUICK ACTION ===
+// ============================================================================
+
+/// What the plugin's single main-menu hook (@vaapivideo) does. Off keeps the main-menu entry and its
+/// three-line quick menu; any other value hides the entry and runs that one action directly, so a key
+/// macro needs no trailing navigation keys. Numeric values are part of the setup.conf wire format --
+/// do not renumber.
+enum class QuickAction : uint8_t {
+    Off = 0,         ///< Main-menu entry shown; the hook opens the quick menu
+    Zoom = 1,        ///< Entry hidden; the hook cycles the zoom one stop
+    Mediaplayer = 2, ///< Entry hidden; the hook opens the file browser
+    Passthrough = 3, ///< Entry hidden; the hook toggles audio passthrough
+};
+
+/// Derived from the last enumerator so it cannot drift
+inline constexpr int CONFIG_QUICK_ACTION_COUNT = static_cast<int>(QuickAction::Passthrough) + 1;
+
+/// Lowercase wire-format label for a QuickAction; same contract as PassthroughModeName().
+[[nodiscard]] constexpr auto QuickActionName(QuickAction action) noexcept -> const char * {
+    switch (action) {
+        case QuickAction::Off:
+            return trNOOP("off");
+        case QuickAction::Zoom:
+            return trNOOP("zoom");
+        case QuickAction::Mediaplayer:
+            return trNOOP("mediaplayer");
+        case QuickAction::Passthrough:
+            return trNOOP("audio passthrough");
+    }
+    return "?"; // unreachable for a valid enum value; silences control-reaches-end warning
+}
+
+// ============================================================================
 // === ZOOM BOUNDS ===
 // ============================================================================
 
@@ -468,6 +501,7 @@ struct VaapiConfig {
     /// Decoded-PCM channel policy; re-read per decoded frame (decode-driven)
     std::atomic<PcmChannelMode> pcmChannelMode{PcmChannelMode::Auto};
     std::atomic<int> pcmLatency{0}; ///< A/V offset (ms, signed) for PCM decode path; + delays audio
+    std::atomic<QuickAction> quickAction{QuickAction::Off}; ///< Main-menu hook behaviour; read by the VDR main thread
     /// Diagnostic tracing (-t / --trace, SVDRP TRACE on|off); never persisted to setup.conf.
     /// Read from the present/decode hot paths via TraceEnabled() -- relaxed, no ordering dependency.
     std::atomic<bool> trace{false};
