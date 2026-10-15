@@ -69,6 +69,7 @@ struct VideoStreamInfo {
 /// Audio elementary stream descriptor. Field order is preserved from the former
 /// AudioStreamParams so designated-initializer call sites in audio.cpp compile unchanged.
 struct AudioStreamInfo {
+    uint64_t channelMask{0};             ///< Container's native speaker mask; 0 = unknown (raw PCM only)
     int channels{0};                     ///< Decoded output channel count
     AVCodecID codecId{AV_CODEC_ID_NONE}; ///< FFmpeg codec identifier
     const uint8_t *extradata{nullptr};   ///< Non-owning; caller owns the buffer lifetime

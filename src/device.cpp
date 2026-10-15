@@ -29,6 +29,7 @@
 #include "osd.h"
 #include "pes.h"
 #include "stream.h"
+#include "subtitle.h"
 
 // C++ Standard Library
 #include <algorithm>
@@ -101,6 +102,7 @@ extern "C" {
 #include <vdr/i18n.h>
 #include <vdr/osd.h>
 #include <vdr/player.h>
+#include <vdr/spu.h>
 #include <vdr/status.h>
 #include <vdr/thread.h>
 #include <vdr/tools.h>
@@ -840,7 +842,9 @@ auto cVaapiSwitchAttacher::ChannelSwitch(const cDevice *device, const int channe
 
 } // namespace
 
-cVaapiDevice::cVaapiDevice() : switchAttacher(std::make_unique<cVaapiSwitchAttacher>(this)) {
+cVaapiDevice::cVaapiDevice()
+    : switchAttacher(std::make_unique<cVaapiSwitchAttacher>(this)),
+      spuDecoder(std::make_unique<cVaapiSpuDecoder>(*this)) {
     isyslog("vaapivideo/device: created");
     SetDescription("VAAPI Video Device");
     SetVideoFormat(true);
@@ -1159,6 +1163,29 @@ auto cVaapiDevice::GetOsdSize(int &Width, int &Height, double &PixelAspect) -> v
         }
     }
     return -1;
+}
+
+[[nodiscard]] auto cVaapiDevice::GetSpuDecoder() -> cSpuDecoder * {
+    // The decoder draws on VDR's one OSD, which belongs to the primary device.
+    return IsPrimaryDevice() ? spuDecoder.get() : nullptr;
+}
+
+auto cVaapiDevice::SetVideoDisplayFormat(eVideoDisplayFormat VideoDisplayFormat) -> void {
+    // cDevice picks the DVD subpicture variant -- and with it the dvd plugin's menu button group -- for the TV
+    // shape in Setup.VideoFormat, 4:3 by default: pan&scan or letterbox. This device shows every picture in its
+    // own shape, a 16:9 DVD fills a wide display, so the wide variant fits whatever that setting says. With the
+    // pan&scan one the highlights of a 16:9 menu sat beside their buttons.
+    int width = 0;
+    int height = 0;
+    double pixelAspect = 1.0;
+    GetOsdSize(width, height, pixelAspect);
+    if (height > 0 && static_cast<double>(width) * pixelAspect >= 1.5 * height) {
+        if (cSpuDecoder *spu = GetSpuDecoder()) {
+            spu->setScaleMode(cSpuDecoder::eSpuNormal);
+        }
+        return;
+    }
+    cDevice::SetVideoDisplayFormat(VideoDisplayFormat);
 }
 
 auto cVaapiDevice::GetVideoSize(int &Width, int &Height, double &VideoAspect) -> void {
@@ -1664,13 +1691,25 @@ auto cVaapiDevice::Play() -> void {
         return Length;
     }
 
+    // VDR passes a substream id as Id only when it parsed a program-stream substream header (DVD); on TS, Id
+    // is the stream id itself. That header must not reach the decoder. Its first byte repeats the id, which
+    // checks that ParsePes() found the same payload start as VDR.
+    std::span<const uint8_t> payload{pes.payload, pes.payloadSize};
+    const bool substream = Data[3] == PES_STREAM_ID_PRIVATE && Id != PES_STREAM_ID_PRIVATE;
+    if (substream) {
+        if (payload.size() <= PES_DVD_SUBSTREAM_HEADER_BYTES || payload.front() != Id) [[unlikely]] {
+            return Length;
+        }
+        payload = payload.subspan(PES_DVD_SUBSTREAM_HEADER_BYTES);
+    }
+
     // Dolby-entry switch in flight: anything not on private_stream_1 is still the OLD track's PID (see
     // audioAwaitDolbyUntilMs) -- fed to the detector it wins the vote for the codec being left behind.
     // AFTER ParsePes() on purpose: pre-CAM scrambled bytes assemble into PES-shaped garbage whose random
     // stream id must neither time the gate out nor be logged against it.
     if (const uint64_t awaitUntil = audioAwaitDolbyUntilMs.load(std::memory_order_relaxed); awaitUntil != 0)
         [[unlikely]] {
-        if (Id == PES_STREAM_ID_PRIVATE) {
+        if (Data[3] == PES_STREAM_ID_PRIVATE) {
             audioAwaitDolbyUntilMs.store(0, std::memory_order_relaxed); // the switch landed
         } else if (cTimeMs::Now() < awaitUntil) {
             return Length;
@@ -1686,7 +1725,7 @@ auto cVaapiDevice::Play() -> void {
 
     if (const int64_t traceMs = startTrace.Fire(TRACE_AUDIO_PES); traceMs >= 0) [[unlikely]] {
         tsyslog("vaapivideo/device: trace +%lldms first audio PES (pts=%lld, %zu bytes)",
-                static_cast<long long>(traceMs), static_cast<long long>(pes.pts), pes.payloadSize);
+                static_cast<long long>(traceMs), static_cast<long long>(pes.pts), payload.size());
     }
 
     // From here on a track-change hook is an in-session switch (see audioPesSeen).
@@ -1744,10 +1783,13 @@ auto cVaapiDevice::Play() -> void {
         // Payload-first: AC-3/MP2/ADTS carry whole frames per PES payload, so one is decisive and
         // the window would only hurt them (see DEVICE_AUDIO_DETECT_WINDOW_BYTES). Only AAC-LATM, whose frames
         // span PES boundaries, needs the cross-payload window -- reached solely on a NONE here.
-        AudioDetection detected = ::DetectAudioCodec({pes.payload, pes.payloadSize});
+        // A DVD substream id names its codec (DvdSubstreamCodec()); the 2-of-2 below still applies.
+        const AVCodecID dvdCodec = substream ? DvdSubstreamCodec(Id) : AV_CODEC_ID_NONE;
+        AudioDetection detected =
+            dvdCodec != AV_CODEC_ID_NONE ? AudioDetection{.codecId = dvdCodec} : ::DetectAudioCodec(payload);
         bool detectedFromWindow = false;
         if (detected.codecId == AV_CODEC_ID_NONE) {
-            audioDetectBuffer.insert(audioDetectBuffer.end(), pes.payload, pes.payload + pes.payloadSize);
+            audioDetectBuffer.insert(audioDetectBuffer.end(), payload.begin(), payload.end());
             if (audioDetectBuffer.size() > DEVICE_AUDIO_DETECT_WINDOW_BYTES) {
                 audioDetectBuffer.erase(
                     audioDetectBuffer.begin(),
@@ -1811,7 +1853,7 @@ auto cVaapiDevice::Play() -> void {
                         avcodec_get_name(detectedCodec), candidateCount);
             }
             if (freshStart && !detectedFromWindow) {
-                audioHeldPayload.assign(pes.payload, pes.payload + pes.payloadSize);
+                audioHeldPayload.assign(payload.begin(), payload.end());
                 audioHeldPts = pes.pts;
             }
             return Length;
@@ -1905,7 +1947,7 @@ auto cVaapiDevice::Play() -> void {
     if (!isLive) {
         NoteDataAfterEosDrain();
     }
-    audioProcessor->Decode(pes.payload, pes.payloadSize, pes.pts);
+    audioProcessor->Decode(payload.data(), payload.size(), pes.pts);
 #if APIVERSNUM < 30014
     if (!isLive && pes.pts != AV_NOPTS_VALUE) {
         lastReplayAudioPts.store(pes.pts, std::memory_order_relaxed);
@@ -2349,6 +2391,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
             // Reset dedup so the new channel's first audio-track hook re-detects.
             lastHandledAudioTrack = ttNone;
             lastHandledAudioPid = 0;
+            dolbyEntryUnresolved = false;
             // Reset transient zoom BEFORE Clear() so any post-clear rebuild observes Off, never the
             // old content's stop. Manual zoom is a per-content choice -- drop it on every change.
             ResetZoom();
@@ -2613,6 +2656,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
     paused.store(false, std::memory_order_relaxed);
     lastHandledAudioTrack = ttNone;
     lastHandledAudioPid = 0;
+    dolbyEntryUnresolved = false;
     osdWidth = 0;
     osdHeight = 0;
     osdModeGeneration = 0;
@@ -3482,10 +3526,11 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
 
     eTrackType type = ttNone;
     const tTrackId *track = nullptr;
+    int dolbySlots = 0;
 
     if (enteringDolby) {
         // GetCurrentAudioTrack() still returns the OLD track (pre-assignment race).
-        // Walk dolby slots and pick the unique populated one. If multiple are present,
+        // Walk dolby slots and pick the unique populated one. If none or several are populated,
         // fall back to ttNone -- the reset still fires and PlayAudio() re-detects.
         // Enum casts are valid per VDR's IS_DOLBY_TRACK range (vdr/device.h).
         for (int offset = 0; offset <= ttDolbyLast - ttDolbyFirst; ++offset) {
@@ -3494,15 +3539,25 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
             if (candidate == nullptr || candidate->id == 0) {
                 continue;
             }
-            if (track == nullptr) {
+            if (++dolbySlots == 1) {
                 type = candidateType;
                 track = candidate;
             } else {
-                // Ambiguous: multiple dolby tracks. Fall back to ttNone.
                 type = ttNone;
                 track = nullptr;
-                break;
             }
+        }
+        // The dvd plugin selects its dolby track before the packets that register it, so that entry finds no
+        // slot. When the next entry finds exactly the track VDR assigned then, the plugin re-selects it:
+        // nothing changes, and a reset would cut the audio mid-title. ttNone alone is no such evidence -- an
+        // ambiguous entry or a session reset leaves it too.
+        if (dolbyEntryUnresolved && track != nullptr && type == GetCurrentAudioTrack()) {
+            dolbyEntryUnresolved = false;
+            lastHandledAudioTrack = type;
+            lastHandledAudioPid = static_cast<uint16_t>(track->id);
+            dsyslog("vaapivideo/device: %s re-selected dolby track %d (PID=%u) -- already playing", reason,
+                    static_cast<int>(type), lastHandledAudioPid);
+            return;
         }
     } else {
         type = GetCurrentAudioTrack();
@@ -3519,6 +3574,7 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
     }
     lastHandledAudioTrack = type;
     lastHandledAudioPid = pid;
+    dolbyEntryUnresolved = enteringDolby && dolbySlots == 0;
 
     const char *kind = "unknown";
     if (IS_AUDIO_TRACK(type)) {
@@ -3544,8 +3600,9 @@ auto cVaapiDevice::HandleAudioTrackChange(const char *reason, bool enteringDolby
                 static_cast<int>(type), (track->language[0] != '\0') ? track->language : "?",
                 (track->description[0] != '\0') ? track->description : "?", pid);
     } else {
-        // Ambiguous dolby (several populated slots): next-packet log identifies the actual codec.
-        isyslog("vaapivideo/device: %s %s an ambiguous %s track (codec re-detect on next packet)", reason, event, kind);
+        // No or several populated dolby slots: the next-packet log identifies the actual codec.
+        isyslog("vaapivideo/device: %s %s %s %s track (codec re-detect on next packet)", reason, event,
+                dolbySlots == 0 ? "a not yet registered" : "an ambiguous", kind);
     }
     // Dolby entry is the one hook VDR fires BEFORE assigning currentAudioTrack (device.c:1172): PlayTs()
     // keeps routing the OLD PID while this handler runs (Clear() below can block tens of ms on the ALSA

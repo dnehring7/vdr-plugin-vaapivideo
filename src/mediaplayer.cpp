@@ -80,6 +80,7 @@ extern "C" {
 #include <libavcodec/packet.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/error.h>
@@ -1000,6 +1001,9 @@ auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInf
     // True channel count; the sink picks the PCM layout (ChooseOutputChannels). 0/unknown -> stereo
     // (SetStreamParams rejects <= 0).
     info.channels = p->ch_layout.nb_channels > 0 ? p->ch_layout.nb_channels : 2;
+    // Raw PCM has no in-band layout; a count alone would turn quad into 4.0.
+    info.channelMask =
+        p->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? av_channel_layout_subset(&p->ch_layout, UINT64_MAX) : 0;
     CopyExtradata(p, storage, info.extradata, info.extradataSize);
 }
 

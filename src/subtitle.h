@@ -2,10 +2,12 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file subtitle.h
- * @brief Subtitle converter for the mediaplayer. FFmpeg turns SubRip/ASS/mov_text into plain text
- *        (VDR core has no text-subtitle decoder) and dvb_subtitle into palette bitmaps; a pacing
- *        thread then drives each cue onto the OSD against the playback clock, mirroring core's
- *        cDvbSubtitleConverter (whose PES/STC pipeline this self-demuxing libav player cannot reuse).
+ * @brief Subtitles: the mediaplayer's converter and the DVD subpicture decoder.
+ *
+ * cSubtitleConverter (mediaplayer): FFmpeg turns SubRip/ASS/mov_text into plain text (VDR core has no
+ * text-subtitle decoder) and dvb_subtitle into palette bitmaps; a pacing thread then drives each cue onto
+ * the OSD against the playback clock, mirroring core's cDvbSubtitleConverter (whose PES/STC pipeline this
+ * self-demuxing libav player cannot reuse).
  *
  * Why a separate thread: a cue must show/hide on the clock, not when its packet happens to arrive --
  * so Convert() only decodes+queues, and Action() owns all display timing.
@@ -16,6 +18,8 @@
  * Why the locking is shaped the way it is: Open/Close/Convert/Reset/Shutdown all run on the demux
  * thread; Action() is the SOLE owner of the cOsd, so OSD access needs no lock; the only state crossing
  * threads is the cue queue (cueMutex_) and the hideRequested_ atomic.
+ *
+ * cVaapiSpuDecoder (dvd plugin): VDR's own DVD subpicture decoder, re-timed against the frame on screen.
  */
 
 #ifndef VDR_VAAPIVIDEO_SUBTITLE_H
@@ -24,17 +28,21 @@
 #include "common.h"
 
 // C++ Standard Library
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
+#include <vdr/dvbspu.h>
 #include <vdr/thread.h>
+#include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
 class cVaapiDevice;
@@ -152,6 +160,64 @@ class cSubtitleConverter final : public cThread {
     std::atomic<bool> stopping_{false};      ///< Shutdown() tells Action() to exit
     std::atomic<bool> hasExited_{true};      ///< Set by Action() before it returns; Shutdown() checks it after Cancel()
     std::atomic<bool> hasShutdown_{false};   ///< guards double teardown (dtor + an explicit Shutdown())
+};
+
+// ============================================================================
+// === DVD SUBPICTURE DECODER ===
+// ============================================================================
+
+inline constexpr size_t SUBTITLE_SPU_CLUT_ENTRIES = 16; ///< DVD subpicture colour lookup table size
+
+/// VDR's DVD subpicture decoder (dvd plugin subtitles and menu buttons), timed against the frame on screen.
+/// The player times subpictures by the packets it reads, and the decode buffer runs those over a second ahead
+/// of the display -- every cue would show and hide that much early.
+class cVaapiSpuDecoder final : public cDvbSpuDecoder {
+  public:
+    /// @p device is borrowed: it owns this decoder.
+    explicit cVaapiSpuDecoder(cVaapiDevice &device) : device_(device) {}
+    ~cVaapiSpuDecoder() noexcept override = default;
+    cVaapiSpuDecoder(const cVaapiSpuDecoder &) = delete;
+    cVaapiSpuDecoder(cVaapiSpuDecoder &&) noexcept = delete;
+    auto operator=(const cVaapiSpuDecoder &) -> cVaapiSpuDecoder & = delete;
+    auto operator=(cVaapiSpuDecoder &&) noexcept -> cVaapiSpuDecoder & = delete;
+
+    // No locking: the dvd player makes every call under its thread lock.
+
+    /// @p pts is the player's read position, 0 its still-frame tick (no position). The base decoder runs
+    /// commands up to ScreenTime() instead.
+    auto setTime(uint32_t pts) -> int override;
+    /// Queues the subpicture until the screen reaches @p pts. The base decoder holds a single one, so taking it
+    /// at read time would drop a cue that is still waiting for the screen. Takes ownership of @p buf (new[]).
+    auto processSPU(uint32_t pts, uint8_t *buf, bool AllowedShow) -> void override;
+    /// Kept for the subpictures read from now on: a queued one must draw with the CLUT of its own read time.
+    auto setPalette(uint32_t *pal) -> void override;
+    auto Empty() -> void override; ///< Also drops the queued subpictures (seek, new title).
+    /// Not while another OSD is open (VDR's audio or subtitle menu): VDR would log an error and hand out a dummy
+    /// OSD, and drawing into that counts as visible, so the player's redraw after the menu would be skipped.
+    auto Draw() -> void override;
+
+  private:
+    using Clut = std::array<uint32_t, SUBTITLE_SPU_CLUT_ENTRIES>; ///< A DVD colour lookup table (YCrCb entries)
+
+    /// A subpicture read ahead of the screen, held until its display time.
+    struct PendingSpu {
+        uint32_t pts{0};                 ///< Display time of the subpicture
+        std::unique_ptr<uint8_t[]> data; ///< Complete SPU as the player assembled it
+        bool allowedShow{true};          ///< Passed through to the base decoder
+        std::optional<Clut> clut;        ///< CLUT at read time; none before the player set one
+    };
+
+    [[nodiscard]] auto ScreenTime() -> std::optional<uint32_t>; ///< How far commands may run; none = not yet
+    auto Advance() -> int;                                      ///< Installs due subpictures, runs their commands
+    auto InstallDueSpus(uint32_t time) -> void;                 ///< Hands queued subpictures due by @p time to the base
+
+    cVaapiDevice &device_;               ///< Source of the presentation clock
+    int64_t lastClock_{-1};              ///< Presentation clock at the previous call; -1 = none
+    cTimeMs clockMovedAt_{0};            ///< When lastClock_ last changed
+    std::deque<PendingSpu> pendingSpus_; ///< Read but not yet due, in stream order
+    std::optional<Clut> clut_;           ///< CLUT at the player's read position
+    std::optional<uint32_t> readPts_;    ///< Player's read position (an SPU's PTS may be a genuine 0)
+    bool inBase_{false};                 ///< Inside a base-class call: its setTime()/Empty() are not the player's
 };
 
 #endif // VDR_VAAPIVIDEO_SUBTITLE_H

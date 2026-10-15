@@ -52,6 +52,7 @@
 
 // C++ Standard Library
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -62,6 +63,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -204,6 +206,17 @@ constexpr uint64_t DECODER_TRICK_REVERSE_STEP_MAX_MS =
     1000; ///< Content one slow-reverse step may count (~one broadcast GOP). More is a discontinuity or a very long
           ///< GOP: better faster than 1/speed than one picture held for many seconds.
 
+/// Most MPEG-1/2 pictures dropped after a Clear() while waiting for an I-picture (~4 s at 25 fps): a stream
+/// without I-pictures (intra refresh) would otherwise never resume.
+constexpr size_t DECODER_RESYNC_DROP_LIMIT = 100;
+
+/// Most frames one decoded picture becomes: two at field-rate deinterlacing. The handoff backpressure keeps room
+/// for them; with one slot left, the second field of a pair went over the cap and was dropped as overflow.
+constexpr size_t DECODER_OUTPUT_BATCH_MAX = 2;
+/// Most frames an EOS codec drain flushes at once: the reorder delay and the deinterlacer's look-ahead, doubled
+/// at field rate.
+constexpr size_t DECODER_EOS_FLUSH_MAX = 8;
+
 /// Slowdown of a slow REVERSE speed: 24/48/63 -> 2/4/8. The /8 level reaches us clamped to 63, which a plain
 /// division would read as /5, so the clamp maps to the table's slowest entry.
 [[nodiscard]] constexpr auto SlowReverseSlowdown(int speed) noexcept -> uint64_t {
@@ -211,6 +224,93 @@ constexpr uint64_t DECODER_TRICK_REVERSE_STEP_MAX_MS =
         return static_cast<uint64_t>(-VDR_SPEEDS.at(VDR_NORMAL_SPEED - VDR_MAX_SPEEDS));
     }
     return std::max<uint64_t>(1, static_cast<uint64_t>(std::max(0, speed)) / VDR_SPEED_MULT);
+}
+
+/// True when the payload opens with an MPEG-1/2 picture, GOP, sequence or sequence-end header, as every new
+/// position does (a seek, a DVD VOBU, a still). A cut picture continues with slice data, a slice, an extension
+/// or user data -- or, rarely, its second field's picture header, which then reads as new data and costs the
+/// GOP the keep would have saved, never a corrupt picture.
+[[nodiscard]] auto OpensMpegPosition(std::span<const uint8_t> payload) noexcept -> bool {
+    const auto zeros = static_cast<size_t>(
+        std::ranges::find_if(payload, [](uint8_t byte) -> bool { return byte != 0; }) - payload.begin());
+    if (zeros < 2 || payload.size() - zeros < 2 || payload[zeros] != 0x01) {
+        return false;
+    }
+    const uint8_t code = payload[zeros + 1];
+    return code == 0x00 || code == 0xB3 || code == 0xB7 || code == 0xB8;
+}
+
+/// True when the AU's FIRST MPEG-1/2 picture header codes an I-picture. Not parserCtx->pict_type: that is
+/// the last header in the AU, and a field pair carries two, so an I/P pair would read as P.
+[[nodiscard]] auto OpensWithIntraPicture(std::span<const uint8_t> au) noexcept -> bool {
+    constexpr std::array<uint8_t, 4> kPictureStartCode{0x00, 0x00, 0x01, 0x00};
+    const auto header = static_cast<size_t>(std::ranges::search(au, kPictureStartCode).begin() - au.begin());
+    // Start code, then temporal_reference (10 bits) and picture_coding_type (3 bits).
+    if (au.size() - header < 6) {
+        return false;
+    }
+    return ((au[header + 5] >> 3) & 0x07) == AV_PICTURE_TYPE_I;
+}
+
+/// The sequence-level headers an MPEG-2 AU opens with, as far as its display size goes.
+struct Mpeg2SequenceHeaders {
+    size_t extensionsEnd{0};      ///< Offset of the first start code after the sequence extension; 0 = none (MPEG-1)
+    unsigned width{0};            ///< Coded size, with the sequence extension's high bits
+    unsigned height{0};           ///<   "
+    bool displayExtension{false}; ///< A sequence_display_extension follows the sequence header
+};
+
+/// Scans @p au from its sequence header to the GOP or picture header; all zero when it has none.
+[[nodiscard]] auto ScanMpeg2SequenceHeaders(std::span<const uint8_t> au) noexcept -> Mpeg2SequenceHeaders {
+    constexpr std::array<uint8_t, 3> kStartCodePrefix{0x00, 0x00, 0x01};
+    constexpr size_t kHeaderBytes = 7; // start code + the longest field read below
+    Mpeg2SequenceHeaders headers;
+    bool inSequence = false;
+    bool afterSequenceExtension = false;
+    size_t pos = 0;
+    while (pos < au.size()) {
+        const auto at =
+            static_cast<size_t>(std::ranges::search(au.subspan(pos), kStartCodePrefix).begin() - au.begin());
+        if (au.size() - at < kHeaderBytes) {
+            break;
+        }
+        const uint8_t code = au[at + 3];
+        if (afterSequenceExtension && headers.extensionsEnd == 0) {
+            headers.extensionsEnd = at;
+        }
+        if (code == 0xB3) { // sequence header: horizontal_size (12 bits), vertical_size (12 bits)
+            headers.width = static_cast<unsigned>(au[at + 4]) << 4 | static_cast<unsigned>(au[at + 5]) >> 4;
+            headers.height = (static_cast<unsigned>(au[at + 5]) & 0x0F) << 8 | au[at + 6];
+            inSequence = true;
+        } else if (!inSequence) {
+            return {};                                     // the AU doesn't open a sequence
+        } else if (code == 0xB5 && au[at + 4] >> 4 == 1) { // sequence extension: the sizes' high bits
+            headers.width |= ((au[at + 5] & 0x01U) << 1 | au[at + 6] >> 7) << 12;
+            headers.height |= ((au[at + 6] >> 5) & 0x03U) << 12;
+            afterSequenceExtension = true;
+        } else if (code == 0xB5 && au[at + 4] >> 4 == 2) {
+            headers.displayExtension = true;
+        } else if (code == 0xB8 || code == 0x00) { // GOP or picture: the sequence-level headers end
+            break;
+        }
+        pos = at + 4;
+    }
+    return headers;
+}
+
+/// A sequence_display_extension giving the coded size as the display size, the default when there is none.
+[[nodiscard]] constexpr auto Mpeg2DisplayExtension(unsigned width, unsigned height) noexcept -> std::array<uint8_t, 9> {
+    // Identifier 2, video_format 5 (unspecified), no colour description; 14-bit sizes around a marker bit.
+    const uint32_t sizes = (width & 0x3FFFU) << 18 | 1U << 17 | (height & 0x3FFFU) << 3;
+    return {0x00,
+            0x00,
+            0x01,
+            0xB5,
+            0x2A,
+            static_cast<uint8_t>(sizes >> 24),
+            static_cast<uint8_t>(sizes >> 16),
+            static_cast<uint8_t>(sizes >> 8),
+            static_cast<uint8_t>(sizes)};
 }
 
 } // namespace
@@ -333,17 +433,26 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
     }
     // hasLoggedFirstFrame NOT reset here: only OpenCodecWithInfo() resets it, avoiding duplicate logs per reopen.
 
-    // AVCodecParserContext has no flush API; recreate it. Null parserCtx means the mediaplayer
-    // path (extradata present); reintroducing a parser mid-stream would corrupt AU boundaries.
+    // Null parserCtx means the mediaplayer path (extradata present); reintroducing a parser mid-stream
+    // would corrupt AU boundaries.
     if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
-        parserCtx.reset(av_parser_init(currentCodecId));
-        if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-            esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
+        const bool mpegVideo = currentCodecId == AV_CODEC_ID_MPEG2VIDEO || currentCodecId == AV_CODEC_ID_MPEG1VIDEO;
+        // A Clear() inside the first picture can be a player resetting the device while its data runs on (the
+        // dvd plugin, at its first audio pack): dropping the head would cost the first GOP. Keep it until the
+        // next payload shows whether it continues the picture -- MPEG-1/2 only, where new data opens with a
+        // picture-level header; an H.264/HEVC continuation looks like new data.
+        if (firstAuPending && mpegVideo) {
+            parserHeadKept = true;
+        } else {
+            RecreateParser();
         }
+        // The flush dropped the reference pictures, and MPEG-1/2 fails every P/B picture without them --
+        // each failure another codec flush. H.264/HEVC skip to the next recovery point by themselves.
+        resyncDropsLeft = mpegVideo ? DECODER_RESYNC_DROP_LIMIT : 0;
     } else if (currentCodecId == AV_CODEC_ID_NONE) {
         parserCtx.reset();
     }
-    trickAwaitSecondField = false; // parser reset: forget any pending PAFF field-pair (parserMutex held)
+    trickAwaitSecondField = false; // forget any pending PAFF field-pair (parserMutex held)
     lastDecodedPts = AV_NOPTS_VALUE;
 
     // Epoch BEFORE NOPTS: any in-flight decoder publish observes the new epoch on its check or
@@ -415,11 +524,24 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         return;
     }
 
+    if (parserHeadKept) [[unlikely]] {
+        parserHeadKept = false;
+        // New data carries a PTS or opens with a header of its own; a cut picture's continuation has neither.
+        if (pts != AV_NOPTS_VALUE || OpensMpegPosition({data, size})) {
+            RecreateParser(); // the kept head belongs to nothing that follows
+            if (!parserCtx) [[unlikely]] {
+                return; // re-init failed (logged): bail like the gate above until the next codec open
+            }
+        } else {
+            dsyslog("vaapivideo/decoder: Clear() cut the first picture -- the stream continues it, kept");
+        }
+    }
+
     // pts is valid only for the first segment of each AU; the parser propagates it internally.
-    const uint8_t *parseData = data;
     if (size > static_cast<size_t>(INT_MAX)) [[unlikely]] {
         return;
     }
+    const uint8_t *parseData = PaddedParserInput(parserInput, {data, size}).data();
     int parseSize = static_cast<int>(size);
     int64_t currentPts = pts;
 
@@ -444,6 +566,9 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         currentPts = AV_NOPTS_VALUE;
 
         if (parsedSize > 0) {
+            if (!AdmitParsedAu({parsedData, static_cast<size_t>(parsedSize)})) {
+                continue;
+            }
             // FF: keep only keyframes (inter frames are undisplayable here). PAFF exception: an I-frame
             // is two field pictures whose second field carries key_frame==0 -- keep it too, or the
             // decoder gets unpaired top fields and rejects them (send_packet EINVAL). Reverse skips this
@@ -461,24 +586,11 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
                 }
             }
 
-            AVPacket *pkt = av_packet_alloc();
+            auto pkt = NewAuPacket({parsedData, static_cast<size_t>(parsedSize)});
             if (!pkt) [[unlikely]] {
-                break;
-            }
-
-            if (av_new_packet(pkt, parsedSize) < 0) [[unlikely]] {
-                av_packet_free(&pkt);
                 continue;
             }
-            std::memcpy(pkt->data, parsedData, static_cast<size_t>(parsedSize));
-
-            pkt->pts = parserCtx->pts;
-            pkt->dts = parserCtx->dts;
-            if (parserCtx->key_frame == 1) {
-                pkt->flags |= AV_PKT_FLAG_KEY;
-            }
-
-            PushPacketToQueue(pkt);
+            PushPacketToQueue(pkt.release());
         }
     }
 
@@ -603,11 +715,73 @@ auto cVaapiDecoder::ReleasePendingAccessUnit() -> void {
     DrainPendingParserAU();
     // The fresh parser reports key_frame=0 until the next in-band SPS/PPS -- consumed only by trick-play
     // filtering and starvation diagnostics, neither active in the live startup window this serves.
+    RecreateParser();
+}
+
+auto cVaapiDecoder::RecreateParser() -> void {
+    // AVCodecParserContext has no flush API. Caller holds parserMutex and checked parserCtx + currentCodecId.
+    // firstAuPending stays: only an open starts a stream whose first picture a Clear() may cut.
     parserCtx.reset(av_parser_init(currentCodecId));
     if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
         esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
     }
-    trickAwaitSecondField = false; // parser reset: forget any pending PAFF field-pair (parserMutex held)
+    parserHeadKept = false;
+    trickAwaitSecondField = false; // forget any pending PAFF field-pair
+}
+
+[[nodiscard]] auto cVaapiDecoder::AdmitParsedAu(std::span<const uint8_t> au) -> bool {
+    // Caller holds parserMutex. Only an armed MPEG-1/2 resync drops anything; the first I-picture ends it.
+    firstAuPending = false;
+    if (resyncDropsLeft == 0) [[likely]] {
+        return true;
+    }
+    const size_t dropped = DECODER_RESYNC_DROP_LIMIT - resyncDropsLeft;
+    if (OpensWithIntraPicture(au)) {
+        resyncDropsLeft = 0;
+        if (dropped > 0) {
+            dsyslog("vaapivideo/decoder: resync -- dropped %zu picture(s) without references before the I-picture",
+                    dropped);
+        }
+        return true;
+    }
+    if (--resyncDropsLeft == 0) [[unlikely]] {
+        dsyslog("vaapivideo/decoder: resync -- no I-picture within %zu pictures, decoding on", dropped + 1);
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] auto cVaapiDecoder::NewAuPacket(std::span<const uint8_t> au) -> std::unique_ptr<AVPacket, FreeAVPacket> {
+    // Caller holds parserMutex. FFmpeg's MPEG-2 decoder takes the display size of a sequence_display_extension
+    // into its aspect ratio and keeps it until the next one, across a flush: a stream without one, shown after
+    // one with (a DVD's 4:3 notice after its 16:9 menu, pan&scan 540 wide), came out 64:45 -- stretched to
+    // 16:9. A context that has taken one gets the default spelled out wherever a sequence lacks it.
+    std::span<const uint8_t> bytes = au;
+    if (currentCodecId == AV_CODEC_ID_MPEG2VIDEO) {
+        const Mpeg2SequenceHeaders headers = ScanMpeg2SequenceHeaders(au);
+        if (headers.displayExtension) {
+            mpeg2DisplaySizeTaken = true;
+        } else if (mpeg2DisplaySizeTaken && headers.extensionsEnd > 0) {
+            const auto extension = Mpeg2DisplayExtension(headers.width, headers.height);
+            auStaging.assign(au.begin(), au.begin() + static_cast<std::ptrdiff_t>(headers.extensionsEnd));
+            auStaging.insert(auStaging.end(), extension.begin(), extension.end());
+            auStaging.insert(auStaging.end(), au.begin() + static_cast<std::ptrdiff_t>(headers.extensionsEnd),
+                             au.end());
+            bytes = auStaging;
+        }
+    }
+
+    std::unique_ptr<AVPacket, FreeAVPacket> pkt{av_packet_alloc()};
+    if (!pkt || av_new_packet(pkt.get(), static_cast<int>(bytes.size())) < 0) [[unlikely]] {
+        return nullptr;
+    }
+    std::ranges::copy(bytes, pkt->data);
+    pkt->pts = parserCtx->pts;
+    pkt->dts = parserCtx->dts;
+    if (parserCtx->key_frame == 1) {
+        pkt->flags |= AV_PKT_FLAG_KEY;
+    }
+    return pkt;
 }
 
 auto cVaapiDecoder::DrainPendingParserAU() -> void {
@@ -615,6 +789,10 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     // (still-picture) and ReleasePendingAccessUnit (live first keyframe, EOS). Caller holds parserMutex;
     // packetMutex taken internally. codecCtx read-only.
     if (!codecCtx || !parserCtx) {
+        return;
+    }
+    if (parserHeadKept) [[unlikely]] { // no payload since the Clear(): nothing continues the kept head
+        RecreateParser();
         return;
     }
 
@@ -626,6 +804,9 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     if (parsed < 0 || parsedSize <= 0 || !parsedData) {
         return;
     }
+    if (!AdmitParsedAu({parsedData, static_cast<size_t>(parsedSize)})) {
+        return;
+    }
 
     // Same FF keyframe gate as EnqueueData; reverse must not filter (PAFF key_frame=0).
     if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
@@ -633,26 +814,16 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
         return;
     }
 
-    AVPacket *pkt = av_packet_alloc();
+    auto pkt = NewAuPacket({parsedData, static_cast<size_t>(parsedSize)});
     if (!pkt) [[unlikely]] {
         return;
-    }
-    if (av_new_packet(pkt, parsedSize) < 0) [[unlikely]] {
-        av_packet_free(&pkt);
-        return;
-    }
-    std::memcpy(pkt->data, parsedData, static_cast<size_t>(parsedSize));
-    pkt->pts = parserCtx->pts;
-    pkt->dts = parserCtx->dts;
-    if (parserCtx->key_frame == 1) {
-        pkt->flags |= AV_PKT_FLAG_KEY;
     }
 
     {
         // Appended past the depth limit: it is the last AU and no feed follows a flush, so nothing builds up.
         // Drop-oldest lost the second-to-last frame of a slow-motion replay (trick depth 1).
         const cMutexLock lock(&packetMutex);
-        packetQueue.push(pkt);
+        packetQueue.push(pkt.release());
         packetCondition.Broadcast();
     }
 }
@@ -981,6 +1152,13 @@ namespace {
         }
     }
 
+    // An open starts a new stream at its detected keyframe: nothing an earlier Clear() kept or armed applies.
+    if (parserHeadKept) {
+        RecreateParser();
+    }
+    firstAuPending = true;
+    resyncDropsLeft = 0;
+
     if (codecCtx && currentCodecId == info.codecId && !forceCodecReopen &&
         ((codecCtx->hw_device_ctx != nullptr) == useHwDecode) && extradataMatches) {
         // Context is shared across an MPEG-2 -> MPEG-2 switch, so refresh the hint here; the
@@ -1023,6 +1201,7 @@ namespace {
         filterChain.Reset();
     }
     currentCodecId = AV_CODEC_ID_NONE;
+    mpeg2DisplaySizeTaken = false; // a fresh context has no display size
     streamInterlaced = false;
     hasLoggedFirstFrame.store(false, std::memory_order_relaxed);
     // Reset so the 3 s and 15 s starvation tiers fire at most once per codec open.
@@ -1287,13 +1466,10 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
                     av_frame_unref(filteredFrame.get());
                 }
             }
-            // No parser flush API; recreate to discard stale partial NALs.
-            // Null parserCtx = mediaplayer path; must not introduce one mid-stream.
+            // Recreate to discard stale partial NALs. Null parserCtx = mediaplayer path; must not introduce
+            // one mid-stream.
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
-                parserCtx.reset(av_parser_init(currentCodecId));
-                if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-                    esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
-                }
+                RecreateParser();
             }
         } else if (generationBoundary && speed == 0 && display && filterChain.IsBuilt()) {
             // Exit to normal play: the codec stream stays contiguous (no flush), but a light trick chain must
@@ -1498,6 +1674,13 @@ auto cVaapiDecoder::Action() -> void {
         // wrong speed, overflow drops).
         const bool inTrick = trickSpeed.load(std::memory_order_acquire) != 0;
         const size_t handoffCap = inTrick ? DECODER_TRICK_QUEUE_CAPACITY : DECODER_RESERVE_CAPACITY;
+        // Room for the whole batch this iteration may push, not just one frame. Trick play pushes single
+        // frames. A drain requested after this sample can still overshoot once.
+        size_t batchMax = 1;
+        if (!inTrick) {
+            batchMax =
+                codecDrainPending.load(std::memory_order_acquire) ? DECODER_EOS_FLUSH_MAX : DECODER_OUTPUT_BATCH_MAX;
+        }
         {
             const cMutexLock hl(&handoffMutex);
             // Bound the producer to the TOTAL decoded reserve (handoffQueue + jitterBuf): the present
@@ -1509,9 +1692,10 @@ auto cVaapiDecoder::Action() -> void {
             // on a stale value (steady playback republishes every ~frame, so the lag is harmless).
             // Wake-driven: every handoffNotFull.Broadcast() holds handoffMutex and this predicate
             // re-checks under the same lock, so no wakeup can be lost -- the timeout is a pure fallback.
-            while ((handoffQueue.size() >= handoffCap ||
-                    (!inTrick && publishedDecodedReserveSize.load(std::memory_order_relaxed) >= handoffCap)) &&
-                   !stopping.load(std::memory_order_acquire)) {
+            while (
+                (handoffQueue.size() + batchMax > handoffCap ||
+                 (!inTrick && publishedDecodedReserveSize.load(std::memory_order_relaxed) + batchMax > handoffCap)) &&
+                !stopping.load(std::memory_order_acquire)) {
                 handoffNotFull.TimedWait(handoffMutex, DECODER_IDLE_WAIT_MS);
             }
         }
@@ -1864,7 +2048,8 @@ auto cVaapiDecoder::PresentAction() -> void {
                     if (noClockBlockedSinceMs == 0) {
                         noClockBlockedSinceMs = nowMs;
                     }
-                    const bool nearCap = jitterBuf.size() >= DECODER_RESERVE_CAPACITY;
+                    // As full as the decode thread fills it: it stops a whole batch short of the cap.
+                    const bool nearCap = jitterBuf.size() + DECODER_OUTPUT_BATCH_MAX > DECODER_RESERVE_CAPACITY;
                     if (!nearCap && nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
                         break;
                     }
@@ -2605,10 +2790,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 }
             }
             if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
-                parserCtx.reset(av_parser_init(currentCodecId));
-                if (!parserCtx) [[unlikely]] { // EnqueueData now bails until the next codec open
-                    esyslog("vaapivideo/decoder: parser re-init failed for %s", avcodec_get_name(currentCodecId));
-                }
+                RecreateParser();
             }
         } else if (display && filterChain.IsBuilt()) {
             // Slow-forward deferred exit (contiguous, no codec flush): a rebuild during slow motion (zoom,

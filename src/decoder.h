@@ -14,6 +14,7 @@
 
 #include <deque>
 #include <functional>
+#include <span>
 
 // VDR
 #pragma GCC diagnostic push
@@ -237,6 +238,12 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
     auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
+    auto RecreateParser() -> void;       ///< Fresh parser, drops a kept head. Caller holds parserMutex.
+    [[nodiscard]] auto NewAuPacket(std::span<const uint8_t> au)
+        -> std::unique_ptr<AVPacket, FreeAVPacket>; ///< Packet of a parsed AU (MPEG-2 display size made explicit);
+                                                    ///< null = OOM. Caller holds parserMutex.
+    [[nodiscard]] auto AdmitParsedAu(std::span<const uint8_t> au)
+        -> bool; ///< False = drop: MPEG-1/2 picture before the first I after a Clear(). Caller holds parserMutex.
     auto FillMissingFramePts(AVFrame *frame) noexcept -> void; ///< Labels a NOPTS decoded frame from lastDecodedPts
                                                                ///< before it enters the chain. Caller holds codecMutex.
     auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
@@ -384,6 +391,12 @@ class cVaapiDecoder : public cThread {
     std::unique_ptr<AVFrame, FreeAVFrame> filteredFrame;
     /// Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx;
+    std::vector<uint8_t> parserInput;  ///< EnqueueData()'s payload plus the parser's padding (parserMutex).
+    std::vector<uint8_t> auStaging;    ///< NewAuPacket()'s AU with an inserted display extension (parserMutex).
+    bool mpeg2DisplaySizeTaken{false}; ///< MPEG-2: the context took a sequence_display_extension (parserMutex).
+    bool firstAuPending{false};        ///< No AU emitted since the codec open (parserMutex).
+    bool parserHeadKept{false};        ///< Clear() kept a cut first picture; the next payload decides (parserMutex).
+    size_t resyncDropsLeft{0};         ///< > 0: MPEG-1/2 pictures still droppable before an I (parserMutex).
     bool trickAwaitSecondField{false}; ///< FF keyframe filter: keep the PAFF I-frame's 2nd field (parserMutex).
 
     // ========================================================================

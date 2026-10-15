@@ -110,7 +110,7 @@ extern "C" {
 /// Shown by "vdr -h" and in VDR's plugin list.
 inline constexpr const char *PLUGIN_DESCRIPTION = trNOOP("Hardware-accelerated video playback with VAAPI");
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.9.0";   ///< Reported to VDR; "make dist" greps this line.
+inline constexpr const char *PLUGIN_VERSION = "1.9.1";   ///< Reported to VDR; "make dist" greps this line.
 
 /// Translate a label: the plugin catalog first, then VDR's. So "auto" (unmarked) comes from VDR, and a word the
 /// plugin translates itself still falls back to VDR in languages the plugin does not ship.
@@ -350,6 +350,18 @@ struct AspectRatio {
 [[nodiscard]] inline auto HwFramesContextOf(const AVBufferRef *ref) noexcept -> AVHWFramesContext * {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- FFmpeg ABI
     return reinterpret_cast<AVHWFramesContext *>(ref->data);
+}
+
+/// @p data copied into @p staging and followed by AV_INPUT_BUFFER_PADDING_SIZE zero bytes, as av_parser_parse2()
+/// requires: a parser reads past the end of its input (ff_combine_frame() copies a frame's end plus the padding),
+/// but a PES payload ends where the player's buffer may end -- the dvd plugin allocates every PES on its own, and the
+/// read ran off that heap block. @p staging keeps its capacity across calls.
+[[nodiscard]] inline auto PaddedParserInput(std::vector<uint8_t> &staging, std::span<const uint8_t> data)
+    -> std::span<const uint8_t> {
+    staging.resize(data.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+    std::ranges::copy(data, staging.begin());
+    std::ranges::fill(std::span{staging}.subspan(data.size()), uint8_t{0});
+    return std::span{staging}.first(data.size());
 }
 
 // ============================================================================

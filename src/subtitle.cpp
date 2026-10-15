@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -52,6 +53,7 @@ extern "C" {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/config.h>
+#include <vdr/dvbspu.h>
 #include <vdr/font.h>
 #include <vdr/osd.h>
 #include <vdr/thread.h>
@@ -79,6 +81,10 @@ constexpr int SUBTITLE_DVB_CANVAS_HEIGHT = 576;  ///< definition segment (so the
 constexpr int SUBTITLE_DVB_COLORS_MAX = 256;     ///< 8 bpp palette ceiling for a DVB region bitmap.
 constexpr int SUBTITLE_DVB_DIMENSION_MAX = 4096; ///< Region w/h ceiling (UHD canvas is 3840x2160): the 16-bit
                                                  ///< DVB fields allow 65535, which overflows cBitmap's int w*h.
+
+// DVD subpictures (cVaapiSpuDecoder).
+constexpr int SUBTITLE_SPU_CLOCK_STALL_MS = 500;      ///< Clock unchanged or absent this long: still frame or pause
+constexpr int32_t SUBTITLE_SPU_LEAD_MAX_90K = 900000; ///< Read position further from the screen: another timeline
 
 /// Scale @p sourceAlpha by VDR's subtitle transparency (0..10), the mapping cDvbSubtitleConverter uses.
 [[nodiscard]] auto SubtitleAlpha(uint8_t sourceAlpha, int transparency) noexcept -> uint8_t {
@@ -890,4 +896,113 @@ auto cSubtitleConverter::HideCue() -> void {
     osdAreaWidth_ = 0;
     osdAreaHeight_ = 0;
     shownCueSerial_ = 0;
+}
+
+// ============================================================================
+// === cVaapiSpuDecoder ===
+// ============================================================================
+
+auto cVaapiSpuDecoder::setTime(uint32_t pts) -> int {
+    if (inBase_) { // the base processSPU() finishing the previous subpicture at the new one's PTS
+        return cDvbSpuDecoder::setTime(std::max(pts, 1U)); // a genuine 0 is not the redraw sentinel
+    }
+    if (pts != 0) {
+        readPts_ = pts;
+    }
+    return Advance();
+}
+
+auto cVaapiSpuDecoder::processSPU(uint32_t pts, uint8_t *buf, bool AllowedShow) -> void {
+    std::unique_ptr<uint8_t[]> data{buf}; // the player allocates with new[], the base frees with delete[]
+    if (pendingSpus_.size() >= SUBTITLE_QUEUE_CAPACITY) [[unlikely]] {
+        return; // only a screen clock that never reaches the queue could fill it
+    }
+    pendingSpus_.push_back({.pts = pts, .data = std::move(data), .allowedShow = AllowedShow, .clut = clut_});
+    readPts_ = pts;
+    (void)Advance();
+}
+
+auto cVaapiSpuDecoder::setPalette(uint32_t *pal) -> void {
+    Clut clut{};
+    std::copy_n(pal, clut.size(), clut.begin());
+    clut_ = clut;
+}
+
+auto cVaapiSpuDecoder::Empty() -> void {
+    if (!inBase_) { // the base empties itself on a corrupt subpicture: the queued ones stay valid
+        pendingSpus_.clear();
+        readPts_.reset();
+        lastClock_ = -1;
+        clockMovedAt_.Set(); // a new position: wait for its first picture again
+    }
+    cDvbSpuDecoder::Empty();
+}
+
+auto cVaapiSpuDecoder::Draw() -> void {
+    // cDvbSpuDecoder::Draw() closes its own OSD before it opens one, so only someone else's blocks it.
+    if (!IsVisible() && cOsd::IsOpen()) {
+        return;
+    }
+    cDvbSpuDecoder::Draw();
+}
+
+[[nodiscard]] auto cVaapiSpuDecoder::ScreenTime() -> std::optional<uint32_t> {
+    // The audio clock is the master the picture is synced to; STC (the last frame handed to the display)
+    // stands in without audio -- as in cSubtitleConverter.
+    int64_t clock = device_.GetAudioClock();
+    if (clock < 0) {
+        clock = device_.GetSTC(); // -1 = none
+    }
+    if (clock != lastClock_) {
+        lastClock_ = clock;
+        clockMovedAt_.Set();
+    }
+    // A clock frozen (still frame, pause) or absent this long never reaches what was read ahead of it: the
+    // read position goes through, as in the stock decoder.
+    const bool frozen = clockMovedAt_.Elapsed() >= SUBTITLE_SPU_CLOCK_STALL_MS;
+    if (clock < 0) {
+        return frozen ? readPts_ : std::nullopt; // no picture yet: wait for the first one
+    }
+    const auto onScreen = static_cast<uint32_t>(clock);
+    if (!readPts_) {
+        return onScreen;
+    }
+    // The player hands over 33-bit PTS cut to 32 bits; cut the clock the same way and compare modulo 2^32.
+    // The screen may also run ahead of the last position read (reading paused): its time still counts.
+    const auto lead = static_cast<int32_t>(*readPts_ - onScreen);
+    if (lead > SUBTITLE_SPU_LEAD_MAX_90K || lead < -SUBTITLE_SPU_LEAD_MAX_90K) {
+        return readPts_; // another timeline (a PTS jump at a cell boundary)
+    }
+    return frozen && lead > 0 ? *readPts_ : onScreen;
+}
+
+auto cVaapiSpuDecoder::Advance() -> int {
+    const std::optional<uint32_t> time = ScreenTime();
+    if (time) {
+        InstallDueSpus(*time);
+    }
+    inBase_ = true;
+    // The base takes 0 as "redraw only": no time yet means just that, a genuine 0 must run its commands.
+    const int result = cDvbSpuDecoder::setTime(time ? std::max(*time, 1U) : 0);
+    inBase_ = false;
+    return result;
+}
+
+auto cVaapiSpuDecoder::InstallDueSpus(uint32_t time) -> void {
+    while (!pendingSpus_.empty()) {
+        // Further ahead than any read-ahead: another timeline (a PTS jump at a cell boundary). Waiting for it
+        // would hold back every later cue, so it goes in at once, as the stock decoder would have done.
+        const auto ahead = static_cast<int32_t>(pendingSpus_.front().pts - time);
+        if (ahead > 0 && ahead <= SUBTITLE_SPU_LEAD_MAX_90K) {
+            return;
+        }
+        PendingSpu due = std::move(pendingSpus_.front());
+        pendingSpus_.pop_front(); // before the base runs: nothing it calls back into may see the entry
+        inBase_ = true;
+        cDvbSpuDecoder::processSPU(due.pts, due.data.release(), due.allowedShow);
+        if (due.clut) { // after the previous subpicture was finished with its own CLUT
+            cDvbSpuDecoder::setPalette(due.clut->data());
+        }
+        inBase_ = false;
+    }
 }

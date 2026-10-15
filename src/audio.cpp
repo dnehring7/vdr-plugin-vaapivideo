@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -129,6 +130,11 @@ constexpr int AUDIO_ERROR_LOG_INTERVAL_MS = 2000; ///< Minimum interval between 
 constexpr uint32_t TRACE_FIRST_WRITE = 1U << 0; ///< First ALSA write after the switch: the master clock anchors here
 constexpr uint32_t TRACE_DAC_RUNNING = 1U << 1; ///< Ring crossed the start threshold; the DAC is audibly playing
 
+/// Raw PCM carries neither layout nor rate in-band: its decoder has only the stream parameters (OpenDecoder()).
+[[nodiscard]] constexpr auto IsRawPcm(AVCodecID codecId) noexcept -> bool {
+    return codecId >= AV_CODEC_ID_PCM_S16LE && codecId < AV_CODEC_ID_ADPCM_IMA_QT;
+}
+
 } // namespace
 
 // ============================================================================
@@ -174,7 +180,12 @@ auto cAudioProcessor::Clear() -> void {
 
     // avcodec_flush_buffers() must run on the Action thread: calling it here races
     // against an in-flight DecodeToPcm() that already passed the refcount gate.
-    if (decoder) {
+    if (decoder && streamParams.codecId == AV_CODEC_ID_PCM_DVD) {
+        // FFmpeg's pcm_dvd has no flush callback: a partial 20/24-bit sample group would survive the flush and
+        // misalign every group after it. A reopen is safe here, as in SetStreamParams() (generation bumped).
+        CloseDecoder();
+        OpenDecoder();
+    } else if (decoder) {
         needsFlush.store(true, std::memory_order_release);
     }
 
@@ -187,6 +198,17 @@ auto cAudioProcessor::ArmStartTrace(uint64_t epochMs) noexcept -> void {
 
 auto cAudioProcessor::DisarmStartTrace() noexcept -> void { startTrace.Disarm(); }
 
+auto cAudioProcessor::EnqueuePayload(std::span<const uint8_t> payload, int64_t pts) -> void {
+    const std::unique_ptr<AVPacket, FreeAVPacket> packet{av_packet_alloc()};
+    if (!packet || av_new_packet(packet.get(), static_cast<int>(payload.size())) < 0) [[unlikely]] {
+        esyslog("vaapivideo/audio: out of memory for a %zu-byte packet", payload.size());
+        return;
+    }
+    std::ranges::copy(payload, packet->data);
+    packet->pts = pts;
+    (void)EnqueuePacket(packet.get()); // a refcounted packet: the queued clone shares the buffer
+}
+
 auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> void {
     if (!data || size == 0) [[unlikely]] {
         return;
@@ -194,7 +216,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
     const cMutexLock lock(mutex.get());
 
-    if (!parserCtx || !decoder) [[unlikely]] {
+    if (!decoder) [[unlikely]] {
         return;
     }
 
@@ -219,12 +241,15 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
             codecRedetectRequested.store(true, std::memory_order_release);
             return;
         }
-        if (!parserCtx) {
-            return;
-        }
     }
 
-    const uint8_t *currentData = data;
+    if (!parserCtx) {
+        // No parser (PCM): a payload is whole samples, so it is one packet.
+        EnqueuePayload({data, size}, pts);
+        return;
+    }
+
+    const uint8_t *currentData = PaddedParserInput(parserInput, {data, size}).data();
     int remainingSize = static_cast<int>(size);
 
     while (remainingSize > 0) {
@@ -493,15 +518,21 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         extradataMatches = params.extradata != nullptr && std::memcmp(storedExtradata.data(), params.extradata,
                                                                       static_cast<size_t>(params.extradataSize)) == 0;
     }
-    const bool hasActivePipeline = alsaHandle != nullptr && decoder != nullptr && parserCtx != nullptr;
+    // No parserCtx test: PCM runs without a parser (OpenDecoder()).
+    const bool hasActivePipeline = alsaHandle != nullptr && decoder != nullptr;
+    // A raw PCM decoder keeps the layout and rate it was opened with, so another PCM format needs a new one
+    // even when codec and ALSA geometry stay (5.1 after stereo on a stereo sink, quad after 4.0).
+    const bool pcmFormatChanged = IsRawPcm(params.codecId) && (streamParams.channels != params.channels ||
+                                                               streamParams.channelMask != params.channelMask ||
+                                                               streamParams.sampleRate != params.sampleRate);
 
     // Fast path: all params and passthrough decision unchanged, pipeline live.
     // PassthroughMode comparison is load-bearing: the user can flip Auto/On/Off from
     // the setup menu between identical-codec calls, which must still trigger a reopen.
     // hasActivePipeline prevents reporting success when a prior open left a broken state.
     if (streamParams.codecId == params.codecId && streamParams.sampleRate == params.sampleRate &&
-        streamParams.channels == params.channels && extradataMatches && wantPassthrough == currentlyPassthrough &&
-        hasActivePipeline) {
+        streamParams.channels == params.channels && extradataMatches && !pcmFormatChanged &&
+        wantPassthrough == currentlyPassthrough && hasActivePipeline) {
         // This fast path skips OpenDecoder()'s reset, so clear recovery evidence here too --
         // a redetect flag raised in a prior era but never consumed would else fire spuriously.
         cascadeRecoveryCount.store(0, std::memory_order_relaxed);
@@ -519,7 +550,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
     }
 
     const AVCodecID oldCodecId = streamParams.codecId;
-    const bool decoderConfigChanged = oldCodecId != params.codecId || !extradataMatches;
+    const bool decoderConfigChanged = oldCodecId != params.codecId || !extradataMatches || pcmFormatChanged;
 
     DrainPacketQueue();
 
@@ -575,11 +606,11 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
             return false;
         }
         OpenDecoder();
-        return alsaHandle != nullptr && decoder != nullptr && parserCtx != nullptr;
+        return alsaHandle != nullptr && decoder != nullptr;
     }
 
     if (decoderConfigChanged || !hasActivePipeline) {
-        // (a) Same HW config but codec or extradata changed, or (b) pipeline torn down
+        // (a) Same HW config but codec, extradata or raw PCM format changed, or (b) pipeline torn down
         // with ALSA still valid (first Decode() after Initialize(), or recovery from a
         // prior OpenDecoder() failure). Drop in-flight PCM so GetClock() doesn't report
         // delay from the previous codec's queued samples, then rebuild the decoder side.
@@ -590,7 +621,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
         ResetPlaybackClock();
         CloseDecoder();
         OpenDecoder();
-        return alsaHandle != nullptr && decoder != nullptr && parserCtx != nullptr;
+        return alsaHandle != nullptr && decoder != nullptr;
     }
     return true;
 }
@@ -1711,6 +1742,11 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
                 }
             }
         }
+        // The tail was written without the decoder reference (EmitConvertedPcm()): the decoder may be gone.
+        if (clearGeneration.load(std::memory_order_acquire) != expectedGeneration) {
+            decoderRefCount.fetch_sub(1, std::memory_order_release);
+            return true;
+        }
         // send_packet(NULL) left the codec at EOF; data can follow without a Clear() (a growing recording).
         FlushDecoderState();
     }
@@ -1737,9 +1773,15 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
             }
         }
     }
+    // WritePcmToAlsa() waits for `mutex`, which SetStreamParams() and Clear() hold while CloseDecoder() waits for the
+    // caller's decoder reference: held across the write, it stalled them AUDIO_DECODER_DRAIN_TIMEOUT_MS, then they
+    // freed the decoder under DecodeToPcm(). Both bump clearGeneration first, so the check after the write tells.
+    decoderRefCount.fetch_sub(1, std::memory_order_release);
     // Clock advances by the real output count (== nb_samples unless swr resamples / rebuffers).
-    return WritePcmToAlsa(pcm.first(static_cast<size_t>(frames) * outCh * 2),
-                          pcmNextPts.load(std::memory_order_relaxed), frames, expectedGeneration);
+    const bool written = WritePcmToAlsa(pcm.first(static_cast<size_t>(frames) * outCh * 2),
+                                        pcmNextPts.load(std::memory_order_relaxed), frames, expectedGeneration);
+    decoderRefCount.fetch_add(1, std::memory_order_acquire);
+    return written && clearGeneration.load(std::memory_order_acquire) == expectedGeneration;
 }
 
 namespace {
@@ -2159,9 +2201,17 @@ auto cAudioProcessor::OpenDecoder() -> void {
     ctx->err_recognition = AV_EF_CAREFUL;
     ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
-    // Deliberately do NOT pre-seed ctx->ch_layout: the decoder reports the stream's true layout
+    // Do NOT pre-seed ctx->ch_layout in general: the decoder reports the stream's true layout
     // (e.g. AAC 5.1) from the bitstream/extradata, and DecodeToPcm() chooses the PCM output count
     // from that frame. Forcing a stereo default here would mask multichannel content.
+    // Raw PCM is the exception: nothing in-band carries a layout, and the PCM decoders refuse to run
+    // without one. pcm_dvd/pcm_bluray replace it from their packet headers.
+    if (IsRawPcm(streamParams.codecId) && streamParams.channels > 0) {
+        const uint64_t mask = streamParams.channelMask;
+        if (std::popcount(mask) != streamParams.channels || av_channel_layout_from_mask(&ctx->ch_layout, mask) < 0) {
+            av_channel_layout_default(&ctx->ch_layout, streamParams.channels);
+        }
+    }
 
     // FFmpeg requires AV_INPUT_BUFFER_PADDING_SIZE zero bytes after extradata
     // (e.g. AAC AudioSpecificConfig) to allow SIMD overread without a fault.
@@ -2184,9 +2234,10 @@ auto cAudioProcessor::OpenDecoder() -> void {
         return;
     }
 
+    // PCM has no parser and needs none: Decode() then feeds each payload whole.
     parserCtx.reset(av_parser_init(streamParams.codecId));
     if (!parserCtx) {
-        esyslog("vaapivideo/audio: av_parser_init failed");
+        dsyslog("vaapivideo/audio: no parser for %s -- payloads are fed whole", avcodec_get_name(streamParams.codecId));
     }
 
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;

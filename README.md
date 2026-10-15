@@ -23,6 +23,7 @@ the plugin refuses to start without it.
 | Display     | DRM atomic mode-setting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, trick play (fast/slow, forward/backward), audio-track switching, text subtitles — see [Mediaplayer](#mediaplayer) |
+| DVD         | Output for the dvd plugin: menus, still frames, DVD subtitles, AC-3/DTS/LPCM/MPEG audio — see [DVD plugin](#dvd-plugin) |
 | A/V sync    | Audio-mastered, EMA-smoothed, proportional with hard-transient bypass — see [AVSYNC.md](AVSYNC.md) |
 
 
@@ -558,6 +559,32 @@ dropped to real-time speed (no motion interpolation); rates within 0.2% count
 as matched and are left alone. Enable
 [display mode switching](#display-mode-switching) to move the display to the
 source's cadence instead of resampling.
+
+
+## DVD plugin
+
+The [dvd plugin](https://github.com/vdr-projects/vdr-plugin-dvd) plays through
+this device: menus and still frames, DVD subtitles and menu buttons, and AC-3,
+DTS, LPCM and MPEG audio. Subpictures go through VDR's own decoder onto the OSD
+plane, timed against the frame on screen rather than the packets being read,
+which run over a second ahead. AC-3 and DTS can take the passthrough path like
+any Dolby track.
+
+- Subtitles the disc switches on by itself appear only with the dvd plugin's
+  setting *Display subtitles* on (default off). Forced subtitles and a subtitle
+  track selected by hand show regardless.
+- A 4:3 title after a 16:9 menu keeps its 4:3 shape. Such menus are often coded
+  4:3 with a pan&scan display size, and FFmpeg keeps that size for every later
+  sequence that names none; the decoder spells out the default there.
+- The dvd plugin clears the device at its first audio packet, usually halfway
+  through the title's first picture. The decoder keeps that picture when the
+  stream continues it, so a title starts on its first frame instead of half a
+  second later.
+- dvd plugin 0.3.8 on VDR 2.8.3 (API 14) selects the Dolby track for every
+  audio stream, and VDR drops the packets of any other track. Without the
+  bitstreamout plugin it decodes AC-3 to LPCM itself, so AC-3 is lost, and it
+  does not forward DTS at all. LPCM and MPEG audio play once the plugin
+  corrects the track, a moment into the title.
 
 
 ## HDR

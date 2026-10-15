@@ -23,6 +23,7 @@ class cAudioProcessor;
 class cStatus;
 class cVaapiDecoder;
 class cVaapiDisplay;
+class cVaapiSpuDecoder;
 struct AudioStreamInfo;
 struct VideoStreamInfo;
 
@@ -194,6 +195,8 @@ class cVaapiDevice : public cDevice {
     auto GetOsdSize(int &Width, int &Height, double &PixelAspect)
         -> void override;                            ///< Return display framebuffer dimensions for OSD allocation
     [[nodiscard]] auto GetSTC() -> int64_t override; ///< Return presentation clock in VDR 90 kHz ticks
+    [[nodiscard]] auto GetSpuDecoder()
+        -> cSpuDecoder * override; ///< DVD subpictures (dvd plugin subtitles and menu buttons); primary device only
     auto GetVideoSize(int &Width, int &Height, double &VideoAspect)
         -> void override; ///< Return active video stream resolution
     [[nodiscard]] auto GrabImage(int &Size, bool Jpeg = true, int Quality = -1, int SizeX = -1, int SizeY = -1)
@@ -217,6 +220,8 @@ class cVaapiDevice : public cDevice {
         -> bool override; ///< Return true when at least one queue has space for more data
     auto ScaleVideo(const cRect &rect = cRect::Null)
         -> void override; ///< Stage target rect; VPP rebuilds on dim change, KMS scanout stays 1:1.
+    auto SetVideoDisplayFormat(eVideoDisplayFormat VideoDisplayFormat)
+        -> void override; ///< DVD subpicture variant for the display's own shape, not for Setup.VideoFormat's TV
     // === Manual zoom (transient; resets to Off on every content change) ===
     [[nodiscard]] auto SetZoom(int stop)
         -> int; ///< Apply cycle stop (0=Off, 1..N=preset); returns clamped stop, rebuilds VPP on change
@@ -493,6 +498,9 @@ class cVaapiDevice : public cDevice {
     /// Attaches VDR's transfer player at the channel switch instead of on the next main-loop pass
     /// (cVaapiSwitchAttacher in device.cpp). Created in the ctor, unregistered first thing in the dtor.
     std::unique_ptr<cStatus> switchAttacher;
+    /// DVD subpicture decoder (subtitle.h); draws through the OSD provider like any OSD. Created in the ctor so
+    /// players on any thread share one instance without a creation race.
+    std::unique_ptr<cVaapiSpuDecoder> spuDecoder;
 
     // --- Display mode switching (all guarded by displayModeMutex) ---
     mutable cMutex displayModeMutex;   ///< Serializes the debounce state below; EvaluateDisplayMode() is
@@ -543,6 +551,7 @@ class cVaapiDevice : public cDevice {
     std::atomic<uint64_t> lastClearMs{0};     ///< Last Clear() timestamp (diagnostic)
     eTrackType lastHandledAudioTrack{ttNone}; ///< (with lastHandledAudioPid) dedup track-change
     uint16_t lastHandledAudioPid{};           ///<   hooks during PMT churn
+    bool dolbyEntryUnresolved{false};         ///< Last hook was a dolby entry that found no dolby track registered
     std::atomic<bool> paused{false};          ///< True while frozen via Freeze()
     std::atomic<PassthroughMode> passthroughResumeMode{PassthroughMode::Auto}; ///< What TogglePassthrough() turns
                                                                                ///< back on: the mode it last left

@@ -15,6 +15,7 @@
 // Platform
 #include <alsa/asoundlib.h>
 #include <climits>
+#include <span>
 
 // VDR
 #pragma GCC diagnostic push
@@ -90,7 +91,7 @@ class cAudioProcessor : public cThread {
     auto ResumeOutput() -> void; ///< Play() after PauseOutput(): ring and clock go on where they stopped; a stopped
                                  ///< ring reads NOPTS until audio restarts (not over the EOS tail).
     auto Decode(const uint8_t *data, size_t size, int64_t pts)
-        -> void; ///< Parses raw PES payload into access units and enqueues them for decoding/passthrough
+        -> void;                 ///< Parses raw PES payload into access units (PCM: one per payload) and enqueues them
     auto RequestDrain() -> void; ///< EOS: after the last packet, play out parser, codec, resampler and ring tails.
                                  ///< Counted by GetPendingWorkSize(); Clear() cancels it, a pause defers it.
     [[nodiscard]] auto GetClock() const noexcept
@@ -171,9 +172,12 @@ class cAudioProcessor : public cThread {
         -> void; ///< Worker only, queue empty: flushes parser + codec + resampler tails to ALSA, then
                  ///< StartPreparedTail().
     auto DrainPacketQueue() -> void; ///< Pops and frees every queued packet. Takes queueMutex internally.
+    auto EnqueuePayload(std::span<const uint8_t> payload, int64_t pts)
+        -> void; ///< Queue @p payload as one packet: the parser-less (PCM) path of Decode().
     [[nodiscard]] auto EmitConvertedPcm(std::span<uint8_t> pcm, unsigned frames, unsigned outCh,
                                         uint32_t expectedGeneration)
-        -> bool; ///< Device channel-order permute + WritePcmToAlsa() of swr output; false = write failed.
+        -> bool; ///< Device channel-order permute + WritePcmToAlsa() of swr output, without DecodeToPcm()'s decoder
+                 ///< reference (held again on return); false = write failed or the decoder may be gone.
     auto ApplyOutputPause() -> void;   ///< snd_pcm_pause (or drop) + clock pin, only while held and nothing is in
                                        ///< flight; idempotent. From PauseOutput() or the worker's FinishPacket().
     auto FinishPacket() -> void;       ///< Worker: clears packetInFlight; applies a pause that arrived meanwhile.
@@ -290,6 +294,7 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> parserNeedsReset{false}; ///< Action() flags INVALIDDATA cascade; Decode() recreates parserCtx
                                                ///< (cannot be done in Action() -- would deadlock CloseDecoder()).
     std::unique_ptr<AVCodecParserContext, FreeAVCodecParserContext> parserCtx; ///< AU-framing parser
+    std::vector<uint8_t> parserInput;                                          ///< Decode() input + padding (mutex)
     int swrChannels{};                                                         ///< swrCtx input channel count
     int swrInRate{};                                                           ///< swrCtx input sample rate (Hz)
     int swrOutChannels{};                                                      ///< swrCtx output channel count
