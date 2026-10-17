@@ -187,9 +187,9 @@ inline constexpr int CONFIG_VPP_DEINT_MODE_COUNT = static_cast<int>(VppDeintMode
 // ============================================================================
 // === POST-PROCESSING OPTIONS (deinterlace / denoise / sharpen / scale) ===
 // ============================================================================
-// Four independent user policies. Each "sw-*" / "SwQuality" value routes the whole post-process
-// through one hwdownload->[SW filters]->hwupload block (filter.cpp); "Auto"/"Hw*" stay on the
-// VAAPI VPP path. Numeric values are part of the setup.conf wire format -- do not renumber.
+// Four independent user policies. Each Sw* value runs its filter inside one
+// hwdownload->[SW filters]->hwupload block (filter.cpp); Auto/Off/Hw* keep the frame on the GPU.
+// Numeric values are part of the setup.conf wire format -- do not renumber.
 
 /// Deinterlacer selection. Auto/Hw* run on the GPU (deinterlace_vaapi, clamped to an advertised
 /// VppDeintMode); Sw* force the software block (bwdif / w3fdif). No explicit MCDI entry: Auto already
@@ -225,56 +225,74 @@ inline constexpr int CONFIG_DEINTERLACE_MODE_COUNT = static_cast<int>(Deinterlac
     return "?";
 }
 
-/// Denoise. Auto uses HW denoise_vaapi (codec-tuned) on the GPU path and adds nothing when the chain
-/// is already in the SW block. Sw* are software hqdn3d presets that force the SW block. Off emits no
-/// node.
+/// Denoise. Auto denoises nothing: a denoiser removes the grain that hides the steps of 8-bit gradients,
+/// so dark scenes band (filter.cpp). Hw is the opt-in VPP denoiser at a user strength; Sw* are software
+/// hqdn3d presets that force the SW block. Off emits no node either; it stays so stored setup values keep
+/// their meaning, which is also why Hw comes last.
 enum class DenoiseMode : uint8_t {
-    Auto = 0,       ///< HW denoise_vaapi (codec-tuned); no SW fallback
+    Auto = 0,       ///< No denoise (the default)
     Off = 1,        ///< No denoise
     SwMinimal = 2,  ///< Software hqdn3d (light) -> forces SW block
     SwEnhanced = 3, ///< Software hqdn3d (medium) -> forces SW block
+    Hw = 4,         ///< denoise_vaapi at VaapiConfig::denoiseLevel
 };
 
 /// Derived from the last enumerator so it cannot drift
-inline constexpr int CONFIG_DENOISE_MODE_COUNT = static_cast<int>(DenoiseMode::SwEnhanced) + 1;
+inline constexpr int CONFIG_DENOISE_MODE_COUNT = static_cast<int>(DenoiseMode::Hw) + 1;
+
+inline constexpr int CONFIG_DENOISE_LEVEL_MIN = 1;     ///< Weakest denoise_vaapi strength (0 would be Off)
+inline constexpr int CONFIG_DENOISE_LEVEL_MAX = 64;    ///< Strongest denoise_vaapi strength (the filter's limit)
+inline constexpr int CONFIG_DENOISE_LEVEL_DEFAULT = 4; ///< Light: tames ringing at bitrate-starved edges
 
 /// Lowercase wire-format label for a DenoiseMode; same contract as PassthroughModeName().
 [[nodiscard]] constexpr auto DenoiseModeName(DenoiseMode mode) noexcept -> const char * {
     switch (mode) {
         case DenoiseMode::Auto:
-            return trNOOP("auto (hardware)");
+            return "auto";
         case DenoiseMode::Off:
             return trNOOP("off");
         case DenoiseMode::SwMinimal:
             return trNOOP("software: light");
         case DenoiseMode::SwEnhanced:
             return trNOOP("software: medium");
+        case DenoiseMode::Hw:
+            return trNOOP("hardware");
     }
     return "?";
 }
 
-/// Sharpening. Auto uses HW sharpness_vaapi; Sw* force the SW block (unsharp). Off emits no node.
+/// Sharpening. Auto sharpens nothing: a sharpener rims text and edges and lifts compression noise
+/// (filter.cpp). Hw is the opt-in VPP sharpener at a user strength; Sw* are software unsharp presets that
+/// force the SW block. Off emits no node either; it stays so stored setup values keep their meaning, which
+/// is also why Hw comes last.
 enum class SharpenMode : uint8_t {
-    Auto = 0,     ///< Codec-tuned HW sharpness
+    Auto = 0,     ///< No sharpening (the default)
     Off = 1,      ///< No sharpening
     SwMild = 2,   ///< Software unsharp (light) -> forces SW block
     SwMedium = 3, ///< Software unsharp (medium) -> forces SW block
+    Hw = 4,       ///< sharpness_vaapi at VaapiConfig::sharpenLevel
 };
 
 /// Derived from the last enumerator so it cannot drift
-inline constexpr int CONFIG_SHARPEN_MODE_COUNT = static_cast<int>(SharpenMode::SwMedium) + 1;
+inline constexpr int CONFIG_SHARPEN_MODE_COUNT = static_cast<int>(SharpenMode::Hw) + 1;
+
+inline constexpr int CONFIG_SHARPEN_LEVEL_MIN = 1;      ///< Weakest sharpness_vaapi strength (0 would be Off)
+inline constexpr int CONFIG_SHARPEN_LEVEL_MAX = 64;     ///< Strongest sharpness_vaapi strength (the filter's limit)
+inline constexpr int CONFIG_SHARPEN_LEVEL_DEFAULT = 20; ///< Mild: stronger values halate bright content
 
 /// Lowercase wire-format label for a SharpenMode; same contract as PassthroughModeName().
 [[nodiscard]] constexpr auto SharpenModeName(SharpenMode mode) noexcept -> const char * {
     switch (mode) {
         case SharpenMode::Auto:
-            return trNOOP("auto (hardware)");
+            return "auto";
         case SharpenMode::Off:
             return trNOOP("off");
         case SharpenMode::SwMild:
             return trNOOP("software: light");
         case SharpenMode::SwMedium:
             return trNOOP("software: medium");
+        case SharpenMode::Hw:
+            return trNOOP("hardware");
     }
     return "?";
 }
@@ -484,8 +502,10 @@ struct VaapiConfig {
     std::atomic<HdrMode> hdrMode{HdrMode::Auto};   ///< Re-read on every codec change / filter-graph rebuild
     // Post-processing policies: re-read on every filter-graph rebuild (alphabetical within group).
     std::atomic<DeinterlaceMode> deinterlaceMode{DeinterlaceMode::Auto}; ///< Deinterlacer selection
-    std::atomic<DenoiseMode> denoiseMode{DenoiseMode::Auto};             ///< Denoise strength
+    std::atomic<int> denoiseLevel{CONFIG_DENOISE_LEVEL_DEFAULT};         ///< Strength for DenoiseMode::Hw
+    std::atomic<DenoiseMode> denoiseMode{DenoiseMode::Auto};             ///< Denoise selection
     std::atomic<ScaleMode> scaleMode{ScaleMode::Auto};                   ///< Scaler selection
+    std::atomic<int> sharpenLevel{CONFIG_SHARPEN_LEVEL_DEFAULT};         ///< Strength for SharpenMode::Hw
     std::atomic<SharpenMode> sharpenMode{SharpenMode::Auto};             ///< Sharpening selection
     // Display mode switching: two match policies plus one enable switch per playback source.
     // Read from the decode and player threads on every filter-graph rebuild / entry open.

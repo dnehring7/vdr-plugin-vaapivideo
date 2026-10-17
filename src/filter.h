@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 /**
  * @file filter.h
- * @brief VAAPI VPP filter chain: deinterlace, denoise, scale, sharpness, and HDR classification.
+ * @brief VAAPI VPP filter chain: deinterlace, scale, opt-in denoise/sharpen, and HDR classification.
  *
  * cVideoFilterChain is standalone and codec-agnostic: Build() takes all decisions through
  * BuildParams so this class has no dependency on cVaapiDecoder, cVaapiDisplay, or
@@ -107,13 +107,12 @@ class cVideoFilterChain {
     /// All inputs Build() needs. Filled once per Build() call; no retained reference after return.
     struct BuildParams {
         // --- Source stream ---
-        AVCodecID codecId{AV_CODEC_ID_NONE}; ///< Used to tune denoise/sharpen levels (MPEG-2 vs. H.264/H.265)
-        int fpsNum{0};                       ///< codecCtx->framerate.num; 0 = unknown (defaults to 50)
-        int fpsDen{1};                       ///< codecCtx->framerate.den
-        AVBufferRef *hwFramesCtx{nullptr};   ///< codecCtx->hw_frames_ctx; nullptr for SW decode
-        AVBufferRef *hwDeviceRef{nullptr};   ///< VAAPI device (required, borrowed -- Build() refs internally)
-        bool streamInterlaced{false};        ///< Positive sequence/container hint; forces deinterlace when set
-        cMutex *vaDriverMutex{nullptr};      ///< Stored in the graph's deleter -- see FreeFilterGraphLocked
+        int fpsNum{0};                     ///< codecCtx->framerate.num; 0 = unknown (defaults to 50)
+        int fpsDen{1};                     ///< codecCtx->framerate.den
+        AVBufferRef *hwFramesCtx{nullptr}; ///< codecCtx->hw_frames_ctx; nullptr for SW decode
+        AVBufferRef *hwDeviceRef{nullptr}; ///< VAAPI device (required, borrowed -- Build() refs internally)
+        bool streamInterlaced{false};      ///< Positive sequence/container hint; forces deinterlace when set
+        cMutex *vaDriverMutex{nullptr};    ///< Stored in the graph's deleter -- see FreeFilterGraphLocked
 
         // --- Target surface ---
         uint32_t outputWidth{0};  ///< Target video rect width; VPP output is DAR-fitted for 1:1 KMS scanout
@@ -132,17 +131,17 @@ class cVideoFilterChain {
         HdrStreamInfo hdrInfo{};    ///< Determines PQ vs. HLG transfer function in scale_vaapi args
 
         // --- GPU capabilities (queried from GpuCaps by caller) ---
-        bool hasDenoise{false};           ///< denoise_vaapi is available on this device
-        bool hasSharpness{false};         ///< sharpness_vaapi is available on this device
         std::string_view deinterlaceMode; ///< Best advertised mode "motion_adaptive"/"bob"/...; empty = skip HW deint
         /// Bit (1u<<VppDeintMode) per driver-supported mode; bounds ClampDeinterlaceMode
         unsigned deinterlaceModeMask{};
 
         // --- Post-processing policies (resolved from config by caller) ---
         DeinterlaceMode userDeint{DeinterlaceMode::Auto}; ///< Deinterlacer selection (GPU clamp vs. SW block)
-        DenoiseMode denoise{DenoiseMode::Auto};           ///< Denoise strength (denoise_vaapi or hqdn3d)
+        DenoiseMode denoise{DenoiseMode::Auto};           ///< Denoise: none, a software hqdn3d preset, or Hw
+        int hwDenoiseLevel{0};                            ///< denoise_vaapi strength for Hw on a capable GPU; 0 = none
         ScaleMode scale{ScaleMode::Auto};                 ///< Scaler (scale_vaapi hq/fast or swscale lanczos)
-        SharpenMode sharpen{SharpenMode::Auto};           ///< Sharpening (sharpness_vaapi or unsharp)
+        SharpenMode sharpen{SharpenMode::Auto};           ///< Sharpening: none, a software unsharp preset, or Hw
+        int hwSharpenLevel{0}; ///< sharpness_vaapi strength for Hw on a capable GPU; 0 = none
 
         // --- Manual zoom (symmetric crop before scale) ---
         double cropH{0.0}; ///< Per-side horizontal crop fraction (decoder derives it from the zoom-in factor); 0 = none

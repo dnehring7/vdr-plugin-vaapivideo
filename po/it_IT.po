@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vdr-vaapivideo 1.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
-"POT-Creation-Date: 2026-10-04 22:46+0200\n"
+"POT-Creation-Date: 2026-10-18 00:01+0200\n"
 "PO-Revision-Date: 2026-10-04 09:40+0200\n"
 "Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
 "Language-Team: Italian <vdr@linuxtv.org>\n"
@@ -43,11 +43,17 @@ msgstr "Deinterlacciamento"
 msgid "Denoising"
 msgstr "Riduzione rumore"
 
+msgid "Denoising strength"
+msgstr "Intensità riduzione rumore"
+
 msgid "Scaling"
 msgstr "Ridimensionamento"
 
 msgid "Sharpening"
 msgstr "Nitidezza"
+
+msgid "Sharpening strength"
+msgstr "Intensità nitidezza"
 
 msgid "HDR passthrough"
 msgstr "Passthrough HDR"
@@ -170,14 +176,14 @@ msgstr "software: bwdif (qualità migliore)"
 msgid "software: w3fdif (faster)"
 msgstr "software: w3fdif (più veloce)"
 
-msgid "auto (hardware)"
-msgstr "automatico (hardware)"
-
 msgid "software: light"
 msgstr "software: leggero"
 
 msgid "software: medium"
 msgstr "software: medio"
+
+msgid "hardware"
+msgstr "hardware"
 
 msgid "auto (hardware, HQ)"
 msgstr "automatico (hardware, HQ)"

@@ -386,7 +386,7 @@ class cVaapiDecoder : public cThread {
     AVContentLightMetadata hintContentLight{};         ///< HDR10 MaxCLL/MaxFALL, valid per the flag above
     /// Staging for avcodec_receive_frame(); unref'd each iteration.
     std::unique_ptr<AVFrame, FreeAVFrame> decodedFrame;
-    cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi -> optional denoise/sharpness).
+    cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi; opt-in denoise/sharpen).
     /// Staging for filterChain.ReceiveFrame(); unref'd each iteration.
     std::unique_ptr<AVFrame, FreeAVFrame> filteredFrame;
     /// Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.

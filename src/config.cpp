@@ -140,12 +140,17 @@ constexpr uint32_t CONFIG_VIDEO_WIDTH_MAX = 3840U;  ///< 4K UHD ceiling for Pars
             zoom += std::format("{}{}=+{:.1f}%", i == 0 ? "" : " ", i + 1, static_cast<double>(level) / 10.0);
         }
     }
-    // Post-processing policies.
-    const std::string postProc = std::format("deint={} denoise={} sharpen={} scale={}",
-                                             DeinterlaceModeName(deinterlaceMode.load(std::memory_order_relaxed)),
-                                             DenoiseModeName(denoiseMode.load(std::memory_order_relaxed)),
-                                             SharpenModeName(sharpenMode.load(std::memory_order_relaxed)),
-                                             ScaleModeName(scaleMode.load(std::memory_order_relaxed)));
+    // Post-processing policies; a hardware denoise/sharpen shows its strength ("hardware:4").
+    const auto withLevel = [](const char *name, bool hardware, const std::atomic<int> &level) -> std::string {
+        return hardware ? std::format("{}:{}", name, level.load(std::memory_order_relaxed)) : std::string{name};
+    };
+    const DenoiseMode denoise = denoiseMode.load(std::memory_order_relaxed);
+    const SharpenMode sharpen = sharpenMode.load(std::memory_order_relaxed);
+    const std::string postProc = std::format(
+        "deint={} denoise={} sharpen={} scale={}", DeinterlaceModeName(deinterlaceMode.load(std::memory_order_relaxed)),
+        withLevel(DenoiseModeName(denoise), denoise == DenoiseMode::Hw, denoiseLevel),
+        withLevel(SharpenModeName(sharpen), sharpen == SharpenMode::Hw, sharpenLevel),
+        ScaleModeName(scaleMode.load(std::memory_order_relaxed)));
     const std::string mark = bookmarkSnapshot.uri.empty()
                                  ? std::string{"none"}
                                  : std::format("{} @ {}ms", bookmarkSnapshot.uri, bookmarkSnapshot.positionMs);
@@ -310,8 +315,16 @@ auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &targ
         ParseEnumValue("DenoiseMode", value, denoiseMode, CONFIG_DENOISE_MODE_COUNT);
         return true;
     }
+    if (strcasecmp(name, "DenoiseLevel") == 0) {
+        ParseBoundedIntValue("DenoiseLevel", value, denoiseLevel, CONFIG_DENOISE_LEVEL_MIN, CONFIG_DENOISE_LEVEL_MAX);
+        return true;
+    }
     if (strcasecmp(name, "SharpenMode") == 0) {
         ParseEnumValue("SharpenMode", value, sharpenMode, CONFIG_SHARPEN_MODE_COUNT);
+        return true;
+    }
+    if (strcasecmp(name, "SharpenLevel") == 0) {
+        ParseBoundedIntValue("SharpenLevel", value, sharpenLevel, CONFIG_SHARPEN_LEVEL_MIN, CONFIG_SHARPEN_LEVEL_MAX);
         return true;
     }
     if (strcasecmp(name, "ScaleMode") == 0) {

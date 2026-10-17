@@ -28,7 +28,6 @@
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
-#include <libavcodec/codec_id.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
@@ -349,32 +348,10 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
 
     // Compare against the cropped dimensions: those are what scale_vaapi actually receives.
     const bool needsResize = (filterWidth != croppedW || filterHeight != croppedH);
-    // Upscale specifically, not merely "resized": magnifying is the only case where the VPP itself
-    // softens edges, and that softening is what the SD sharpen level below exists to undo.
-    const bool upscales = (filterWidth > croppedW || filterHeight > croppedH);
 
-    // UHD: GPU already saturated by 4K decode/scale; skip denoise/sharpen to avoid stutter.
-    // MPEG-2 SD: DCT-block and analog-tape artifacts warrant heavier processing.
-    // H.264/H.265 HD: lighter touch preserves encoder-intended detail.
-    int denoiseLevel = 0;
-    int sharpnessLevel = 0;
-
-    if (!isUhd) {
-        if (params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-            // Denoise regardless of the scale factor: the blocking is in the source and gets
-            // magnified either way -- by us when we upscale, by the TV's scaler when we hand it a
-            // native 576p raster. Higher smears motion.
-            denoiseLevel = 12;
-            // Sharpen only when WE magnify. Resolution matching can now put an SD stream out 1:1 on
-            // a 576p/480p mode, where the VPP softens nothing and the TV's own scaler applies its
-            // own edge enhancement downstream -- pre-sharpening would stack on top of that and
-            // halate titles. 26 restores upscale-softened edges without ringing.
-            sharpnessLevel = upscales ? 26 : 0;
-        } else {
-            denoiseLevel = 4;    // 1080i is near-native; just tame ringing at bitrate-starved edges
-            sharpnessLevel = 20; // mild -- stronger values halate bright HD content
-        }
-    }
+    // No denoise or sharpen unless asked for, for any content. A denoiser smooths away the grain that dithers
+    // 8-bit gradients, so dark scenes band; a sharpener draws dark rims around text and edges and lifts
+    // compression noise, and at 1:1 it only loses fidelity. Both stay an opt-in: a VPP strength or a sw-* preset.
 
     // HDR path: P010 (10-bit packed) preserves bit depth through VPP; NV12 would clip to 8-bit.
     // scaleColorArgs is appended after ':' (resize) or after '=' (no-resize); no leading separator.
@@ -391,12 +368,17 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         scaleColorArgs = std::format("format={}:out_color_matrix=bt709:out_range=tv", pixFmt);
     }
 
-    // Trick/still drop denoise/sharpness (minimal chain). Deinterlacing differs (see the GPU VPP
+    // Trick/still run a minimal chain: no software block, no fps filter. Deinterlacing differs (see the GPU VPP
     // block): trick keeps a spatial deinterlacer (1x, frame rate) so interlaced FF/RW/slow doesn't
     // comb; still drops it -- a lone frame has no field-pair partner and the temporal VPP delay
     // swallows it.
     const bool minimalChain = params.trickMode || params.stillPicture;
     const bool useSpatialDeinterlace = params.trickMode;
+
+    // Opt-in VPP denoise/sharpen strength (0 = no node). UHD gets neither: 4K decode and scale already load
+    // the GPU, and another full-frame pass stutters there.
+    const int gpuDenoiseLevel = (isUhd || minimalChain) ? 0 : params.hwDenoiseLevel;
+    const int gpuSharpenLevel = (isUhd || minimalChain) ? 0 : params.hwSharpenLevel;
 
     // SW post-processing block decision. Any effective sw-* post-process choice pulls the needed prefix
     // into one hwdownload..hwupload block. Forced off for HDR (no P010/BT.2020 in the SW chain), UHD
@@ -469,11 +451,11 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // Filter chain (comma-joined, two domains chosen by useSwPost below):
     //   GPU VPP: [deinterlace_vaapi|bwdif(SW-decode)] -> [denoise_vaapi] -> [crop] -> scale_vaapi
     //            -> [sharpness_vaapi] -> [fps]
-    //   Hybrid:  hwdownload -> [bwdif|w3fdif] -> [SW-only denoise/scale/sharpen] -> format=nv12,hwupload
+    //   Hybrid:  [hwdownload] -> [bwdif|w3fdif] -> [SW-only denoise/scale/sharpen] -> format=nv12,hwupload
     //            -> [denoise_vaapi] -> [crop] -> [scale_vaapi] -> [sharpness_vaapi] -> [fps]
     // The hybrid keeps exactly ONE hwdownload and ONE hwupload but runs only the software-mandatory
     // filters (the SW deinterlacer + any explicit sw-* node) in system memory; everything else stays on
-    // the GPU after the upload. It is taken only when the user picks a sw-* deint/scale/sharpen and the
+    // the GPU after the upload. It is taken only when the user picks a sw-* deint/denoise/scale/sharpen and the
     // content is SDR, non-UHD, non-trick/still (see useSwPost). [crop] is the manual-zoom node; the
     // final surface is always VAAPI for KMS scanout.
     std::vector<std::string> filters;
@@ -483,27 +465,18 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.push_back(std::format("crop={}:{}:{}:{}", croppedW, croppedH, cropOffX, cropOffY));
     };
 
-    // Effective GPU VPP levels for the active policy (0 = skip). Only Auto applies HW denoise/sharpen;
-    // Off skips and the Sw* values never reach the GPU domain (they force the SW block). UHD leaves the
-    // base at 0.
-    const int gpuDenoiseLevel = (params.denoise == DenoiseMode::Auto) ? denoiseLevel : 0;
-    const int gpuSharpenLevel = (params.sharpen == SharpenMode::Auto) ? sharpnessLevel : 0;
-
     if (useSwPost) {
         // --- Hybrid SW/HW post-processing: ONE hwdownload, ONE hwupload ---
         // Only the filters that MUST run in software go in the SW segment (the deinterlacer, plus any
         // explicit sw-* denoise/scale/sharpen); everything else stays on the GPU after the single
-        // upload (denoise_vaapi / scale_vaapi / sharpness_vaapi). The expensive scale in particular is
-        // kept on the GPU unless the user explicitly asked for software scaling -- the previous all-SW
-        // block needlessly ran swscale (and HW-capable denoise/sharpen) on the CPU.
+        // upload. The expensive scale in particular is kept on the GPU unless the user explicitly asked
+        // for software scaling -- the previous all-SW block needlessly ran swscale on the CPU.
         //
         // The SW segment is the pipeline prefix deinterlace->denoise->scale->sharpen up to the LAST
         // sw-* stage (one upload => no going back to the GPU and returning). Pipeline order forces the
-        // boundary: sw sharpen (post-scale) pulls scale into SW; sw scale pulls denoise's slot into SW.
-        // An "auto" denoise/sharpen that lands inside the SW segment is dropped (auto = HW-only); scale
-        // inside the segment runs as swscale because it is mandatory.
+        // boundary: sw sharpen (post-scale) pulls scale into SW, where it runs as swscale because it is
+        // mandatory.
         const bool scaleInSw = swScaleRequested || swSharpenRequested; // sharpen follows the scale slot; keep boundary
-        const bool denoiseInSw = swDenoiseRequested || scaleInSw;      // denoise precedes scale; keep SW contiguous
 
         // -- single hwdownload (HW decode only; an already-SW-decoded frame is in system memory) --
         if (!isSoftwareDecode) {
@@ -544,7 +517,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
         filters.emplace_back("format=nv12,hwupload");
 
         // -- HW VPP tail: everything not done in software, on the GPU --
-        if (!denoiseInSw && gpuDenoiseLevel > 0 && params.hasDenoise) {
+        // A VPP denoise belongs before the scale. With the scale in software it would have to run between
+        // two SW stages, which one round trip cannot do, so it is dropped rather than run out of order.
+        if (!scaleInSw && gpuDenoiseLevel > 0) {
             filters.push_back(std::format("denoise_vaapi=denoise={}", gpuDenoiseLevel));
         }
         if (!scaleInSw) {
@@ -561,7 +536,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
                 filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
             }
         }
-        if (!swSharpenRequested && gpuSharpenLevel > 0 && params.hasSharpness) {
+        if (gpuSharpenLevel > 0) {
             filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
         }
     } else {
@@ -592,14 +567,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             }
         }
 
-        const bool wantDenoise = !minimalChain && gpuDenoiseLevel > 0;
         if (isSoftwareDecode) {
-            // SW-decode sysmem tail. MPEG-2 hqdn3d fall-back only when the GPU lacks denoise_vaapi:
-            // SW decode is cheap and block-artifact removal is worth the per-frame CPU cost (~5 ms
-            // @ 1080p25). Crop in system memory before uploading so zoom adds no GPU readback.
-            if (wantDenoise && !params.hasDenoise && params.codecId == AV_CODEC_ID_MPEG2VIDEO) {
-                filters.emplace_back("hqdn3d=5");
-            }
+            // SW-decode sysmem tail. Crop in system memory before uploading so zoom adds no GPU readback.
             filters.push_back(std::format("format={}", pixFmt));
             if (wantCrop) {
                 appendCropFilter();
@@ -607,8 +576,8 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             filters.emplace_back("hwupload");
         }
 
-        // HW denoise (native for HW decode / post-hwupload for SW). Skipped on GPUs without it.
-        if (wantDenoise && params.hasDenoise) {
+        // Ahead of the crop node: that only tags the surface, and scale_vaapi has to be the pass that reads it.
+        if (gpuDenoiseLevel > 0) {
             filters.push_back(std::format("denoise_vaapi=denoise={}", gpuDenoiseLevel));
         }
 
@@ -634,7 +603,7 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
             filters.push_back(std::format("scale_vaapi={}", scaleColorArgs));
         }
 
-        if (!minimalChain && gpuSharpenLevel > 0 && params.hasSharpness) {
+        if (gpuSharpenLevel > 0) {
             filters.push_back(std::format("sharpness_vaapi=sharpness={}", gpuSharpenLevel));
         }
     }

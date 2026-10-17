@@ -14,8 +14,8 @@
  *   hard-ahead policy in SyncAndSubmitFrame.)
  *
  * Filters:
- *   [bwdif|deinterlace_vaapi rate=field] -> [hqdn3d|denoise_vaapi]
- *   -> scale_vaapi (NV12 BT.709 TV-range) -> [sharpness_vaapi]
+ *   [bwdif|deinterlace_vaapi rate=field] -> [hqdn3d|denoise_vaapi, opt-in only]
+ *   -> scale_vaapi (NV12 BT.709 TV-range) -> [unsharp|sharpness_vaapi, opt-in only]
  *   VPP nodes probed per GPU at device init (caps.cpp).
  *
  * Sync (audio-master, four regimes):
@@ -2658,7 +2658,6 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     display->SetHdrOutputState(hdrPassthrough ? hdrInfo : HdrStreamInfo{});
 
     cVideoFilterChain::BuildParams params;
-    params.codecId = currentCodecId;
     params.streamInterlaced = streamInterlaced;
     params.fpsNum = codecCtx->framerate.num;
     params.fpsDen = codecCtx->framerate.den;
@@ -2680,8 +2679,6 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.outputRefreshMilliHz = display->GetOutputRefreshMilliHz();
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;
-    params.hasDenoise = vaapiContext->caps.vppDenoise;
-    params.hasSharpness = vaapiContext->caps.vppSharpness;
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;
     params.deinterlaceModeMask = vaapiContext->caps.deinterlaceModeMask;
     // Post-processing policies; re-read on every filter-graph rebuild so a setup change applies live.
@@ -2689,6 +2686,14 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     params.denoise = vaapiConfig.denoiseMode.load(std::memory_order_relaxed);
     params.scale = vaapiConfig.scaleMode.load(std::memory_order_relaxed);
     params.sharpen = vaapiConfig.sharpenMode.load(std::memory_order_relaxed);
+    // The opt-in VPP strengths reach the filter only when the GPU has that filter: an absent one would fail
+    // the whole graph.
+    params.hwDenoiseLevel = (params.denoise == DenoiseMode::Hw && vaapiContext->caps.vppDenoise)
+                                ? vaapiConfig.denoiseLevel.load(std::memory_order_relaxed)
+                                : 0;
+    params.hwSharpenLevel = (params.sharpen == SharpenMode::Hw && vaapiContext->caps.vppSharpness)
+                                ? vaapiConfig.sharpenLevel.load(std::memory_order_relaxed)
+                                : 0;
     params.trickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     params.stillPicture = stillPictureMode.load(std::memory_order_relaxed);
     params.compactLog = compactLog;

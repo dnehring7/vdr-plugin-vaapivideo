@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vdr-vaapivideo 1.9.0\n"
 "Report-Msgid-Bugs-To: https://github.com/dnehring7/vdr-plugin-vaapivideo/issues\n"
-"POT-Creation-Date: 2026-10-04 22:46+0200\n"
+"POT-Creation-Date: 2026-10-18 00:01+0200\n"
 "PO-Revision-Date: 2026-10-04 09:40+0200\n"
 "Last-Translator: Dirk Nehring <dnehring@gmx.net>\n"
 "Language-Team: Finnish <vdr@linuxtv.org>\n"
@@ -43,11 +43,17 @@ msgstr "Lomituksen poisto"
 msgid "Denoising"
 msgstr "Kohinanpoisto"
 
+msgid "Denoising strength"
+msgstr "Kohinanpoiston voimakkuus"
+
 msgid "Scaling"
 msgstr "Skaalaus"
 
 msgid "Sharpening"
 msgstr "Terävöinti"
+
+msgid "Sharpening strength"
+msgstr "Terävöinnin voimakkuus"
 
 msgid "HDR passthrough"
 msgstr "HDR-läpivienti"
@@ -170,14 +176,14 @@ msgstr "ohjelmisto: bwdif (paras laatu)"
 msgid "software: w3fdif (faster)"
 msgstr "ohjelmisto: w3fdif (nopeampi)"
 
-msgid "auto (hardware)"
-msgstr "auto (laitteisto)"
-
 msgid "software: light"
 msgstr "ohjelmisto: kevyt"
 
 msgid "software: medium"
 msgstr "ohjelmisto: keskivahva"
+
+msgid "hardware"
+msgstr "laitteisto"
 
 msgid "auto (hardware, HQ)"
 msgstr "auto (laitteisto, HQ)"

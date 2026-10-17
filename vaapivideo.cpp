@@ -90,6 +90,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // into range before first use, so even a corrupt atomic cannot index past a label array.
         : editClearOnChannelSwitch(vaapiConfig.clearOnChannelSwitch.load(std::memory_order_relaxed) ? 1 : 0),
           editDeinterlaceMode(static_cast<int>(vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed))),
+          editDenoiseLevel(vaapiConfig.denoiseLevel.load(std::memory_order_relaxed)),
           editDenoiseMode(static_cast<int>(vaapiConfig.denoiseMode.load(std::memory_order_relaxed))),
           editHdrMode(static_cast<int>(vaapiConfig.hdrMode.load(std::memory_order_relaxed))),
           editMatchRefreshRate(vaapiConfig.matchRefreshRate.load(std::memory_order_relaxed) ? 1 : 0),
@@ -105,17 +106,37 @@ class cMenuSetupVaapi : public cMenuSetupPage {
           editPcmLatency(vaapiConfig.pcmLatency.load(std::memory_order_relaxed)),
           editQuickAction(static_cast<int>(vaapiConfig.quickAction.load(std::memory_order_relaxed))),
           editScaleMode(static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed))),
+          editSharpenLevel(vaapiConfig.sharpenLevel.load(std::memory_order_relaxed)),
           editSharpenMode(static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed))) {
         SetSection(tr("VAAPI Video"));
         for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
             editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
         }
         BuildMenu();
+        // Index 0 is the Audio header (non-selectable); start the cursor on the first real entry.
+        SetCurrent(Get(1));
+    }
+
+    /// Show or hide a strength item when Denoising/Sharpening moves onto or off "hardware". The strength
+    /// item sits below the edited row, so the cursor index stays valid across the rebuild.
+    [[nodiscard]] auto ProcessKey(eKeys key) -> eOSState override {
+        const bool denoiseHw = editDenoiseMode == static_cast<int>(DenoiseMode::Hw);
+        const bool sharpenHw = editSharpenMode == static_cast<int>(SharpenMode::Hw);
+        const eOSState state = cMenuSetupPage::ProcessKey(key);
+        if (denoiseHw != (editDenoiseMode == static_cast<int>(DenoiseMode::Hw)) ||
+            sharpenHw != (editSharpenMode == static_cast<int>(SharpenMode::Hw))) {
+            const int row = Current();
+            BuildMenu();
+            SetCurrent(Get(row));
+            Display();
+        }
+        return state;
     }
 
   protected:
-    /// Build the item list from the scratch values once at construction (VDR draws it).
-    /// cMenuEditItem strdup()s its label, so the temporary cString labels are safe.
+    /// Build the item list from the scratch values: at construction, and again whenever a choice that
+    /// shows a strength item changes (ProcessKey). cMenuEditItem strdup()s its label, so the temporary
+    /// cString labels are safe.
     auto BuildMenu() -> void {
         Clear();
         const char *const off = TrLabel("off");
@@ -142,14 +163,23 @@ class cMenuSetupVaapi : public cMenuSetupPage {
                                  CONFIG_AUDIO_LATENCY_MIN_MS, CONFIG_AUDIO_LATENCY_MAX_MS));
 
         // --- Video ---
-        // Post-processing policies: a sw-* deinterlace/sharpen or sw-quality scale routes the whole
-        // post-process through one hwdownload->SW->hwupload block (see filter.cpp); decode stays HW.
+        // Post-processing policies: any sw-* choice runs its filter inside one hwdownload->SW->hwupload
+        // block (see filter.cpp); decoding is unaffected.
         addHeader(tr("Video"));
         Add(new cMenuEditStraItem(tr("Deinterlacing"), &editDeinterlaceMode, kDeinterlaceCount,
                                   deinterlaceLabels.data()));
         Add(new cMenuEditStraItem(tr("Denoising"), &editDenoiseMode, kDenoiseCount, denoiseLabels.data()));
+        // A strength only means something for the hardware filter, so it is listed only then.
+        if (editDenoiseMode == static_cast<int>(DenoiseMode::Hw)) {
+            Add(new cMenuEditIntItem(tr("Denoising strength"), &editDenoiseLevel, CONFIG_DENOISE_LEVEL_MIN,
+                                     CONFIG_DENOISE_LEVEL_MAX));
+        }
         Add(new cMenuEditStraItem(tr("Scaling"), &editScaleMode, kScaleCount, scaleLabels.data()));
         Add(new cMenuEditStraItem(tr("Sharpening"), &editSharpenMode, kSharpenCount, sharpenLabels.data()));
+        if (editSharpenMode == static_cast<int>(SharpenMode::Hw)) {
+            Add(new cMenuEditIntItem(tr("Sharpening strength"), &editSharpenLevel, CONFIG_SHARPEN_LEVEL_MIN,
+                                     CONFIG_SHARPEN_LEVEL_MAX));
+        }
         Add(new cMenuEditStraItem(tr("HDR passthrough"), &editHdrMode, kHdrModeCount, hdrModeLabels.data()));
 
         // --- Display ---
@@ -184,9 +214,6 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         Add(new cMenuEditBoolItem(tr("Clear display on channel switch"), &editClearOnChannelSwitch, off, on));
         // Anything but off hides the main-menu entry; VDR rebuilds the main menu on every open, so no live apply.
         Add(new cMenuEditStraItem(tr("Quick action"), &editQuickAction, kQuickActionCount, quickActionLabels.data()));
-
-        // Index 0 is the Audio header (non-selectable); start the cursor on the first real entry.
-        SetCurrent(Get(1));
     }
 
     /// Commit the scratch values and apply what changed to the running stream at once.
@@ -196,8 +223,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         const bool postProcChanged =
             static_cast<int>(vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed)) != editDeinterlaceMode ||
             static_cast<int>(vaapiConfig.denoiseMode.load(std::memory_order_relaxed)) != editDenoiseMode ||
+            vaapiConfig.denoiseLevel.load(std::memory_order_relaxed) != editDenoiseLevel ||
             static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed)) != editScaleMode ||
-            static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed)) != editSharpenMode;
+            static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed)) != editSharpenMode ||
+            vaapiConfig.sharpenLevel.load(std::memory_order_relaxed) != editSharpenLevel;
 
         // Same idiom for the display-mode group: sample BEFORE the stores, so a bare setup OK
         // cannot trigger a spurious modeset (which costs a second of black on an HDMI link).
@@ -219,8 +248,10 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         vaapiConfig.clearOnChannelSwitch.store(editClearOnChannelSwitch != 0, std::memory_order_relaxed);
         vaapiConfig.quickAction.store(static_cast<QuickAction>(editQuickAction), std::memory_order_relaxed);
         vaapiConfig.deinterlaceMode.store(static_cast<DeinterlaceMode>(editDeinterlaceMode), std::memory_order_relaxed);
+        vaapiConfig.denoiseLevel.store(editDenoiseLevel, std::memory_order_relaxed);
         vaapiConfig.denoiseMode.store(static_cast<DenoiseMode>(editDenoiseMode), std::memory_order_relaxed);
         vaapiConfig.scaleMode.store(static_cast<ScaleMode>(editScaleMode), std::memory_order_relaxed);
+        vaapiConfig.sharpenLevel.store(editSharpenLevel, std::memory_order_relaxed);
         vaapiConfig.sharpenMode.store(static_cast<SharpenMode>(editSharpenMode), std::memory_order_relaxed);
         SetupStore("PcmLatency", editPcmLatency);
         SetupStore("PassthroughLatency", editPassthroughLatency);
@@ -232,7 +263,9 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // Post-processing policies; applied by the filter rebuild below, or any later rebuild.
         SetupStore("DeinterlaceMode", editDeinterlaceMode);
         SetupStore("DenoiseMode", editDenoiseMode);
+        SetupStore("DenoiseLevel", editDenoiseLevel);
         SetupStore("SharpenMode", editSharpenMode);
+        SetupStore("SharpenLevel", editSharpenLevel);
         SetupStore("ScaleMode", editScaleMode);
         // Display mode switching; applied at the end of Store() via the primary device.
         vaapiConfig.matchRefreshRate.store(editMatchRefreshRate != 0, std::memory_order_relaxed);
@@ -352,18 +385,15 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     static constexpr int kDeinterlaceCount = static_cast<int>(kDeinterlaceLabels.size());
     static_assert(kDeinterlaceCount == CONFIG_DEINTERLACE_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kDenoiseLabels{
-        DenoiseModeName(DenoiseMode::Auto),
-        DenoiseModeName(DenoiseMode::Off),
-        DenoiseModeName(DenoiseMode::SwMinimal),
-        DenoiseModeName(DenoiseMode::SwEnhanced),
+        DenoiseModeName(DenoiseMode::Auto),      DenoiseModeName(DenoiseMode::Off),
+        DenoiseModeName(DenoiseMode::SwMinimal), DenoiseModeName(DenoiseMode::SwEnhanced),
+        DenoiseModeName(DenoiseMode::Hw),
     };
     static constexpr int kDenoiseCount = static_cast<int>(kDenoiseLabels.size());
     static_assert(kDenoiseCount == CONFIG_DENOISE_MODE_COUNT, "menu labels out of sync with enum");
     static constexpr std::array kSharpenLabels{
-        SharpenModeName(SharpenMode::Auto),
-        SharpenModeName(SharpenMode::Off),
-        SharpenModeName(SharpenMode::SwMild),
-        SharpenModeName(SharpenMode::SwMedium),
+        SharpenModeName(SharpenMode::Auto),     SharpenModeName(SharpenMode::Off), SharpenModeName(SharpenMode::SwMild),
+        SharpenModeName(SharpenMode::SwMedium), SharpenModeName(SharpenMode::Hw),
     };
     static constexpr int kSharpenCount = static_cast<int>(kSharpenLabels.size());
     static_assert(kSharpenCount == CONFIG_SHARPEN_MODE_COUNT, "menu labels out of sync with enum");
@@ -430,6 +460,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     /// the `k<Name>Labels` array, an int the value itself.
     int editClearOnChannelSwitch;
     int editDeinterlaceMode;
+    int editDenoiseLevel;
     int editDenoiseMode;
     int editHdrMode;
     int editMatchRefreshRate;
@@ -445,6 +476,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editPcmLatency;
     int editQuickAction;
     int editScaleMode;
+    int editSharpenLevel;
     int editSharpenMode;
     ///@}
     int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Per-preset zoom level (tenths-of-%).

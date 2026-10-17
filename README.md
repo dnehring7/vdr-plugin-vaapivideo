@@ -18,7 +18,7 @@ the plugin refuses to start without it.
 | Component   | Capabilities                                                                                       |
 |-------------|----------------------------------------------------------------------------------------------------|
 | Decode      | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10), AV1 Main / Main 10 — hardware (VAAPI) with per-profile software fallback |
-| Filters     | Deinterlace, denoise, DAR-preserving scale, sharpen — hardware (VAAPI VPP) or software (bwdif, hqdn3d) |
+| Filters     | Deinterlace and DAR-preserving scale — hardware (VAAPI VPP) or software (bwdif, swscale); opt-in denoise and sharpen, hardware or software (hqdn3d, unsharp) |
 | Audio       | PCM decode/downmix with sink-driven multichannel output; IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
 | Display     | DRM atomic mode-setting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
@@ -167,8 +167,8 @@ A logout or service restart is required for group changes to take effect.
 ### 4. Install the VAAPI driver
 
 The plugin requires a VAAPI driver with **Video Processing Pipeline (VPP)**
-support — the source of all hardware scaling, deinterlacing, denoising, and
-colorspace conversion.
+support — the source of all hardware deinterlacing, scaling, and colorspace
+conversion.
 
 <details>
 <summary>Fedora / RHEL / openSUSE</summary>
@@ -277,9 +277,11 @@ another application at boot.
 | `Passthrough audio latency (ms)` | −200 … 200       | A/V offset applied when audio is forwarded as IEC61937                                               |
 | **Video** | | |
 | `Deinterlacing`                  | auto / hardware: motion adaptive / weave / bob / software: bwdif / w3fdif | Deinterlacer policy (see [Post-processing](#post-processing)) |
-| `Denoising`                      | auto (hardware) / off / software: light / medium | Denoise policy                                                                       |
+| `Denoising`                      | auto / off / software: light / medium / hardware | Denoise policy                                                                       |
+| `Denoising strength`             | 1 … 64           | Strength of `hardware` denoising (default 4); listed only while it is selected                       |
 | `Scaling`                        | auto (hardware, HQ) / hardware: fast / software: lanczos (HQ) / bilinear (fast) | Scaler selection                                      |
-| `Sharpening`                     | auto (hardware) / off / software: light / medium | Sharpen policy                                                                       |
+| `Sharpening`                     | auto / off / software: light / medium / hardware | Sharpen policy                                                                       |
+| `Sharpening strength`            | 1 … 64           | Strength of `hardware` sharpening (default 20); listed only while it is selected                     |
 | `HDR passthrough`                | auto / on / off  | HDR10 / HLG output policy (see [HDR](#hdr))                                                          |
 | **Display mode** — all off by default | | |
 | `Match refresh rate`             | off / on         | Track the source frame rate with the display refresh rate                                            |
@@ -357,14 +359,17 @@ convention.
 ### Post-processing
 
 Deinterlace, denoise, scaling, and sharpen are four independent policies. They
-all default to **auto**, the zero-copy VAAPI VPP path. Each option's label says
-where it runs: `auto` and `hardware:` choices stay on the GPU; any `software:`
-choice pulls the decoded frame to system memory once, runs the whole
-post-process in software, and uploads the result back for display. Decoding
-always stays on the GPU, and the software block is automatically bypassed for
-HDR, UHD, and trick play. Slow motion keeps the chain it starts from: it
-continues the paused stream, and a rebuild would lose the pictures the
-deinterlacer still holds.
+all default to **auto**: the GPU deinterlaces and scales on the zero-copy VAAPI
+VPP path, with no denoise and no sharpening. Each option's label says where it
+runs: `auto`, `off`, and `hardware` choices stay on the GPU; a `software:`
+choice moves the frame to system memory once, runs the software filters there,
+and uploads the result for the GPU to finish. Because there is only that one
+round trip, pipeline order decides what moves along: on interlaced input the
+deinterlacer runs in software too (`bwdif` unless `w3fdif` is picked), and
+software sharpening takes the scaler with it. Decoding is never affected, and
+the software block is bypassed for HDR, UHD, trick play, and still pictures.
+Slow motion keeps the chain it starts from: it continues the paused stream, and
+a rebuild would lose the pictures the deinterlacer still holds.
 
 - **Deinterlacing** — `auto` picks the best mode the driver advertises
   (motion-compensated when present). `hardware:` requests a specific VAAPI
@@ -372,18 +377,30 @@ deinterlacer still holds.
   choice for interlaced broadcast on GPUs with a weak hardware deinterlacer
   (notably AMD/Mesa, which leaves visible combing); `software: w3fdif` is a
   lighter alternative for slower CPUs.
-- **Denoising** — `auto (hardware)` is the codec-tuned VAAPI denoiser; `off`
-  skips it; `software: light / medium` are `hqdn3d` presets.
-- **Sharpening** — `auto (hardware)` is the codec-tuned VAAPI sharpener; `off`
-  skips it; `software: light / medium` are `unsharp` presets.
+- **Denoising** — `auto` and `off` leave the picture alone: a denoiser
+  removes the fine grain that hides the steps of 8-bit gradients, and dark
+  scenes then band, SD and HD alike. For sources noisy enough to be worth that,
+  `hardware` runs the GPU denoiser at `Denoising strength`, and
+  `software: light / medium` are `hqdn3d` presets.
+- **Sharpening** — `auto` and `off` leave the picture alone: a sharpener puts
+  dark rims around text and edges and lifts compression noise, and at native
+  resolution it only loses detail. For those who prefer a crisper look,
+  `hardware` runs the GPU sharpener at `Sharpening strength`, and
+  `software: light / medium` are `unsharp` presets.
 - **Scaling** — `auto (hardware, HQ)` is high-quality GPU scaling and the right
   choice almost always; the alternatives are niche fallbacks for GPUs whose
   scaler is suspect.
 
+The `hardware` denoiser and sharpener need a driver that offers them (the
+startup log line `VPP -- denoise=… sharpen=…` says so) and leave UHD alone,
+where 4K decoding and scaling already load the GPU. Hardware denoising also
+pauses while scaling runs in software: it belongs in front of the scaler, and
+that slot is then inside the software block.
+
 The software block runs at field rate (1080i50 becomes 50 fps through every
 software filter), so a low-power CPU can saturate and drop frames. If playback
-can't keep up: use `w3fdif`, set denoise to `off`, or return to the hardware
-path.
+can't keep up: use `w3fdif`, drop software denoising and sharpening, or return
+to the hardware path.
 
 Changes apply to live playback immediately on leaving the setup menu — the
 filter graph is rebuilt in place, no channel switch needed.
@@ -742,14 +759,13 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
 | Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Sharing the seat](#sharing-the-seat-with-an-x-server-or-compositor)) |
 | Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlacing = software: bwdif` (or `w3fdif`) |
-| Picture | Blocky / smeared (Intel Nxxx)        | VPP denoiser broken on these iGPUs — `Denoising = off`     |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
 | Audio   | Multichannel plays as stereo / wrong speakers | Use a direct `hw:`/`plughw:CARD,DEV`, not `default` |
 | Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough audio latency` (see [AVSYNC.md](AVSYNC.md)) |
 | Audio   | Short dropout shortly after a channel switch | ALSA ring ran dry — the log reports `ALSA … recovered -- N xrun(s)`; check `state:`/`avail_max` in `/proc/asound/card0/pcm3p/sub0/status` and see [AVSYNC.md](AVSYNC.md#ring-cushion) |
 | Perf    | AMD iGPU stutters / drops            | GPU pinned `low` DPM — `power_dpm_force_performance_level=auto` |
-| Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif` or HW `Deinterlacing = auto` |
+| Perf    | Drops only with `software:` filters  | CPU can't sustain field-rate SW — use `w3fdif`, or set every post-processing option back to `auto` |
 | Perf    | High CPU on encrypted HD             | Software CSA descrambling (CAM/softcam), not the plugin — a CI+ CAM offloads it |
 
 Increase the VDR log verbosity with `-l 3` to capture decoder, display, and
@@ -785,14 +801,17 @@ Mediaplayer ──libavformat──▶ AVPacket ──────────�
                                     VAAPI HW Decode          FFmpeg SW Decode
                                           │                         │
                                           ▼                         ▼
-                                    VAAPI VPP Filters     SW Filters (bwdif, hqdn3d)
-                                 (deinterlace, denoise)        + hwupload
+                                 [deinterlace_vaapi]             [bwdif]
+                                   [denoise_vaapi]               [crop]
+                                       [crop]                   hwupload
+                                          │                  [denoise_vaapi]
                                           │                         │
                                           └────────────┬────────────┘
                                                        ▼
                                                   scale_vaapi
-                                              + sharpness_vaapi
                                      (SDR: BT.709 NV12; HDR: BT.2020 P010)
+                                               [sharpness_vaapi]
+                                                     [fps]
                                                        │
                                                        ▼
                                            DRM PRIME (zero-copy)
@@ -813,6 +832,13 @@ and replay traffic enters as PES through `cVaapiDevice::PlayVideo` /
 pre-framed access units into the same decoder. Codec selection, HDR routing,
 and A/V sync are path-agnostic.
 
+Bracketed filter nodes are conditional: the deinterlacer runs on interlaced
+input, `denoise_vaapi` / `sharpness_vaapi` only for a `hardware` strength,
+`crop` for manual zoom, and `fps` when the source rate differs from the
+display's. A `software:` post-processing choice adds one download → software
+filters → upload block in front of `scale_vaapi`, and software scaling replaces
+that node — see [AVSYNC.md](AVSYNC.md#filter-pipeline).
+
 Inside `cVaapiDecoder`, decode and presentation run on separate threads: the
 decode thread filters frames into a decode-ahead reserve, and a presentation
 thread drains it at the audio-synced cadence, so a slow 4K VPP step spends the
@@ -827,7 +853,7 @@ threading, buffering, correction regimes, diagnostics — is documented in
 | `vaapivideo.cpp`      | Plugin entry point, VDR lifecycle, setup menu, SVDRP, main-menu hook                  |
 | `src/device.cpp`      | VDR device integration, PES routing, hardware init/teardown, mediaplayer feed surface |
 | `src/decoder.cpp`     | Decoupled VAAPI decode + presentation threads, A/V sync controller                    |
-| `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / denoise / scale / sharpen; HW and SW chains) |
+| `src/filter.cpp`      | FFmpeg filter-graph build (deinterlace / scale; opt-in denoise / sharpen; HW and SW)  |
 | `src/display.cpp`     | DRM atomic mode-setting, PRIME import, page-flip thread                               |
 | `src/audio.cpp`       | ALSA output (multichannel PCM / downmix, chmap), IEC61937 passthrough, HDMI ELD read  |
 | `src/osd.cpp`         | DRM dumb-buffer OSD overlay (ARGB8888 plane)                                          |

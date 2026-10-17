@@ -215,17 +215,18 @@ controller stay present-thread-private (no lock).
 
 ## Filter pipeline
 
-Two filter domains, selected by `useSwPost` (true when a `sw-*`
-deinterlace/denoise/scale/sharpen preset is active and the stream is not HDR
-passthrough / UHD / simple-deint):
+Two filter domains, selected by `useSwPost`: true when a `sw-*`
+denoise/scale/sharpen preset is active, or a `sw-*` deinterlacer meets
+interlaced input, unless the stream is HDR passthrough or UHD, or playback runs
+the minimal trick / still chain:
 
 ```
-GPU VPP domain (default / "auto" presets):
-  SW decode: [bwdif|yadif] → [hqdn3d] → format=nv12|p010le → [crop] → hwupload → [denoise_vaapi] → scale_vaapi → [sharpness_vaapi] [→ fps]
-  HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → [crop] → scale_vaapi → [sharpness_vaapi] [→ fps]
+GPU VPP domain (default; every auto / off / hardware choice):
+  SW decode: [bwdif|yadif] → format=nv12|p010le → [crop] → hwupload → [denoise_vaapi] → scale_vaapi [→ sharpness_vaapi] [→ fps]
+  HW decode: [deinterlace_vaapi=rate=field] → [denoise_vaapi] → [crop] → scale_vaapi [→ sharpness_vaapi] [→ fps]
 
 Hybrid SW/HW domain (a sw-* preset is active) — HW decode adds one hwdownload; all paths end with one hwupload:
-  [hwdownload (HW decode only)] → [bwdif|w3fdif] → [hqdn3d] → [crop → swscale] → [unsharp] → hwupload → [denoise_vaapi] → [crop → scale_vaapi] → [sharpness_vaapi] [→ fps]
+  [hwdownload (HW decode only)] → [bwdif|w3fdif] → [hqdn3d] → [crop → swscale] → [unsharp] → hwupload → [denoise_vaapi] → [crop] → [scale_vaapi] [→ sharpness_vaapi] [→ fps]
 ```
 
 Frames leave the chain with the filters' own timestamps, rescaled from the
@@ -240,14 +241,19 @@ ghost-field drop recognizes the first output by that stamp.
 Bracketed nodes are conditional. In the GPU VPP domain the chain forks again on
 decode path (`isSoftwareDecode`): a SW-decoded frame is uploaded mid-chain
 (`format=nv12|p010le`, `p010le` under HDR, then `hwupload`), while a HW-decoded
-frame deinterlaces and scales natively. `[bwdif|yadif]` runs on interlaced input
-(`yadif`/`bob` in trick / still mode); `[hqdn3d]` is an MPEG-2-only SW-denoise
-fallback used when the GPU lacks `denoise_vaapi`;
-`[denoise_vaapi]`/`[sharpness_vaapi]` depend on codec + GPU-VPP availability;
-`[crop]` is active only while a manual-zoom preset is; and `[fps]` per invariant
-3. In the GPU VPP domain `scale_vaapi` is always present — it normalizes pixel
-format + colorimetry even when not resizing (the hybrid domain may run `swscale`
-instead when a `sw-*` scale/sharpen pulls scaling into the SW segment).
+frame deinterlaces and scales natively. The deinterlacer runs on interlaced
+input at field rate; trick mode swaps in a spatial one at frame rate (`yadif`,
+or `deinterlace_vaapi` bob), and a still picture skips it, since a temporal
+deinterlacer would hold the lone frame back. `[hqdn3d]` / `[unsharp]` run only
+for a `sw-*` preset and `[denoise_vaapi]` / `[sharpness_vaapi]` only for a
+hardware strength — nothing denoises or sharpens by default, because removing
+the grain lets 8-bit gradients band and sharpening rims edges. The VPP pair
+skips UHD and the trick / still chain, and `denoise_vaapi` drops out when
+scaling runs in software, whose segment then holds its slot. `[crop]` is active
+only while a manual-zoom preset is, and `[fps]` per invariant 3. In the GPU VPP
+domain `scale_vaapi` is always present — it normalizes pixel format +
+colorimetry even when not resizing (the hybrid domain may run `swscale` instead
+when a `sw-*` scale/sharpen pulls scaling into the SW segment).
 
 `fps` only duplicates or drops `AVFrame` references; it never reprocesses pixels.
 Placing it at the chain tail keeps scale/denoise/sharpen at one execution per
