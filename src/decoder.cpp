@@ -14,9 +14,9 @@
  *   hard-ahead policy in SyncAndSubmitFrame.)
  *
  * Filters:
- *   [bwdif|deinterlace_vaapi rate=field] -> [hqdn3d|denoise_vaapi, opt-in only]
- *   -> scale_vaapi (NV12 BT.709 TV-range) -> [unsharp|sharpness_vaapi, opt-in only]
- *   VPP nodes probed per GPU at device init (caps.cpp).
+ *   Default: [bwdif|deinterlace_vaapi rate=field] -> scale_vaapi (NV12 BT.709 TV-range).
+ *   Opt-in software denoise/sharpen run before the hwupload, the VPP ones around scale_vaapi;
+ *   AVSYNC.md "Filter pipeline" has both chains. VPP nodes probed per GPU at device init (caps.cpp).
  *
  * Sync (audio-master, four regimes):
  *   freerun  -- no clock / post-event window             -> submit unpaced
@@ -414,21 +414,10 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
         // vaDriverMutex: avcodec_flush_buffers (VAAPI hwaccel reset) and filterChain.Reset()
         // (VPP teardown) make VA API calls that race the display thread's PRIME export.
         const cMutexLock vaLock(&display->GetVaDriverMutex());
-
-        if (codecCtx) {
-            avcodec_flush_buffers(codecCtx.get()); // codec stays open; next I-frame continues without reopen.
-        }
-
+        FlushCodecAndFrames(); // codec stays open; the next I-frame continues without a reopen
         if (resetFilter) {
             // Graph caches hw_frames_ctx and may hold stale-PTS frames; rebuilt lazily on next frame.
-            ClearPendingFilterRebuild();
-            filterChain.Reset();
-        }
-        if (decodedFrame) {
-            av_frame_unref(decodedFrame.get());
-        }
-        if (filteredFrame) {
-            av_frame_unref(filteredFrame.get());
+            RetireFilterGraph(/*compactRebuild=*/false);
         }
     }
     // hasLoggedFirstFrame NOT reset here: only OpenCodecWithInfo() resets it, avoiding duplicate logs per reopen.
@@ -453,7 +442,6 @@ auto cVaapiDecoder::ClearInternal(bool resetFilter, bool preserveSeekHint) -> vo
         parserCtx.reset();
     }
     trickAwaitSecondField = false; // forget any pending PAFF field-pair (parserMutex held)
-    lastDecodedPts = AV_NOPTS_VALUE;
 
     // Epoch BEFORE NOPTS: any in-flight decoder publish observes the new epoch on its check or
     // recheck and aborts/undoes. Reversed order would let a stale publish overwrite NOPTS.
@@ -566,31 +554,7 @@ auto cVaapiDecoder::EnqueueData(const uint8_t *data, size_t size, int64_t pts) -
         currentPts = AV_NOPTS_VALUE;
 
         if (parsedSize > 0) {
-            if (!AdmitParsedAu({parsedData, static_cast<size_t>(parsedSize)})) {
-                continue;
-            }
-            // FF: keep only keyframes (inter frames are undisplayable here). PAFF exception: an I-frame
-            // is two field pictures whose second field carries key_frame==0 -- keep it too, or the
-            // decoder gets unpaired top fields and rejects them (send_packet EINVAL). Reverse skips this
-            // filter entirely (same reason). One-shot: a kept keyframe field arms the next field.
-            if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed)) {
-                const bool isField = parserCtx->picture_structure == AV_PICTURE_STRUCTURE_TOP_FIELD ||
-                                     parserCtx->picture_structure == AV_PICTURE_STRUCTURE_BOTTOM_FIELD;
-                if (parserCtx->key_frame != 0) {
-                    trickAwaitSecondField = isField; // I-frame first field -> keep its pair's second field
-                } else if (trickAwaitSecondField && isField) {
-                    trickAwaitSecondField = false; // second field completes the keyframe pair
-                } else {
-                    trickAwaitSecondField = false;
-                    continue; // inter frame
-                }
-            }
-
-            auto pkt = NewAuPacket({parsedData, static_cast<size_t>(parsedSize)});
-            if (!pkt) [[unlikely]] {
-                continue;
-            }
-            PushPacketToQueue(pkt.release());
+            QueueParsedAu({parsedData, static_cast<size_t>(parsedSize)}, QueueDepth::Bounded);
         }
     }
 
@@ -624,7 +588,7 @@ auto cVaapiDecoder::EnqueuePacket(const AVPacket *packet) -> void {
         return;
     }
 
-    // Same FF keyframe filter as EnqueueData; AV_PKT_FLAG_KEY is the demuxer's equivalent of parserCtx->key_frame.
+    // FF keeps keyframes only; the demuxer's AV_PKT_FLAG_KEY stands in for the parser verdict of the PES path.
     if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
         (packet->flags & AV_PKT_FLAG_KEY) == 0) {
         return;
@@ -634,15 +598,15 @@ auto cVaapiDecoder::EnqueuePacket(const AVPacket *packet) -> void {
     if (!pkt) [[unlikely]] {
         return;
     }
-    PushPacketToQueue(pkt);
+    (void)PushPacketToQueue(pkt, QueueDepth::Bounded);
 }
 
-auto cVaapiDecoder::PushPacketToQueue(AVPacket *pkt) -> void {
+[[nodiscard]] auto cVaapiDecoder::PushPacketToQueue(AVPacket *pkt, QueueDepth depth) -> bool {
     // Takes ownership of pkt regardless of outcome: freed on overflow/trick drop, queued otherwise.
     const cMutexLock lock(&packetMutex);
     const bool isTrickMode = trickSpeed.load(std::memory_order_relaxed) != 0;
     const size_t maxDepth = isTrickMode ? DECODER_TRICK_QUEUE_CAPACITY : DECODER_QUEUE_CAPACITY;
-    if (packetQueue.size() >= maxDepth) {
+    if (depth == QueueDepth::Bounded && packetQueue.size() >= maxDepth) {
         if (isTrickMode) {
             // Trick-queue depth is 1, and during a TrickSpeed transition VDR can bulk-feed dozens
             // of stale packets in milliseconds. Throttle to one log per 500 ms with a drop count so
@@ -655,13 +619,14 @@ auto cVaapiDecoder::PushPacketToQueue(AVPacket *pkt) -> void {
                 lastTrickDropWarn.Set();
             }
             av_packet_free(&pkt);
-            return;
+            return false;
         }
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
         packetQueue.pop();
     }
     packetQueue.push(pkt);
     packetCondition.Broadcast();
+    return true;
 }
 
 auto cVaapiDecoder::NoteStarvationTick(const AVPacket *pkt) noexcept -> void {
@@ -751,6 +716,50 @@ auto cVaapiDecoder::RecreateParser() -> void {
     return false;
 }
 
+namespace {
+/// PAFF: the parser delimited one field of a complementary pair, not a frame.
+[[nodiscard]] auto IsFieldPicture(const AVCodecParserContext &parser) noexcept -> bool {
+    return parser.picture_structure == AV_PICTURE_STRUCTURE_TOP_FIELD ||
+           parser.picture_structure == AV_PICTURE_STRUCTURE_BOTTOM_FIELD;
+}
+} // namespace
+
+[[nodiscard]] auto cVaapiDecoder::PassesFastForwardFilter() -> bool {
+    // Inter frames are undisplayable in fast forward. PAFF exception: an I-frame is two field pictures whose
+    // second carries key_frame==0 -- keep it too, or the decoder gets an unpaired first field and rejects it
+    // (send_packet EINVAL). Reverse skips the filter for the same reason. A kept keyframe field arms the next.
+    // An unknown verdict (-1, the MPEG-2 parser) passes: treating it as inter would drop every picture.
+    if (trickSpeed.load(std::memory_order_acquire) == 0 || !isTrickFastForward.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    const bool isField = IsFieldPicture(*parserCtx);
+    if (parserCtx->key_frame != 0) {
+        trickAwaitSecondField = isField; // I-frame first field -> keep its pair's second field
+        return true;
+    }
+    const bool secondField = trickAwaitSecondField && isField;
+    trickAwaitSecondField = false;
+    return secondField; // the second field completes the keyframe pair; anything else is an inter frame
+}
+
+auto cVaapiDecoder::QueueParsedAu(std::span<const uint8_t> au, QueueDepth depth) -> void {
+    // The second field of a kept PAFF I-frame has to follow its first into the codec, and the trick queue holds
+    // one packet: both fields can arrive before the decode thread takes the first. Decided before the gate,
+    // which consumes the pairing flag.
+    const bool completesPair = trickAwaitSecondField && parserCtx->key_frame == 0 && IsFieldPicture(*parserCtx);
+    if (!AdmitParsedAu(au) || !PassesFastForwardFilter()) {
+        return;
+    }
+    auto pkt = NewAuPacket(au);
+    if (!pkt) [[unlikely]] {
+        trickAwaitSecondField = false; // a lost first field must not let its mate in alone
+        return;
+    }
+    if (!PushPacketToQueue(pkt.release(), completesPair ? QueueDepth::Unbounded : depth)) {
+        trickAwaitSecondField = false;
+    }
+}
+
 [[nodiscard]] auto cVaapiDecoder::NewAuPacket(std::span<const uint8_t> au) -> std::unique_ptr<AVPacket, FreeAVPacket> {
     // Caller holds parserMutex. FFmpeg's MPEG-2 decoder takes the display size of a sequence_display_extension
     // into its aspect ratio and keeps it until the next one, across a flush: a stream without one, shown after
@@ -804,28 +813,7 @@ auto cVaapiDecoder::DrainPendingParserAU() -> void {
     if (parsed < 0 || parsedSize <= 0 || !parsedData) {
         return;
     }
-    if (!AdmitParsedAu({parsedData, static_cast<size_t>(parsedSize)})) {
-        return;
-    }
-
-    // Same FF keyframe gate as EnqueueData; reverse must not filter (PAFF key_frame=0).
-    if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickFastForward.load(std::memory_order_relaxed) &&
-        parserCtx->key_frame == 0) {
-        return;
-    }
-
-    auto pkt = NewAuPacket({parsedData, static_cast<size_t>(parsedSize)});
-    if (!pkt) [[unlikely]] {
-        return;
-    }
-
-    {
-        // Appended past the depth limit: it is the last AU and no feed follows a flush, so nothing builds up.
-        // Drop-oldest lost the second-to-last frame of a slow-motion replay (trick depth 1).
-        const cMutexLock lock(&packetMutex);
-        packetQueue.push(pkt.release());
-        packetCondition.Broadcast();
-    }
+    QueueParsedAu({parsedData, static_cast<size_t>(parsedSize)}, QueueDepth::Unbounded);
 }
 
 [[nodiscard]] auto cVaapiDecoder::GetLastPts() const noexcept -> int64_t {
@@ -1043,6 +1031,60 @@ auto cVaapiDecoder::ClearPendingFilterRebuild() noexcept -> void {
     filterRebuildLastRequestMs.store(0, std::memory_order_relaxed);
 }
 
+auto cVaapiDecoder::RetireFilterGraph(bool compactRebuild) noexcept -> void {
+    // Caller holds codecMutex and vaDriverMutex (Reset() tears VPP state down). The compact flag is set-only:
+    // FlushForSeek stages its own request before its ClearInternal() lands here, and a plain Clear() cancels it
+    // on the present thread (ApplyDeferredJitterFlush).
+    ClearPendingFilterRebuild();
+    filterChain.Reset();
+    if (compactRebuild) {
+        filterCompactRebuildPending.store(true, std::memory_order_release);
+    }
+}
+
+auto cVaapiDecoder::FlushCodecAndFrames() -> void {
+    // Caller holds codecMutex and vaDriverMutex (the hwaccel reset is a VA call). The flush drops the reference
+    // pictures, so the label chain for NOPTS frames restarts with the next stamped one.
+    if (codecCtx) {
+        avcodec_flush_buffers(codecCtx.get());
+    }
+    lastDecodedPts = AV_NOPTS_VALUE;
+    if (decodedFrame) {
+        av_frame_unref(decodedFrame.get());
+    }
+    if (filteredFrame) {
+        av_frame_unref(filteredFrame.get());
+    }
+}
+
+auto cVaapiDecoder::FlushForTrickBoundary() -> void {
+    // Caller holds codecMutex and parserMutex, so the codec flush and the parser recreate are one step against a
+    // concurrent EnqueueData(). The FF/REW feeds are non-contiguous and VDR skips DeviceClear() on trick entry:
+    // queued packets, stale partial NALs and decoded frames of the old generation would corrupt the new one.
+    DrainQueue();
+    {
+        const cMutexLock vaLock(&display->GetVaDriverMutex());
+        FlushCodecAndFrames();
+        // flush_buffers may rebuild hw_frames_ctx, and the graph holds the old ref. A trick rebuild logs one line.
+        RetireFilterGraph(/*compactRebuild=*/true);
+    }
+    // Null parserCtx = mediaplayer path; must not introduce one mid-stream.
+    if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
+        RecreateParser();
+    }
+}
+
+auto cVaapiDecoder::RetireTrickGraph() -> void {
+    // Caller holds codecMutex. In-flight surfaces keep the retired graph alive via FilterGraphToken. A graph
+    // built in normal play (slow forward keeps it) is the full chain already: retiring it would only cost a
+    // rebuild and the pictures its temporal filters hold.
+    if (!display || !filterChain.IsBuilt() || !filterBuiltInTrickMode) {
+        return;
+    }
+    const cMutexLock vaLock(&display->GetVaDriverMutex());
+    RetireFilterGraph(/*compactRebuild=*/true);
+}
+
 [[nodiscard]] auto cVaapiDecoder::OpenCodec(AVCodecID codecId) -> bool {
     // PES path: no extradata; SPS/PPS/VPS are inline, and FFmpeg infers profile on first frame.
     // Backend table defaults to 8-bit row; bit-depth update requires a full reopen via OpenCodecWithInfo.
@@ -1197,8 +1239,7 @@ namespace {
         // vaDriverMutex: vaDestroyContext (VAAPI hwaccel) + VPP teardown make VA API calls.
         const cMutexLock vaLock(&display->GetVaDriverMutex());
         codecCtx.reset();
-        ClearPendingFilterRebuild();
-        filterChain.Reset();
+        RetireFilterGraph(/*compactRebuild=*/false);
     }
     currentCodecId = AV_CODEC_ID_NONE;
     mpeg2DisplaySizeTaken = false; // a fresh context has no display size
@@ -1446,40 +1487,12 @@ auto cVaapiDecoder::SetTrickSpeed(int speed, bool forward, bool fast) -> void {
         needsFlush = generationBoundary && (speed > 0) && (fast || !forward);
 
         if (needsFlush) {
-            DrainQueue();
-            {
-                // vaDriverMutex: avcodec_flush_buffers + filterChain.Reset() make VA calls that
-                // must not overlap the display thread's map on the same VADisplay.
-                const cMutexLock vaLock(&display->GetVaDriverMutex());
-                if (codecCtx) {
-                    avcodec_flush_buffers(codecCtx.get());
-                    lastDecodedPts = AV_NOPTS_VALUE;
-                }
-                // flush_buffers may rebuild hw_frames_ctx; graph holds the old ref and must be torn down.
-                ClearPendingFilterRebuild();
-                filterChain.Reset();
-                filterCompactRebuildPending.store(true, std::memory_order_release); // trick rebuild: one line suffices
-                if (decodedFrame) {
-                    av_frame_unref(decodedFrame.get());
-                }
-                if (filteredFrame) {
-                    av_frame_unref(filteredFrame.get());
-                }
-            }
-            // Recreate to discard stale partial NALs. Null parserCtx = mediaplayer path; must not introduce
-            // one mid-stream.
-            if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
-                RecreateParser();
-            }
-        } else if (generationBoundary && speed == 0 && display && filterChain.IsBuilt()) {
+            FlushForTrickBoundary();
+        } else if (generationBoundary && speed == 0) {
             // Exit to normal play: the codec stream stays contiguous (no flush), but a light trick chain must
-            // give way to the full one; in-flight surfaces keep their graph alive via FilterGraphToken.
-            // Slow-forward entry keeps its graph: a reset would drop the pictures a temporal deinterlacer or
-            // fps filter still holds, and at 1/speed the full chain is cheap.
-            const cMutexLock vaLock(&display->GetVaDriverMutex());
-            ClearPendingFilterRebuild();
-            filterChain.Reset();
-            filterCompactRebuildPending.store(true, std::memory_order_release); // trick rebuild: one line suffices
+            // give way to the full one. Slow-forward entry keeps its graph: a reset would drop the pictures a
+            // temporal deinterlacer or fps filter still holds, and at 1/speed the full chain is cheap.
+            RetireTrickGraph();
         }
 
         // Flags, pacing, the generation-boundary purge, and trickSpeed are ALL published while
@@ -1612,26 +1625,6 @@ auto cVaapiDecoder::Shutdown() -> void {
 // ============================================================================
 // === THREAD ===
 // ============================================================================
-
-namespace {
-/// The chain's EOF flush extrapolates the last field's stamp: deinterlace_vaapi keeps prev_pts in an int
-/// (truncates past 2^31, i.e. 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
-/// drop the last picture as stale. Only the flush outputs are repaired: at EOS no real jump can occur.
-auto RepairEosFlushPts(std::vector<std::unique_ptr<VaapiFrame>> &frames, size_t firstFlushIndex, int64_t refPts,
-                       int64_t frameDur90k) noexcept -> void {
-    constexpr int64_t kMaxStep90k = 10 * 1000 * PTS_TICKS_PER_MS; // 10 s
-    if (refPts == AV_NOPTS_VALUE) {
-        return;
-    }
-    for (size_t i = firstFlushIndex; i < frames.size(); ++i) {
-        int64_t &pts = frames.at(i)->pts;
-        if (pts == AV_NOPTS_VALUE || pts < refPts - kMaxStep90k || pts > refPts + kMaxStep90k) {
-            pts = refPts + frameDur90k;
-        }
-        refPts = pts;
-    }
-}
-} // namespace
 
 auto cVaapiDecoder::Action() -> void {
     std::vector<std::unique_ptr<VaapiFrame>> pendingFrames;
@@ -1768,23 +1761,7 @@ auto cVaapiDecoder::Action() -> void {
                 const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
                 const size_t firstProducedIndex = pendingFrames.size();
                 DrainCodecAtEos(pendingFrames); // takes vaDriverMutex internally only where needed
-                if (filterChain.IsBuilt()) {
-                    const cMutexLock vaLock(&display->GetVaDriverMutex());
-                    if (filterChain.SendFrame(nullptr) >= 0) {
-                        while (true) {
-                            av_frame_unref(filteredFrame.get());
-                            if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
-                                break;
-                            }
-                            if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
-                                pendingFrames.push_back(std::move(vaapiFrame));
-                            }
-                        }
-                    }
-                    ClearPendingFilterRebuild();
-                    filterChain.Reset();
-                    filterCompactRebuildPending.store(true, std::memory_order_release); // once per reverse step
-                }
+                FlushFilterChain(pendingFrames, /*compactRebuild=*/true); // one chain line per reverse step
                 stampProducedEpoch(pendingFrames, firstProducedIndex, producedEpoch);
             }
             if (pendingFrames.empty()) {
@@ -1819,30 +1796,7 @@ auto cVaapiDecoder::Action() -> void {
             const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
             const size_t firstProducedIndex = pendingFrames.size();
             DrainCodecAtEos(pendingFrames);
-
-            // Temporal filters (bwdif) hold frames internally; EOS-flush surfaces them.
-            if (filterChain.IsBuilt()) {
-                const cMutexLock vaLock(&display->GetVaDriverMutex());
-                const size_t firstFlushIndex = pendingFrames.size();
-                const int64_t refPts =
-                    firstFlushIndex > 0 ? pendingFrames.back()->pts : lastPts.load(std::memory_order_acquire);
-                if (filterChain.SendFrame(nullptr) >= 0) {
-                    while (true) {
-                        av_frame_unref(filteredFrame.get());
-                        if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
-                            break;
-                        }
-                        if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
-                            pendingFrames.push_back(std::move(vaapiFrame));
-                        }
-                    }
-                    RepairEosFlushPts(pendingFrames, firstFlushIndex, refPts,
-                                      static_cast<int64_t>(outputFrameDurationMs.load(std::memory_order_relaxed)) *
-                                          PTS_TICKS_PER_MS);
-                }
-                ClearPendingFilterRebuild();
-                filterChain.Reset(); // graph in EOF state after drain; rebuild on next packet.
-            }
+            FlushFilterChain(pendingFrames, /*compactRebuild=*/false);
 
             // Exit still mode: next packet rebuilds the graph with full temporal filters.
             stillPictureMode.store(false, std::memory_order_release);
@@ -2259,6 +2213,24 @@ auto StampFilterOutputs(std::vector<std::unique_ptr<VaapiFrame>> &outFrames, siz
             sourcePts != AV_NOPTS_VALUE ? sourcePts + (frameDurMs * PTS_TICKS_PER_MS * step) : sourcePts;
     }
 }
+
+/// The chain's EOF flush extrapolates the last field's stamp: deinterlace_vaapi keeps prev_pts in an int
+/// (truncates past 2^31, i.e. 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
+/// drop the last picture as stale. Only the flush outputs are repaired: no real jump can occur inside one.
+auto RepairEosFlushPts(std::vector<std::unique_ptr<VaapiFrame>> &frames, size_t firstFlushIndex, int64_t refPts,
+                       int64_t frameDur90k) noexcept -> void {
+    constexpr int64_t kMaxStep90k = 10 * 1000 * PTS_TICKS_PER_MS; // 10 s
+    if (refPts == AV_NOPTS_VALUE) {
+        return;
+    }
+    for (size_t i = firstFlushIndex; i < frames.size(); ++i) {
+        int64_t &pts = frames.at(i)->pts;
+        if (pts == AV_NOPTS_VALUE || pts < refPts - kMaxStep90k || pts > refPts + kMaxStep90k) {
+            pts = refPts + frameDur90k;
+        }
+        refPts = pts;
+    }
+}
 } // namespace
 
 auto cVaapiDecoder::FillMissingFramePts(AVFrame *frame) noexcept -> void {
@@ -2327,15 +2299,7 @@ auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<Vaap
         }
 
         if (filterChain.IsBuilt() && filterChain.SendFrame(decodedFrame.get()) >= 0) {
-            while (true) {
-                av_frame_unref(filteredFrame.get());
-                if (filterChain.ReceiveFrame(filteredFrame.get()) < 0) {
-                    break;
-                }
-                if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
-                    outFrames.push_back(std::move(vaapiFrame));
-                }
-            }
+            ReceiveFilteredFrames(outFrames);
         } else if (!filterChain.IsBuilt()) {
             // Filter graph failed to build (rare: GPU OOM, driver bug); pass raw frame through unscaled.
             if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
@@ -2346,6 +2310,49 @@ auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<Vaap
 
     StampFilterOutputs(outFrames, prevOutCount, sourcePts, IsSeekingTrick(),
                        static_cast<int64_t>(outputFrameDurationMs.load(std::memory_order_relaxed)));
+}
+
+auto cVaapiDecoder::ReceiveFilteredFrames(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
+    // Caller holds codecMutex and vaDriverMutex. EAGAIN and EOF end the pull. A hard error retires the graph
+    // here: buffersrc only queues the input, so the graph runs -- and fails -- on the receive side, and the
+    // next SendFrame() would keep succeeding against a broken graph.
+    while (true) {
+        av_frame_unref(filteredFrame.get());
+        const int ret = filterChain.ReceiveFrame(filteredFrame.get());
+        if (ret < 0) {
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) [[unlikely]] {
+                dsyslog("vaapivideo/decoder: filter receive failed: %s -- rebuilding the chain", AvErr(ret).data());
+                RetireFilterGraph(/*compactRebuild=*/true);
+            }
+            break;
+        }
+        if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
+            outFrames.push_back(std::move(vaapiFrame));
+        }
+    }
+}
+
+auto cVaapiDecoder::FlushFilterChain(std::vector<std::unique_ptr<VaapiFrame>> &outFrames, bool compactRebuild) -> void {
+    // Caller holds codecMutex. A temporal filter (bwdif, deinterlace_vaapi) holds frames until more input arrives;
+    // the NULL send surfaces them. The graph is in EOF state afterwards, so it is retired and rebuilt on the next
+    // frame.
+    if (!filterChain.IsBuilt()) {
+        return;
+    }
+    const cMutexLock vaLock(&display->GetVaDriverMutex());
+    const size_t firstFlushIndex = outFrames.size();
+    const int64_t refPts = firstFlushIndex > 0 ? outFrames.back()->pts : lastPts.load(std::memory_order_acquire);
+    if (filterChain.SendFrame(nullptr) >= 0) {
+        ReceiveFilteredFrames(outFrames);
+        // Contiguous playback only: FF/REW step whole GOPs between presented pictures, so a flushed stamp far
+        // from the last one is a real step there, and rewriting it forward would make reverse discard it.
+        if (!IsSeekingTrick()) {
+            RepairEosFlushPts(outFrames, firstFlushIndex, refPts,
+                              static_cast<int64_t>(outputFrameDurationMs.load(std::memory_order_relaxed)) *
+                                  PTS_TICKS_PER_MS);
+        }
+    }
+    RetireFilterGraph(compactRebuild);
 }
 
 auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
@@ -2399,11 +2406,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         break;
     }
     {
-        // vaDriverMutex: avcodec_flush_buffers touches the VA driver (hwaccel reset), which must
-        // not overlap the display thread's map on the same VADisplay.
+        // vaDriverMutex: the hwaccel reset must not overlap the display thread's map on the same VADisplay.
         const cMutexLock vaLock(&display->GetVaDriverMutex());
-        avcodec_flush_buffers(codecCtx.get());
-        lastDecodedPts = AV_NOPTS_VALUE;
+        FlushCodecAndFrames();
     }
 }
 
@@ -2429,10 +2434,10 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 // burst logs one chain line per reset, not the full multi-line diagnostic.
                 dsyslog("vaapivideo/decoder: send_packet failed: %s -- flushing for recovery", AvErr(ret).data());
                 const cMutexLock vaLock(&display->GetVaDriverMutex());
+                // lastDecodedPts stays: the stream is contiguous, so a NOPTS frame after the recovery still
+                // continues it.
                 avcodec_flush_buffers(codecCtx.get());
-                ClearPendingFilterRebuild();
-                filterChain.Reset();
-                filterCompactRebuildPending.store(true, std::memory_order_release);
+                RetireFilterGraph(/*compactRebuild=*/true);
                 return anyFrameDecoded;
             }
             packetSent = true; // success or EOF; don't retry
@@ -2557,31 +2562,14 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
                 if (filterChain.IsBuilt()) {
                     if (filterChain.SendFrame(decodedFrame.get()) < 0) [[unlikely]] {
-                        ClearPendingFilterRebuild();
-                        filterChain.Reset();
+                        RetireFilterGraph(/*compactRebuild=*/false);
                         continue;
                     }
-
-                    while (true) {
-                        av_frame_unref(filteredFrame.get());
-                        const int filterRet = filterChain.ReceiveFrame(filteredFrame.get());
-                        if (filterRet == AVERROR(EAGAIN) || filterRet == AVERROR_EOF) {
-                            break;
-                        }
-                        if (filterRet < 0) [[unlikely]] {
-                            break;
-                        }
-
-                        if (auto vaapiFrame = CreateVaapiFrame(filteredFrame.get())) {
-                            outFrames.push_back(std::move(vaapiFrame));
-                            anyFrameDecoded = true;
-                        }
-                    }
+                    ReceiveFilteredFrames(outFrames);
                 } else {
                     // Filter graph unavailable: pass the raw frame through unscaled.
                     if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
                         outFrames.push_back(std::move(vaapiFrame));
-                        anyFrameDecoded = true;
                     }
                 }
             }
@@ -2601,6 +2589,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
             // Only [prevOutCount, end): earlier receive iterations are already final.
             const size_t newOutCount = outFrames.size() - prevOutCount;
+            anyFrameDecoded = anyFrameDecoded || newOutCount > 0;
             const bool seekingTrick = IsSeekingTrick();
             StampFilterOutputs(outFrames, prevOutCount, sourcePts, seekingTrick,
                                static_cast<int64_t>(outputFrameDurationMs.load(std::memory_order_relaxed)));
@@ -2712,6 +2701,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     }
 
     const bool built = filterChain.Build(firstFrame, params);
+    if (built) {
+        filterBuiltInTrickMode = params.trickMode;
+    }
     // Relaxed: standalone scalar read by the present-thread sync math; no happens-before role.
     // Stored on failure too, so a failed rebuild reports the chain's 20 ms fallback instead of
     // keeping the previous graph's cadence in the sync math.
@@ -2775,35 +2767,11 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
         const bool flushCodec =
             isTrickFastForward.load(std::memory_order_relaxed) || isTrickReverse.load(std::memory_order_relaxed);
         if (flushCodec) {
-            DrainQueue();
-            {
-                // vaDriverMutex: avcodec_flush_buffers + filterChain.Reset() issue VA calls that
-                // must not overlap the display thread's map on the same VADisplay.
-                const cMutexLock vaLock(&display->GetVaDriverMutex());
-                if (codecCtx) {
-                    avcodec_flush_buffers(codecCtx.get());
-                    lastDecodedPts = AV_NOPTS_VALUE;
-                }
-                ClearPendingFilterRebuild();
-                filterChain.Reset();
-                filterCompactRebuildPending.store(true, std::memory_order_release); // trick exit: one line suffices
-                if (decodedFrame) {
-                    av_frame_unref(decodedFrame.get());
-                }
-                if (filteredFrame) {
-                    av_frame_unref(filteredFrame.get());
-                }
-            }
-            if (parserCtx && currentCodecId != AV_CODEC_ID_NONE) {
-                RecreateParser();
-            }
-        } else if (display && filterChain.IsBuilt()) {
+            FlushForTrickBoundary();
+        } else {
             // Slow-forward deferred exit (contiguous, no codec flush): a rebuild during slow motion (zoom,
             // format change) built the light trick chain, and normal play needs the full one.
-            const cMutexLock vaLock(&display->GetVaDriverMutex());
-            ClearPendingFilterRebuild();
-            filterChain.Reset();
-            filterCompactRebuildPending.store(true, std::memory_order_release); // trick exit: one line suffices
+            RetireTrickGraph();
         }
 
         // Publish normal-play state. Flags before the trickSpeed release-store so an acquire reader
@@ -3117,6 +3085,15 @@ auto cVaapiDecoder::ApplyDeferredJitterFlush(uint64_t &lastDrainMs, bool preserv
         rawDeltaSumSinceLog90k = 0;
         rawDeltaCountSinceLog = 0;
     }
+}
+
+[[nodiscard]] auto cVaapiDecoder::EnterCatchUp() noexcept -> bool {
+    // The frame at hand is the regime's first drop: the caller returns true for it without a submit.
+    catchingUp = true;
+    catchUpStartMs = cTimeMs::Now();
+    catchUpDrops = 1;
+    ++syncDropSinceLog;
+    return BeginCatchUpLogCycle();
 }
 
 [[nodiscard]] auto cVaapiDecoder::BeginCatchUpLogCycle() noexcept -> bool {
@@ -3540,32 +3517,20 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
             return true;
         }
     } else if (rawDelta < -2 * DECODER_SYNC_HARD_THRESHOLD_90K) {
-        catchingUp = true;
-        catchUpStartMs = cTimeMs::Now();
-        catchUpDrops = 1;
-        ++syncDropSinceLog;
-        if (BeginCatchUpLogCycle()) {
+        if (EnterCatchUp()) {
             tsyslog("vaapivideo/decoder: catch-up entered (spike) raw=%+lldms",
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
         }
         return true;
     } else if (!smoothedDeltaValid && rawDelta < -2 * DECODER_SYNC_CORRIDOR_90K) {
         // Pre-warmup raw-based entry: drains a stale pre-roll backlog before it poisons the EMA.
-        catchingUp = true;
-        catchUpStartMs = cTimeMs::Now();
-        catchUpDrops = 1;
-        ++syncDropSinceLog;
-        if (BeginCatchUpLogCycle()) {
+        if (EnterCatchUp()) {
             tsyslog("vaapivideo/decoder: catch-up entered (warmup) raw=%+lldms",
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));
         }
         return true;
     } else if (smoothedDeltaValid && smoothedDelta90k < -2 * DECODER_SYNC_CORRIDOR_90K) {
-        catchingUp = true;
-        catchUpStartMs = cTimeMs::Now();
-        catchUpDrops = 1;
-        ++syncDropSinceLog;
-        if (BeginCatchUpLogCycle()) {
+        if (EnterCatchUp()) {
             tsyslog("vaapivideo/decoder: catch-up entered (sustained) avg=%+lldms raw=%+lldms",
                     static_cast<long long>(smoothedDelta90k / PTS_TICKS_PER_MS),
                     static_cast<long long>(rawDelta / PTS_TICKS_PER_MS));

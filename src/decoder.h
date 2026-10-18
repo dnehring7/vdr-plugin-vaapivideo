@@ -235,6 +235,18 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< Consume a debounced RequestFilterRebuild(); true = rebuild now. Decode thread only.
     auto ClearPendingFilterRebuild() noexcept
         -> void; ///< Cancel a debounced rebuild that an explicit filter reset just subsumed.
+    auto RetireFilterGraph(bool compactRebuild) noexcept
+        -> void; ///< Retire the chain's graph (in-flight tokens keep it alive) and cancel the debounced rebuild it
+                 ///< would have served; compactRebuild asks the next Build() for the one-line log. Caller holds
+                 ///< codecMutex and vaDriverMutex.
+    auto FlushCodecAndFrames() -> void;   ///< avcodec_flush_buffers + drop the scratch frames; the label chain for
+                                          ///< NOPTS frames restarts. Caller holds codecMutex and vaDriverMutex.
+    auto FlushForTrickBoundary() -> void; ///< Entry into or exit from a non-contiguous trick feed (fast forward,
+                                          ///< reverse): drop the queue, flush the codec, retire the graph, recreate
+                                          ///< the parser. Caller holds codecMutex and parserMutex.
+    auto RetireTrickGraph() -> void; ///< Exit to normal play without a flush: a chain built under trick pacing is the
+                                     ///< light one and gives way to the full one; one built in normal play stays.
+                                     ///< Caller holds codecMutex.
     [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
     auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
@@ -244,11 +256,19 @@ class cVaapiDecoder : public cThread {
                                                     ///< null = OOM. Caller holds parserMutex.
     [[nodiscard]] auto AdmitParsedAu(std::span<const uint8_t> au)
         -> bool; ///< False = drop: MPEG-1/2 picture before the first I after a Clear(). Caller holds parserMutex.
+    [[nodiscard]] auto PassesFastForwardFilter() -> bool; ///< False = drop: fast forward keeps keyframes (and a PAFF
+                                                          ///< I-frame's 2nd field). Caller holds parserMutex.
     auto FillMissingFramePts(AVFrame *frame) noexcept -> void; ///< Labels a NOPTS decoded frame from lastDecodedPts
                                                                ///< before it enters the chain. Caller holds codecMutex.
     auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< Push decodedFrame through the filter graph (lazily built) and append with monotonic PTS.
                  ///< Caller holds codecMutex and must have populated decodedFrame.
+    auto ReceiveFilteredFrames(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
+        -> void; ///< Append every frame the chain has ready; a hard error retires the graph. Caller holds
+                 ///< codecMutex and vaDriverMutex.
+    auto FlushFilterChain(std::vector<std::unique_ptr<VaapiFrame>> &outFrames, bool compactRebuild)
+        -> void; ///< EOS-flush a built chain into @p outFrames (a temporal deinterlacer holds its last frames) and
+                 ///< retire it: the graph is in EOF state afterwards. Caller holds codecMutex.
     auto DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
         -> void; ///< NULL-packet EOS drain, then avcodec_flush_buffers to re-arm. Caller holds codecMutex.
     auto ApplyContainerColorHints(AVFrame *frame) const noexcept
@@ -284,10 +304,17 @@ class cVaapiDecoder : public cThread {
                     ///< commit + page flip). Pass nullptr to use PCM knob (safe default before audio processor is
                     ///< attached).
     auto UpdateSmoothedDelta(int64_t rawDelta90k) noexcept
-        -> void;                                   ///< Residual-accumulator EMA; call once per output frame.
-    auto ResetSmoothedDelta() noexcept -> void;    ///< Invalidate EMA, clear warmup, zero debounce counters.
-    auto PushPacketToQueue(AVPacket *pkt) -> void; ///< Takes ownership of pkt. Trick mode: drops incoming on overflow.
-                                                   ///< Normal mode: drops oldest. Shared by PES and mediaplayer paths.
+        -> void;                                ///< Residual-accumulator EMA; call once per output frame.
+    auto ResetSmoothedDelta() noexcept -> void; ///< Invalidate EMA, clear warmup, zero debounce counters.
+    /// Depth policy of PushPacketToQueue(). Bounded: trick mode drops the incoming packet on overflow, normal
+    /// mode the oldest. Unbounded: a parser flush's last AU, or the second field of a kept PAFF I-frame --
+    /// neither builds up, and dropping either loses a picture at trick depth 1.
+    enum class QueueDepth : uint8_t { Bounded, Unbounded };
+    [[nodiscard]] auto PushPacketToQueue(AVPacket *pkt, QueueDepth depth)
+        -> bool; ///< Takes ownership of pkt; true = queued. Shared by the PES feed, the parser flush and the
+                 ///< mediaplayer.
+    auto QueueParsedAu(std::span<const uint8_t> au, QueueDepth depth)
+        -> void; ///< The one path from av_parser_parse2 to packetQueue: gates, packet, queue. Caller holds parserMutex.
     auto NoteStarvationTick(const AVPacket *pkt) noexcept
         -> void; ///< Starvation diagnostic: counts packets/keyframes until first frame lands. No-op after that (one
                  ///< load).
@@ -319,6 +346,8 @@ class cVaapiDecoder : public cThread {
         -> int64_t; ///< Present thread only. dueIn (= headPts - clock - latency) threshold below which the head is
                     ///< released: half a frame early when the display queue is empty (pre-fill), else strict-due
                     ///< (halfFrame). Single source of truth shared by the drain loop and the waitMs sleep.
+    [[nodiscard]] auto EnterCatchUp() noexcept
+        -> bool; ///< Arm the catch-up regime with the frame at hand as its first drop; true = this cycle logs.
     [[nodiscard]] auto BeginCatchUpLogCycle() noexcept
         -> bool; ///< Catch-up log throttle gate; flushes any pending "cycling settled" summary on the first
                  ///< logged entry after a suppressed run. Returns true if this entry should be logged.
@@ -386,7 +415,9 @@ class cVaapiDecoder : public cThread {
     AVContentLightMetadata hintContentLight{};         ///< HDR10 MaxCLL/MaxFALL, valid per the flag above
     /// Staging for avcodec_receive_frame(); unref'd each iteration.
     std::unique_ptr<AVFrame, FreeAVFrame> decodedFrame;
-    cVideoFilterChain filterChain; ///< VPP graph (bwdif/deinterlace -> scale_vaapi; opt-in denoise/sharpen).
+    cVideoFilterChain filterChain;      ///< VPP graph (bwdif/deinterlace -> scale_vaapi; opt-in denoise/sharpen).
+    bool filterBuiltInTrickMode{false}; ///< The built graph is the light trick chain (codecMutex); a full one
+                                        ///< survives a slow-forward exit.
     /// Staging for filterChain.ReceiveFrame(); unref'd each iteration.
     std::unique_ptr<AVFrame, FreeAVFrame> filteredFrame;
     /// Null on mediaplayer path (extradata present). Slices PES NAL bytes into whole AUs.
