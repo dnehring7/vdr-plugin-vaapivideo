@@ -158,7 +158,7 @@ class cVaapiDisplay : public cThread {
     /// Borrowed DRM fd; the display owns it, so callers must not close it.
     [[nodiscard]] auto GetDrmFd() const noexcept -> int { return drmFd; }
     /// Snapshot the most recently displayed VAAPI surface as a host-side AVFrame (NV12 or P010).
-    /// Returns nullptr if no frame has been displayed yet or the GPU download fails. Used by GrabImage.
+    /// Returns nullptr if no frame has been displayed yet or the GPU download fails, and logs which. Used by GrabImage.
     [[nodiscard]] auto GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame>;
     /// Active scanout height (px); use GetOutputGeometry() when both dimensions must agree.
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t;

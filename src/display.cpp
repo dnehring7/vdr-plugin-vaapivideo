@@ -539,6 +539,7 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
 
 [[nodiscard]] auto cVaapiDisplay::GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame> {
     if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
+        esyslog("vaapivideo/display: grab failed: display not running");
         return nullptr;
     }
 
@@ -552,17 +553,16 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
     {
         const cMutexLock lock(&bufferMutex);
         if (!displayedBuffer.frame) [[unlikely]] {
+            esyslog("vaapivideo/display: grab failed: no frame on screen yet");
             return nullptr;
         }
         source.reset(av_frame_clone(displayedBuffer.frame));
         sourceGraphToken = displayedBuffer.graphToken;
     }
-    if (!source) [[unlikely]] {
-        return nullptr;
-    }
 
     std::unique_ptr<AVFrame, FreeAVFrame> dest{av_frame_alloc()};
-    if (!dest) [[unlikely]] {
+    if (!source || !dest) [[unlikely]] {
+        esyslog("vaapivideo/display: grab failed: out of memory");
         return nullptr;
     }
 

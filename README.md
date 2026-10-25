@@ -717,6 +717,51 @@ with `Ctrl+Alt+F8`, back to a login shell with `Ctrl+Alt+F1`. The plugin logs
 `stdin is not a VT` (drop-in missing, KBD disabled) or `VT_ACTIVATE denied`
 (capability missing, VT switches manual) when the configuration is incomplete.
 
+### IR receivers and doubled keys
+
+A remote decoded by the kernel's rc-core (`ir-keytable` lists it) is also an
+input device, and the console keyboard handler forwards its keys to the
+foreground VT, which with the drop-in above is VDR's. VDR then gets every key
+that has a console sequence twice: from LIRC (`--lirc`) and from the KBD
+remote. With the `rc-rc6-mce` keymap these are the arrow keys (`KEY_UP` arrives
+as `ESC [ A`, i.e. `KBD.Up`), and keymaps that use `KEY_ENTER` or `KEY_1`…
+double Ok and the digits as well. In a menu the cursor moves two lines per
+press.
+
+This happens with lircd's `default` driver, which reads `/dev/lircN` and leaves
+the input device to the console. The `devinput` driver grabs the input device
+itself, so its keys arrive once, and a second grab would take them away from
+it. With the `default` driver, grab the receiver's input device so that its
+events reach no input handler; `/dev/lircN` is unaffected, and a keyboard keeps
+working through the KBD remote:
+
+    sudo tee /etc/udev/rules.d/70-vdr-ir-grab.rules > /dev/null <<'EOF'
+    ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", SUBSYSTEMS=="rc", TAG+="systemd", ENV{SYSTEMD_WANTS}+="vdr-ir-grab@%k.service"
+    EOF
+    sudo tee /etc/systemd/system/vdr-ir-grab@.service > /dev/null <<'EOF'
+    [Unit]
+    Description=Keep the IR remote's key events (%I) off the console
+    BindsTo=dev-input-%i.device
+    After=dev-input-%i.device
+
+    [Service]
+    ExecStart=/usr/bin/evtest --grab /dev/input/%I
+    StandardOutput=null
+    Restart=on-failure
+    EOF
+    sudo systemctl daemon-reload
+    sudo udevadm control --reload
+    sudo udevadm trigger --action=add --subsystem-match=input
+
+The rule must match every event but `remove`: a `change` event without the
+`systemd` tag unplugs the device unit, and `BindsTo=` stops the grab.
+`SUBSYSTEMS=="rc"` grabs every rc-core receiver. To grab only the one VDR
+uses, match its name instead, e.g. `ATTRS{name}=="ITE8708 CIR transceiver"`
+(`ir-keytable` prints it). `evtest` is in the distribution's `evtest` package.
+`systemctl status 'vdr-ir-grab@*'` shows the grab, and a second
+`sudo evtest --grab /dev/input/eventN` then reports the device as grabbed.
+Without a keyboard, `--no-kbd` on VDR's command line is the simpler fix.
+
 ### Sharing the seat with an X server or compositor
 
 vaapivideo drives KMS directly and **does not need an X server**. If one shares
@@ -758,6 +803,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Startup | No video output                      | Check group membership (`video`, `render`); run `vainfo`   |
 | Startup | Black screen after resume            | SVDRP `PLUG vaapivideo DETA` then `ATTA`                   |
 | Startup | `ATTA` / start fails: `another DRM client holds the display` | An X server or compositor owns the active VT — `sudo fuser -v /dev/dri/card*`; stop it, or `ATTA` from VDR's own VT (see [Sharing the seat](#sharing-the-seat-with-an-x-server-or-compositor)) |
+| Remote  | Arrow keys act twice                 | The IR receiver's keys also reach VDR's VT and the KBD remote — grab its input device (see [IR receivers](#ir-receivers-and-doubled-keys)) |
 | Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlacing = software: bwdif` (or `w3fdif`) |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |

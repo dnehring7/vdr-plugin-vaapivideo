@@ -1444,8 +1444,7 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
     // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010).
     auto srcFrame = display->GrabDisplayedFrame();
     if (!srcFrame) [[unlikely]] {
-        esyslog("vaapivideo/device: GrabImage -- no displayed frame yet");
-        return nullptr;
+        return nullptr; // GrabDisplayedFrame() logged why
     }
 
     // 2. Drive the HDR branch from the display's cached state, NOT srcFrame->color_trc:
