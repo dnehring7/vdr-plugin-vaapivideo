@@ -2665,7 +2665,10 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     const AspectRatio outputPar = display->GetOutputPixelAspect();
     params.outputParNum = outputPar.num;
     params.outputParDen = outputPar.den;
-    params.outputRefreshMilliHz = display->GetOutputRefreshMilliHz();
+    // Likewise the staged refresh rate (not the active one): the media player requests the mode before
+    // the first frame decodes, so the first chain already paces for it instead of carrying fps=50 through
+    // the modeset and dropping every other frame on the new mode until the rebuild.
+    params.outputRefreshMilliHz = display->GetTargetRefreshMilliHz();
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;

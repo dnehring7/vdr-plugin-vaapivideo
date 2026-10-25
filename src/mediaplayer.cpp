@@ -277,22 +277,32 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
     return p->codec_type == AVMEDIA_TYPE_SUBTITLE && IsSupportedSubtitle(p->codec_id);
 }
 
-/// Match cDevice::EnsureAudioTrack's pick (Setup.AudioLanguages, else track 0) so opening
-/// cDisplayTracks never silently re-switches the track. -1 when the source has no audio.
+/// Setup.AudioLanguages pick, like cDevice::EnsureAudioTrack, except that the source's current track
+/// (libavformat's best stream, which honours the container's default flag) wins over track 0 when no
+/// language matches and over later tracks of the same language. -1 when the source has no audio.
 [[nodiscard]] auto ChoosePreferredAudioTrack(const cVaapiMediaSource &source) -> int {
     const auto &tracks = source.AudioTracks();
     if (tracks.empty()) {
         return -1;
     }
-    int preferred = -1;
+    const int count = static_cast<int>(tracks.size());
+    const int first = std::clamp(source.CurrentAudioTrack(), 0, count - 1);
+    int preferred = first;
     int languagePreference = -1;
-    for (size_t i = 0; i < tracks.size(); ++i) {
+    // I18nIsPreferredLanguage accepts the first track it sees when none matches and keeps the first of
+    // equally preferred ones, so visiting the current track first makes it the fallback and tie winner.
+    for (int n = -1; n < count; ++n) {
+        const int i = n < 0 ? first : n;
+        if (n == first) {
+            continue;
+        }
         int pos = 0;
-        if (I18nIsPreferredLanguage(Setup.AudioLanguages, tracks.at(i).language.c_str(), languagePreference, &pos)) {
-            preferred = static_cast<int>(i);
+        if (I18nIsPreferredLanguage(Setup.AudioLanguages, tracks.at(static_cast<size_t>(i)).language.c_str(),
+                                    languagePreference, &pos)) {
+            preferred = i;
         }
     }
-    return preferred >= 0 ? preferred : 0;
+    return preferred;
 }
 
 /// libavformat interrupt_callback. Polled by avformat_open_input / av_read_frame on slow

@@ -174,6 +174,12 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputRefreshMilliHz() const noexcept -> uint32_t {
         return outputRefreshMilliHz.load(std::memory_order_acquire);
     }
+    /// Refresh rate (millihertz) the next VPP build should pace for: the staged request's rate from
+    /// RequestDisplayMode() until the display thread has programmed it or given up, the active rate
+    /// otherwise (the GetTargetVideoRect() counterpart for the rate).
+    [[nodiscard]] auto GetTargetRefreshMilliHz() const noexcept -> uint32_t {
+        return targetRefreshMilliHz.load(std::memory_order_acquire);
+    }
     /// Active scanout width (px); see GetOutputHeight().
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t;
     /// Snapshot of the mode currently programmed on the CRTC. Used by the device to skip a
@@ -511,6 +517,9 @@ class cVaapiDisplay : public cThread {
     /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
     /// reports no clock.
     std::atomic<uint32_t> outputRefreshMilliHz{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000};
+    /// Refresh rate (millihertz) of the staged mode request while one is in flight, else of the active mode; the
+    /// decoder builds its VPP graph against this so a chain built during the modeset already fits the new rate.
+    std::atomic<uint32_t> targetRefreshMilliHz{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000};
     uint32_t videoPlaneId{};    ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{}; ///< Cached atomic prop IDs for the video plane
     /// Requested rect (next VPP build target).

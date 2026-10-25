@@ -93,7 +93,8 @@ constexpr size_t DISPLAY_PRERENDER_CAPACITY =
        ///< you change this (the relationship is not linear -- see the note at that definition).
 
 // --- Page flip ---
-constexpr int DISPLAY_PAGE_FLIP_TIMEOUT_MS = 40; ///< ~2 vblanks @ 50 Hz: tolerates one missed flip before giving up
+constexpr uint32_t DISPLAY_PAGE_FLIP_TIMEOUT_VBLANKS =
+    2; ///< Tolerates one missed flip before giving up; in vblanks, as one flip already takes 41.7 ms at 23.976 Hz
 constexpr uint64_t DISPLAY_PAGE_FLIP_STUCK_MS =
     200; ///< Stuck-flip watchdog: force-clear isFlipPending if the kernel swallows the page-flip event.
 constexpr int DISPLAY_DRAIN_ITERATION_LIMIT =
@@ -340,7 +341,10 @@ auto cVaapiDisplay::BeginStreamSwitch() -> void {
     }
     // Best-effort (see WaitForPageFlip): if this times out, old buffers remain alive and
     // the consumer still owns DRM event dispatch, but the drain was not confirmed.
-    if (!WaitForPageFlip(DISPLAY_PAGE_FLIP_TIMEOUT_MS)) [[unlikely]] {
+    const uint32_t refreshMilliHz = std::max(outputRefreshMilliHz.load(std::memory_order_acquire), 1U);
+    const auto flipTimeoutMs =
+        static_cast<int>(((DISPLAY_PAGE_FLIP_TIMEOUT_VBLANKS * 1'000'000U) + refreshMilliHz - 1) / refreshMilliHz);
+    if (!WaitForPageFlip(flipTimeoutMs)) [[unlikely]] {
         esyslog("vaapivideo/display: timed out waiting for page flip before stream switch");
     }
     importMutex.Lock();
@@ -520,6 +524,12 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
     {
         const cMutexLock lock(&modeRequestMutex);
         modeRequest = mode;
+    }
+    // Let the decoder pace for the requested rate right away: the modeset takes a few hundred ms, and a
+    // graph built for the outgoing rate meanwhile (fps=50 for a 24p file) is dropped frame by frame on
+    // the new mode until the post-modeset rebuild. A degenerate mode is ignored by ChangeDisplayMode.
+    if (const uint32_t rateMilliHz = ModeRefreshMilliHz(mode); rateMilliHz > 0) {
+        targetRefreshMilliHz.store(rateMilliHz, std::memory_order_release);
     }
     // Published after the mode itself so the display thread never reads a half-written request.
     modeRequestPending.store(true, std::memory_order_release);
@@ -1281,6 +1291,7 @@ auto cVaapiDisplay::PublishOutputGeometry(const drmModeModeInfo &mode) -> void {
     // changing one without the other desyncs the A/V controllers.
     const uint32_t rateMilliHz = ModeRefreshMilliHz(mode);
     outputRefreshMilliHz.store(rateMilliHz > 0 ? rateMilliHz : 50000U, std::memory_order_release);
+    targetRefreshMilliHz.store(rateMilliHz > 0 ? rateMilliHz : 50000U, std::memory_order_release); // request fulfilled
 
     const cRect fullRect(0, 0, static_cast<int>(mode.hdisplay), static_cast<int>(mode.vdisplay));
     const cMutexLock lock(&videoRectMutex);
@@ -1432,6 +1443,10 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
         // rejected again. ApplyDisplayMode already named it; report only the consequence.
         esyslog("vaapivideo/display: keeping current mode %ux%u@%.3fHz", GetOutputWidth(), GetOutputHeight(),
                 static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
+        // The decoder may have built its graph for the rejected rate (GetTargetRefreshMilliHz); point it back
+        // at the active one and have it rebuild, or a 24p file would run without its fps filter on 50 Hz.
+        targetRefreshMilliHz.store(GetOutputRefreshMilliHz(), std::memory_order_release);
+        geometryChanged.store(true, std::memory_order_release);
     }
 
     modesetActive.store(false, std::memory_order_release);
