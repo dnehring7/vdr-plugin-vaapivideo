@@ -1223,11 +1223,10 @@ namespace {
         hintMasteringDisplay = info.masteringDisplay;
         hintHasContentLight = info.hasContentLight;
         hintContentLight = info.contentLight;
-        // Reset to 0/1 (the fresh-alloc default) when the new file has no fps, so the filter graph
-        // falls back to DVB 50/1 instead of pacing at the previous file's rate. Fallback only --
-        // the decoder overwrites it from VUI for h.264/HEVC.
-        codecCtx->framerate = (info.fpsNum > 0 && info.fpsDen > 0) ? AVRational{.num = info.fpsNum, .den = info.fpsDen}
-                                                                   : AVRational{.num = 0, .den = 1};
+        // 0/1 when the new file has none: pace at DVB 50/1, not at the previous file's rate.
+        hintFrameRate = (info.fpsNum > 0 && info.fpsDen > 0) ? AVRational{.num = info.fpsNum, .den = info.fpsDen}
+                                                             : AVRational{.num = 0, .den = 1};
+        codecCtx->framerate = hintFrameRate;
         return true;
     }
     forceCodecReopen = false;
@@ -1274,13 +1273,11 @@ namespace {
     decoderCtx->err_recognition = AV_EF_CAREFUL;
     decoderCtx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
 
-    // Mediaplayer hint: VP9/AV1 carry no bitstream framerate; without this seed
-    // codecCtx->framerate stays 0/0 and the filter chain falls back to the DVB 50/1
-    // default. The decoder may overwrite this from VUI for h.264/HEVC -- the hint is
-    // strictly a fallback for codecs that don't signal it.
-    if (info.fpsNum > 0 && info.fpsDen > 0) {
-        decoderCtx->framerate = AVRational{.num = info.fpsNum, .den = info.fpsDen};
-    }
+    // VP9/AV1 often lack a bitstream rate; without the container's the filter chain assumes DVB 50/1.
+    // Kept apart from the codec seed: libdav1d resets it to 0/1 at open and on each sequence header.
+    hintFrameRate = (info.fpsNum > 0 && info.fpsDen > 0) ? AVRational{.num = info.fpsNum, .den = info.fpsDen}
+                                                         : AVRational{.num = 0, .den = 1};
+    decoderCtx->framerate = hintFrameRate;
 
     // VP9/AV1 signal HDR transfer/primaries only in the container, not the bitstream. Seed the codec
     // color fields so FFmpeg stamps them onto every frame; UNSPECIFIED on the PES path leaves the
@@ -2233,11 +2230,18 @@ auto RepairEosFlushPts(std::vector<std::unique_ptr<VaapiFrame>> &frames, size_t 
 }
 } // namespace
 
+[[nodiscard]] auto cVaapiDecoder::StreamFrameRate() const noexcept -> AVRational {
+    if (codecCtx && codecCtx->framerate.num > 0 && codecCtx->framerate.den > 0) {
+        return codecCtx->framerate;
+    }
+    return hintFrameRate;
+}
+
 auto cVaapiDecoder::FillMissingFramePts(AVFrame *frame) noexcept -> void {
     // The deinterlacers do arithmetic on NOPTS, turning neighboring stamps into garbage the presenter
     // drops as stale. Frames leave the codec in presentation order: previous label + one frame period.
     if (frame->pts == AV_NOPTS_VALUE && lastDecodedPts != AV_NOPTS_VALUE) {
-        const AVRational rate = codecCtx ? codecCtx->framerate : AVRational{};
+        const AVRational rate = StreamFrameRate();
         const int64_t frameDur90k =
             rate.num > 0 && rate.den > 0 ? (1000 * PTS_TICKS_PER_MS * rate.den) / rate.num : 40 * PTS_TICKS_PER_MS;
         frame->pts = lastDecodedPts + frameDur90k;
@@ -2648,8 +2652,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
     cVideoFilterChain::BuildParams params;
     params.streamInterlaced = streamInterlaced;
-    params.fpsNum = codecCtx->framerate.num;
-    params.fpsDen = codecCtx->framerate.den;
+    const AVRational frameRate = StreamFrameRate();
+    params.fpsNum = frameRate.num;
+    params.fpsDen = frameRate.den;
     params.hwFramesCtx = codecCtx->hw_frames_ctx;
     params.hwDeviceRef = vaapiContext->hwDeviceRef;
     // Stored in the graph's deleter; outlives every token because cVaapiDevice destroys the

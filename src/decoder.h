@@ -258,6 +258,8 @@ class cVaapiDecoder : public cThread {
         -> bool; ///< False = drop: MPEG-1/2 picture before the first I after a Clear(). Caller holds parserMutex.
     [[nodiscard]] auto PassesFastForwardFilter() -> bool; ///< False = drop: fast forward keeps keyframes (and a PAFF
                                                           ///< I-frame's 2nd field). Caller holds parserMutex.
+    [[nodiscard]] auto StreamFrameRate() const noexcept
+        -> AVRational; ///< Codec-reported rate, else the container's; 0/1 when neither knows. Caller holds codecMutex.
     auto FillMissingFramePts(AVFrame *frame) noexcept -> void; ///< Labels a NOPTS decoded frame from lastDecodedPts
                                                                ///< before it enters the chain. Caller holds codecMutex.
     auto FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
@@ -404,8 +406,9 @@ class cVaapiDecoder : public cThread {
     int64_t lastDecodedPts{AV_NOPTS_VALUE};     ///< PTS of the last frame fed to the chain (codecMutex); the label a
                                                 ///< NOPTS frame gets, plus one frame period. NOPTS after every flush.
     bool streamInterlaced{false};               ///< Positive sequence-level hint; forces deinterlace at graph build.
-    // Container HDR hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED on the PES path.
-    AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED};             ///< Container colour primaries
+    // Container hints from VideoStreamInfo; set + read under codecMutex. UNSPECIFIED / 0/1 on the PES path.
+    AVRational hintFrameRate{.num = 0, .den = 1};               ///< Container frame rate; StreamFrameRate()'s fallback
+    AVColorPrimaries hintColorPrimaries{AVCOL_PRI_UNSPECIFIED}; ///< Container colour primaries
     AVColorTransferCharacteristic hintColorTransfer{AVCOL_TRC_UNSPECIFIED}; ///< Container transfer function
     AVColorSpace hintColorSpace{AVCOL_SPC_UNSPECIFIED};                     ///< Container matrix coefficients
     AVColorRange hintColorRange{AVCOL_RANGE_UNSPECIFIED};                   ///< Container range (tv/pc)
