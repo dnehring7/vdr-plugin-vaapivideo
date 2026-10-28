@@ -168,6 +168,7 @@ auto cAudioProcessor::Clear() -> void {
     {
         const cMutexLock queueLock(queueMutex.get());
         drainRequested = false; // a Clear() cancels an EOS drain (cDevice::Drain() contract); DropOutput() keeps it
+        queuedSinceClear.store(false, std::memory_order_relaxed);
         // Ends a pause too: a stop while paused (SetPlayMode() without Play()) must not leave the worker parked.
         outputHeld.store(false, std::memory_order_release);
         packetCondition.Broadcast();
@@ -488,6 +489,7 @@ auto cAudioProcessor::Decode(const uint8_t *data, size_t size, int64_t pts) -> v
 
         packetQueue.push(packet.release());
         approxQueueSize.store(packetQueue.size(), std::memory_order_relaxed);
+        queuedSinceClear.store(true, std::memory_order_relaxed);
     }
 
     packetCondition.Broadcast();

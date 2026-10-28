@@ -186,8 +186,9 @@ constexpr uint64_t DECODER_NO_CLOCK_HOLD_MS =
     1500; ///< Walltime the drain holds the first frame still (jitterBuf non-empty, ap non-null,
           ///< GetClock()=NOPTS) waiting for the audio clock to anchor before falling back to no-clock
           ///< freerun. Keeps post-seek frames buffered so the head doesn't run ahead of the clock at
-          ///< VSync rate. Bounded so a video-only stream (ap non-null, no audio anchor ever) does not
-          ///< freeze forever; the nearCap escape additionally bypasses it if jitterBuf hits the cap.
+          ///< VSync rate. Not entered before the first audio packet since the Clear() is queued (none may
+          ///< come), bounded so audio that never anchors does not freeze video forever; the nearCap
+          ///< escape additionally bypasses it if jitterBuf hits the cap.
 constexpr uint64_t DECODER_DRAIN_MISS_GRACE_MS =
     3000; ///< Post-flush grace before drain gaps count toward `miss`: after a Clear()/seek/mediaplayer
           ///< open the pipeline legitimately stalls (filter rebuild, mode-switch HDMI retrain, audio
@@ -1983,8 +1984,11 @@ auto cVaapiDecoder::PresentAction() -> void {
             }
             const bool consumingDrop = pendingDrops > 0;
             const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
+            // A still picture (a DVD menu's VOBU, often a whole GOP) is submitted unsynced anyway; holding
+            // it only delayed its drain.
+            const bool stillPicture = stillPictureMode.load(std::memory_order_relaxed);
 
-            if (!inTrick && !consumingDrop && !canFreerun && ap) {
+            if (!inTrick && !consumingDrop && !canFreerun && !stillPicture && ap) {
                 // With a valid clock, hold until the head PTS is due. A missing clock (track switch,
                 // ALSA reset, video-only stream) falls through to SyncAndSubmitFrame()'s no-clock freerun.
                 const int64_t clock = ap->GetClock();
@@ -2001,7 +2005,10 @@ auto cVaapiDecoder::PresentAction() -> void {
                     }
                     // As full as the decode thread fills it: it stops a whole batch short of the cap.
                     const bool nearCap = jitterBuf.size() + DECODER_OUTPUT_BATCH_MAX > DECODER_RESERVE_CAPACITY;
-                    if (!nearCap && nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
+                    // Not before the first audio packet is queued: none may come (a DVD's silent clip), and a
+                    // muxed stream's follows its first picture within tens of ms.
+                    if (ap->HasQueuedSinceClear() && !nearCap &&
+                        nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
                         break;
                     }
                 } else {

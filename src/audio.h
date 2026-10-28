@@ -113,6 +113,9 @@ class cAudioProcessor : public cThread {
         return approxQueueSize.load(std::memory_order_relaxed);
     } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() is exact but
       ///< takes queueMutex; this mirror avoids even that short queue lock in hot display / status paths.
+    [[nodiscard]] auto HasQueuedSinceClear() const noexcept -> bool {
+        return queuedSinceClear.load(std::memory_order_relaxed);
+    } ///< A clock is on its way. Lock-free for the present thread's no-clock hold, which waits for nothing else.
     [[nodiscard]] auto GetPendingWorkSize() const
         -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The EOS drains need this, not
                    ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
@@ -312,6 +315,7 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
                                              ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
     std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
+    std::atomic<bool> queuedSinceClear{false}; ///< A packet was queued since the last Clear() (queueMutex writes)
 
     // ========================================================================
     // === PCM CLOCK ===

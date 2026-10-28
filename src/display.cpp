@@ -562,12 +562,18 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
     std::unique_ptr<AVFrame, FreeAVFrame> source;
     {
         const cMutexLock lock(&bufferMutex);
-        if (!displayedBuffer.frame) [[unlikely]] {
+        // pendingBuffer holds the last committed frame; it is on screen once its flip has landed
+        // (and is re-presented while no new frame comes). displayedBuffer is the one before it, so
+        // grabbing it showed the previous picture -- for a still, the black frame ahead of it.
+        const bool pendingShown = pendingBufferShown.load(std::memory_order_acquire);
+        const DrmFramebuffer &onScreen =
+            pendingBuffer.frame && (pendingShown || !displayedBuffer.frame) ? pendingBuffer : displayedBuffer;
+        if (!onScreen.frame) [[unlikely]] {
             esyslog("vaapivideo/display: grab failed: no frame on screen yet");
             return nullptr;
         }
-        source.reset(av_frame_clone(displayedBuffer.frame));
-        sourceGraphToken = displayedBuffer.graphToken;
+        source.reset(av_frame_clone(onScreen.frame));
+        sourceGraphToken = onScreen.graphToken;
     }
 
     std::unique_ptr<AVFrame, FreeAVFrame> dest{av_frame_alloc()};
@@ -847,6 +853,7 @@ auto cVaapiDisplay::Action() -> void {
         // Past the gate the last commit has flipped (or its event was given up on): whatever was
         // popped is on screen. Cleared before the pop below may set it again for the next frame.
         frameInFlight.store(false, std::memory_order_release);
+        pendingBufferShown.store(true, std::memory_order_release);
 
         // Runtime mode change, serviced here and nowhere else: this thread owns every DRM commit
         // and is the sole drmHandleEvent dispatcher, so doing the ALLOW_MODESET inline needs no
@@ -919,6 +926,7 @@ auto cVaapiDisplay::Action() -> void {
                             // scanning it (kernel use-after-free on next scanout).
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
+                            pendingBufferShown.store(false, std::memory_order_release);
                             // Arm warmup grace whenever decoder resumes from idle: post-Clear
                             // (lastCommit==0) OR after a long gap (commit > DISPLAY_WARMUP_ACTIVE_WINDOW_MS old).
                             // The latter covers transitions where BeginStreamSwitch wasn't invoked

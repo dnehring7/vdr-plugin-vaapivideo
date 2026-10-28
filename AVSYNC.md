@@ -463,9 +463,11 @@ SkipStaleJitterFrames(): bulk-drop heads more than HARD_THRESHOLD behind clock (
 loop:
   if devicePaused:                              break                     // Freeze: hold, clock pinned
   if trick || freerun || pendingDrops || !ap:   SyncAndSubmitFrame(head)  // due-gate bypassed
+  if stillPicture:                              SyncAndSubmitFrame(head)  // submitted unsynced anyway
   clock = GetClock()
   if clock == NOPTS:                                                       // audio not yet anchored
-      hold ≤ NO_CLOCK_HOLD_MS (escape if jitterBuf near cap), else no-clock freerun submit
+      hold ≤ NO_CLOCK_HOLD_MS once audio was queued since the Clear() (escape if jitterBuf
+      near cap), else no-clock freerun submit
   dueIn = headPts − clock − latency
   wake  = PresentWakeThreshold90k()             // frameDur if prerender empty (pre-fill), else halfFrame
   if dueIn > wake:
@@ -495,7 +497,11 @@ Guards against startup / re-anchor / pause stalls:
   anyway if `jitterBuf` approaches `RESERVE_CAPACITY`, so a fast HW decoder can't
   overflow waiting for an anchor that never comes (video-only stream). This covers
   the mux-interleave seek offset — a TS seek can land on a keyframe up to ~1 s
-  ahead of the target audio.
+  ahead of the target audio. Not before the first audio packet since the
+  `Clear()` is queued: a stream without audio (a DVD's silent clip) has no clock
+  to wait for, and the hold froze its first picture for 1.5 s. A still picture
+  (`StillPicture()`) is never held: `SyncAndSubmitFrame()` submits it unsynced
+  anyway.
 
 - **`RESERVE_CAPACITY` (`DECODER_RESERVE_CAPACITY = 64`, ~1.3 s @ 50 fps).**
   Drop-oldest runaway guard for the case the gates above miss
