@@ -8,6 +8,7 @@
 #include "stream.h"
 
 #include "caps.h"
+#include "common.h"
 
 // C++ standard library
 #include <algorithm>
@@ -26,7 +27,6 @@
 extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavcodec/defs.h>
-#include <libavutil/intreadwrite.h>
 }
 #pragma GCC diagnostic pop
 
@@ -115,12 +115,12 @@ struct CodecEvidence {
 /// Returns 0 for a reserved sampling_frequency_index or a length below the header size --
 /// which is 9, not 7, when protection_absent == 0, since aac_frame_length counts the CRC.
 [[nodiscard]] auto AdtsFrameLength(const uint8_t *hdr) noexcept -> size_t {
-    if (((AV_RB8(hdr + 2) >> 2) & 0x0F) >= 13) { // sampling_frequency_index: 13/14 reserved, 15 escape
+    if (((hdr[2] >> 2) & 0x0F) >= 13) { // sampling_frequency_index: 13/14 reserved, 15 escape
         return 0;
     }
-    const size_t frameLen = (static_cast<size_t>(AV_RB8(hdr + 3) & 0x03) << 11) |
-                            (static_cast<size_t>(AV_RB8(hdr + 4)) << 3) | (AV_RB8(hdr + 5) >> 5);
-    const size_t headerLen = (AV_RB8(hdr + 1) & 0x01) != 0 ? 7U : 9U;
+    const size_t frameLen =
+        (static_cast<size_t>(hdr[3] & 0x03) << 11) | (static_cast<size_t>(hdr[4]) << 3) | (hdr[5] >> 5);
+    const size_t headerLen = (hdr[1] & 0x01) != 0 ? 7U : 9U;
     return frameLen >= headerLen ? frameLen : 0;
 }
 
@@ -145,7 +145,7 @@ struct CodecEvidence {
 }
 
 /// Strength of a frame-length corroboration (FrameLengthCorroborates): callers treat Chained -- two
-/// complete frame headers linked by an exact frame-length step, i.e. two real audio frames -- as
+/// complete frame headers linked by an exact frame-length step, so two real audio frames -- as
 /// stronger evidence than a single frame (exact payload fill / Dolby head-span).
 enum class Corroboration : uint8_t {
     None = 0,    ///< Not corroborated; the sync hit is payload noise
@@ -213,7 +213,7 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
     const uint8_t *p = data.data();
 
     for (size_t i = 0; i + 4 <= size; ++i) {
-        const uint16_t sync = AV_RB16(p + i);
+        const uint16_t sync = ReadBe16(p + i);
 
         if ((sync & 0xFF00) == 0xFF00) [[unlikely]] {
             // ADTS (layer 00, mask 0xFFF6) tested before MPEG audio (layer 01/10/11, mask 0xFFE0):
@@ -225,7 +225,7 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
                 if (frameLen != 0) {
                     const Corroboration hit = FrameLengthCorroborates(
                         i, frameLen, size, /*allowHeadSpan=*/false, [p, size](size_t pos) noexcept -> bool {
-                            return pos + 6 <= size && (AV_RB16(p + pos) & 0xFFF6) == 0xFFF0 &&
+                            return pos + 6 <= size && (ReadBe16(p + pos) & 0xFFF6) == 0xFFF0 &&
                                    AdtsFrameLength(p + pos) != 0;
                         });
                     if (hit != Corroboration::None) {
@@ -234,13 +234,13 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
                 }
             }
             if ((sync & 0xFFE0) == 0xFFE0) [[likely]] {
-                const size_t frameLen = Mp2FrameLength(AV_RB32(p + i));
+                const size_t frameLen = Mp2FrameLength(ReadBe32(p + i));
                 // Mask 0xFFFE requires the neighbor to repeat version + layer (drops only protection).
                 if (frameLen != 0) {
                     const Corroboration hit = FrameLengthCorroborates(
                         i, frameLen, size, /*allowHeadSpan=*/false, [p, size, sync](size_t pos) noexcept -> bool {
-                            return pos + 4 <= size && (AV_RB16(p + pos) & 0xFFFE) == (sync & 0xFFFE) &&
-                                   Mp2FrameLength(AV_RB32(p + pos)) != 0;
+                            return pos + 4 <= size && (ReadBe16(p + pos) & 0xFFFE) == (sync & 0xFFFE) &&
+                                   Mp2FrameLength(ReadBe32(p + pos)) != 0;
                         });
                     if (hit != Corroboration::None) {
                         return Confirmed(AV_CODEC_ID_MP2, hit);
@@ -252,15 +252,14 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
         // AAC-LATM/LOAS (ISO 14496-3 sec.1.7.3): 11-bit sync + 13-bit audioMuxLengthBytes. DVB
         // carries one AudioMuxElement per PES, so exact fill (not the chained sync) usually confirms.
         if ((sync & 0xFFE0) == 0x56E0) [[unlikely]] {
-            const auto muxLen = static_cast<size_t>(((sync & 0x1FU) << 8) | AV_RB8(p + i + 2));
+            const auto muxLen = static_cast<size_t>(((sync & 0x1FU) << 8) | p[i + 2]);
             if (muxLen >= 2) {
                 const Corroboration hit = FrameLengthCorroborates(
                     i, muxLen + 3, size, /*allowHeadSpan=*/false, [p, size](size_t pos) noexcept -> bool {
-                        if (pos + 3 > size || (AV_RB16(p + pos) & 0xFFE0) != 0x56E0) {
+                        if (pos + 3 > size || (ReadBe16(p + pos) & 0xFFE0) != 0x56E0) {
                             return false;
                         }
-                        const auto nextMuxLen =
-                            static_cast<size_t>(((AV_RB16(p + pos) & 0x1FU) << 8) | AV_RB8(p + pos + 2));
+                        const auto nextMuxLen = static_cast<size_t>(((ReadBe16(p + pos) & 0x1FU) << 8) | p[pos + 2]);
                         return nextMuxLen >= 2;
                     });
                 if (hit != Corroboration::None) {
@@ -273,21 +272,21 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
         // byte+5 bits 7..3, A/52 sec.A.4.3): bsid <= 10 -> AC-3, 11-15 -> reserved (classified
         // as E-AC-3 to match FFmpeg, but no real stream uses these), 16 -> E-AC-3.
         if (sync == 0x0B77 && i + 6 <= size) [[unlikely]] {
-            const uint8_t bsid = (AV_RB8(p + i + 5) >> 3) & 0x1F;
+            const uint8_t bsid = (p[i + 5] >> 3) & 0x1F;
             size_t frameLen = 0;
             AVCodecID dolby = AV_CODEC_ID_NONE;
             if (bsid <= 10) {
-                frameLen = Ac3FrameLength(AV_RB8(p + i + 4) >> 6, AV_RB8(p + i + 4) & 0x3F);
+                frameLen = Ac3FrameLength(p[i + 4] >> 6, p[i + 4] & 0x3F);
                 dolby = AV_CODEC_ID_AC3;
-            } else if (bsid <= 16 && (AV_RB8(p + i + 2) >> 6) != 3) { // strmtyp 3 is reserved
+            } else if (bsid <= 16 && (p[i + 2] >> 6) != 3) { // strmtyp 3 is reserved
                 // E-AC-3 frmsiz (11 bits, bytes +2/+3): frame bytes = (frmsiz + 1) * 2.
-                frameLen = (static_cast<size_t>(AV_RB16(p + i + 2) & 0x07FF) + 1) * 2;
+                frameLen = (static_cast<size_t>(ReadBe16(p + i + 2) & 0x07FF) + 1) * 2;
                 dolby = frameLen >= 6 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_NONE;
             }
             if (dolby != AV_CODEC_ID_NONE && frameLen != 0) {
                 const Corroboration hit =
                     FrameLengthCorroborates(i, frameLen, size, /*allowHeadSpan=*/true,
-                                            [p](size_t pos) noexcept -> bool { return AV_RB16(p + pos) == 0x0B77; });
+                                            [p](size_t pos) noexcept -> bool { return ReadBe16(p + pos) == 0x0B77; });
                 if (hit != Corroboration::None) {
                     return Confirmed(dolby, hit);
                 }
@@ -296,13 +295,13 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
 
         // DTS Coherent Acoustics core (ETSI TS 102 114). 32-bit sync, no ambiguity -- but a lone
         // sync is still one header of evidence: chained=false keeps the 2-of-2 payload rule.
-        if (AV_RB32(p + i) == 0x7FFE8001) [[unlikely]] {
+        if (ReadBe32(p + i) == 0x7FFE8001) [[unlikely]] {
             return Confirmed(AV_CODEC_ID_DTS, Corroboration::SingleFrame);
         }
 
         // TrueHD major sync (0xF8726FBA, Dolby TrueHD sec.5.3). Mandatory in the first frame
         // and recurs periodically, so probing for it on early input is reliable.
-        if (AV_RB32(p + i) == 0xF8726FBA) [[unlikely]] {
+        if (ReadBe32(p + i) == 0xF8726FBA) [[unlikely]] {
             return Confirmed(AV_CODEC_ID_TRUEHD, Corroboration::SingleFrame);
         }
     }
@@ -394,12 +393,10 @@ auto DetectVideoCodec(std::span<const uint8_t> data) noexcept -> AVCodecID {
 
                 if (hevcType >= 32 && hevcType <= 34 && layerIdZero) {
                     bit = static_cast<uint8_t>(1U << (hevcType - 32)); // VPS=0x01, SPS=0x02, PPS=0x04
-                } else if (hevcType >= 19 && hevcType <= 21 && layerIdZero) {
+                } else if (hevcType >= 19 && hevcType <= 21 && layerIdZero && (hevc.seenMask & kHevcParamMask) != 0) {
                     // IDR_W_RADL(19)/IDR_N_LP(20)/CRA(21): gate on a prior param set because
                     // H.264 bytes 0x27/0x28 alias HEVC types 19/20; IDR-only is not enough.
-                    if ((hevc.seenMask & kHevcParamMask) != 0) {
-                        bit = 0x08;
-                    }
+                    bit = 0x08;
                 }
 
                 if (bit != 0) {
@@ -648,7 +645,7 @@ class BitReader {
 }
 
 /// True iff @p profileIdc carries the extended SPS fields (chroma_format_idc,
-/// bit_depth_luma_minus8, etc. from H.264 sec.7.3.2.1.1). This is NOT the same as
+/// bit_depth_luma_minus8 and the rest of H.264 sec.7.3.2.1.1). This is NOT the same as
 /// "high-bit-depth": High(100) and Scalable Baseline(83) are 8-bit but still carry
 /// the syntax, so the cursor must traverse these fields to reach any that follow.
 [[nodiscard]] constexpr auto HasH264ExtendedSpsFields(int profileIdc) noexcept -> bool {
@@ -820,7 +817,7 @@ class BitReader {
         }
         if (!info.hasSps) { // scanning for sequence_header_code: horizontal_size(12) + vertical_size(12)
             if (p[headerPos] == 0xB3) {
-                const uint32_t hv = AV_RB24(p + headerPos + 1);
+                const uint32_t hv = ReadBe24(p + headerPos + 1);
                 info.codedWidth = static_cast<int>((hv >> 12) & 0x0FFF);
                 info.codedHeight = static_cast<int>(hv & 0x0FFF);
                 info.hasSps = info.codedWidth > 0 && info.codedHeight > 0;

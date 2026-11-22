@@ -21,6 +21,7 @@
 
 // C++ Standard Library
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -45,13 +46,6 @@
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
-// ============================================================================
-// === GLOBAL STATE ===
-// ============================================================================
-
-// See declaration in osd.h for rationale.
-cOsdProvider *osdProvider = nullptr;
-
 namespace {
 
 /// cOsd's 3-arg constructor is protected and only befriended to cOsdProvider, so
@@ -74,7 +68,7 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
     // display_ is null under --detached: skins probe ProvidesTrueColor() during VDR Start()
     // before hardware is ready. AttachDisplay() wires the real display later. All pixel-path
     // methods guard on display_ before use.
-    if (auto *currentDisplay = GetDisplay()) {
+    if (const auto *currentDisplay = GetDisplay()) {
         dsyslog("vaapivideo/osd: provider created %ux%u (TrueColor only)", currentDisplay->GetOutputWidth(),
                 currentDisplay->GetOutputHeight());
     } else {
@@ -82,13 +76,18 @@ cVaapiOsdProvider::cVaapiOsdProvider(cVaapiDisplay *const display) : display_(di
     }
 }
 
+auto cVaapiOsdProvider::Register(cVaapiDisplay *display) -> void {
+    // The new provider's base ctor deletes a previous one, whose dtor still sees itself in instance_.
+    instance_ = new cVaapiOsdProvider(display);
+}
+
 cVaapiOsdProvider::~cVaapiOsdProvider() noexcept {
     dsyslog("vaapivideo/osd: provider destructor start display_=%p", static_cast<void *>(GetDisplay()));
 
     // A fast restart installs the new provider before VDR destroys the old one; only null
-    // the global if it still points at this instance.
-    if (::osdProvider == this) {
-        ::osdProvider = nullptr;
+    // the instance if it still points at this one.
+    if (instance_ == this) {
+        instance_ = nullptr;
     }
 
     // VDR's cOsdProvider ctor deletes the old provider while cVaapiOsd objects may still live
@@ -246,7 +245,7 @@ auto cVaapiOsdProvider::UpdateOsd(cVaapiOsd &osd) const -> void {
     // provider is registered; with a provider installed it passes nullptr straight to the
     // caller. On any failure return cVaapiDummyOsd -- the same kind of no-op VDR uses
     // as its own internal fallback.
-    auto *display = GetDisplay();
+    const auto *display = GetDisplay();
     if (!display || !display->IsInitialized()) [[unlikely]] {
         dsyslog("vaapivideo/osd: CreateOsd while detached -- returning dummy cOsd");
         return new cVaapiDummyOsd(left, top, level);
@@ -357,7 +356,7 @@ auto cVaapiOsd::Flush() -> void {
     // lock -- so pixels_/provider_ stay valid for the whole flush. Cheap to hold across
     // UpdateOsd(): only the rare SVDRP grab/detach contends it, never the display thread.
     const cMutexLock bufferLock(&providerState_->mutex);
-    auto *const provider = provider_.load(std::memory_order_acquire);
+    const auto *const provider = provider_.load(std::memory_order_acquire);
     if (!provider || !pixels_) [[unlikely]] {
         return;
     }
@@ -489,12 +488,12 @@ auto cVaapiOsd::Flush() -> void {
     }
 
     // Register as a KMS FB. ARGB8888 is single-plane so only handles[0] is populated.
-    const uint32_t handles[4] = {gemHandle_, 0, 0, 0};
-    const uint32_t pitches[4] = {stride_, 0, 0, 0};
-    const uint32_t offsets[4] = {0, 0, 0, 0};
+    const std::array<uint32_t, 4> handles{gemHandle_, 0, 0, 0};
+    const std::array<uint32_t, 4> pitches{stride_, 0, 0, 0};
+    const std::array<uint32_t, 4> offsets{};
 
-    if (drmModeAddFB2(drmFd_, fbWidth, fbHeight, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &framebufferId_, 0) <
-        0) [[unlikely]] {
+    if (drmModeAddFB2(drmFd_, fbWidth, fbHeight, DRM_FORMAT_ARGB8888, handles.data(), pitches.data(), offsets.data(),
+                      &framebufferId_, 0) < 0) [[unlikely]] {
         esyslog("vaapivideo/osd: drmModeAddFB2 failed: %s", std::strerror(errno));
         DestroyDumbBuffer();
         return false;

@@ -8,7 +8,7 @@
 %global __provides_exclude_from ^%{vdr_libdir}/.*\\.so.*$
 
 Name:           vdr-%{pname}
-Version:        1.9.1
+Version:        1.10.0
 Release:        1%{?dist}
 Summary:        VAAPI video plugin for VDR
 
@@ -27,7 +27,7 @@ BuildRequires:  pkgconfig(libavutil)
 BuildRequires:  pkgconfig(libdrm)
 BuildRequires:  pkgconfig(libswresample)
 BuildRequires:  pkgconfig(libva-drm) >= 1.22
-BuildRequires:  vdr-devel >= 2.6.6
+BuildRequires:  pkgconfig(vdr) >= 2.6.6
 Requires:       vdr(abi)%{?_isa} = %{vdr_apiversion}
 
 %description

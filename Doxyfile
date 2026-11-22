@@ -27,6 +27,9 @@ EXTRACT_STATIC         = YES
 EXTRACT_ANON_NSPACES   = YES
 # A ///@{ ... ///@} group shares its first member's comment (rows of parallel members need just one).
 DISTRIBUTE_GROUP_DOC   = YES
+# A multi-line /// block has no brief otherwise, leaving its summary-table row blank (about 700 of
+# them). The first sentence becomes the brief, so it must not contain "e.g. ", "i.e. " or "cf. ".
+JAVADOC_AUTOBRIEF      = YES
 
 # @R appears in "-r WxH@R" in README.md -- not a Doxygen command
 ALIASES                = "R=R"

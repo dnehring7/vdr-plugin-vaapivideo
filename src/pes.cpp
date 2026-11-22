@@ -13,6 +13,7 @@
  */
 
 #include "pes.h"
+#include "common.h"
 
 // C++ Standard Library
 #include <algorithm>
@@ -26,7 +27,6 @@
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
 #include <libavutil/avutil.h>
-#include <libavutil/intreadwrite.h>
 }
 #pragma GCC diagnostic pop
 
@@ -60,13 +60,13 @@ constexpr uint8_t PES_STREAM_ID_VIDEO_FIRST = 0xE0; ///< MPEG video base; mask 0
     // mandatory marker bit (sec.2.4.3.7). All three marker bits must be 1; a missing marker
     // means the data is corrupt. Rejecting here prevents garbage timestamps from reaching
     // the A/V sync controller.
-    if ((AV_RB8(bytes) & AV_RB8(bytes + 2) & AV_RB8(bytes + 4) & 0x01) == 0) [[unlikely]] {
+    if ((bytes[0] & bytes[2] & bytes[4] & 0x01) == 0) [[unlikely]] {
         return AV_NOPTS_VALUE;
     }
 
-    const uint64_t b32_30 = (AV_RB8(bytes) >> 1) & 0x07;
-    const uint64_t b29_15 = (AV_RB16(bytes + 1) >> 1) & 0x7FFF;
-    const uint64_t b14_0 = (AV_RB16(bytes + 3) >> 1) & 0x7FFF;
+    const uint64_t b32_30 = (bytes[0] >> 1) & 0x07;
+    const uint64_t b29_15 = (ReadBe16(bytes + 1) >> 1) & 0x7FFF;
+    const uint64_t b14_0 = (ReadBe16(bytes + 3) >> 1) & 0x7FFF;
 
     return static_cast<int64_t>((b32_30 << 30) | (b29_15 << 15) | b14_0);
 }
@@ -87,7 +87,7 @@ auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket {
 
     const uint8_t *p = data.data();
 
-    if (AV_RB24(p) != PES_START_CODE_PREFIX) [[unlikely]] {
+    if (ReadBe24(p) != PES_START_CODE_PREFIX) [[unlikely]] {
         return result;
     }
 
@@ -137,7 +137,7 @@ auto ParsePes(std::span<const uint8_t> data) noexcept -> PesPacket {
     // Note: PES_packet_length counts from byte 6 onward and does NOT include the 6-byte
     // fixed header, so the payload starts at byte (6 + headerExtLen) = headerSize.
     size_t payloadLen = size - headerSize;
-    const uint16_t pesLen = AV_RB16(p + 4);
+    const uint16_t pesLen = ReadBe16(p + 4);
 
     if (pesLen > 0) {
         const auto declared = static_cast<size_t>(pesLen);

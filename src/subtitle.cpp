@@ -155,7 +155,7 @@ constexpr int32_t SUBTITLE_SPU_LEAD_MAX_90K = 900000; ///< Read position further
     return digits > 0 ? value : -1;
 }
 
-/// Color from an ASS override block (content between {}), e.g. `\c&Hbbggrr&` / `\1c&Hbbggrr&` (the
+/// Color from an ASS override block (content between {}), such as `\c&Hbbggrr&` / `\1c&Hbbggrr&` (the
 /// ffmpeg subrip decoder emits `<font color>` in this form). ASS stores B,G,R; returns 0xRRGGBB or -1.
 [[nodiscard]] auto ParseAssColor(std::string_view block) -> int32_t {
     for (size_t p = block.find("c&H"); p != std::string_view::npos; p = block.find("c&H", p + 1)) {
@@ -176,7 +176,7 @@ constexpr int32_t SUBTITLE_SPU_LEAD_MAX_90K = 900000; ///< Read position further
     return -1;
 }
 
-/// Color from an HTML-ish tag (content between <>), e.g. `font color="yellow"` / `font color="#rrggbb"`.
+/// Color from an HTML-ish tag (content between <>), such as `font color="yellow"` / `font color="#rrggbb"`.
 /// Returns 0xRRGGBB or -1 when the tag carries no recognizable color.
 [[nodiscard]] auto ParseHtmlColor(std::string_view tag) -> int32_t {
     const size_t key = tag.find("color");
@@ -864,7 +864,7 @@ auto cSubtitleConverter::ShowBitmapCue(const Cue &cue) -> bool {
     for (const BitmapRegion &region : cue.regions) {
         const int rx = static_cast<int>(std::lround(factor * (region.x - x1)));
         const int ry = static_cast<int>(std::lround(factor * (region.y - y1)));
-        osd_->DrawScaledBitmap(rx, ry, *region.bitmap, factor, factor, Setup.AntiAlias);
+        osd_->DrawScaledBitmap(rx, ry, *region.bitmap, factor, factor, Setup.AntiAlias != 0);
     }
     osd_->Flush();
     return true;
@@ -913,7 +913,7 @@ auto cVaapiSpuDecoder::setTime(uint32_t pts) -> int {
 }
 
 auto cVaapiSpuDecoder::processSPU(uint32_t pts, uint8_t *buf, bool AllowedShow) -> void {
-    std::unique_ptr<uint8_t[]> data{buf}; // the player allocates with new[], the base frees with delete[]
+    SpuBuffer data{buf};
     if (pendingSpus_.size() >= SUBTITLE_QUEUE_CAPACITY) [[unlikely]] {
         return; // only a screen clock that never reaches the queue could fill it
     }

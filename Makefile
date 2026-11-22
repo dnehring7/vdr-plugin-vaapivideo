@@ -10,6 +10,10 @@
 
 PLUGIN = vaapivideo
 
+# Every rule is spelled out below; without the built-in rules make no longer probes each
+# prerequisite (Makefile, .clang-tidy, the sources) for RCS/SCCS/compiler rules.
+MAKEFLAGS += --no-builtin-rules
+
 ### The version number of this plugin (taken from the main source file):
 
 VERSION = $(shell sed -n 's/.*PLUGIN_VERSION[^"]*"\([^"]*\)".*/\1/p' src/common.h)
@@ -19,16 +23,15 @@ VERSION = $(shell sed -n 's/.*PLUGIN_VERSION[^"]*"\([^"]*\)".*/\1/p' src/common.
 # Use package data if installed...otherwise assume the build runs under the VDR source directory:
 PKG_CONFIG ?= pkg-config
 PKGCFG = $(if $(VDRDIR),$(shell $(PKG_CONFIG) --variable=$(1) $(VDRDIR)/vdr.pc),$(shell PKG_CONFIG_PATH="$$PKG_CONFIG_PATH:../../.." $(PKG_CONFIG) --variable=$(1) vdr))
+# A pkg-config call is a process chain (Fedora's wrapper runs rpm): values every run needs are
+# expanded once (:=), as = reruns it on each use; values read once per run or only by install stay =.
 LIBDIR = $(call PKGCFG,libdir)
-LOCDIR = $(call PKGCFG,locdir)
+LOCDIR := $(call PKGCFG,locdir)
 PLGCFG = $(call PKGCFG,plgcfg)
-#
-TMPDIR ?= /tmp
 
 ### The compiler options:
 
-export CFLAGS   = $(call PKGCFG,cflags)
-export CXXFLAGS = $(call PKGCFG,cxxflags)
+CXXFLAGS := $(call PKGCFG,cxxflags)
 
 ### The version number of VDR's plugin API:
 
@@ -43,19 +46,14 @@ APIVERSION = $(call PKGCFG,apiversion)
 # ------------------------------------------------------------
 REQUIRED_LIBS = alsa libavcodec libavfilter libavformat libavutil libdrm libswresample libva-drm
 
-# Library Validation Function
-define check_lib
-$(shell $(PKG_CONFIG) --exists $(1) || (echo "Error: $(1) not found" >&2 && exit 1))
-endef
-
-# Validate Required Libraries
-$(foreach lib,$(REQUIRED_LIBS),$(call check_lib,$(lib)))
-
-# ------------------------------------------------------------
-# Toolchain
-# ------------------------------------------------------------
-CXX ?= g++
-CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
+# One call fetches the flags and validates the set: pkg-config fails and names a missing package.
+# Goals that never compile skip the verdict.
+REQUIRED_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(REQUIRED_LIBS))
+ifneq ($(.SHELLSTATUS),0)
+ifeq ($(filter clean dist docs check-docs-defaults indent i18n,$(MAKECMDGOALS)),)
+$(error pkg-config: required libraries missing (needs $(REQUIRED_LIBS)))
+endif
+endif
 
 # ------------------------------------------------------------
 # Sanitizers -- `make SANITIZE=thread` (or =address); empty = packaging build.
@@ -66,11 +64,11 @@ CXXFLAGS ?= -s -O3 -march=native -mtune=native -flto=auto
 SANITIZE ?=
 
 ifeq ($(SANITIZE),thread)
-CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+CXXFLAGS := -g -Og -fno-omit-frame-pointer -fno-lto \
            -fsanitize=thread \
            -ftrivial-auto-var-init=zero
 else ifeq ($(SANITIZE),address)
-CXXFLAGS = -g -Og -fno-omit-frame-pointer -fno-lto \
+CXXFLAGS := -g -Og -fno-omit-frame-pointer -fno-lto \
            -fsanitize=address,undefined,leak \
            -fsanitize-address-use-after-scope \
            -fstack-protector-strong \
@@ -113,7 +111,7 @@ endif
 CXXFLAGS += -std=c++20 -fPIC
 CXXFLAGS += -DPLUGIN_NAME_I18N='"$(PLUGIN)"'
 CXXFLAGS += -I$(VDRDIR)/include -I.
-CXXFLAGS += $(shell $(PKG_CONFIG) --cflags $(REQUIRED_LIBS))
+CXXFLAGS += $(REQUIRED_CFLAGS)
 
 ifeq ($(origin RPM_ARCH),undefined)
 LDFLAGS := $(filter-out %redhat-package-notes,$(LDFLAGS))
@@ -149,10 +147,10 @@ SOURCES = $(PLUGIN).cpp \
 # Build Artifacts
 OBJECTS = $(SOURCES:.cpp=.o)
 SOFILE = libvdr-$(PLUGIN).so
-HEADERS = $(wildcard src/*.h)
+HEADERS := $(wildcard src/*.h)
 
 # Build Targets
-.PHONY: all clean install install-lib install-i18n i18n dist indent lint docs check-docs-defaults probe
+.PHONY: all clean install install-dirs install-lib install-i18n i18n dist indent lint docs check-docs-defaults probe
 
 all: $(SOFILE) i18n
 
@@ -172,7 +170,7 @@ $(SOFILE): $(OBJECTS)
 # The .pot is extracted from every source AND header: config.h/common.h carry trNOOP() labels.
 # Building refreshes po/*.po against it (msgmerge), as in every VDR plugin.
 PODIR    = po
-I18Npo   = $(wildcard $(PODIR)/*.po)
+I18Npo   := $(wildcard $(PODIR)/*.po)
 I18Nmo   = $(I18Npo:.po=.mo)
 I18Nmsgs = $(addprefix $(DESTDIR)$(LOCDIR)/,$(addsuffix /LC_MESSAGES/vdr-$(PLUGIN).mo,$(notdir $(basename $(I18Npo)))))
 I18Npot  = $(PODIR)/$(PLUGIN).pot
@@ -189,7 +187,7 @@ $(I18Npot): $(SOURCES) $(HEADERS)
 	msgmerge -U --no-wrap --no-location --backup=none -q -N $@ $<
 	@touch $@
 
-$(I18Nmsgs): $(DESTDIR)$(LOCDIR)/%/LC_MESSAGES/vdr-$(PLUGIN).mo: $(PODIR)/%.mo
+$(I18Nmsgs): $(DESTDIR)$(LOCDIR)/%/LC_MESSAGES/vdr-$(PLUGIN).mo: $(PODIR)/%.mo | install-dirs
 	install -D -m644 $< $@
 
 i18n: $(I18Nmo) $(I18Npot)
@@ -207,40 +205,37 @@ $(PROBE_BIN): $(PROBE_SRC) Makefile
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(shell $(PKG_CONFIG) --cflags $(PROBE_PKGS)) \
 		$< $(shell $(PKG_CONFIG) --libs $(PROBE_PKGS)) -o $@
 
-.deps: $(SOURCES) $(HEADERS) Makefile
-	$(CXX) -MM $(CXXFLAGS) $(SOURCES) > $@
-
-# Include Dependencies (only for build targets, skip for clean/dist/docs/etc)
-ifeq ($(filter clean dist docs check-docs-defaults lint indent i18n,$(MAKECMDGOALS)),)
--include .deps
-endif
-
 # Format source code using clang-format
 indent:
 	@echo "Formatting source code..."
 	@if command -v clang-format >/dev/null 2>&1; then \
-        clang-format -i $(SOURCES) $(HEADERS); \
+        clang-format -i $(SOURCES) $(HEADERS) $(PROBE_SRC); \
         echo "Code formatted with clang-format"; \
     else \
         echo "clang-format not found, skipping formatting"; \
     fi
 
 clean:
-	@-rm -f $(OBJECTS) $(SOFILE) $(PROBE_BIN) .deps compile_commands.json
+	@-rm -f $(OBJECTS) $(SOFILE) $(PROBE_BIN)
 	@-rm -f *.so *.tgz core* *~ src/*~
 	@-rm -rf docs .lint
 	@-rm -f $(PODIR)/*.mo $(PODIR)/*.pot
 
 install: install-lib install-i18n
 
-install-lib: $(SOFILE)
+# One call creates the parents the parallel installs share: concurrent "install -D" calls race on
+# them with uutils (Ubuntu's default install), failing make -j install at random.
+install-dirs:
+	install -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(LOCDIR)
+
+install-lib: $(SOFILE) | install-dirs
 	install -D $< $(DESTDIR)$(LIBDIR)/$<.$(APIVERSION)
 
 dist: clean
 	@-rm -f ../vdr-$(PLUGIN)-$(VERSION).tar.gz
 	@cd .. && tar czf vdr-$(PLUGIN)-$(VERSION).tar.gz \
 		--transform='s/^vdr-plugin-$(PLUGIN)/vdr-plugin-$(PLUGIN)-$(VERSION)/' \
-		--exclude={.git,'*.tar.gz','*.o','*.so',.deps} \
+		--exclude={.git,'*.tar.gz','*.o','*.so'} \
 		vdr-plugin-$(PLUGIN)
 	@echo "Distribution package created as ../vdr-$(PLUGIN)-$(VERSION).tar.gz"
 
@@ -273,23 +268,12 @@ NJOBS ?= $(shell nproc 2>/dev/null || echo 1)
 # spreads the per-file clang-tidy invocations across cores (clang-tidy itself is single-threaded).
 LINT_STAMPS = $(SOURCES:%.cpp=.lint/%.stamp) $(PROBE_SRC:%.cpp=.lint/%.stamp)
 
-# compile_commands.json is regenerated only when sources or headers change. The bear-driven full
-# rebuild is the expensive step; without this dependency lint would pay ~15s on every invocation.
-# Makefile is a dep so build-flag edits also invalidate the database.
-compile_commands.json: $(SOURCES) $(HEADERS) $(PROBE_SRC) Makefile
-	@command -v bear >/dev/null 2>&1 || { echo "bear not found"; exit 1; }
-	@bear --force-preload -- $(MAKE) --no-print-directory -B -j$(NJOBS) $(OBJECTS)
-
-# Check clang-tidy availability BEFORE running the expensive bear step, so a missing
-# tool short-circuits without paying for the rebuild. compile_commands.json is invoked
-# only after the check passes.
 lint:
 	@if ! command -v clang-tidy >/dev/null 2>&1; then \
 		echo "clang-tidy not found"; \
 		exit 0; \
 	fi; \
 	echo "Running clang-tidy analysis (NJOBS=$(NJOBS))..."; \
-	$(MAKE) --no-print-directory compile_commands.json && \
 	$(MAKE) --no-print-directory -j$(NJOBS) $(LINT_STAMPS)
 
 # Probe uses libdrm/libva flags (specific rule). Plugin sources use the FFmpeg/VDR set
@@ -302,9 +286,8 @@ lint:
 	@touch $@
 
 # $(HEADERS) in deps: re-lint when any header changes (avoids stale results when a
-# transitively included symbol moves or a definition changes). compile_commands.json in
-# deps so a stamp invoked directly still rebuilds the database first.
-.lint/%.stamp: %.cpp $(HEADERS) .clang-tidy compile_commands.json Makefile
+# transitively included symbol moves or a definition changes).
+.lint/%.stamp: %.cpp $(HEADERS) .clang-tidy Makefile
 	@mkdir -p $(dir $@)
 	@clang-tidy $< --quiet -- $(CLANG_CXXFLAGS)
 	@touch $@

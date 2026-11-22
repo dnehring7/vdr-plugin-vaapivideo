@@ -406,7 +406,8 @@ constexpr uint8_t DEVICE_SPLASH_LUMA_WHITE = 235; ///< NV12 TV-range white for f
 /// '\n' splits into block-centered lines. CPU-only. Safe off the main thread (radio/encrypted paths):
 /// cFont::CreateFont() yields a self-contained font with its own FT_Library/FT_Face, sharing no global
 /// FreeType state with VDR's OSD fonts -- so do not be tempted to cache/share one instance.
-auto DrawCenteredLuma(AVFrame *nv12, std::string_view text) -> void {
+/// Writes only the pixels behind data[0]; the AVFrame itself is unchanged.
+auto DrawCenteredLuma(const AVFrame *nv12, std::string_view text) -> void {
     if (text.empty() || nv12 == nullptr || nv12->data[0] == nullptr) [[unlikely]] {
         return;
     }
@@ -639,7 +640,7 @@ auto cVaapiDevice::ShowEncryptedScreen() -> void {
     static_cast<void>(SubmitBlackFrame(text)); // one-shot notice; a transient submit failure just skips it
 }
 
-[[nodiscard]] auto cVaapiDevice::CurrentChannelIsEncrypted() const -> bool {
+[[nodiscard]] auto cVaapiDevice::CurrentChannelIsEncrypted() -> bool {
     LOCK_CHANNELS_READ;
     const cChannel *channel = Channels->GetByNumber(cDevice::CurrentChannel());
     return channel != nullptr && channel->Ca() != 0;
@@ -869,7 +870,7 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 
     // Sever OSD provider's display pointer before display is destroyed. The OSD provider
     // outlives this device (VDR owns it via cOsdProvider::Shutdown).
-    if (auto *vaapiProvider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+    if (auto *vaapiProvider = cVaapiOsdProvider::Instance()) {
         vaapiProvider->DetachDisplay();
         dsyslog("vaapivideo/device: OSD provider detached from display");
     }
@@ -1372,7 +1373,7 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
 
 /// Encode a single YUV420P AVFrame as a JFIF JPEG via libavcodec MJPEG into a malloc()'d buffer.
 /// @p quality is 1..100 (higher = better); -1 maps to 95.
-[[nodiscard]] auto EncodeMjpeg(AVFrame *yuv420p, int quality, int &outSize) -> uchar * {
+[[nodiscard]] auto EncodeMjpeg(const AVFrame *yuv420p, int quality, int &outSize) -> uchar * {
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!codec) [[unlikely]] {
         esyslog("vaapivideo/device: MJPEG encoder unavailable in this FFmpeg build");
@@ -1441,8 +1442,9 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
         return nullptr;
     }
 
-    // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010).
-    auto srcFrame = display->GrabDisplayedFrame();
+    // 1. Snapshot the displayed VAAPI surface to host memory (NV12 or P010), with the connector's HDR state.
+    StreamHdrKind hdrKind{StreamHdrKind::Sdr};
+    auto srcFrame = display->GrabDisplayedFrame(hdrKind);
     if (!srcFrame) [[unlikely]] {
         return nullptr; // GrabDisplayedFrame() logged why
     }
@@ -1450,15 +1452,16 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
     // 2. Drive the HDR branch from the display's cached state, NOT srcFrame->color_trc:
     // av_hwframe_transfer_data strips all color metadata on download. We re-stamp colorimetry
     // for zscale/tonemap (per-frame) AND pass colorspace+range as buffersrc options below
-    // (zscale reads those from the filter LINK, not the frame).
-    const StreamHdrKind hdrKind = display->GetActiveHdrKind();
+    // (zscale reads those from the filter LINK, not the frame). The SDR matrix is the one the VPP
+    // chain converts to (scale_vaapi out_color_matrix=bt709, tv range); left unspecified,
+    // swscale would decode it as BT.601 and shift the hues.
     const bool isHdr = (hdrKind != StreamHdrKind::Sdr);
     if (isHdr) {
         srcFrame->color_primaries = AVCOL_PRI_BT2020;
         srcFrame->color_trc = (hdrKind == StreamHdrKind::Hlg) ? AVCOL_TRC_ARIB_STD_B67 : AVCOL_TRC_SMPTE2084;
-        srcFrame->colorspace = AVCOL_SPC_BT2020_NCL;
-        srcFrame->color_range = AVCOL_RANGE_MPEG;
     }
+    srcFrame->colorspace = isHdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+    srcFrame->color_range = AVCOL_RANGE_MPEG;
     // HDR-to-SDR tonemap (canonical FFmpeg wiki shape; requires libzimg for zscale):
     //   PQ/HLG -> linear (npl=200, ~ BT.2408 graphics white) -> gbrpf32le (linearization needs
     //   RGB; YUV matrix is undefined for linear samples) -> BT.2020->BT.709 gamut -> hable
@@ -1483,16 +1486,15 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
         }
         videoChain += layoutChain;
     }
-    auto rgb24 = RunGrabFilter(srcFrame.get(), videoChain, AV_PIX_FMT_RGB24,
-                               isHdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_UNSPECIFIED,
-                               isHdr ? AVCOL_RANGE_MPEG : AVCOL_RANGE_UNSPECIFIED);
+    auto rgb24 =
+        RunGrabFilter(srcFrame.get(), videoChain, AV_PIX_FMT_RGB24, srcFrame->colorspace, srcFrame->color_range);
     if (!rgb24) [[unlikely]] {
         return nullptr;
     }
 
     // 3. Composite the visible OSD on top at native display geometry, before any user-requested
     // resize -- OSD geometry is screen-space and would misalign if the video was scaled first.
-    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+    if (auto *provider = cVaapiOsdProvider::Instance()) {
         provider->CompositeOntoRgb24(rgb24->data[0], rgb24->width, rgb24->height, rgb24->linesize[0],
                                      display->GetActiveOsdFbId());
     }
@@ -1519,9 +1521,12 @@ constexpr int DEVICE_GRAB_HEIGHT_MAX = 4320;
 
     if (Jpeg) {
         // yuv420p + AVCOL_RANGE_JPEG on the encoder context yields JFIF full-range without the
-        // deprecated YUVJ pixfmts. scale fused into this pass to skip an intermediate frame.
-        const std::string chain = needScale ? std::format("scale={}:{}", outW, outH) : std::string{};
-        auto yuv = RunGrabFilter(rgb24.get(), chain, AV_PIX_FMT_YUV420P, kRgbSrcColorspace, kRgbSrcColorRange);
+        // deprecated YUVJ pixfmts. scale fused into this pass to skip an intermediate frame. The
+        // conversion must produce what the encoder declares (JFIF: BT.601, full range): a bare
+        // format=yuv420p negotiates tv range, and the JPEG would show black as grey.
+        const std::string chain = needScale ? std::format("scale={}:{}:out_color_matrix=bt601:out_range=pc", outW, outH)
+                                            : std::string{"scale=out_color_matrix=bt601:out_range=pc"};
+        const auto yuv = RunGrabFilter(rgb24.get(), chain, AV_PIX_FMT_YUV420P, kRgbSrcColorspace, kRgbSrcColorRange);
         if (!yuv) [[unlikely]] {
             return nullptr;
         }
@@ -1588,13 +1593,13 @@ auto cVaapiDevice::MakePrimaryDevice(bool On) -> void {
             // display==nullptr so skins probing cOsdProvider::SupportsTrueColor() during
             // Start() find a provider; pixel-path methods tolerate a null display until
             // AttachDisplay() wires one in.
-            if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+            if (auto *provider = cVaapiOsdProvider::Instance()) {
                 if (display) {
                     provider->AttachDisplay(display.get());
                     dsyslog("vaapivideo/device: OSD provider reattached to display");
                 }
             } else {
-                ::osdProvider = new cVaapiOsdProvider(display.get());
+                cVaapiOsdProvider::Register(display.get());
                 isyslog("vaapivideo/device: OSD provider registered%s", display ? "" : " (detached)");
             }
         } else {
@@ -2065,7 +2070,9 @@ auto cVaapiDevice::Play() -> void {
             if (!decoder->IsReadyForNextTrickFrame() || decoder->GetQueueSize() >= DECODER_TRICK_QUEUE_CAPACITY) {
                 return 0;
             }
-        } else if (decoder->IsQueueFull()) {
+        } else if (decoder->IsQueueFull() || decoder->IsInTrickMode()) {
+            // Still in trick mode: Play()'s exit grace, in which the depth-1 trick queue would drop the
+            // resumed feed -- pictures lost after slow motion, which never flushes (cf. SubmitVideoPacket()).
             return 0;
         }
         NoteDataAfterEosDrain(); // accepted from here on: every path below enqueues
@@ -2105,7 +2112,9 @@ auto cVaapiDevice::Play() -> void {
         }
         return decoder->IsReadyForNextTrickFrame() && decoder->GetQueueSize() < DECODER_TRICK_QUEUE_CAPACITY;
     }
-    return !decoder->IsQueueFull() && (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
+    // A decoder still in trick mode is in Play()'s exit grace: wait it out, as PlayVideo() would refuse the data.
+    return !decoder->IsQueueFull() && !decoder->IsInTrickMode() &&
+           (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
 }
 
 [[nodiscard]] auto cVaapiDevice::Poll(cPoller & /*Poller*/, int TimeoutMs) -> bool {
@@ -2167,7 +2176,7 @@ auto cVaapiDevice::ScaleVideo(const cRect &rect) -> void {
     // the ScaleVideo() mechanism. zoomActive is read by the decoder when it rebuilds. Selecting a
     // disabled (level 0) preset is treated as Off so the label/crop never claim a no-op zoom.
     int clamped = std::clamp(stop, 0, CONFIG_ZOOM_PRESET_COUNT);
-    if (clamped > 0 && vaapiConfig.zoomLevel[clamped - 1].load(std::memory_order_relaxed) <= 0) {
+    if (clamped > 0 && vaapiConfig.ZoomLevelOfStop(clamped) <= 0) {
         clamped = 0;
     }
     const int previous = vaapiConfig.zoomActive.exchange(clamped, std::memory_order_relaxed);
@@ -2188,7 +2197,7 @@ namespace {
 auto NextZoomStop(int current) -> int {
     for (int step = 1; step <= CONFIG_ZOOM_PRESET_COUNT + 1; ++step) {
         const int cand = (current + step) % (CONFIG_ZOOM_PRESET_COUNT + 1);
-        if (cand == 0 || vaapiConfig.zoomLevel[cand - 1].load(std::memory_order_relaxed) > 0) {
+        if (cand == 0 || vaapiConfig.ZoomLevelOfStop(cand) > 0) {
             return cand;
         }
     }
@@ -2218,8 +2227,7 @@ auto cVaapiDevice::RefreshZoom() -> void {
     // Setup-menu edited the crop values of the live preset: request a rebuild WITHOUT touching
     // zoomActive, so a concurrent CycleZoom()/SetZoom() selection can't be reverted by a stale snapshot.
     const int stop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
-    if (stop < 1 || stop > CONFIG_ZOOM_PRESET_COUNT ||
-        vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed) <= 0) {
+    if (vaapiConfig.ZoomLevelOfStop(stop) <= 0) {
         return;
     }
     dsyslog("vaapivideo/device: zoom stop %d refresh (rebuild)", stop);
@@ -2251,9 +2259,7 @@ auto cVaapiDevice::ResetZoom() -> void {
     // English because scripts may parse them.
     const char *zoom = localized ? tr("Zoom") : "Zoom";
     const int stop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
-    const int level = (stop >= 1 && stop <= CONFIG_ZOOM_PRESET_COUNT)
-                          ? vaapiConfig.zoomLevel[stop - 1].load(std::memory_order_relaxed)
-                          : 0;
+    const int level = vaapiConfig.ZoomLevelOfStop(stop);
     if (level <= 0) {
         return std::format("{}: {}", zoom, localized ? TrLabel("off") : "off");
     }
@@ -2309,11 +2315,11 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
 }
 
 [[nodiscard]] auto cVaapiDevice::SetPlayMode(ePlayMode PlayMode) -> bool {
-    static constexpr const char *kModeNames[] = {
+    static constexpr std::array<const char *, 6> kModeNames{
         "pmNone", "pmAudioVideo", "pmAudioOnly", "pmAudioOnlyBlack", "pmVideoOnly", "pmExtern",
     };
-    const auto idx = static_cast<unsigned>(PlayMode);
-    dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
+    const auto idx = static_cast<size_t>(PlayMode);
+    dsyslog("vaapivideo/device: SetPlayMode(%s) called", idx < kModeNames.size() ? kModeNames.at(idx) : "unknown");
     // VDR attaches the new player right after this call, so "now" is the switch as the viewer sees it.
     const uint64_t switchMs = cTimeMs::Now();
     bool armStartTrace = false;
@@ -2346,7 +2352,7 @@ auto cVaapiDevice::SetDigitalAudioDevice(bool On) -> void {
     if (externActive.exchange(false, std::memory_order_acq_rel) && initState.load(std::memory_order_acquire) == 0 &&
         !drmPath.empty()) {
         isyslog("vaapivideo/device: SetPlayMode(%s) -- resuming hardware after pmExtern",
-                idx < std::size(kModeNames) ? kModeNames[idx] : "unknown");
+                idx < kModeNames.size() ? kModeNames.at(idx) : "unknown");
         if (!Attach()) [[unlikely]] {
             esyslog("vaapivideo/device: failed to resume hardware after pmExtern");
             return false;
@@ -2499,7 +2505,7 @@ auto cVaapiDevice::StillPicture(const uchar *Data, int Length) -> void {
                 [[unlikely]] {
                 break;
             }
-            const auto pesField = static_cast<int>((Data[offset + 4] << 8) | Data[offset + 5]);
+            const int pesField = (Data[offset + 4] << 8) | Data[offset + 5];
             const int pesLen = (pesField > 0) ? std::min(pesField + 6, remaining) : remaining;
             if (pesLen < 9) [[unlikely]] {
                 break;
@@ -2577,11 +2583,11 @@ auto cVaapiDevice::TrickSpeed(int Speed, bool Forward) -> void {
     // Mirrors the MakePrimaryDevice() OSD branch: the detached-primary -> SVDRP ATTA path
     // runs MakePrimaryDevice() before display exists, so Attach() must wire it up here.
     if (IsPrimaryDevice()) {
-        if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+        if (auto *provider = cVaapiOsdProvider::Instance()) {
             provider->AttachDisplay(display.get());
             dsyslog("vaapivideo/device: OSD provider reattached to display");
         } else {
-            ::osdProvider = new cVaapiOsdProvider(display.get());
+            cVaapiOsdProvider::Register(display.get());
             isyslog("vaapivideo/device: OSD provider registered");
         }
     }
@@ -2621,7 +2627,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
     DisarmStartTrace();
     DetachAllReceivers();
 
-    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+    if (auto *provider = cVaapiOsdProvider::Instance()) {
         provider->DetachDisplay();
         dsyslog("vaapivideo/device: OSD provider detached from display");
     }
@@ -2630,7 +2636,7 @@ auto cVaapiDevice::SuspendHardware() -> void {
 
     // Force-release OSD mmap'd dumb buffers: VDR may keep cVaapiOsd objects alive past this
     // point, and their kernel refs would block drmDropMaster/close.
-    if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+    if (auto *provider = cVaapiOsdProvider::Instance()) {
         provider->ReleaseAllOsdResources();
     }
 
@@ -2764,20 +2770,14 @@ namespace {
             .minHeight = MinResolutionModeHeight(vaapiConfig.minResolution.load(std::memory_order_relaxed))};
 }
 
-/// Two modes are "the same output" iff size and exact rate agree; drmModeModeInfo also carries
-/// timing detail that is irrelevant to whether a modeset is worth its HDMI relink.
-[[nodiscard]] auto SameOutputMode(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
-    return a.hdisplay == b.hdisplay && a.vdisplay == b.vdisplay && ModeRefreshMilliHz(a) == ModeRefreshMilliHz(b);
-}
-
 } // namespace
 
-auto cVaapiDevice::ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs) -> void {
+auto cVaapiDevice::ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs, uint64_t dueMs) -> void {
     modeCandidate = request;
     modeCandidateSinceMs = nowMs;
-    // Publish a non-zero due time last so PollPendingDisplayMode()'s lock-free probe never sees an
-    // armed window before the payload behind it. (+1 guards the theoretical nowMs==0 tick.)
-    modeCandidateDueMs.store(nowMs + DEVICE_DISPLAY_MODE_STABLE_MS + 1, std::memory_order_release);
+    // Publish the (non-zero) due time last so PollPendingDisplayMode()'s lock-free probe never sees an
+    // armed window before the payload behind it.
+    modeCandidateDueMs.store(dueMs, std::memory_order_release);
 }
 
 auto cVaapiDevice::ClearModeCandidateLocked() -> void {
@@ -2786,18 +2786,17 @@ auto cVaapiDevice::ClearModeCandidateLocked() -> void {
     modeCandidateSinceMs = 0;
 }
 
-auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, PlaybackSource source, uint64_t nowMs)
-    -> void {
+auto cVaapiDevice::ApplyDisplayModePolicy(StreamModeRequest request, PlaybackSource source, uint64_t nowMs) -> void {
     // Caller holds displayModeMutex. Runs the matcher and stages the winner; the stability gate
-    // and the scope/policy gates are the caller's business.
+    // and the scope/policy gates are the caller's business. @p request is a copy: the poll passes
+    // modeCandidate, which the disarm below clears before the switch log reads it.
 
     // Rate limit: each change costs an HDMI link retrain, so back-to-back switches must be
-    // impossible even when a playlist advances through short entries. Deliberately returns with
-    // the candidate STILL ARMED -- PollPendingDisplayMode() re-enters at the cooldown boundary the
-    // due time is pushed to, so a throttled switch is deferred rather than dropped. Leaving the
-    // due time in the past would instead have the poll take this mutex on every decode tick.
+    // impossible even when a playlist advances through short entries. A throttled switch is
+    // deferred, not dropped: armed for the cooldown boundary, replacing any older candidate, and
+    // PollPendingDisplayMode() applies it there.
     if (lastModeChangeMs != 0 && nowMs - lastModeChangeMs < DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS) {
-        modeCandidateDueMs.store(lastModeChangeMs + DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS, std::memory_order_release);
+        ArmModeCandidateLocked(request, nowMs, lastModeChangeMs + DEVICE_DISPLAY_MODE_INTERVAL_MIN_MS);
         return;
     }
 
@@ -2811,7 +2810,9 @@ auto cVaapiDevice::ApplyDisplayModePolicy(const StreamModeRequest &request, Play
         return;
     }
     const auto &winner = connectorModes.at(modeCandidates.at(static_cast<size_t>(match.index)).index);
-    if (SameOutputMode(winner, display->GetActiveMode())) {
+    // Against the latest request, not the programmed mode: one in flight is already on its way, and one the
+    // driver rejected would be rejected again -- each retry a blanking commit.
+    if (SameOutputMode(winner, display->GetRequestedMode())) {
         // The common case once settled -- and what closes the rebuild -> publish -> evaluate loop,
         // since the rebuilt filter graph republishes the very format that produced this mode.
         return;
@@ -2834,7 +2835,8 @@ auto cVaapiDevice::RestoreDefaultModeLocked(uint64_t nowMs) -> void {
     if (defaultMode.hdisplay == 0) {
         return;
     }
-    if (SameOutputMode(defaultMode, display->GetActiveMode())) {
+    // The latest request, not the programmed mode: a stop inside an in-flight switch must still undo it.
+    if (SameOutputMode(defaultMode, display->GetRequestedMode())) {
         return; // the overwhelmingly common case: nothing ever moved the mode
     }
     // No rate limit here, unlike ApplyDisplayModePolicy: this path is edge-driven with nothing left
@@ -2885,8 +2887,8 @@ auto cVaapiDevice::EvaluateDisplayMode(const StreamModeRequest &request, Playbac
         return;
     }
 
+    // No stability gate; the policy re-arms or disarms the candidate on every path.
     if (immediate) {
-        ClearModeCandidateLocked();
         ApplyDisplayModePolicy(request, source, nowMs);
         return;
     }
@@ -2896,7 +2898,8 @@ auto cVaapiDevice::EvaluateDisplayMode(const StreamModeRequest &request, Playbac
     // PollPendingDisplayMode() -- the reactive publish fires once per filter-graph build, so a
     // second identical notification would never arrive on its own.
     if (modeCandidateSinceMs == 0 || !(modeCandidate == request)) {
-        ArmModeCandidateLocked(request, nowMs);
+        // +1: the theoretical nowMs == 0 tick must not read as disarmed.
+        ArmModeCandidateLocked(request, nowMs, nowMs + DEVICE_DISPLAY_MODE_STABLE_MS + 1);
         return;
     }
     if (nowMs - modeCandidateSinceMs < DEVICE_DISPLAY_MODE_STABLE_MS) {
@@ -2936,9 +2939,10 @@ auto cVaapiDevice::PollPendingDisplayMode() -> void {
     }
     const uint64_t nowMs = cTimeMs::Now();
 
-    // Re-check under the lock: another thread may have disarmed or re-armed since the probe.
-    if (modeCandidateSinceMs != 0 && modeCandidate.IsValid() &&
-        nowMs - modeCandidateSinceMs >= DEVICE_DISPLAY_MODE_STABLE_MS) {
+    // Re-check under the lock: another thread may have disarmed or re-armed since the probe. The due
+    // time, not the age: a throttled switch is due at the cooldown boundary, not a window after it.
+    const uint64_t candidateDueNowMs = modeCandidateDueMs.load(std::memory_order_acquire);
+    if (candidateDueNowMs != 0 && nowMs >= candidateDueNowMs && modeCandidate.IsValid()) {
         // Re-check the gates: the operator may have changed a setting while the candidate aged.
         const auto policy = SnapshotModePolicy(defaultMode);
         if (!ModeSwitchEnabledFor(lastRequestSource) || (!policy.matchRefresh && !policy.matchResolution)) {
@@ -2985,10 +2989,8 @@ auto cVaapiDevice::ScheduleIdleModeRestore() -> void {
     if (!HardwareReady() || !display) {
         return;
     }
-    // Armed unconditionally, not only when off the default: GetActiveMode() names the last mode the
-    // display thread finished PROGRAMMING, so a stop landing inside an in-flight switch would see
-    // the outgoing mode and leave the incoming one unwatched. A spurious arm costs one no-op poll --
-    // RestoreDefaultModeLocked() early-outs when the mode really is the default.
+    // Armed unconditionally, not only when off the default: a spurious arm costs one no-op poll --
+    // RestoreDefaultModeLocked() early-outs when the latest request already is the default.
     modeIdleRestoreDueMs.store(cTimeMs::Now() + DEVICE_DISPLAY_MODE_IDLE_RESTORE_MS, std::memory_order_release);
 }
 
@@ -3021,10 +3023,8 @@ auto cVaapiDevice::ResetDisplayModeToDefault() -> void {
     modeIdleRestoreDueMs.store(0, std::memory_order_release); // the request below is the restore
     lastRequest = {};
     lastModeChangeMs = 0; // an explicit stop must not be swallowed by the rate limit
-    // Deliberately NOT gated on GetActiveMode(): that names the last mode the display thread
-    // finished programming, so a stop landing inside an in-flight switch would see the old mode and
-    // strand the output on the new one. RequestDisplayMode is idempotent, so requesting
-    // unconditionally is free and overrides a still-queued request.
+    // Deliberately ungated: RequestDisplayMode() ignores a repeat of the latest request, so requesting
+    // unconditionally is free and overrides a still-queued one.
     // Worded apart from RestoreDefaultModeLocked()'s line: that one is the automatic policy edge,
     // this one an explicit external reset (setup change, player teardown, SVDRP).
     dsyslog("vaapivideo/device: display mode reset -- requesting default %ux%u@%.3fHz", defaultMode.hdisplay,
@@ -3285,11 +3285,10 @@ auto cVaapiDevice::RequestEosDrain() -> void {
     }
     // decode queue + decoded reserve + display backlog + audio pending work. The pending-drain flag
     // bridges the gap between RequestEosDrain() and the reorder tail landing in the reserve, so the
-    // drain wait can't read a premature zero.
-    size_t depth = decoder->GetQueueSize() + decoder->GetDecodedReserveSize();
-    if (decoder->IsCodecDrainPending()) {
-        ++depth;
-    }
+    // drain wait can't read a premature zero. Read first: the drain clears it only after counting the
+    // tail in the reserve.
+    size_t depth = decoder->IsCodecDrainPending() ? 1U : 0U;
+    depth += decoder->GetQueueSize() + decoder->GetDecodedReserveSize();
     if (display) {
         // Frames leave the decoder reserve before they are on screen; without these terms the last
         // frames of the tail would be cut at EOS (audio often ends before the final video flip).

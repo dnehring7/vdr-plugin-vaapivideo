@@ -8,8 +8,8 @@
 #ifndef VDR_VAAPIVIDEO_CONFIG_H
 #define VDR_VAAPIVIDEO_CONFIG_H
 
+#include <array>
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -531,7 +531,10 @@ struct VaapiConfig {
     /// crop that yields it is derived in the decoder, and the kept region refills the screen (aspect preserved).
     /// 0 disables a level and skips it while cycling. Defaults fill the two common theatrical ratios on a 16:9
     /// screen -- 1 = 2.39:1 scope (+34.4%), 2 = 2.00:1 (+12.5%); 3-5 off.
-    std::atomic<int> zoomLevel[CONFIG_ZOOM_PRESET_COUNT]{344, 125, 0, 0, 0};
+    std::array<std::atomic<int>, CONFIG_ZOOM_PRESET_COUNT> zoomLevel{344, 125, 0, 0, 0};
+
+    [[nodiscard]] auto ZoomLevelOfStop(int stop) const
+        -> int; ///< zoomLevel of cycle stop @p stop (1-based); 0 for Off or a stop outside the presets
 
     [[nodiscard]] auto GetSummary() const -> std::string; ///< One-line human-readable snapshot for logging
     [[nodiscard]] auto SetupParse(const char *name, const char *value)
@@ -551,6 +554,7 @@ inline constexpr int CONFIG_AUDIO_LATENCY_MAX_MS = 200;  ///< Upper bound for PC
 // === GLOBAL INSTANCE ===
 // ============================================================================
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables) -- VDR plugin model, like VDR's Setup
 extern VaapiConfig vaapiConfig; ///< Singleton plugin configuration; see VaapiConfig for thread-safety contract
 
 /// True while diagnostic tracing is on; the gate behind every tsyslog() (see common.h).

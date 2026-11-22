@@ -14,8 +14,18 @@
 
 // Platform
 #include <alsa/asoundlib.h>
+
+// C++ Standard Library
+#include <atomic>
 #include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <queue>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // VDR
 #pragma GCC diagnostic push
@@ -24,9 +34,10 @@
 #include <vdr/tools.h>
 #pragma GCC diagnostic pop
 
-// FFmpeg (forward declarations for IEC61937 spdif muxer)
+// FFmpeg (forward declarations: IEC61937 spdif muxer, resampler)
 struct AVFormatContext;
 struct AVIOContext;
+struct SwrContext;
 
 // ============================================================================
 // === CONSTANTS ===
@@ -174,7 +185,8 @@ class cAudioProcessor : public cThread {
     auto DrainAtEos(uint32_t generation, bool passthrough)
         -> void; ///< Worker only, queue empty: flushes parser + codec + resampler tails to ALSA, then
                  ///< StartPreparedTail().
-    auto DrainPacketQueue() -> void; ///< Pops and frees every queued packet. Takes queueMutex internally.
+    auto DrainPacketQueue() -> void;       ///< Pops and frees every queued packet. Takes queueMutex internally.
+    auto DrainPacketQueueLocked() -> void; ///< DrainPacketQueue() for a caller already holding queueMutex.
     auto EnqueuePayload(std::span<const uint8_t> payload, int64_t pts)
         -> void; ///< Queue @p payload as one packet: the parser-less (PCM) path of Decode().
     [[nodiscard]] auto EmitConvertedPcm(std::span<uint8_t> pcm, unsigned frames, unsigned outCh,
@@ -194,7 +206,7 @@ class cAudioProcessor : public cThread {
     auto ResetResampler() noexcept -> void;         ///< Frees swrCtx + clears its geometry (single owner of that
                                                     ///< teardown -- a partial reset pairs stale geometry with a null
                                                     ///< context). The next DecodeToPcm() rebuilds it.
-    [[nodiscard]] auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
+    [[nodiscard]] static auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough)
         -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
     [[nodiscard]] auto ChooseOutputChannels(int inChannels) const noexcept
         -> unsigned; ///< PCM output channel count for an input of @p inChannels, per PcmChannelMode + sink caps

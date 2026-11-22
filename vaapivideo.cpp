@@ -109,8 +109,8 @@ class cMenuSetupVaapi : public cMenuSetupPage {
           editSharpenLevel(vaapiConfig.sharpenLevel.load(std::memory_order_relaxed)),
           editSharpenMode(static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed))) {
         SetSection(tr("VAAPI Video"));
-        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
-            editZoomLevel[i] = vaapiConfig.zoomLevel[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < editZoomLevel.size(); ++i) {
+            editZoomLevel.at(i) = vaapiConfig.zoomLevel.at(i).load(std::memory_order_relaxed);
         }
         BuildMenu();
         // Index 0 is the Audio header (non-selectable); start the cursor on the first real entry.
@@ -203,9 +203,9 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // applied as an equal crop on all sides; 0 disables the level (skipped while cycling). The
         // active stop is transient and not edited here.
         addHeader(tr("Zoom (in 0.1% steps)"));
-        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
-            Add(new cMenuEditIntItem(*cString::sprintf(tr("Zoom level %d"), i + 1), &editZoomLevel[i],
-                                     CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX));
+        for (size_t i = 0; i < editZoomLevel.size(); ++i) {
+            Add(new cMenuEditIntItem(*cString::sprintf(tr("Zoom level %d"), static_cast<int>(i) + 1),
+                                     &editZoomLevel.at(i), CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX));
         }
 
         // --- General ---
@@ -219,14 +219,17 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     /// Commit the scratch values and apply what changed to the running stream at once.
     auto Store() -> void override {
         // Detect whether any post-processing policy actually changed BEFORE overwriting the atomics, so a
-        // bare setup OK doesn't trigger a (glitchy) live filter rebuild.
+        // bare setup OK doesn't trigger a (glitchy) live filter rebuild. A strength counts only when its
+        // mode is Hw: the other modes ignore it, and an edit left behind after switching away is just stored.
         const bool postProcChanged =
             static_cast<int>(vaapiConfig.deinterlaceMode.load(std::memory_order_relaxed)) != editDeinterlaceMode ||
             static_cast<int>(vaapiConfig.denoiseMode.load(std::memory_order_relaxed)) != editDenoiseMode ||
-            vaapiConfig.denoiseLevel.load(std::memory_order_relaxed) != editDenoiseLevel ||
+            (editDenoiseMode == static_cast<int>(DenoiseMode::Hw) &&
+             vaapiConfig.denoiseLevel.load(std::memory_order_relaxed) != editDenoiseLevel) ||
             static_cast<int>(vaapiConfig.scaleMode.load(std::memory_order_relaxed)) != editScaleMode ||
             static_cast<int>(vaapiConfig.sharpenMode.load(std::memory_order_relaxed)) != editSharpenMode ||
-            vaapiConfig.sharpenLevel.load(std::memory_order_relaxed) != editSharpenLevel;
+            (editSharpenMode == static_cast<int>(SharpenMode::Hw) &&
+             vaapiConfig.sharpenLevel.load(std::memory_order_relaxed) != editSharpenLevel);
 
         // Same idiom for the display-mode group: sample BEFORE the stores, so a bare setup OK
         // cannot trigger a spurious modeset (which costs a second of black on an HDMI link).
@@ -288,12 +291,12 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         bool activePresetChanged = false;
         if (activeZoom >= 1 && activeZoom <= CONFIG_ZOOM_PRESET_COUNT) {
             activePresetChanged =
-                editZoomLevel[activeZoom - 1] != vaapiConfig.zoomLevel[activeZoom - 1].load(std::memory_order_relaxed);
+                editZoomLevel.at(static_cast<size_t>(activeZoom - 1)) != vaapiConfig.ZoomLevelOfStop(activeZoom);
         }
         // Persist only the level definitions; zoomActive is intentionally not stored (transient).
-        for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
-            vaapiConfig.zoomLevel[i].store(editZoomLevel[i], std::memory_order_relaxed);
-            SetupStore(*cString::sprintf("Zoom%d", i + 1), editZoomLevel[i]);
+        for (size_t i = 0; i < editZoomLevel.size(); ++i) {
+            vaapiConfig.zoomLevel.at(i).store(editZoomLevel.at(i), std::memory_order_relaxed);
+            SetupStore(*cString::sprintf("Zoom%zu", i + 1), editZoomLevel.at(i));
         }
         // Re-apply only when the live preset's level changed, so the picture updates now instead of
         // waiting for the next zoom/content event. If the live preset was just disabled (set to 0),
@@ -301,7 +304,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
         // plugin, so reach the device via the primary-device registry.)
         if (activePresetChanged) {
             if (auto *device = dynamic_cast<cVaapiDevice *>(cDevice::PrimaryDevice()); device != nullptr) {
-                if (editZoomLevel[activeZoom - 1] <= 0) {
+                if (editZoomLevel.at(static_cast<size_t>(activeZoom - 1)) <= 0) {
                     (void)device->SetZoom(0);
                 } else {
                     device->RefreshZoom();
@@ -479,7 +482,7 @@ class cMenuSetupVaapi : public cMenuSetupPage {
     int editSharpenLevel;
     int editSharpenMode;
     ///@}
-    int editZoomLevel[CONFIG_ZOOM_PRESET_COUNT]{}; ///< Per-preset zoom level (tenths-of-%).
+    std::array<int, CONFIG_ZOOM_PRESET_COUNT> editZoomLevel{}; ///< Per-preset zoom level (tenths-of-%).
 };
 
 // ============================================================================
@@ -582,7 +585,7 @@ class cVaapiVideoPlugin : public cPlugin {
     [[nodiscard]] auto Initialize() -> bool override;
     [[nodiscard]] auto MainMenuEntry() -> const char * override;
     [[nodiscard]] auto MainMenuAction() -> cOsdObject * override;
-    [[nodiscard]] auto ProcessArgs(int argc, char *argv[]) -> bool override;
+    [[nodiscard]] auto ProcessArgs(int argc, char **argv) -> bool override;
     [[nodiscard]] auto Service(const char *serviceId, void *data = nullptr) -> bool override;
     [[nodiscard]] auto SetupMenu() -> cMenuSetupPage * override;
     [[nodiscard]] auto SetupParse(const char *Name, const char *Value) -> bool override;
@@ -755,7 +758,7 @@ auto cVaapiVideoPlugin::Initialize() -> bool {
     return true;
 }
 
-auto cVaapiVideoPlugin::ProcessArgs(int argc, char *argv[]) -> bool {
+auto cVaapiVideoPlugin::ProcessArgs(int argc, char **argv) -> bool {
     static constexpr std::array<option, 8> kLongOptions = {
         {{.name = "audio", .has_arg = required_argument, .flag = nullptr, .val = 'a'},
          {.name = "connector", .has_arg = required_argument, .flag = nullptr, .val = 'c'},
@@ -841,14 +844,14 @@ auto cVaapiVideoPlugin::Service(const char *serviceId, void *data) -> bool {
 
     if (strcmp(serviceId, "VaapiVideo-Available-v1.0") == 0) {
         if (data != nullptr) {
-            *static_cast<bool *>(data) = vaapiDevice && vaapiDevice->HasDecoder();
+            *static_cast<bool *>(data) = vaapiDevice != nullptr && vaapiDevice->HasDecoder();
         }
         return true;
     }
 
     if (strcmp(serviceId, "VaapiVideo-IsReady-v1.0") == 0) {
         if (data != nullptr) {
-            *static_cast<bool *>(data) = vaapiDevice && vaapiDevice->IsReady();
+            *static_cast<bool *>(data) = vaapiDevice != nullptr && vaapiDevice->IsReady();
         }
         return true;
     }
@@ -917,7 +920,7 @@ auto cVaapiVideoPlugin::Stop() -> void {
     if (vaapiDevice) {
         // cVaapiOsdProvider holds a raw pointer to cVaapiDisplay; detach before VDR destroys
         // cVaapiDevice to prevent a dangling-pointer dereference in the display destructor.
-        if (auto *provider = dynamic_cast<cVaapiOsdProvider *>(::osdProvider)) {
+        if (auto *provider = cVaapiOsdProvider::Instance()) {
             provider->DetachDisplay();
             dsyslog("vaapivideo: OSD provider detached from display");
         }
@@ -1091,7 +1094,7 @@ auto cVaapiVideoPlugin::SVDRPCommand(const char *command, const char *option, in
                 replyCode = 550;
                 return cString::sprintf("ZOOM needs 'next' or 0-%d", CONFIG_ZOOM_PRESET_COUNT);
             }
-            if (parsed > 0 && vaapiConfig.zoomLevel[parsed - 1].load(std::memory_order_relaxed) <= 0) {
+            if (parsed > 0 && vaapiConfig.ZoomLevelOfStop(parsed) <= 0) {
                 replyCode = 550;
                 return cString::sprintf("Zoom stop %d is disabled (level 0)", parsed);
             }
@@ -1119,7 +1122,8 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
     static const cString kModeHelp =
         cString::sprintf("MODE\n    List the connector's usable display modes with exact refresh rates, the active "
                          "and default mode, and the mode the matcher would pick for the current stream.");
-    static const char *const kHelpPages[] = {
+    // Mutable slots: VDR's interface is const char **, and a const array would need a const_cast to return it.
+    static auto helpPages = std::to_array<const char *>({
         "DETA\n    Detach from the DRM/VAAPI hardware, allowing other applications to use the display.",
         "ATTA\n    Re-attach to the DRM/VAAPI hardware and restart all subsystem threads.",
         "STAT\n    Show detailed device status and statistics.",
@@ -1128,10 +1132,9 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
         *kModeHelp,
         "PLAY <uri>\n    Play a local file, URL, or .m3u/.m3u8 playlist via the integrated mediaplayer.",
         *kZoomHelp,
-        nullptr};
-    // VDR's SVDRPHelpPages() signature is const char ** but the literal array is const char *const *;
-    // both pointee levels are read-only at the call site, so stripping the inner const is safe.
-    return const_cast<const char **>(kHelpPages);
+        nullptr,
+    });
+    return helpPages.data();
 }
 
 // ============================================================================
@@ -1141,4 +1144,5 @@ auto cVaapiVideoPlugin::SVDRPHelpPages() -> const char ** {
 } // namespace
 
 /// VDR entry point: expands to the exported factory the plugin loader calls (see PLUGINS.html).
+// NOLINTNEXTLINE(misc-const-correctness) -- VDR's macro declares VDRPluginDestroyer(PluginClass *p)
 VDRPLUGINCREATOR(cVaapiVideoPlugin);

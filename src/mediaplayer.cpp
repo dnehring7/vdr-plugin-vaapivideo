@@ -81,6 +81,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/common.h>
 #include <libavutil/dict.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/error.h>
@@ -124,6 +125,9 @@ constexpr int MEDIAPLAYER_OSD_TIMEOUT_DEFAULT_S =
     4; ///< Auto-hide delay after a key event; matches VDR replay-control feel.
 constexpr int MEDIAPLAYER_OSD_REFRESH_INTERVAL_MS =
     500; ///< Replay-bar update cadence; ~2 Hz feels live without flicker.
+
+/// VDR's audio track slots; a track beyond them cannot be listed or selected.
+constexpr int MEDIAPLAYER_AUDIO_TRACK_CAPACITY = static_cast<int>(ttAudioLast) - static_cast<int>(ttAudioFirst) + 1;
 
 /// Demux thread back-off when the device queues are full or input stalls.
 constexpr int MEDIAPLAYER_BACKPRESSURE_SLEEP_MS = 5;
@@ -279,14 +283,16 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
 
 /// Setup.AudioLanguages pick, like cDevice::EnsureAudioTrack, except that the source's current track
 /// (libavformat's best stream, which honours the container's default flag) wins over track 0 when no
-/// language matches and over later tracks of the same language. -1 when the source has no audio.
+/// language matches and over later tracks of the same language. Only the tracks VDR can list are
+/// candidates, or the OSD would name another track than the one playing. -1 when the source has no audio.
 [[nodiscard]] auto ChoosePreferredAudioTrack(const cVaapiMediaSource &source) -> int {
     const auto &tracks = source.AudioTracks();
     if (tracks.empty()) {
         return -1;
     }
-    const int count = static_cast<int>(tracks.size());
-    const int first = std::clamp(source.CurrentAudioTrack(), 0, count - 1);
+    const int count = static_cast<int>(std::min<size_t>(tracks.size(), MEDIAPLAYER_AUDIO_TRACK_CAPACITY));
+    const int current = source.CurrentAudioTrack();
+    const int first = (current >= 0 && current < count) ? current : 0;
     int preferred = first;
     int languagePreference = -1;
     // I18nIsPreferredLanguage accepts the first track it sees when none matches and keeps the first of
@@ -296,10 +302,12 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
         if (n == first) {
             continue;
         }
-        int pos = 0;
         if (I18nIsPreferredLanguage(Setup.AudioLanguages, tracks.at(static_cast<size_t>(i)).language.c_str(),
-                                    languagePreference, &pos)) {
+                                    languagePreference)) {
             preferred = i;
+            if (languagePreference == 0) {
+                break; // the first preferred language: nothing can beat it
+            }
         }
     }
     return preferred;
@@ -308,6 +316,7 @@ auto CopyExtradata(const AVCodecParameters *p, std::vector<uint8_t> &storage, co
 /// libavformat interrupt_callback. Polled by avformat_open_input / av_read_frame on slow
 /// network I/O; returning non-zero makes those calls bail out with AVERROR_EXIT so both
 /// player shutdown AND pending seek/next are bounded. @p opaque is the cVaapiMediaSource.
+// NOLINTNEXTLINE(misc-const-correctness) -- C-API: AVIOInterruptCB fixes the callback as int (*)(void *)
 extern "C" auto InterruptOnStop(void *opaque) -> int {
     const auto *source = static_cast<const cVaapiMediaSource *>(opaque);
     return (source != nullptr && source->IoInterrupted()) ? 1 : 0;
@@ -326,12 +335,12 @@ constexpr std::array<std::string_view, 2> MEDIAPLAYER_PLAYLIST_EXTENSIONS{{".m3u
 
 /// Cap on the in-memory playlist read. Real .m3u files are tiny; the browser filters only by
 /// extension, so a mislabeled huge file must not balloon VDR's memory.
-constexpr size_t MEDIAPLAYER_PLAYLIST_MAX_BYTES = 8U * 1024U * 1024U;
+constexpr size_t MEDIAPLAYER_PLAYLIST_MAX_BYTES = size_t{8} * 1024 * 1024;
 
 /// URI schemes we hand straight to libavformat rather than resolving as filesystem paths.
 /// HLS .m3u8 over http(s) deliberately goes here rather than through our local m3u parser.
-/// file:// is included so an M3U line like "file:///media/movie.mkv" is taken verbatim
-/// instead of being mangled into "<playlist-dir>/file:///media/movie.mkv".
+/// `file://` is included so an M3U line like `file:///media/movie.mkv` is taken verbatim
+/// instead of being mangled into `<playlist-dir>/file:///media/movie.mkv`.
 constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "http://", "https://", "ftp://"}};
 
 /// std::tolower() for a char: the unsigned char cast keeps bytes >= 0x80 out of undefined behaviour.
@@ -416,7 +425,7 @@ constexpr std::array<std::string_view, 4> MEDIAPLAYER_URL_SCHEMES{{"file://", "h
 /// rounds to "0 MB": sub-half-MiB sizes are floored up to "1 MB" so the column
 /// always reflects that there is content.
 [[nodiscard]] auto FormatSizeMb(std::uintmax_t bytes) -> cString {
-    constexpr std::uintmax_t kBytesPerMiB = 1024U * 1024U;
+    constexpr std::uintmax_t kBytesPerMiB = std::uintmax_t{1024} * 1024;
     std::uintmax_t mib = (bytes + (kBytesPerMiB / 2)) / kBytesPerMiB;
     if (mib == 0 && bytes > 0) {
         mib = 1;
@@ -636,7 +645,7 @@ auto PersistBookmark(const MediaBookmark &bm) -> void {
         }
         vaapiConfig.bookmark = bm;
         BookmarkDirty() = true;
-        onMainThread = cThread::IsMainThread();
+        onMainThread = cThread::IsMainThread() != 0; // VDR returns the comparison as a tThreadId
     }
     if (onMainThread) {
         FlushPendingBookmarkSave();
@@ -688,7 +697,7 @@ auto StartPlayback(PlaylistEntry origin) -> StartPlaybackResult {
     origin.uri = NormalizeBookmarkUri(std::move(origin.uri)); // spelling-independent bookmark identity
     // Reject before Launch: launching closes the browser (osEnd) and only then fails in Activate(true),
     // stranding the user on the old channel with no error. IsReady() here keeps the menu open to report it.
-    auto *vaapiDev = FindPrimaryVaapiDevice();
+    const auto *vaapiDev = FindPrimaryVaapiDevice();
     if (vaapiDev == nullptr || !vaapiDev->IsReady()) [[unlikely]] {
         esyslog("vaapivideo/mediaplayer: no ready primary vaapivideo device -- playback rejected");
         return StartPlaybackResult::DeviceNotReady;
@@ -834,29 +843,9 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
     subtitleStreamIndex = -1;
     subtitleTimeBase = AVRational{.num = 1, .den = 90000};
 
-    // Pick ptsOrigin90k = MAX of tracked-stream start_times so both streams begin at
-    // rebased PTS 0 together. Files where audio (or any other stream) leads video by
-    // hundreds of ms in the container would otherwise present as: audio plays from t=0,
-    // video frames at rebased PTS=+lead sit "too far in future" against the audio clock
-    // and get continuously dropped -- the user sees a still image with progressing
-    // audio. Dropping the small leading-audio prefix (handled by the < 0 guard in
-    // ReadPacket) starts both streams together, no audio-only intro.
-    // Falls back to formatCtx->start_time if neither stream advertises start_time, then
-    // to the first packet seen by ReadPacket's lazy-set path if even that is unknown.
     // One load + explicit null guard for the video stream: StreamStart90k tolerates nullptr,
     // and reusing the guarded pointer below keeps the deref provably safe (-Wnull-dereference).
     const AVStream *videoStream = videoStreamIndex >= 0 ? formatCtx->streams[videoStreamIndex] : nullptr;
-    const int64_t videoStart = StreamStart90k(videoStream);
-    const int64_t audioStart =
-        audioStreamIndex >= 0 ? StreamStart90k(formatCtx->streams[audioStreamIndex]) : AV_NOPTS_VALUE;
-    ptsOrigin90k = FormatStart90k(formatCtx.get()); // fall-back
-    if (videoStart != AV_NOPTS_VALUE) {
-        ptsOrigin90k = videoStart;
-    }
-    if (audioStart != AV_NOPTS_VALUE) {
-        ptsOrigin90k = (ptsOrigin90k == AV_NOPTS_VALUE) ? audioStart : std::max(ptsOrigin90k, audioStart);
-    }
-
     videoFps = 0.0;
     if (videoStream != nullptr) {
         const AVStream *stream = videoStream;
@@ -948,22 +937,29 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
             desc.language = lang->value;
         }
         PopulateAudioInfo(stream, desc.info, desc.extradataStorage);
+        if (desc.avStreamIndex == audioStreamIndex) {
+            currentAudioTrack = static_cast<int>(audioTracks.size());
+        }
         audioTracks.push_back(std::move(desc));
     }
 
-    // Default to libavformat's best-stream pick; the player overrides it with the preferred-language
-    // track before the codec opens.
-    currentAudioTrack = -1;
-    for (size_t i = 0; i < audioTracks.size(); ++i) {
-        if (audioTracks.at(i).avStreamIndex == audioStreamIndex) {
-            currentAudioTrack = static_cast<int>(i);
-            break;
-        }
-    }
-    if (currentAudioTrack < 0 && !audioTracks.empty()) {
-        currentAudioTrack = 0;
-    }
+    // The preferred-language track, seeded above with libavformat's pick (the container default). Chosen
+    // before the origin below, which depends on it, and before the player opens the codec.
+    currentAudioTrack = ChoosePreferredAudioTrack(*this);
     ApplyCurrentAudioTrack();
+
+    // ptsOrigin90k = the later start of the two streams that play, so both begin at rebased PTS 0: against an
+    // earlier start the late stream sits too far ahead, and late video is dropped against the audio clock (a
+    // still over running audio). ReadPacket() drops leading audio and decodes leading video for its references
+    // only. A manual track switch keeps this timeline. NOPTS sorts below every stamp; with neither start known,
+    // the container start, then the first packet, seeds it.
+    const int64_t videoStart = StreamStart90k(videoStream);
+    const int64_t audioStart =
+        audioStreamIndex >= 0 ? StreamStart90k(formatCtx->streams[audioStreamIndex]) : AV_NOPTS_VALUE;
+    ptsOrigin90k = std::max(videoStart, audioStart);
+    if (ptsOrigin90k == AV_NOPTS_VALUE) {
+        ptsOrigin90k = FormatStart90k(formatCtx.get());
+    }
 
     // Enumerate supported subtitle streams (reserve once: SubtitleTrackDesc holds a borrowed
     // codecpar, but the vector itself must not move while the chooser indexes into it). Unsupported
@@ -1018,7 +1014,7 @@ auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInf
 }
 
 auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
-    if (currentAudioTrack < 0 || currentAudioTrack >= static_cast<int>(audioTracks.size())) {
+    if (currentAudioTrack < 0 || std::cmp_greater_equal(currentAudioTrack, audioTracks.size())) {
         audioStreamIndex = -1;
         audioTimeBase = AVRational{.num = 1, .den = 90000};
         audioInfo = AudioStreamInfo{};
@@ -1031,7 +1027,7 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
 }
 
 [[nodiscard]] auto cVaapiMediaSource::SelectAudioTrack(int trackIdx) -> bool {
-    if (trackIdx < 0 || trackIdx >= static_cast<int>(audioTracks.size())) {
+    if (trackIdx < 0 || std::cmp_greater_equal(trackIdx, audioTracks.size())) {
         return false;
     }
     if (trackIdx == currentAudioTrack) {
@@ -1046,7 +1042,7 @@ auto cVaapiMediaSource::ApplyCurrentAudioTrack() -> void {
 }
 
 auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
-    if (currentSubtitleTrack < 0 || currentSubtitleTrack >= static_cast<int>(subtitleTracks.size())) {
+    if (currentSubtitleTrack < 0 || std::cmp_greater_equal(currentSubtitleTrack, subtitleTracks.size())) {
         subtitleStreamIndex = -1;
         subtitleTimeBase = AVRational{.num = 1, .den = 90000};
         return;
@@ -1058,7 +1054,7 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
 
 [[nodiscard]] auto cVaapiMediaSource::SelectSubtitleTrack(int trackIdx) -> bool {
     // trackIdx < 0 disables routing (subtitles off). A valid index >= track count is rejected.
-    if (trackIdx >= static_cast<int>(subtitleTracks.size())) {
+    if (std::cmp_greater_equal(trackIdx, subtitleTracks.size())) {
         return false;
     }
     currentSubtitleTrack = trackIdx < 0 ? -1 : trackIdx;
@@ -1070,7 +1066,13 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
     if (!formatCtx || formatCtx->duration <= 0) {
         return 0;
     }
-    return static_cast<int>(formatCtx->duration / (AV_TIME_BASE / 1000));
+    // The timeline GetIndex/Seek share starts at ptsOrigin90k: a lead-in trimmed there is not playable.
+    int64_t duration90k = av_rescale_rnd(formatCtx->duration, PTS_TICKS_PER_MS, AV_TIME_BASE / 1000, AV_ROUND_DOWN);
+    const int64_t start = FormatStart90k(formatCtx.get());
+    if (start != AV_NOPTS_VALUE && ptsOrigin90k > start) {
+        duration90k -= av_sat_sub64(ptsOrigin90k, start);
+    }
+    return static_cast<int>(std::clamp<int64_t>(duration90k / PTS_TICKS_PER_MS, 0, std::numeric_limits<int>::max()));
 }
 
 [[nodiscard]] auto cVaapiMediaSource::ReadPacket(AVPacket *out, MediaPacketStream &stream) -> int {
@@ -1181,12 +1183,14 @@ auto cVaapiMediaSource::ApplyCurrentSubtitleTrack() -> void {
         }
 
         const int64_t clock90k = PacketClock90k(out);
-        // Drop pre-sync prefix (rebased clock < 0): PopulateStreamInfo() picks
-        // ptsOrigin90k = MAX(stream.start_time) so the trailing stream defines t=0 and the
-        // leading stream's prefix is discarded here -- both streams start together.
+        // Pre-sync prefix (rebased clock < 0, see PopulateStreamInfo()): leading audio is dropped,
+        // leading video decoded but not shown -- it holds the references of the first visible pictures.
         if (clock90k != AV_NOPTS_VALUE && clock90k < 0) {
-            av_packet_unref(out);
-            continue;
+            if (stream == MediaPacketStream::Audio) {
+                av_packet_unref(out);
+                continue;
+            }
+            out->flags |= AV_PKT_FLAG_DISCARD;
         }
         // Post-seek audio discard: keep video preroll (rebuilds H.264/HEVC reference chain)
         // but drop audio earlier than the seek target. Without this the master clock anchors
@@ -1371,11 +1375,6 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         esyslog("vaapivideo/mediaplayer: primary device is not vaapivideo -- cannot play");
         return false;
     }
-    // Pick the preferred-language track BEFORE OpenForMediaPlayer so the right codec opens directly
-    // (no startup reopen).
-    if (const int preferred = ChoosePreferredAudioTrack(*nextSource); preferred >= 0) {
-        (void)nextSource->SelectAudioTrack(preferred);
-    }
     // Proactive display-mode match: the container already carries the authoritative frame rate and
     // coded size, so unlike live TV / recordings this needs no decoded frame and no stability gate.
     // CloseCurrentEntry() has drained the pipeline, so any modeset lands in an idle window rather
@@ -1390,7 +1389,7 @@ cVaapiPlayer::~cVaapiPlayer() noexcept {
         // upper bound guards the cast -- a malformed container can report an absurd r_frame_rate.
         const int64_t rateNum = static_cast<int64_t>(videoInfo.fpsNum) * 1000 * (videoInfo.streamInterlaced ? 2 : 1);
         const int64_t rateMilliHz = (rateNum + (videoInfo.fpsDen / 2)) / videoInfo.fpsDen;
-        if (rateMilliHz > 0 && rateMilliHz <= UINT32_MAX) {
+        if (rateMilliHz > 0 && std::in_range<uint32_t>(rateMilliHz)) {
             modeRequest = {.height = static_cast<uint32_t>(videoInfo.codedHeight),
                            .rateMilliHz = static_cast<uint32_t>(rateMilliHz),
                            .width = static_cast<uint32_t>(videoInfo.codedWidth)};
@@ -1608,7 +1607,7 @@ auto cVaapiPlayer::EnterTrick(PlayMode mode, bool forward, int firstStep) -> voi
 
 auto cVaapiPlayer::TrickSpeedStep(int increment) -> void {
     const int idx = trickSpeedIdx.load(std::memory_order_acquire) + increment;
-    if (idx < 0 || idx >= static_cast<int>(VDR_SPEEDS.size())) [[unlikely]] {
+    if (idx < 0 || std::cmp_greater_equal(idx, VDR_SPEEDS.size())) [[unlikely]] {
         return; // outside the table; unreachable via the key state machine
     }
     const int entry = VDR_SPEEDS.at(static_cast<size_t>(idx));
@@ -1788,7 +1787,7 @@ auto cVaapiPlayer::ApplyStartPosition() -> void {
         const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
         // A leading "* " marks the active track; "  " keeps the others column-aligned.
         rows.emplace_back(std::format("{} {}", tr("Audio"), i + 1),
-                          std::format("{}{} {} Hz {}{}", (static_cast<int>(i) == current) ? "* " : "  ",
+                          std::format("{}{} {} Hz {}{}", std::cmp_equal(i, current) ? "* " : "  ",
                                       avcodec_get_name(track.info.codecId), track.info.sampleRate, channels, lang));
     }
     const auto &subtitleTracks = source->SubtitleTracks();
@@ -1796,9 +1795,9 @@ auto cVaapiPlayer::ApplyStartPosition() -> void {
     for (size_t i = 0; i < subtitleTracks.size(); ++i) {
         const auto &track = subtitleTracks.at(i);
         const std::string lang = track.language.empty() ? std::string{} : std::format(" [{}]", track.language);
-        rows.emplace_back(std::format("{} {}", tr("Subtitle"), i + 1),
-                          std::format("{}{}{}", (static_cast<int>(i) == currentSub) ? "* " : "  ",
-                                      SubtitleCodecName(track.codecId), lang));
+        rows.emplace_back(
+            std::format("{} {}", tr("Subtitle"), i + 1),
+            std::format("{}{}{}", std::cmp_equal(i, currentSub) ? "* " : "  ", SubtitleCodecName(track.codecId), lang));
     }
     if (playlist.size() > 1) {
         rows.emplace_back(tr("Playlist"), std::format("{}/{}", idx + 1, playlist.size()));
@@ -1982,9 +1981,18 @@ auto cVaapiPlayer::PerformTrickTransition(TrickCommand cmd) -> void {
         if (ret != 0) {
             return false; // EAGAIN (command interrupt) / EXIT: let the outer loop service it
         }
-        if (stream == MediaPacketStream::Video && (packet->flags & AV_PKT_FLAG_KEY) != 0 &&
-            packet->pts != AV_NOPTS_VALUE) {
-            break;
+        if (stream == MediaPacketStream::Video && (packet->flags & AV_PKT_FLAG_KEY) != 0) {
+            // Decode-only: the keyframe lies before the origin (Seek() reset the preroll window), so none lies
+            // between the origin and the target -- the start is reached. Reading on would step to a keyframe
+            // ahead of the position.
+            if ((packet->flags & AV_PKT_FLAG_DISCARD) != 0) {
+                av_packet_unref(packet);
+                reverseTargetPts90k = -1;
+                return true;
+            }
+            if (packet->pts != AV_NOPTS_VALUE) {
+                break;
+            }
         }
         av_packet_unref(packet); // audio / subtitles / GOP tail: reverse shows keyframes only
     }
@@ -2059,9 +2067,8 @@ auto cVaapiPlayer::RegisterAudioTracks() -> void {
     }
     DeviceClrAvailableTracks(); // also resets the device's currentAudioTrack to ttNone
     const auto &tracks = source->AudioTracks();
-    constexpr int kMaxAudioSlots = static_cast<int>(ttAudioLast) - static_cast<int>(ttAudioFirst) + 1;
-    const int count = std::min(static_cast<int>(tracks.size()), kMaxAudioSlots);
-    if (static_cast<int>(tracks.size()) > count) {
+    const int count = static_cast<int>(std::min<size_t>(tracks.size(), MEDIAPLAYER_AUDIO_TRACK_CAPACITY));
+    if (std::cmp_greater(tracks.size(), count)) {
         isyslog("vaapivideo/mediaplayer: %zu audio tracks -- only the first %d are selectable", tracks.size(), count);
     }
     for (int i = 0; i < count; ++i) {
@@ -2071,7 +2078,7 @@ auto cVaapiPlayer::RegisterAudioTracks() -> void {
         (void)DeviceSetAvailableTrack(ttAudio, i, static_cast<uint16_t>(track.avStreamIndex + 1),
                                       track.language.c_str(), desc.c_str());
     }
-    // Clamp the source's current track into the selectable range (only matters for the >32 edge).
+    // Defensive: the chooser and the Audio menu only ever pick a selectable track.
     int current = source->CurrentAudioTrack();
     if (current < 0 || current >= count) {
         current = count > 0 ? 0 : -1;
@@ -2095,7 +2102,7 @@ auto cVaapiPlayer::RegisterSubtitleTracks() -> void {
     const auto &tracks = source->SubtitleTracks();
     constexpr int kMaxSubtitleSlots = static_cast<int>(ttSubtitleLast) - static_cast<int>(ttSubtitleFirst) + 1;
     const int count = std::min(static_cast<int>(tracks.size()), kMaxSubtitleSlots);
-    if (static_cast<int>(tracks.size()) > count) {
+    if (std::cmp_greater(tracks.size(), count)) {
         isyslog("vaapivideo/mediaplayer: %zu subtitle tracks -- only the first %d are selectable", tracks.size(),
                 count);
     }

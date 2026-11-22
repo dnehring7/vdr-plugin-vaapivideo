@@ -13,7 +13,11 @@
 #include "config.h"
 #include "filter.h" // FilterGraphToken (DrmFramebuffer keeps the producing VPP graph alive)
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <memory>
 
 // VDR
 #pragma GCC diagnostic push
@@ -158,9 +162,10 @@ class cVaapiDisplay : public cThread {
     /// Borrowed DRM fd; the display owns it, so callers must not close it.
     [[nodiscard]] auto GetDrmFd() const noexcept -> int { return drmFd; }
     /// Snapshot the VAAPI surface on screen (the last committed one once its flip has landed) as a
-    /// host-side AVFrame (NV12 or P010).
-    /// Returns nullptr if no frame has been displayed yet or the GPU download fails, and logs which. Used by GrabImage.
-    [[nodiscard]] auto GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame>;
+    /// host-side AVFrame (NV12 or P010), and in @p hdrKind the connector HDR state it is shown with.
+    /// Returns nullptr if no frame is on screen (none yet, or a mode change) or the GPU download fails, and logs
+    /// which. Used by GrabImage.
+    [[nodiscard]] auto GrabDisplayedFrame(StreamHdrKind &hdrKind) -> std::unique_ptr<AVFrame, FreeAVFrame>;
     /// Active scanout height (px); use GetOutputGeometry() when both dimensions must agree.
     [[nodiscard]] auto GetOutputHeight() const noexcept -> uint32_t;
     /// Both dimensions from ONE load of the packed atomic. Calling GetOutputWidth() and
@@ -175,16 +180,17 @@ class cVaapiDisplay : public cThread {
     [[nodiscard]] auto GetOutputRefreshMilliHz() const noexcept -> uint32_t {
         return outputRefreshMilliHz.load(std::memory_order_acquire);
     }
-    /// Refresh rate (millihertz) the next VPP build should pace for: the staged request's rate from
-    /// RequestDisplayMode() until the display thread has programmed it or given up, the active rate
-    /// otherwise (the GetTargetVideoRect() counterpart for the rate).
-    [[nodiscard]] auto GetTargetRefreshMilliHz() const noexcept -> uint32_t {
-        return targetRefreshMilliHz.load(std::memory_order_acquire);
-    }
+    /// Refresh rate (millihertz) the next VPP build should pace for: the latest RequestDisplayMode() rate,
+    /// queued or programmed, or the active one after the driver rejected it (the GetTargetVideoRect()
+    /// counterpart for the rate).
+    [[nodiscard]] auto GetTargetRefreshMilliHz() const noexcept -> uint32_t;
     /// Active scanout width (px); see GetOutputHeight().
     [[nodiscard]] auto GetOutputWidth() const noexcept -> uint32_t;
-    /// Snapshot of the mode currently programmed on the CRTC. Used by the device to skip a
-    /// request that would be a no-op. Display-thread state, so this takes modeRequestMutex.
+    /// The latest RequestDisplayMode() mode, whether queued, programmed or rejected. The device's mode
+    /// policy compares against it, so neither an in-flight nor a rejected switch is requested again.
+    [[nodiscard]] auto GetRequestedMode() const -> drmModeModeInfo;
+    /// Snapshot of the mode currently programmed on the CRTC (status report). Display-thread state, so
+    /// this takes modeRequestMutex.
     [[nodiscard]] auto GetActiveMode() const -> drmModeModeInfo;
     /// Bumped once per successful runtime mode change. Consumers cache against it to detect that
     /// the output geometry moved under them (see cVaapiDevice::GetOsdSize).
@@ -422,7 +428,7 @@ class cVaapiDisplay : public cThread {
     /// Export a VAAPI surface as a KMS framebuffer via PRIME. Takes ownership of vaapiFrame;
     /// the AVFrame ref is transferred to the returned DrmFramebuffer to keep the surface alive.
     [[nodiscard]] auto MapVaapiFrame(std::unique_ptr<VaapiFrame> vaapiFrame) const -> DrmFramebuffer;
-    /// libdrm page-flip callback. @p data is the cVaapiDisplay* from drmModeAtomicCommit.
+    /// libdrm page-flip callback. @p data is the commit serial AtomicCommit() passed as user_data.
     static auto OnPageFlipEvent(int fd, unsigned int seq, unsigned int sec, unsigned int usec, void *data) -> void;
     /// Submit a page-flip for @p fb, bundling any pending OSD change in the same atomic commit.
     [[nodiscard]] auto PresentBuffer(const DrmFramebuffer &fb) -> bool;
@@ -453,8 +459,9 @@ class cVaapiDisplay : public cThread {
     cCondVar frameSlotCond;             ///< Signaled when a pendingFrames slot opens up (under bufferMutex)
     std::atomic<bool> hasExited{false}; ///< Set by Action() just before return; Shutdown() polls this
     AVBufferRef *hwDeviceRef{};         ///< Owned VAAPI hw-device context ref (av_buffer_ref of hwDevice)
-    mutable cMutex importMutex;         ///< Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it
-                                ///< while the codec is being torn down to prevent MapVaapiFrame racing the teardown.
+    /// Held across VAAPI->PRIME import + atomic commit; BeginStreamSwitch holds it while the codec is being
+    /// torn down to prevent MapVaapiFrame racing the teardown.
+    mutable cMutex importMutex;
     /// Serializes VA-driver calls: MapVaapiFrame (display), VPP pull (decoder), retired-graph
     /// teardown (FreeFilterGraphLocked, any thread) -- one VADisplay may not be driven from two
     /// threads at once. Precedes only the leaf mutexes (see the class lock-order comment); the
@@ -462,6 +469,8 @@ class cVaapiDisplay : public cThread {
     mutable cMutex vaDriverMutex;
     /// Set during stream switch; gates new frame imports in Action() and SubmitFrame()
     std::atomic<bool> isClearing{false};
+    uintptr_t flipSerial{};                      ///< Serial of the newest event-bearing commit; only its event
+                                                 ///< confirms pendingBuffer. Display thread (the event reader).
     std::atomic<bool> isFlipPending{false};      ///< True between commit and page-flip event; Action() waits on this
     std::atomic<uint64_t> flipPendingSinceMs{0}; ///< cTimeMs::Now() when isFlipPending was set; 0 = not pending.
                                                  ///< Action() force-clears the flag if no event arrives within a
@@ -481,10 +490,13 @@ class cVaapiDisplay : public cThread {
     std::atomic<uint64_t> lastVSyncTimeMs{0};    ///< Wall-clock ms of the most recent page-flip event
     uint32_t modeBlobId{};                       ///< KMS MODE_ID blob; must outlive CRTC enable, freed in Shutdown()
     std::atomic<uint64_t> modeGeneration{0};     ///< Incremented after every successful runtime mode change
-    drmModeModeInfo modeRequest{};               ///< Mode staged by RequestDisplayMode (guarded by modeRequestMutex)
+    drmModeModeInfo modeRequest{};               ///< Latest RequestDisplayMode() mode, kept once serviced
+                                                 ///< (guarded by modeRequestMutex)
+    bool modeRequestRejected{false};             ///< The driver rejected modeRequest; the VPP target rate falls back
+                                                 ///< to activeMode until a new request (guarded by modeRequestMutex)
     std::atomic<bool> modeRequestPending{false}; ///< True while modeRequest awaits the display thread
-    mutable cMutex modeRequestMutex;             ///< Guards modeRequest, modeRequestPending and activeMode
-                                                 ///< (written by the display thread, read by GetActiveMode())
+    mutable cMutex modeRequestMutex;             ///< Guards modeRequest, modeRequestRejected, modeRequestPending
+                                                 ///< and activeMode (written by the display thread)
     std::atomic<bool> modesetActive{false};      ///< Set while the display thread is inside ChangeDisplayMode();
                                                  ///< gates SubmitFrame(). A separate flag from isClearing, which
                                                  ///< BeginStreamSwitch() owns -- sharing one would let whichever
@@ -509,8 +521,9 @@ class cVaapiDisplay : public cThread {
     std::atomic<bool> geometryChanged{false}; ///< Set by ChangeDisplayMode; consumed once by the decoder via
                                               ///< TakeGeometryChange() to trigger a VPP rebuild for the new size.
     DrmFramebuffer pendingBuffer; ///< Back buffer staged for the next flip; promoted to displayedBuffer on success
-    /// pendingBuffer is on screen: cleared by the commit that stages it, set once Action() passes the
-    /// flip gate after it. Tells GrabDisplayedFrame() which of the two buffers is scanned out.
+    /// pendingBuffer is on screen: set by its page-flip event (or at once for a synchronous commit, or when
+    /// the flip watchdog gives up on a lost event -- the flip itself was accepted), cleared by the commit
+    /// that stages the next one. Tells GrabDisplayedFrame() which of the two buffers is scanned out.
     std::atomic<bool> pendingBufferShown{false};
     /// Up to DISPLAY_PRERENDER_CAPACITY frames awaiting MapVaapiFrame (guarded by bufferMutex).
     std::deque<std::unique_ptr<VaapiFrame>> pendingFrames;
@@ -521,9 +534,6 @@ class cVaapiDisplay : public cThread {
     /// Active refresh rate in millihertz, derived from the mode timings; falls back to 50000 when the mode
     /// reports no clock.
     std::atomic<uint32_t> outputRefreshMilliHz{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000};
-    /// Refresh rate (millihertz) of the staged mode request while one is in flight, else of the active mode; the
-    /// decoder builds its VPP graph against this so a chain built during the modeset already fits the new rate.
-    std::atomic<uint32_t> targetRefreshMilliHz{CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000};
     uint32_t videoPlaneId{};    ///< DRM plane object ID for the video primary plane
     DrmPlaneProps videoProps{}; ///< Cached atomic prop IDs for the video plane
     /// Requested rect (next VPP build target).

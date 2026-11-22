@@ -39,11 +39,13 @@
 #include "stream.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 // VDR
@@ -173,13 +175,15 @@ class cVaapiMediaSource final : public IMediaSource {
     /// the keyframe at/below the target). Also disarmed by the first video packet at/after the
     /// target, or by the next Seek().
     auto DiscardVideoPrerollBefore(int64_t before90k) noexcept -> void { discardVideoBefore90k = before90k; }
-    [[nodiscard]] auto DurationMs() const noexcept -> int; ///< 0 when unknown (live streams)
+    [[nodiscard]] auto DurationMs() const noexcept -> int; ///< Length from the timeline origin; 0 = unknown (live)
     [[nodiscard]] auto IoInterrupted() const noexcept
         -> bool; ///< True if a blocking libavformat I/O should bail (shutdown via stopFlag, or a
                  ///< pending seek/next via interruptFlag). Polled by the interrupt_callback.
+    ///@{
     /// True once a stream is routed; audio-less video (and vice versa) is legal, so both are checked.
     [[nodiscard]] auto HasAudio() const noexcept -> bool { return audioStreamIndex >= 0; }
-    [[nodiscard]] auto HasVideo() const noexcept -> bool { return videoStreamIndex >= 0; } ///< @see HasAudio()
+    [[nodiscard]] auto HasVideo() const noexcept -> bool { return videoStreamIndex >= 0; }
+    ///@}
     /// All audio streams found at Open(); the index doubles as the cDisplayTracks menu index.
     [[nodiscard]] auto AudioTracks() const noexcept -> const std::vector<AudioTrackDesc> & { return audioTracks; }
     /// Number of AudioTracks(); 0 for video-only input.
@@ -233,9 +237,10 @@ class cVaapiMediaSource final : public IMediaSource {
     int audioStreamIndex{-1};                  ///< formatCtx->streams index of the decoding audio stream
     AVRational videoTimeBase{.num = 1, .den = 90000}; ///< Video stream time base (drives Rebase90k)
     AVRational audioTimeBase{.num = 1, .den = 90000}; ///< Audio stream time base (drives Rebase90k)
-    int64_t ptsOrigin90k{AV_NOPTS_VALUE};             ///< First-packet PTS in 90 kHz (or formatCtx->start_time
-                                                      ///< when known); subtracted from every emitted PTS so the
-                                                      ///< replay bar and Seek() math share a zero-based timeline.
+    int64_t ptsOrigin90k{AV_NOPTS_VALUE};             ///< Later start of video and chosen audio in 90 kHz (else
+                                                      ///< formatCtx->start_time, else the first packet's PTS);
+                                                      ///< subtracted from every emitted PTS so the replay bar
+                                                      ///< and Seek() math share a zero-based timeline.
     int64_t discardAudioBefore90k{AV_NOPTS_VALUE};    ///< Post-seek guard: armed to the seek target, drops
                                                       ///< audio packets earlier than that so the master
                                                       ///< clock anchors at the requested timeline (and not
@@ -271,7 +276,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     /// folding them in here made two threads write one variable for values nobody read.
     enum class State : uint8_t { Running, Eof, Stopped };
 
-    /// dvbplayer-style play phase (cf. ePlayModes in vdr/dvbplayer.c). The VDR main thread (key
+    /// dvbplayer-style play phase (like ePlayModes in vdr/dvbplayer.c). The VDR main thread (key
     /// handlers) is the primary writer; the demux thread writes only on auto-exit edges (reverse
     /// play reaching the file start, EOF during a trick mode). Fast = keyframe stepping paced by
     /// the decoder's trick hold; Slow = full decode paced below real time. Direction lives in the
@@ -292,10 +297,10 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     /// Resume normal playback from pause or any trick mode (cf. cDvbPlayer::Play()); no-op while playing.
     auto Play() -> void;
-    /// Toggle pause (cf. cDvbPlayer::Pause()): freezes from normal play (parks the demux thread and
+    /// Toggle pause (as cDvbPlayer::Pause()): freezes from normal play (parks the demux thread and
     /// halts the audio master clock), exits a trick mode into pause, resumes when already paused.
     auto Pause() -> void;
-    /// One notch toward faster-forward (cf. cDvbPlayer::Forward()): from play -> fast forward, deeper
+    /// One notch toward faster-forward (as cDvbPlayer::Forward()): from play -> fast forward, deeper
     /// on repeat; from pause -> slow motion; winds an active backward mode down through normal.
     auto Forward() -> void;
     /// Mirror of Forward() toward backward playback (cf. cDvbPlayer::Backward()).
@@ -331,7 +336,7 @@ class cVaapiPlayer final : public cPlayer, public cThread {
     // ========================================================================
     // === cPlayer overrides (public) ===
     // ========================================================================
-    /// cPlayer hook for the replay bar (cf. cDvbPlayer::GetReplayMode): Play/Forward/Speed from the
+    /// cPlayer hook for the replay bar (as cDvbPlayer::GetReplayMode): Play/Forward/Speed from the
     /// trick state, so skins render the usual "1>>".."3>>" / "<<1" / "1|>" / "<|1" mode symbols.
     [[nodiscard]] auto GetReplayMode(bool &Play, bool &Forward, int &Speed) -> bool override;
     /// Position and length in MILLISECONDS, not cPlayer's frame unit -- cVaapiControl, the only

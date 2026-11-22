@@ -34,16 +34,16 @@ env:
   TAG: ${{ inputs.tag || github.event.release.tag_name }}
   PUBLISH: ${{ github.event_name == 'release' || inputs.publish }}
   PLUGIN: vaapivideo
-  FEDORA_REL: '44'
+  FEDORA_REL: '45'
 
 jobs:
   # ================================================================
   # rpm -- build + sign RPMs, assemble the dnf repo (Fedora)
   # ================================================================
   rpm:
-    name: rpm (fedora 44)
+    name: rpm (fedora 45)
     runs-on: ubuntu-latest
-    container: fedora:44
+    container: fedora:45
     outputs:
       version: ${{ steps.prep.outputs.version }}
 

@@ -13,35 +13,19 @@
 #include "config.h"
 
 // ============================================================================
-// === SYSTEM HEADERS ===
-// ============================================================================
-
-// ============================================================================
 // === C++ STANDARD LIBRARY ===
 // ============================================================================
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
-#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <format>
-#include <memory>
 #include <numeric>
-#include <queue>
 #include <span>
-#include <string>
-#include <string_view>
-#include <utility>
 #include <vector>
 
 // ============================================================================
 // === DRM/KMS ===
 // ============================================================================
-#include <libdrm/drm.h>
-#include <libdrm/drm_fourcc.h>
 #include <libdrm/drm_mode.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -55,30 +39,15 @@
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
 #include <libavcodec/avcodec.h>
-#include <libavcodec/codec.h>
-#include <libavcodec/codec_id.h>
 #include <libavcodec/defs.h>
 #include <libavcodec/packet.h>
 #include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
 #include <libavutil/buffer.h>
-#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_drm.h>
-#include <libavutil/hwcontext_vaapi.h>
-#include <libavutil/intreadwrite.h>
-#include <libavutil/log.h>
 #include <libavutil/mastering_display_metadata.h>
-#include <libavutil/mem.h>
-#include <libavutil/pixdesc.h>
-#include <libavutil/pixfmt.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
 }
 #pragma GCC diagnostic pop
 
@@ -110,7 +79,7 @@ extern "C" {
 /// Shown by "vdr -h" and in VDR's plugin list.
 inline constexpr const char *PLUGIN_DESCRIPTION = trNOOP("Hardware-accelerated video playback with VAAPI");
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.9.1";   ///< Reported to VDR; "make dist" greps this line.
+inline constexpr const char *PLUGIN_VERSION = "1.10.0";  ///< Reported to VDR; "make dist" greps this line.
 
 /// Translate a label: the plugin catalog first, then VDR's. So "auto" (unmarked) comes from VDR, and a word the
 /// plugin translates itself still falls back to VDR in languages the plugin does not ship.
@@ -252,6 +221,12 @@ struct StreamStartTrace {
     return static_cast<uint32_t>((num + (den / 2)) / den); // round to nearest
 }
 
+/// Two modes are "the same output" iff size and exact rate agree; drmModeModeInfo also carries
+/// timing detail that is irrelevant to whether a modeset is worth its HDMI relink.
+[[nodiscard]] inline auto SameOutputMode(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
+    return a.hdisplay == b.hdisplay && a.vdisplay == b.vdisplay && ModeRefreshMilliHz(a) == ModeRefreshMilliHz(b);
+}
+
 /// An exact width:height ratio. Rational rather than a double so the VPP fit can cross-multiply in
 /// integers (see cVideoFilterChain::Build).
 struct AspectRatio {
@@ -317,6 +292,29 @@ struct AspectRatio {
         den /= divisor;
     }
     return {.den = den, .num = num};
+}
+
+// ============================================================================
+// === BITSTREAM LOADS ===
+// ============================================================================
+
+// Big-endian loads for the PES/ES parsers. Spelled out because FFmpeg's AV_RB16/AV_RB32 type-pun through a
+// C cast; compilers fold these into a single load + bswap.
+
+/// Read an unaligned big-endian 16-bit stream field.
+[[nodiscard]] constexpr auto ReadBe16(const uint8_t *p) noexcept -> uint16_t {
+    return static_cast<uint16_t>((static_cast<unsigned>(p[0]) << 8U) | p[1]);
+}
+
+/// Read an unaligned big-endian 24-bit stream field.
+[[nodiscard]] constexpr auto ReadBe24(const uint8_t *p) noexcept -> uint32_t {
+    return (static_cast<uint32_t>(p[0]) << 16U) | (static_cast<uint32_t>(p[1]) << 8U) | p[2];
+}
+
+/// Read an unaligned big-endian 32-bit stream field.
+[[nodiscard]] constexpr auto ReadBe32(const uint8_t *p) noexcept -> uint32_t {
+    return (static_cast<uint32_t>(p[0]) << 24U) | (static_cast<uint32_t>(p[1]) << 16U) |
+           (static_cast<uint32_t>(p[2]) << 8U) | p[3];
 }
 
 // ============================================================================

@@ -13,9 +13,9 @@
  * Lock order: importMutex -> vaDriverMutex (frame import); importMutex -> bufferMutex ->
  * vaDriverMutex (releasing a DrmFramebuffer / clearing pendingFrames can drop the last
  * FilterGraphToken, whose deleter locks vaDriverMutex and nothing else). vaDriverMutex may
- * precede only the leaf mutexes {videoRectMutex, osdMutex, hdrStateMutex} -- decoder rebuilds
- * query geometry/HDR state under it -- and the leaves have no outgoing edges, so the lock
- * graph stays acyclic.
+ * precede only the leaf mutexes {videoRectMutex, osdMutex, hdrStateMutex, modeRequestMutex} --
+ * decoder rebuilds query geometry/HDR state/target rate under it -- and the leaves have no
+ * outgoing edges, so the lock graph stays acyclic.
  * PresentBuffer() may run under bufferMutex; its leaf locks
  * {videoRectMutex, osdMutex, hdrStateMutex} are never nested with each other.
  * DRM fd rule: the consumer thread is the ONLY drmHandleEvent dispatcher while Action()
@@ -34,7 +34,9 @@
 
 // C++ Standard Library
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -80,6 +82,9 @@ extern "C" {
 // ============================================================================
 
 namespace {
+
+/// The display drmHandleEvent() dispatches for: it calls back on this thread, and user_data holds the commit serial.
+thread_local cVaapiDisplay *dispatchDisplay{};
 
 // --- Prerender queue ---
 constexpr size_t DISPLAY_PRERENDER_CAPACITY =
@@ -406,7 +411,8 @@ auto cVaapiDisplay::EndStreamSwitch() -> void {
     {
         const cMutexLock lock(&modeRequestMutex);
         activeMode = displayMode;
-        modeRequest = {};
+        modeRequest = displayMode;
+        modeRequestRejected = false;
     }
     modeRequestPending.store(false, std::memory_order_release);
     modesetActive.store(false, std::memory_order_release);
@@ -517,21 +523,32 @@ auto cVaapiDisplay::GetOutputGeometry(uint32_t &width, uint32_t &height) const n
     return activeMode;
 }
 
+[[nodiscard]] auto cVaapiDisplay::GetRequestedMode() const -> drmModeModeInfo {
+    const cMutexLock lock(&modeRequestMutex);
+    return modeRequest;
+}
+
+[[nodiscard]] auto cVaapiDisplay::GetTargetRefreshMilliHz() const noexcept -> uint32_t {
+    // The latest request, so the decoder paces for it at once: a graph built for the outgoing rate during the
+    // modeset (fps=50 for a 24p file) drops frames on the new mode. Derived under the lock: a separately
+    // published rate could be overwritten by a finished modeset while a newer request is still queued.
+    const cMutexLock lock(&modeRequestMutex);
+    const uint32_t rateMilliHz = ModeRefreshMilliHz(modeRequestRejected ? activeMode : modeRequest);
+    return rateMilliHz > 0 ? rateMilliHz : CONFIG_DISPLAY_REFRESH_DEFAULT_HZ * 1000U;
+}
+
 auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
-    if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
+    if (!ready.load(std::memory_order_acquire) || mode.hdisplay == 0 || mode.vdisplay == 0) [[unlikely]] {
         return;
     }
-    {
-        const cMutexLock lock(&modeRequestMutex);
-        modeRequest = mode;
+    const cMutexLock lock(&modeRequestMutex);
+    // A repeat of the latest request changes nothing: it is queued, programmed, or was rejected and would be
+    // rejected again.
+    if (SameOutputMode(modeRequest, mode)) {
+        return;
     }
-    // Let the decoder pace for the requested rate right away: the modeset takes a few hundred ms, and a
-    // graph built for the outgoing rate meanwhile (fps=50 for a 24p file) is dropped frame by frame on
-    // the new mode until the post-modeset rebuild. A degenerate mode is ignored by ChangeDisplayMode.
-    if (const uint32_t rateMilliHz = ModeRefreshMilliHz(mode); rateMilliHz > 0) {
-        targetRefreshMilliHz.store(rateMilliHz, std::memory_order_release);
-    }
-    // Published after the mode itself so the display thread never reads a half-written request.
+    modeRequest = mode;
+    modeRequestRejected = false;
     modeRequestPending.store(true, std::memory_order_release);
 }
 
@@ -547,7 +564,7 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
     return lastCommittedOsdFbId;
 }
 
-[[nodiscard]] auto cVaapiDisplay::GrabDisplayedFrame() -> std::unique_ptr<AVFrame, FreeAVFrame> {
+[[nodiscard]] auto cVaapiDisplay::GrabDisplayedFrame(StreamHdrKind &hdrKind) -> std::unique_ptr<AVFrame, FreeAVFrame> {
     if (!ready.load(std::memory_order_acquire)) [[unlikely]] {
         esyslog("vaapivideo/display: grab failed: display not running");
         return nullptr;
@@ -562,18 +579,24 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
     std::unique_ptr<AVFrame, FreeAVFrame> source;
     {
         const cMutexLock lock(&bufferMutex);
+        // A modeset blanks the planes and then drops both buffers: what they hold is no longer on screen.
+        if (modesetActive.load(std::memory_order_acquire)) [[unlikely]] {
+            esyslog("vaapivideo/display: grab failed: mode change in progress");
+            return nullptr;
+        }
         // pendingBuffer holds the last committed frame; it is on screen once its flip has landed
         // (and is re-presented while no new frame comes). displayedBuffer is the one before it, so
         // grabbing it showed the previous picture -- for a still, the black frame ahead of it.
-        const bool pendingShown = pendingBufferShown.load(std::memory_order_acquire);
         const DrmFramebuffer &onScreen =
-            pendingBuffer.frame && (pendingShown || !displayedBuffer.frame) ? pendingBuffer : displayedBuffer;
+            pendingBufferShown.load(std::memory_order_acquire) ? pendingBuffer : displayedBuffer;
         if (!onScreen.frame) [[unlikely]] {
             esyslog("vaapivideo/display: grab failed: no frame on screen yet");
             return nullptr;
         }
         source.reset(av_frame_clone(onScreen.frame));
         sourceGraphToken = onScreen.graphToken;
+        // With the frame: the connector's HDR state changes with the commit that stages the next one.
+        hdrKind = GetActiveHdrKind();
     }
 
     std::unique_ptr<AVFrame, FreeAVFrame> dest{av_frame_alloc()};
@@ -827,7 +850,7 @@ auto cVaapiDisplay::Action() -> void {
     while (!stopping.load(std::memory_order_relaxed) && ready.load(std::memory_order_relaxed)) {
         const auto refreshHz = GetOutputRefreshRate();
         const auto vsyncMs = refreshHz > 0 ? 1000U / refreshHz : 20U;
-        const uint64_t thresholdMs = DISPLAY_UNDERRUN_THRESHOLD_VSYNCS * vsyncMs;
+        const uint64_t thresholdMs = uint64_t{DISPLAY_UNDERRUN_THRESHOLD_VSYNCS} * vsyncMs;
 
         // Non-blocking drain so isFlipPending is up-to-date before the gate check below.
         while (DrainDrmEvents(0)) {
@@ -847,13 +870,15 @@ auto cVaapiDisplay::Action() -> void {
                         static_cast<unsigned long long>(cTimeMs::Now() - since));
                 flipPendingSinceMs.store(0, std::memory_order_release);
                 isFlipPending.store(false, std::memory_order_release);
+                // The kernel accepted the commit, so the flip happens; only its event was lost (typically
+                // the first plane attach -- a still, whose grab would otherwise return the frame before it).
+                pendingBufferShown.store(true, std::memory_order_release);
             }
             continue;
         }
         // Past the gate the last commit has flipped (or its event was given up on): whatever was
         // popped is on screen. Cleared before the pop below may set it again for the next frame.
         frameInFlight.store(false, std::memory_order_release);
-        pendingBufferShown.store(true, std::memory_order_release);
 
         // Runtime mode change, serviced here and nowhere else: this thread owns every DRM commit
         // and is the sole drmHandleEvent dispatcher, so doing the ALLOW_MODESET inline needs no
@@ -926,7 +951,9 @@ auto cVaapiDisplay::Action() -> void {
                             // scanning it (kernel use-after-free on next scanout).
                             displayedBuffer = std::move(pendingBuffer);
                             pendingBuffer = std::move(newFb);
-                            pendingBufferShown.store(false, std::memory_order_release);
+                            // A synchronous commit (OSD over HDR) is on screen already and sends no event.
+                            pendingBufferShown.store(!isFlipPending.load(std::memory_order_acquire),
+                                                     std::memory_order_release);
                             // Arm warmup grace whenever decoder resumes from idle: post-Clear
                             // (lastCommit==0) OR after a long gap (commit > DISPLAY_WARMUP_ACTIVE_WINDOW_MS old).
                             // The latter covers transitions where BeginStreamSwitch wasn't invoked
@@ -1113,8 +1140,12 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     //   Display thread blocks until applied.
     // ATOMIC_ASYNC is unused -- it requires linear buffers, our VAAPI surfaces are tiled.
     const uint32_t commitFlags = (flags == 0) ? DISPLAY_PAGE_FLIP_COMMIT_FLAGS : flags;
-    if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, this) == 0) {
-        if ((commitFlags & DRM_MODE_PAGE_FLIP_EVENT) != 0) {
+    // The serial lets the event name its commit: one the watchdog gave up on can still deliver late.
+    const bool wantsEvent = (commitFlags & DRM_MODE_PAGE_FLIP_EVENT) != 0;
+    const uintptr_t serial = wantsEvent ? flipSerial + 1 : 0;
+    if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, std::bit_cast<void *>(serial)) == 0) {
+        if (wantsEvent) {
+            flipSerial = serial;
             flipPendingSinceMs.store(cTimeMs::Now(), std::memory_order_release);
             isFlipPending.store(true, std::memory_order_release);
         }
@@ -1139,7 +1170,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         "synchronous commits while the OSD is shown (brief A/V interruption possible)");
                 osdHdrNeedsModeset = true;
             }
-            if (drmModeAtomicCommit(drmFd, req.Handle(), DRM_MODE_ATOMIC_ALLOW_MODESET, this) == 0) {
+            if (drmModeAtomicCommit(drmFd, req.Handle(), DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) == 0) {
                 return true; // sync path carries no PAGE_FLIP_EVENT -> isFlipPending stays clear
             }
         }
@@ -1299,7 +1330,6 @@ auto cVaapiDisplay::PublishOutputGeometry(const drmModeModeInfo &mode) -> void {
     // changing one without the other desyncs the A/V controllers.
     const uint32_t rateMilliHz = ModeRefreshMilliHz(mode);
     outputRefreshMilliHz.store(rateMilliHz > 0 ? rateMilliHz : 50000U, std::memory_order_release);
-    targetRefreshMilliHz.store(rateMilliHz > 0 ? rateMilliHz : 50000U, std::memory_order_release); // request fulfilled
 
     const cRect fullRect(0, 0, static_cast<int>(mode.hdisplay), static_cast<int>(mode.vdisplay));
     const cMutexLock lock(&videoRectMutex);
@@ -1392,13 +1422,13 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
         const cMutexLock lock(&modeRequestMutex);
         wanted = modeRequest;
         modeRequestPending.store(false, std::memory_order_release);
-        alreadyActive = wanted.hdisplay == activeMode.hdisplay && wanted.vdisplay == activeMode.vdisplay &&
-                        ModeRefreshMilliHz(wanted) == ModeRefreshMilliHz(activeMode);
+        alreadyActive = SameOutputMode(wanted, activeMode);
     }
-    // Requests are idempotent so callers can fire one unconditionally (ResetDisplayModeToDefault
-    // cannot tell whether an earlier change is still in flight). Nothing to do, and skipping the
-    // commit spares the sink a pointless link retrain.
-    if (alreadyActive || wanted.hdisplay == 0 || wanted.vdisplay == 0) {
+    // A request back to the programmed mode (one cancelling an earlier request still queued): skipping the
+    // commit spares the sink a pointless link retrain. The cancelled request may already have supplied the
+    // rate of a VPP build (GetTargetRefreshMilliHz), so have the decoder rebuild for the programmed one.
+    if (alreadyActive) {
+        geometryChanged.store(true, std::memory_order_release);
         return;
     }
 
@@ -1412,11 +1442,6 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
         pendingFrames.clear();
         pendingDepth.store(0, std::memory_order_release);
         frameSlotCond.Broadcast();
-        // Dropping both framebuffers is what makes the transition safe: Action()'s re-present
-        // branch runs outside importMutex, so an invalid pendingBuffer is the one thing that
-        // reliably stops it from committing a stale-sized fb mid-modeset.
-        displayedBuffer = DrmFramebuffer{};
-        pendingBuffer = DrmFramebuffer{};
     }
 
     const bool applied = ApplyDisplayMode(wanted, /*blankPlanes=*/true);
@@ -1425,6 +1450,14 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
     ResetPlaneStateCaches();
 
     if (applied) {
+        // Only now that the commit detached them: a released fb is removed (drmModeRmFB), which switches off a
+        // plane still scanning it, so a rejected mode would blank the picture it keeps. Before Action() loops
+        // on: its re-present must not commit an fb sized for the old mode.
+        {
+            const cMutexLock lock(&bufferMutex);
+            displayedBuffer = DrmFramebuffer{};
+            pendingBuffer = DrmFramebuffer{};
+        }
         PublishOutputGeometry(wanted);
         // The commit detached the OSD plane; record that under osdMutex or AwaitOsdHidden() hangs
         // a cVaapiOsd destructor for its full 500 ms timeout on a stale fbId. currentOsd is kept
@@ -1453,7 +1486,13 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
                 static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
         // The decoder may have built its graph for the rejected rate (GetTargetRefreshMilliHz); point it back
         // at the active one and have it rebuild, or a 24p file would run without its fps filter on 50 Hz.
-        targetRefreshMilliHz.store(GetOutputRefreshMilliHz(), std::memory_order_release);
+        // Unless a newer request is already queued: its rate is the one to build for.
+        {
+            const cMutexLock lock(&modeRequestMutex);
+            if (!modeRequestPending.load(std::memory_order_relaxed)) {
+                modeRequestRejected = true;
+            }
+        }
         geometryChanged.store(true, std::memory_order_release);
     }
 
@@ -1718,7 +1757,10 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
     if (ret <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 || (pfd.revents & POLLIN) == 0) {
         return false;
     }
-    return drmHandleEvent(drmFd, &eventContext) == 0;
+    dispatchDisplay = this;
+    const bool handled = drmHandleEvent(drmFd, &eventContext) == 0;
+    dispatchDisplay = nullptr;
+    return handled;
 }
 
 [[nodiscard]] auto cVaapiDisplay::LoadDrmProperties() -> bool {
@@ -1903,9 +1945,10 @@ namespace {
     return x.num == y.num && x.den == y.den;
 }
 
-/// Compare two 2-element AVRational arrays (chromaticity XY, an FFmpeg ABI C-array type).
+/// Compare two chromaticity XY pairs (AVRational[2] in FFmpeg's ABI).
 /// A named helper keeps the paired element compares readable at the call sites.
-[[nodiscard]] auto XyRationalEqual(const AVRational (&a)[2], const AVRational (&b)[2]) noexcept -> bool {
+[[nodiscard]] auto XyRationalEqual(std::span<const AVRational, 2> a, std::span<const AVRational, 2> b) noexcept
+    -> bool {
     return AvRationalEqual(a[0], b[0]) && AvRationalEqual(a[1], b[1]);
 }
 
@@ -2146,20 +2189,20 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
     const auto width = static_cast<uint32_t>(srcFrame->width);
     const auto height = static_cast<uint32_t>(srcFrame->height);
 
-    uint32_t handles[4] = {0};
-    uint32_t pitches[4] = {0};
-    uint32_t offsets[4] = {0};
-    uint64_t modifiers[4] = {0};
+    std::array<uint32_t, 4> handles{};
+    std::array<uint32_t, 4> pitches{};
+    std::array<uint32_t, 4> offsets{};
+    std::array<uint64_t, 4> modifiers{};
 
-    int planeIdx = 0;
-    for (int i = 0; i < desc->nb_layers && planeIdx < 4; ++i) {
+    size_t planeIdx = 0;
+    for (int i = 0; i < desc->nb_layers && planeIdx < handles.size(); ++i) {
         const auto &layer = desc->layers[i];
-        for (int j = 0; j < layer.nb_planes && planeIdx < 4; ++j) {
+        for (int j = 0; j < layer.nb_planes && planeIdx < handles.size(); ++j) {
             const auto &plane = layer.planes[j];
-            handles[planeIdx] = gemHandle;
-            pitches[planeIdx] = static_cast<uint32_t>(plane.pitch);
-            offsets[planeIdx] = static_cast<uint32_t>(plane.offset);
-            modifiers[planeIdx] = desc->objects[plane.object_index].format_modifier;
+            handles.at(planeIdx) = gemHandle;
+            pitches.at(planeIdx) = static_cast<uint32_t>(plane.pitch);
+            offsets.at(planeIdx) = static_cast<uint32_t>(plane.offset);
+            modifiers.at(planeIdx) = desc->objects[plane.object_index].format_modifier;
             planeIdx++;
         }
     }
@@ -2168,7 +2211,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
     // descriptor doesn't actually describe a 4:2:0 two-plane layout and AddFB2 would reject
     // it anyway.
     if (planeIdx != 2) [[unlikely]] {
-        esyslog("vaapivideo/display: unexpected plane count %d (expected 2 for NV12/P010)", planeIdx);
+        esyslog("vaapivideo/display: unexpected plane count %zu (expected 2 for NV12/P010)", planeIdx);
         drm_gem_close closeArgs{.handle = gemHandle, .pad = 0};
         drmIoctl(drmFd, DRM_IOCTL_GEM_CLOSE, &closeArgs);
         av_frame_free(&mappedFrame);
@@ -2176,8 +2219,8 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
     }
 
     uint32_t fbId = 0;
-    if (drmModeAddFB2WithModifiers(drmFd, width, height, format, handles, pitches, offsets, modifiers, &fbId,
-                                   DRM_MODE_FB_MODIFIERS) != 0) {
+    if (drmModeAddFB2WithModifiers(drmFd, width, height, format, handles.data(), pitches.data(), offsets.data(),
+                                   modifiers.data(), &fbId, DRM_MODE_FB_MODIFIERS) != 0) {
         esyslog("vaapivideo/display: drmModeAddFB2WithModifiers failed: %s", std::strerror(errno));
         drm_gem_close closeArgs{.handle = gemHandle, .pad = 0};
         drmIoctl(drmFd, DRM_IOCTL_GEM_CLOSE, &closeArgs);
@@ -2191,7 +2234,7 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
     fb.gemHandle = gemHandle;
     fb.width = width;
     fb.height = height;
-    fb.modifier = modifiers[0];
+    fb.modifier = modifiers.front();
     // Move the AVFrame ownership into the DrmFramebuffer so the VA surface ref outlives
     // the scanout. Dropping it earlier would let the VA driver recycle the surface while
     // the kernel is still reading from the DMA-BUF -> green/garbled frames on the next flip.
@@ -2209,11 +2252,12 @@ constexpr uint8_t HDMI_EOTF_ARIB_STD_B67 = 3;  ///< HLG
 auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] unsigned int seq,
                                     [[maybe_unused]] unsigned int sec, [[maybe_unused]] unsigned int usec, void *data)
     -> void {
-    // Dispatched from drmHandleEvent() on the consumer thread (sole reader while Action()
-    // runs -- file-header DRM fd rule). `data` is the `this` cookie from drmModeAtomicCommit.
-    // Release-store on isFlipPending publishes "flip done" to acquire-loaders.
-    auto *display = static_cast<cVaapiDisplay *>(data);
-    if (display) {
+    // Inside DrainDrmEvents(), on the event reader's thread. A late event of a commit the watchdog gave up on
+    // must not mark the newer frame shown.
+    auto *display = dispatchDisplay;
+    if (display && display->isFlipPending.load(std::memory_order_relaxed) &&
+        std::bit_cast<uintptr_t>(data) == display->flipSerial) {
+        display->pendingBufferShown.store(true, std::memory_order_release);
         display->lastVSyncTimeMs.store(cTimeMs::Now(), std::memory_order_release);
         display->flipPendingSinceMs.store(0, std::memory_order_release);
         display->isFlipPending.store(false, std::memory_order_release);

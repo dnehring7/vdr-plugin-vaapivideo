@@ -18,6 +18,11 @@
 #include "caps.h"
 #include "common.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <span>
+
 // ============================================================================
 // === STREAM DATA MODEL ===
 // ============================================================================
@@ -206,7 +211,7 @@ enum class MediaPacketStream : uint8_t { Video, Audio, Subtitle };
 ///  - Packets are returned in demux order via a single cursor: no per-stream side queues,
 ///    no artificial drops. Splitting reads across two methods is unsafe -- when one stream
 ///    runs ahead of the other, buffered packets on the lagging side can be dropped, causing
-///    audible/visible gaps. Callers route the packet by inspecting the @p stream out-arg.
+///    audible/visible gaps. Callers route the packet by ReadPacket()'s @p stream out-arg.
 ///  - AVPacket::pts is in the 90 kHz VDR domain, already rebased from the source timebase.
 ///  - AVPacket buffers are owned by the packet; consumer calls av_packet_unref.
 ///  - Callers serialize access; implementations need not be thread-safe.

@@ -128,12 +128,19 @@ constexpr uint32_t CONFIG_VIDEO_WIDTH_MAX = 3840U;  ///< 4K UHD ceiling for Pars
 // === PLUGIN CONFIGURATION ===
 // ============================================================================
 
+[[nodiscard]] auto VaapiConfig::ZoomLevelOfStop(int stop) const -> int {
+    if (stop < 1 || stop > CONFIG_ZOOM_PRESET_COUNT) {
+        return 0;
+    }
+    return zoomLevel.at(static_cast<size_t>(stop - 1)).load(std::memory_order_relaxed);
+}
+
 [[nodiscard]] auto VaapiConfig::GetSummary() const -> std::string {
     const MediaBookmark bookmarkSnapshot = LoadBookmark(); // locked: a teardown thread may be writing it
     // Zoom levels are stored in tenths-of-% zoom-in factor; render as a human-readable list.
     std::string zoom;
-    for (int i = 0; i < CONFIG_ZOOM_PRESET_COUNT; ++i) {
-        const int level = zoomLevel[i].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < zoomLevel.size(); ++i) {
+        const int level = zoomLevel.at(i).load(std::memory_order_relaxed);
         if (level <= 0) {
             zoom += std::format("{}{}=off", i == 0 ? "" : " ", i + 1);
         } else {
@@ -367,7 +374,8 @@ auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &targ
     if (strncasecmp(name, "Zoom", 4) == 0 && name[4] != '\0' && name[5] == '\0') {
         const int preset = name[4] - '1';
         if (preset >= 0 && preset < CONFIG_ZOOM_PRESET_COUNT) {
-            ParseBoundedIntValue(name, value, zoomLevel[preset], CONFIG_ZOOM_LEVEL_MIN, CONFIG_ZOOM_LEVEL_MAX);
+            ParseBoundedIntValue(name, value, zoomLevel.at(static_cast<size_t>(preset)), CONFIG_ZOOM_LEVEL_MIN,
+                                 CONFIG_ZOOM_LEVEL_MAX);
             return true;
         }
     }
@@ -381,4 +389,5 @@ auto ParseEnumValue(const char *key, const char *value, std::atomic<EnumT> &targ
 // === GLOBAL INSTANCE ===
 // ============================================================================
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables) -- VDR plugin model, like VDR's Setup
 VaapiConfig vaapiConfig; // process-wide singleton declared extern in config.h

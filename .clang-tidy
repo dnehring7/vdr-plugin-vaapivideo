@@ -8,6 +8,20 @@ SystemHeaders: false
 WarningsAsErrors: '*'
 FormatStyle: file
 
+# Off, and why:
+#   bugprone-easily-swappable-parameters -- adjacent ints (width/height, pts/duration) are the C APIs' own shape.
+#   bugprone-signed-bitwise -- bitstream parsing masks bytes, which promote to int, with int literals;
+#     a cast at every mask would bury the bit layout.
+#   cppcoreguidelines-avoid-magic-numbers, readability-magic-numbers -- spec tables and bit layouts are their
+#     own documentation; naming every field offset would not make them clearer.
+#   cppcoreguidelines-owning-memory -- VDR's API takes ownership of raw new'd objects (menus, OSDs, items).
+#   cppcoreguidelines-pro-bounds-array-to-pointer-decay, -pro-bounds-constant-array-index,
+#   -pro-bounds-pointer-arithmetic -- PES/ES parsing and the FFmpeg/DRM/VA C structs index raw buffers.
+#   cppcoreguidelines-pro-type-vararg -- VDR's syslog macros and cString::sprintf are printf-style.
+#   readability-function-cognitive-complexity -- the state machines (sync, trick, mode policy) read best whole.
+#   readability-identifier-length -- x/y/w/h, fd and loop counters are clearer short.
+#   readability-trailing-comma -- a trailing comma makes clang-format put each element of a braced list
+#     on its own line.
 Checks: >
   -*,
   bugprone-*,
@@ -20,28 +34,27 @@ Checks: >
   portability-*,
   readability-*,
   -bugprone-easily-swappable-parameters,
-  -bugprone-implicit-widening-of-multiplication-result,
-  -cppcoreguidelines-avoid-c-arrays,
+  -bugprone-signed-bitwise,
   -cppcoreguidelines-avoid-magic-numbers,
-  -cppcoreguidelines-avoid-non-const-global-variables,
   -cppcoreguidelines-owning-memory,
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-pro-bounds-constant-array-index,
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
-  -cppcoreguidelines-pro-type-cstyle-cast,
   -cppcoreguidelines-pro-type-vararg,
-  -misc-non-private-member-variables-in-classes,
-  -misc-use-anonymous-namespace,
-  -modernize-avoid-c-arrays,
-  -modernize-use-integer-sign-comparison,
-  -readability-convert-member-functions-to-static,
   -readability-function-cognitive-complexity,
   -readability-identifier-length,
-  -readability-implicit-bool-conversion,
-  -readability-magic-numbers
+  -readability-magic-numbers,
+  -readability-trailing-comma
 
 CheckOptions:
+  # Variables in an anonymous namespace are file-local state, not globals.
+  cppcoreguidelines-avoid-non-const-global-variables.AllowInternalLinkage: true
   # std::span has no .at() before C++26. The option replaces the default list, hence the first three.
   cppcoreguidelines-pro-bounds-avoid-unchecked-container-access.ExcludeClasses: '::std::map;::std::unordered_map;::std::flat_map;::std::span'
+  # Plain structs (all members public) are aggregates, not classes with invariants.
+  misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: true
   # Private glibc/kernel headers behind <getopt.h> and ESTRPIPE: no IWYU mapping to the public header.
   misc-include-cleaner.IgnoreHeaders: 'getopt\.h;bits/getopt_.*\.h;asm-generic/errno\.h'
+  # if (!ptr) and if (count) are idiomatic; value conversions (bool b = ptr) still need an explicit test.
+  readability-implicit-bool-conversion.AllowIntegerConditions: true
+  readability-implicit-bool-conversion.AllowPointerConditions: true

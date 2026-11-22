@@ -1,7 +1,7 @@
 # Coding Rules
 
 README.md = architecture/build; `src/common.h` = RAII deleters + `AvErr()`.
-Build `make DEV_WARNINGS=1` (strict `-Werror`; plain `make` is the lenient packaging build) · lint `make lint` (bear+clang-tidy) · format `make indent`.
+Build `make DEV_WARNINGS=1` (strict `-Werror`; plain `make` is the lenient packaging build) · lint `make lint` (clang-tidy) · format `make indent`.
 
 ## Hard rules
 - Trailing return type everywhere (incl. `-> void`, deleted ops); `[[nodiscard]]` on every value-returning fn.

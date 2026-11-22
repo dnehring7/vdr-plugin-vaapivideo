@@ -33,9 +33,12 @@
 
 #include "common.h"
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <vector>
 
 // ============================================================================
 // === GPU CAPABILITIES ===
@@ -63,8 +66,8 @@ struct GpuCaps {
 
     // === VPP FILTERS ===
     bool vppP010{};                 ///< Driver allocates P010 (YUV420_10) surfaces; HDR passthrough prerequisite
-    bool vppDenoise{};              ///< VAProcFilterNoiseReduction available
-    bool vppSharpness{};            ///< VAProcFilterSharpening available
+    bool vppDenoise{};              ///< VAProcFilterNoiseReduction and FFmpeg's denoise_vaapi available
+    bool vppSharpness{};            ///< VAProcFilterSharpening and FFmpeg's sharpness_vaapi available
     std::string deinterlaceMode;    ///< Best VAProcDeinterlacing mode name for deinterlace_vaapi; "" = none
     unsigned deinterlaceModeMask{}; ///< Bit (1u<<VppDeintMode) set per supported mode; lets ClampDeinterlaceMode pick
                                     ///< only modes the driver actually advertises (a GPU may expose just one)
@@ -176,7 +179,7 @@ auto ParseEdidHdrCaps(std::span<const uint8_t> edid, DisplayCaps &caps) noexcept
 [[nodiscard]] auto ParseEldSinkCaps(std::span<const uint8_t> eld) noexcept -> std::optional<AudioSinkCaps>;
 
 /// Render a CEA-861 speaker-allocation mask (AudioSinkCaps::speakerAlloc) as a human-readable list of the
-/// speaker groups it advertises, e.g. "FL/FR LFE FC RL/RR RC RLC/RRC"; "none" when the mask is zero. Pure;
+/// speaker groups it advertises, such as "FL/FR LFE FC RL/RR RC RLC/RRC"; "none" when the mask is zero. Pure;
 /// used only for the sink-capabilities diagnostic log.
 [[nodiscard]] auto DescribeSpeakerAlloc(uint8_t alloc) noexcept -> std::string;
 

@@ -12,9 +12,18 @@
 #include "filter.h"
 #include "stream.h"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
+#include <queue>
 #include <span>
+#include <vector>
+
+// VA-API
+#include <va/va.h>
 
 // VDR
 #pragma GCC diagnostic push
@@ -70,6 +79,7 @@ struct VaapiFrame {
                                  ///< older than the current clearEpoch, so pre-Clear material self-discards regardless
                                  ///< of the race timing between decode, present, and Clear().
     int64_t pts{AV_NOPTS_VALUE}; ///< Presentation timestamp in 90 kHz units.
+    bool stillPicture{false};    ///< Produced in still mode: shown unsynced even after the drain ends the mode.
     bool synthetic{false};       ///< Painted by the device (black frame, notice, splash), not decoded from the
                                  ///< stream; the display leaves the stream-start trace armed for such a frame
     VASurfaceID vaSurfaceId{VA_INVALID_SURFACE}; ///< Cached from avFrame->data[3]; used for zero-copy DRM PRIME export.
@@ -153,7 +163,7 @@ class cVaapiDecoder : public cThread {
     auto SetAudioProcessor(cAudioProcessor *audio)
         -> void; ///< Attach the A/V sync master clock. Stored as atomic pointer.
     auto SetLoopTickCallback(std::function<void()> callback)
-        -> void; ///< Called once per decode-loop iteration (incl. the ~100 ms idle ticks when no packets arrive),
+        -> void; ///< Called once per decode-loop iteration (including the ~100 ms idle ticks when no packets arrive),
                  ///< giving the device a thread that ticks even when a scrambled channel delivers no PES. Must be
                  ///< set before Initialize() starts the thread.
     auto SetStreamFormatCallback(std::function<void(uint32_t width, uint32_t height, uint32_t rateMilliHz)> callback)
@@ -172,7 +182,8 @@ class cVaapiDecoder : public cThread {
     [[nodiscard]] auto IsCodecDrainPending() const noexcept -> bool {
         return codecDrainPending.load(std::memory_order_acquire) || codecDrainActive.load(std::memory_order_acquire);
     } ///< True from the request until the drained reorder tail has been pushed to the reserve, so an EOS
-      ///< depth poll never reads 0 while the decode thread is still filtering that tail.
+      ///< depth poll never reads 0 while the decode thread is still filtering that tail. Pending is read
+      ///< first: the drain sets active before it clears pending.
     auto SetStillPictureMode(bool mode) -> void; ///< Spatial-only deinterlace for single-frame output; clears on drain.
     auto RequestCodecReopen() -> void;           ///< Force full codec teardown on next OpenCodec() even for same ID.
     auto RequestFilterRebuild()
@@ -247,8 +258,8 @@ class cVaapiDecoder : public cThread {
     auto RetireTrickGraph() -> void; ///< Exit to normal play without a flush: a chain built under trick pacing is the
                                      ///< light one and gives way to the full one; one built in normal play stays.
                                      ///< Caller holds codecMutex.
-    [[nodiscard]] auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
-        -> bool;                         ///< avcodec_send_packet + drain loop. Returns true if any frame was appended.
+    auto DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
+        -> void; ///< avcodec_send_packet + drain loop, appends the frames. Caller holds codecMutex, codecCtx set.
     auto DrainPendingParserAU() -> void; ///< NULL-input flush of av_parser_parse2. Caller holds parserMutex.
     auto RecreateParser() -> void;       ///< Fresh parser, drops a kept head. Caller holds parserMutex.
     [[nodiscard]] auto NewAuPacket(std::span<const uint8_t> au)
@@ -430,15 +441,17 @@ class cVaapiDecoder : public cThread {
     bool mpeg2DisplaySizeTaken{false}; ///< MPEG-2: the context took a sequence_display_extension (parserMutex).
     bool firstAuPending{false};        ///< No AU emitted since the codec open (parserMutex).
     bool parserHeadKept{false};        ///< Clear() kept a cut first picture; the next payload decides (parserMutex).
-    size_t resyncDropsLeft{0};         ///< > 0: MPEG-1/2 pictures still droppable before an I (parserMutex).
+    size_t resyncDropsLeft{0};         ///< MPEG-1/2 pictures that may still be dropped before an I (parserMutex).
     bool trickAwaitSecondField{false}; ///< FF keyframe filter: keep the PAFF I-frame's 2nd field (parserMutex).
 
     // ========================================================================
     // === PACKET QUEUE ===
     // ========================================================================
     std::queue<AVPacket *> packetQueue; ///< FIFO of parsed packets awaiting HW decode. Owned by packetMutex.
-    cTimeMs lastTrickDropWarn;          ///< Rate-limits the trick-enqueue drop log. Held under packetMutex.
-    size_t trickDropsSinceWarn{0};      ///< Drops accumulated since the last emitted trick-drop log line.
+    std::atomic<uint64_t> packetQueueGeneration{0}; ///< Bumped by DrainQueue(): a packet claimed under an older value
+                                                    ///< predates the flush. Atomic: checked under codecMutex.
+    cTimeMs lastTrickDropWarn;                      ///< Rate-limits the trick-enqueue drop log. Held under packetMutex.
+    size_t trickDropsSinceWarn{0};                  ///< Drops accumulated since the last emitted trick-drop log line.
     std::atomic<bool> stopping{false}; ///< Shutdown signal. Set by Shutdown(); read by encode thread and enqueue paths.
 
     // ========================================================================
@@ -586,8 +599,9 @@ class cVaapiDecoder : public cThread {
     int suppressedCatchUpDrops{};    ///< Cumulative dropped-frame count of those cycles.
     uint64_t suppressedCatchUpWallMs{}; ///< Cumulative wall time spent inside those cycles.
     uint64_t nextCatchUpSummaryMs{};    ///< cTimeMs::Now() at which the next periodic-during-run summary should fire.
-    cTimeMs staleJitterLogGate;         ///< Rate-limits the "stale-jitter bulk" drop log (present thread); a rapid-seek
-                                ///< burst fires it per seek and would otherwise flood/block the drain on syslog.
+    /// Rate-limits the "stale-jitter bulk" drop log (present thread); a rapid-seek burst fires it per seek
+    /// and would otherwise flood/block the drain on syslog.
+    cTimeMs staleJitterLogGate;
     int staleJitterDropsSinceLog{}; ///< Stale-jitter frames dropped while the gate suppressed the log.
 
     // ========================================================================

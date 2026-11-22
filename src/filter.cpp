@@ -611,8 +611,9 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     if (insertFpsFilter) {
         // Nearest-neighbor sample/duplicate to the display rate. Drops for source>display, dupes
         // for source<display (exact 2x for 25->50/24->48, or uneven cadence for inexact ratios).
-        // No pixel work on the duplicated frame.
-        filters.push_back(std::format("fps={}", displayFps));
+        // No pixel work on the duplicated frame. The exact display rate (fps evaluates the fraction), not the
+        // rounded one: fps=60 on a 59.94 Hz mode produces a frame too many every ~17 s.
+        filters.push_back(std::format("fps={}/1000", displayMilliHz));
     }
 
     std::string filterChain;

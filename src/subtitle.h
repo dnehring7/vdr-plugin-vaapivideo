@@ -30,6 +30,7 @@
 // C++ Standard Library
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -143,14 +144,16 @@ class cSubtitleConverter final : public cThread {
     cVaapiDevice *device_; ///< borrowed (player outlives us): clock + OSD-size source
     std::unique_ptr<AVCodecContext, FreeAVCodecContext> codecCtx_; ///< decoder; demux-thread only, hence unlocked
     cOsd *osd_{};                                                  ///< live OSD; Action-thread only, hence unlocked
-    /// Geometry of the live OSD: a same-shape successor cue reuses it (clear + redraw) instead of
+    ///@{
+    /// Geometry of the live OSD (px): a same-shape successor cue reuses it (clear + redraw) instead of
     /// realloc'ing the dumb buffer + KMS framebuffer. Action-thread only, valid only while osd_ != nullptr.
     /// osdLeft_ is 0 for text bands (full-width, centered text); bitmap cues place the OSD at the scaled
     /// region bounding box, so reuse must match the left edge too.
-    int osdLeft_{};             ///< Left edge of the live OSD (px)
-    int osdTop_{};              ///< Top edge of the live OSD (px)
-    int osdAreaWidth_{};        ///< Width of the live OSD (px)
-    int osdAreaHeight_{};       ///< Height of the live OSD (px)
+    int osdLeft_{};
+    int osdTop_{};
+    int osdAreaWidth_{};
+    int osdAreaHeight_{};
+    ///@}
     uint64_t shownCueSerial_{}; ///< Cue::serial on screen now (0 = nothing); dedups redraws. Action-thread only.
     uint64_t nextCueSerial_{1}; ///< next serial to hand out; demux-thread only. 0 is reserved for "nothing shown".
 
@@ -199,12 +202,19 @@ class cVaapiSpuDecoder final : public cDvbSpuDecoder {
   private:
     using Clut = std::array<uint32_t, SUBTITLE_SPU_CLUT_ENTRIES>; ///< A DVD colour lookup table (YCrCb entries)
 
+    /// Deleter for an SPU buffer: the player allocates it with new[], cDvbSpuDecoder frees it with delete[].
+    struct FreeSpuBuffer {
+        /// Release a subpicture buffer allocated by the DVD player.
+        auto operator()(const uint8_t *buf) const noexcept -> void { delete[] buf; }
+    };
+    using SpuBuffer = std::unique_ptr<uint8_t, FreeSpuBuffer>; ///< Owns one DVD subpicture buffer.
+
     /// A subpicture read ahead of the screen, held until its display time.
     struct PendingSpu {
-        uint32_t pts{0};                 ///< Display time of the subpicture
-        std::unique_ptr<uint8_t[]> data; ///< Complete SPU as the player assembled it
-        bool allowedShow{true};          ///< Passed through to the base decoder
-        std::optional<Clut> clut;        ///< CLUT at read time; none before the player set one
+        uint32_t pts{0};          ///< Display time of the subpicture
+        SpuBuffer data;           ///< Complete SPU as the player assembled it
+        bool allowedShow{true};   ///< Passed through to the base decoder
+        std::optional<Clut> clut; ///< CLUT at read time; none before the player set one
     };
 
     [[nodiscard]] auto ScreenTime() -> std::optional<uint32_t>; ///< How far commands may run; none = not yet

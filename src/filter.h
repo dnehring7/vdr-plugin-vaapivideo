@@ -18,9 +18,12 @@
 
 #include "common.h"
 #include "config.h"
-#include "stream.h"
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <string_view>
 
 // VDR
 #pragma GCC diagnostic push

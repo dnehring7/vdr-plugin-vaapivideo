@@ -57,9 +57,11 @@ source:
 - **PES** (live TV / dvbplayer replay) is already in that domain.
 - **Mediaplayer** (libavformat) rebases each packet in `Rebase90k`: rescale the
   container timestamp to 90 kHz, then subtract `ptsOrigin90k`. `ptsOrigin90k` is
-  `max(start_time)` across the tracked streams (`PopulateStreamInfo`), so the
-  *trailing* stream defines t=0 and any leading pre-sync packets (rebased PTS < 0)
-  are dropped in `ReadPacket` — both streams begin at rebased PTS 0 together.
+  `max(start_time)` of the video and the chosen audio track (`PopulateStreamInfo`
+  picks the preferred-language track first), so the *trailing* stream defines t=0
+  and both begin at rebased PTS 0 together. `ReadPacket` drops leading pre-sync
+  audio (rebased PTS < 0) and flags leading video `AV_PKT_FLAG_DISCARD`: it holds
+  the references of the first visible pictures.
   Subtitle packets never seed `ptsOrigin90k`, so a stray early cue can't shift the
   A/V timeline. A seek additionally arms `discardAudioBefore90k` so audio anchors at the requested
   position, not at the earlier keyframe libavformat lands on; every re-anchor likewise arms
@@ -461,7 +463,7 @@ front-purge: drop jitterBuf heads with producedEpoch < presentEpoch
 runaway guard: if jitterBuf > RESERVE_CAPACITY, drop oldest down to cap
 SkipStaleJitterFrames(): bulk-drop heads more than HARD_THRESHOLD behind clock (not paused, not in trick)
 loop:
-  if devicePaused:                              break                     // Freeze: hold, clock pinned
+  if devicePaused and not head.stillPicture:    break                     // Freeze: hold, clock pinned
   if trick || freerun || pendingDrops || !ap:   SyncAndSubmitFrame(head)  // due-gate bypassed
   if stillPicture:                              SyncAndSubmitFrame(head)  // submitted unsynced anyway
   clock = GetClock()
@@ -495,13 +497,15 @@ Guards against startup / re-anchor / pause stalls:
   `jitterBuf` rather than freerunning pre-anchor video at VSync rate — which would
   land the head far ahead the moment audio anchors. A near-cap escape submits
   anyway if `jitterBuf` approaches `RESERVE_CAPACITY`, so a fast HW decoder can't
-  overflow waiting for an anchor that never comes (video-only stream). This covers
+  overflow waiting for an anchor that never comes (audio that fails to start). This covers
   the mux-interleave seek offset — a TS seek can land on a keyframe up to ~1 s
   ahead of the target audio. Not before the first audio packet since the
   `Clear()` is queued: a stream without audio (a DVD's silent clip) has no clock
-  to wait for, and the hold froze its first picture for 1.5 s. A still picture
-  (`StillPicture()`) is never held: `SyncAndSubmitFrame()` submits it unsynced
-  anyway.
+  to wait for, and the hold froze its first picture for 1.5 s. The hold is timed
+  from that packet, so a silent lead-in does not use it up. A still picture
+  (`StillPicture()`) is never held, not even by a pause: `SyncAndSubmitFrame()`
+  submits it unsynced anyway. The mark rides on each frame, as the decoder leaves
+  still mode right after the drain that brings the picture out.
 
 - **`RESERVE_CAPACITY` (`DECODER_RESERVE_CAPACITY = 64`, ~1.3 s @ 50 fps).**
   Drop-oldest runaway guard for the case the gates above miss

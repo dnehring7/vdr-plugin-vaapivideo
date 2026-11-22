@@ -33,12 +33,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// FFmpeg (codec id enumeration used by AudioSinkCaps::Supports)
+// FFmpeg (codec ids for AudioSinkCaps::Supports, filter lookup for the VPP probe)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 extern "C" {
 #include <libavcodec/codec_id.h>
+#include <libavfilter/avfilter.h>
 }
 #pragma GCC diagnostic pop
 
@@ -344,11 +345,13 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
     // Driver bug guard: same overflow risk as numProfiles / epCount above.
     const std::span<const VAProcFilterType> validFilters{filters.data(),
                                                          std::min(static_cast<size_t>(numFilters), filters.size())};
+    // Driver support alone is not enough: a reduced FFmpeg build may lack the filter node, and a graph
+    // naming it would fail to build.
     for (const auto filter : validFilters) {
         if (filter == VAProcFilterNoiseReduction) {
-            caps.vppDenoise = true;
+            caps.vppDenoise = avfilter_get_by_name("denoise_vaapi") != nullptr;
         } else if (filter == VAProcFilterSharpening) {
-            caps.vppSharpness = true;
+            caps.vppSharpness = avfilter_get_by_name("sharpness_vaapi") != nullptr;
         }
     }
 
@@ -361,15 +364,16 @@ auto ProbeGpuCaps(std::string_view renderNode) noexcept -> std::optional<GpuCaps
         VA_STATUS_SUCCESS) {
         // Mode names come from config.h's VppDeintModeArg() so the probe, ClampDeinterlaceMode
         // (filter.cpp), and the diagnostic log all share one source of truth for the quality order.
-        static constexpr struct {
+        struct DeintModeRow {
             VAProcDeinterlacingType type;
             VppDeintMode mode;
-        } kDeintModes[] = {
+        };
+        static constexpr auto kDeintModes = std::to_array<DeintModeRow>({
             {.type = VAProcDeinterlacingMotionCompensated, .mode = VppDeintMode::MotionCompensated},
             {.type = VAProcDeinterlacingMotionAdaptive, .mode = VppDeintMode::MotionAdaptive},
             {.type = VAProcDeinterlacingWeave, .mode = VppDeintMode::Weave},
             {.type = VAProcDeinterlacingBob, .mode = VppDeintMode::Bob},
-        };
+        });
 
         // Driver bug guard: same overflow risk as numFilters / numProfiles.
         const std::span<const VAProcFilterCapDeinterlacing> validDeintCaps{

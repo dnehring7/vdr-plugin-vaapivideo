@@ -164,9 +164,11 @@ auto cAudioProcessor::Clear() -> void {
     alsaErrorCount.store(0, std::memory_order_relaxed);
     ResetPlaybackClock();
     clearGeneration.fetch_add(1, std::memory_order_release);
-    DrainPacketQueue();
     {
+        // Emptied and flagged in ONE critical section: EnqueuePacket() takes only queueMutex, and a packet it
+        // queued in between would stay queued with queuedSinceClear reset (the decoder's no-clock hold gate).
         const cMutexLock queueLock(queueMutex.get());
+        DrainPacketQueueLocked();
         drainRequested = false; // a Clear() cancels an EOS drain (cDevice::Drain() contract); DropOutput() keeps it
         queuedSinceClear.store(false, std::memory_order_relaxed);
         // Ends a pause too: a stop while paused (SetPlayMode() without Play()) must not leave the worker parked.
@@ -720,8 +722,13 @@ auto cAudioProcessor::CloseDevice() -> void {
 
 auto cAudioProcessor::DrainPacketQueue() -> void {
     // Takes queueMutex (the packet-queue lock). Callers already hold `mutex`; lock order is
-    // mutex -> queueMutex. FreeAVPacket deleter runs on each packet as the unique_ptr leaves scope.
+    // mutex -> queueMutex.
     const cMutexLock lock(queueMutex.get());
+    DrainPacketQueueLocked();
+}
+
+auto cAudioProcessor::DrainPacketQueueLocked() -> void {
+    // Caller holds queueMutex. FreeAVPacket deleter runs on each packet as the unique_ptr leaves scope.
     while (!packetQueue.empty()) {
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
         packetQueue.pop();
@@ -841,7 +848,7 @@ auto cAudioProcessor::ResumeOutput() -> void {
     if (!clockPaused.load(std::memory_order_relaxed)) {
         return;
     }
-    const bool dacRunning = alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING;
+    const bool dacRunning = alsaHandle != nullptr && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING;
     clockSequence.fetch_add(1, std::memory_order_acq_rel);
     if (!dacRunning && !eosTail) {
         playbackPts.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
@@ -1093,7 +1100,7 @@ auto cAudioProcessor::Action() -> void {
             const int64_t prevNextPts = pcmNextPts.load(std::memory_order_relaxed);
             if (prevNextPts != AV_NOPTS_VALUE) {
                 const int64_t diff = (pts > prevNextPts) ? (pts - prevNextPts) : (prevNextPts - pts);
-                if (diff > (5 * PTSTICKS)) {
+                if (diff > (int64_t{5} * PTSTICKS)) {
                     // >5 s PTS jump (channel switch, seek, wrap): flush ALSA so
                     // WritePcmToAlsa() publishes a clean playbackPts on the new timeline.
                     if (alsaHandle) {
@@ -1202,7 +1209,7 @@ auto cAudioProcessor::FlushDecoderState() -> void {
     decoderGracePackets = AUDIO_DECODER_GRACE_PACKETS;
 }
 
-[[nodiscard]] auto cAudioProcessor::ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough) const
+[[nodiscard]] auto cAudioProcessor::ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough)
     -> unsigned {
     if (!passthrough) {
         return streamRate;
@@ -1331,7 +1338,7 @@ auto cAudioProcessor::QueryDeviceChannelOrder(snd_pcm_t *handle, unsigned channe
             return; // a slot we can't place: don't risk a wrong permutation, keep swr default order
         }
         packed |= static_cast<uint64_t>(src & 0xF) << (4U * (slot + 1U));
-        identity = identity && (src == static_cast<int>(slot));
+        identity = identity && std::cmp_equal(src, slot);
     }
     av_channel_layout_uninit(&swrOrder);
 
@@ -1662,7 +1669,7 @@ auto cAudioProcessor::ReconfigurePcmOutput() -> void {
         const unsigned deviceRate = alsaSampleRate.load(std::memory_order_relaxed);
         const int outRate = deviceRate > 0 ? static_cast<int>(deviceRate) : frame->sample_rate;
 
-        if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels || static_cast<int>(outCh) != swrOutChannels ||
+        if (swrCtx && (frameFmt != swrFormat || frameCh != swrChannels || std::cmp_not_equal(outCh, swrOutChannels) ||
                        frame->sample_rate != swrInRate || outRate != swrOutRate)) {
             ResetResampler();
         }
@@ -2512,7 +2519,7 @@ auto cAudioProcessor::ProbeSinkCaps() -> void {
     // No clock before the DAC runs: in PREPARED snd_pcm_delay() only counts queued frames, so GetClock()
     // would extrapolate through audio nobody hears and snap back on every write. NOPTS keeps the decoder
     // in its no-clock hold, so the picture starts with the sound after a switch, seek or resume.
-    const bool dacRunning = alsaHandle && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING;
+    const bool dacRunning = alsaHandle != nullptr && snd_pcm_state(alsaHandle) == SND_PCM_STATE_RUNNING;
 
     // Single-writer seqlock: mutex already excludes ResetPlaybackClock(). GetClock()
     // retries past the odd sequence so no concurrent reader sees a torn pair.

@@ -52,18 +52,18 @@ not implement the Video Processing Pipeline (VPP) that this plugin requires.
 
 ### Pre-built packages
 
-Signed Fedora 44, Debian 13, and Ubuntu 26.04 LTS package repositories are
+Signed Fedora 45, Debian 13, and Ubuntu 26.04 LTS package repositories are
 published on every
 [GitHub release](https://github.com/dnehring7/vdr-plugin-vaapivideo/releases)
 and served via GitHub Pages. All configs reference the signing key at
 <https://github.com/dnehring7.gpg>.
 
 <details>
-<summary>Fedora 44 (x86_64)</summary>
+<summary>Fedora 45 (x86_64)</summary>
 
 ```sh
 sudo dnf config-manager addrepo \
-  --from-repofile=https://dnehring7.github.io/vdr-plugin-vaapivideo/fedora/44/vdr-vaapivideo.repo
+  --from-repofile=https://dnehring7.github.io/vdr-plugin-vaapivideo/fedora/45/vdr-vaapivideo.repo
 sudo dnf install vdr-vaapivideo
 ```
 
@@ -207,18 +207,24 @@ Look for the VPP entry point in the output:
 If this line is missing, the plugin will not start — verify the driver
 (step 4) and the render-node permissions (step 3).
 
-For deeper diagnostics, a standalone probe tool reports decode profiles, VPP
-filters, surface formats, HDR tone mapping (including the HLG → HDR10 H2H
-path), variable refresh rate support (kernel `vrr_capable` / `VRR_ENABLED`
-plus the sink's advertised VRR ranges: HDMI 2.1 game-VRR, AMD FreeSync, and
-VESA range limits), and the sink's EDID HDR capabilities.
+For deeper diagnostics, a standalone probe tool reports decode profiles (with
+the driver's maximum picture size), VPP filters, surface formats, a real
+64×64 P010 → NV12 conversion (allocating both surfaces does not prove the
+10-bit → 8-bit path), HDR tone mapping (including the HLG → HDR10 H2H path),
+variable refresh rate support (kernel `vrr_capable` / `VRR_ENABLED` plus the
+sink's advertised VRR ranges: HDMI 2.1 game-VRR, AMD FreeSync, and VESA range
+limits), the sink's EDID HDR capabilities, and per DRM plane its video/OSD
+formats and the CRTCs it can scan out on.
 It is built on demand:
 
     make probe
-    ./vaapivideo-probe [/dev/dri/cardN]     # default: /dev/dri/card0
+    ./vaapivideo-probe                       # the card the plugin picks without -d
+    ./vaapivideo-probe /dev/dri/card1        # a specific GPU
+    ./vaapivideo-probe /dev/dri/renderD128   # VAAPI only
 
 Any line showing **no** indicates a missing driver or sink capability; compare
-against the plugin log (`vdr -l 3`).
+against the plugin log (`vdr -l 3`). A redirected report is plain text, as is
+one with `NO_COLOR` set.
 
 ### 6. Configure the ALSA audio device
 
@@ -925,7 +931,7 @@ Each `src/*.cpp` has a header of the same name holding its interface.
 | `make clean`          | Remove build artifacts                                                 |
 | `make dist`           | Create source tarball                                                  |
 | `make indent`         | Format sources with clang-format                                       |
-| `make lint`           | Static analysis with clang-tidy (requires bear)                        |
+| `make lint`           | Static analysis with clang-tidy                                        |
 | `make docs`           | Doxygen HTML; fails on any undocumented entity, the probe included     |
 | `make probe`          | Build the `vaapivideo-probe` diagnostic tool                           |
 

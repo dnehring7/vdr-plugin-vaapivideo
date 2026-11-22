@@ -156,7 +156,7 @@ constexpr int DECODER_SYNC_LOG_HEARTBEAT_MS =
     30000; ///< Max silence between sync lines: a stable stream still proves liveness every 30 s,
            ///< matching the systemd watchdog ping cadence so the two liveness signals interleave.
 constexpr int64_t DECODER_SYNC_LOG_AVG_STEP_90K =
-    PTS_TICKS_PER_MS; ///< avg drift (vs. the last emitted line) that justifies a new line: 1 ms. Sub-millisecond
+    PTS_TICKS_PER_MS; ///< avg drift (against the last emitted line) that justifies a new line: 1 ms. Sub-millisecond
                       ///< wobble around a converged EMA carries no information and only buries real events.
 constexpr int DECODER_SYNC_FREERUN_FRAMES = 1; ///< Unpaced frames after Clear() / track switch / trick-exit.
 constexpr int64_t DECODER_SYNC_HARD_THRESHOLD_90K =
@@ -323,7 +323,8 @@ struct Mpeg2SequenceHeaders {
 VaapiFrame::VaapiFrame(VaapiFrame &&other) noexcept
     : avFrame(std::exchange(other.avFrame, nullptr)), graphToken(std::move(other.graphToken)),
       ownsFrame(std::exchange(other.ownsFrame, false)), producedEpoch(std::exchange(other.producedEpoch, 0)),
-      pts(std::exchange(other.pts, AV_NOPTS_VALUE)), synthetic(std::exchange(other.synthetic, false)),
+      pts(std::exchange(other.pts, AV_NOPTS_VALUE)), stillPicture(std::exchange(other.stillPicture, false)),
+      synthetic(std::exchange(other.synthetic, false)),
       vaSurfaceId(std::exchange(other.vaSurfaceId, VA_INVALID_SURFACE)) {}
 
 VaapiFrame::~VaapiFrame() noexcept {
@@ -344,6 +345,7 @@ auto VaapiFrame::operator=(VaapiFrame &&other) noexcept -> VaapiFrame & {
         ownsFrame = std::exchange(other.ownsFrame, false);
         producedEpoch = std::exchange(other.producedEpoch, 0);
         pts = std::exchange(other.pts, AV_NOPTS_VALUE);
+        stillPicture = std::exchange(other.stillPicture, false);
         synthetic = std::exchange(other.synthetic, false);
         vaSurfaceId = std::exchange(other.vaSurfaceId, VA_INVALID_SURFACE);
     }
@@ -475,6 +477,7 @@ auto cVaapiDecoder::WakePresenter() noexcept -> void {
 
 auto cVaapiDecoder::DrainQueue() -> void {
     const cMutexLock lock(&packetMutex);
+    packetQueueGeneration.fetch_add(1, std::memory_order_relaxed);
     while (!packetQueue.empty()) {
         const std::unique_ptr<AVPacket, FreeAVPacket> dropped{packetQueue.front()};
         packetQueue.pop();
@@ -1162,7 +1165,7 @@ namespace {
     // Table-driven (STREAM_VIDEO_BACKEND_TABLE in stream.h): returns the GpuCaps member pointer for this
     // codec/profile/depth, or nullptr for SW-only. Adding a codec = one row in stream.h + one probe in caps.cpp.
     bool useHwDecode = false;
-    if (auto capFlag = SelectVideoBackendCap(info); capFlag != nullptr) {
+    if (const auto capFlag = SelectVideoBackendCap(info); capFlag != nullptr) {
         useHwDecode = vaapiContext->caps.*capFlag;
     }
 
@@ -1695,6 +1698,7 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         std::unique_ptr<AVPacket, FreeAVPacket> queuedPacket;
+        uint64_t packetGeneration = 0;
 
         // Wake-driven: every enqueue and RequestCodecDrain Broadcasts packetCondition under
         // packetMutex, and this empty-check runs under the same lock, so no arrival is missed.
@@ -1714,6 +1718,7 @@ auto cVaapiDecoder::Action() -> void {
             }
 
             if (!packetQueue.empty()) {
+                packetGeneration = packetQueueGeneration.load(std::memory_order_relaxed);
                 queuedPacket.reset(packetQueue.front());
                 packetQueue.pop();
             }
@@ -1729,10 +1734,15 @@ auto cVaapiDecoder::Action() -> void {
         // can't stamp these frames stale-then-current.
         if (queuedPacket && !stopping.load(std::memory_order_acquire)) {
             const cMutexLock decodeLock(&codecMutex);
+            // Flushed since the pop: the old packet would decode into the fresh codec under the new epoch.
+            if (packetGeneration != packetQueueGeneration.load(std::memory_order_relaxed)) {
+                trickEmptyDecodes = 0;
+                continue;
+            }
             if (codecCtx) {
                 const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
                 const size_t firstProducedIndex = pendingFrames.size();
-                (void)DecodeOnePacket(queuedPacket.get(), pendingFrames);
+                DecodeOnePacket(queuedPacket.get(), pendingFrames);
                 stampProducedEpoch(pendingFrames, firstProducedIndex, producedEpoch);
             }
         }
@@ -1755,6 +1765,10 @@ auto cVaapiDecoder::Action() -> void {
         }
         if (queuedPacket && reverseTrick && pendingFrames.empty() && trickEmptyDecodes >= 2) {
             const cMutexLock decodeLock(&codecMutex);
+            if (packetGeneration != packetQueueGeneration.load(std::memory_order_relaxed)) {
+                trickEmptyDecodes = 0; // flushed meanwhile: nothing of this step is left to drain
+                continue;
+            }
             if (codecCtx) {
                 const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
                 const size_t firstProducedIndex = pendingFrames.size();
@@ -1770,37 +1784,32 @@ auto cVaapiDecoder::Action() -> void {
         }
 
         // --- Still-picture codec drain ---
-        // Drain only when the queue is empty. A PAFF field pair is two packets (one decoded per
-        // iteration); draining mid-pair sends EOS holding just the top field, which is discarded ->
-        // frozen 1080i still. RequestCodecDrain() is published after FlushParser() queues any
-        // trailing field, so sample the flag first and only then snapshot the queue state.
-        const bool drainPending = codecDrainPending.load(std::memory_order_acquire);
-        bool packetQueueEmpty = false;
-        if (drainPending) {
-            const cMutexLock lock(&packetMutex);
-            packetQueueEmpty = packetQueue.empty();
-        }
-        if (drainPending && packetQueueEmpty) {
-            // Active until the handoff push below: an EOS depth poll must not read 0 while the reorder
-            // tail is still on its way to the reserve.
-            codecDrainActive.store(true, std::memory_order_release);
-            drainedCodecAtEof = codecDrainPending.exchange(false, std::memory_order_acq_rel);
-            if (!drainedCodecAtEof) {
-                codecDrainActive.store(false, std::memory_order_release); // a Clear() cancelled it meanwhile
-            }
-        }
-        if (drainedCodecAtEof) {
+        // Only with the queue empty: EOS between a PAFF pair's packets keeps the top field alone, which is
+        // discarded -> frozen 1080i still. Claimed under codecMutex (a Clear() between claim and drain would
+        // flush the next stream and drop its still flag) and packetMutex (empty check and claim in one step).
+        if (codecDrainPending.load(std::memory_order_acquire)) {
             const cMutexLock decodeLock(&codecMutex);
-            const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
-            const size_t firstProducedIndex = pendingFrames.size();
-            DrainCodecAtEos(pendingFrames);
-            FlushFilterChain(pendingFrames, /*compactRebuild=*/false);
+            {
+                const cMutexLock queueLock(&packetMutex);
+                if (packetQueue.empty() && codecDrainPending.load(std::memory_order_acquire)) {
+                    // Active first: IsCodecDrainPending() must not read both clear while the tail is in flight.
+                    codecDrainActive.store(true, std::memory_order_release);
+                    codecDrainPending.store(false, std::memory_order_release);
+                    drainedCodecAtEof = true;
+                }
+            }
+            if (drainedCodecAtEof) {
+                const uint64_t producedEpoch = clearEpoch.load(std::memory_order_acquire);
+                const size_t firstProducedIndex = pendingFrames.size();
+                DrainCodecAtEos(pendingFrames);
+                FlushFilterChain(pendingFrames, /*compactRebuild=*/false);
 
-            // Exit still mode: next packet rebuilds the graph with full temporal filters.
-            stillPictureMode.store(false, std::memory_order_release);
-            stampProducedEpoch(pendingFrames, firstProducedIndex, producedEpoch);
-            tsyslog("vaapivideo/decoder: codec drain -- %zu frame(s) flushed from the reorder buffer and the chain",
-                    pendingFrames.size() - firstProducedIndex);
+                // Exit still mode: next packet rebuilds the graph with full temporal filters.
+                stillPictureMode.store(false, std::memory_order_release);
+                stampProducedEpoch(pendingFrames, firstProducedIndex, producedEpoch);
+                tsyslog("vaapivideo/decoder: codec drain -- %zu frame(s) flushed from the reorder buffer and the chain",
+                        pendingFrames.size() - firstProducedIndex);
+            }
         }
 
         // --- Hand off to the presentation thread ---
@@ -1976,23 +1985,26 @@ auto cVaapiDecoder::PresentAction() -> void {
             // Presentation hold (Freeze): the head must not drift against the stopped clock -- a clock-less
             // pause would no-clock-freerun at vsync rate and resume hundreds of ms ahead of audio (a
             // drain-stall loop). Trick play included: VDR pauses slow motion with a bare Freeze(). Reset the
-            // stall/miss trackers so the pause does not read as a stall or miss spike on resume.
-            if (devicePaused.load(std::memory_order_acquire)) [[unlikely]] {
+            // stall/miss trackers so the pause does not read as a stall or miss spike on resume. A still
+            // picture is exempt: the player sent it to be shown.
+            const bool stillPicture = jitterBuf.front()->stillPicture;
+            if (devicePaused.load(std::memory_order_acquire) && !stillPicture) [[unlikely]] {
                 noClockBlockedSinceMs = 0;
                 lastDrainMs = 0;
                 break;
             }
             const bool consumingDrop = pendingDrops > 0;
             const bool canFreerun = freerunFrames.load(std::memory_order_relaxed) > 0;
+
             // A still picture (a DVD menu's VOBU, often a whole GOP) is submitted unsynced anyway; holding
             // it only delayed its drain.
-            const bool stillPicture = stillPictureMode.load(std::memory_order_relaxed);
-
             if (!inTrick && !consumingDrop && !canFreerun && !stillPicture && ap) {
                 // With a valid clock, hold until the head PTS is due. A missing clock (track switch,
                 // ALSA reset, video-only stream) falls through to SyncAndSubmitFrame()'s no-clock freerun.
                 const int64_t clock = ap->GetClock();
-                if (clock == AV_NOPTS_VALUE) {
+                // Only once audio is queued: none may come (a DVD's silent clip), and a muxed stream's follows
+                // its first picture within tens of ms. Timed from then, or a silent lead-in uses up the hold.
+                if (clock == AV_NOPTS_VALUE && ap->HasQueuedSinceClear()) {
                     // Post-Clear/seek window, audio anchor incoming: hold so freerun does not submit
                     // pre-anchor video at VSync rate and leave the head far ahead of the clock once audio
                     // anchors. After DECODER_NO_CLOCK_HOLD_MS -- or once jitterBuf nears the cap, which a
@@ -2005,16 +2017,13 @@ auto cVaapiDecoder::PresentAction() -> void {
                     }
                     // As full as the decode thread fills it: it stops a whole batch short of the cap.
                     const bool nearCap = jitterBuf.size() + DECODER_OUTPUT_BATCH_MAX > DECODER_RESERVE_CAPACITY;
-                    // Not before the first audio packet is queued: none may come (a DVD's silent clip), and a
-                    // muxed stream's follows its first picture within tens of ms.
-                    if (ap->HasQueuedSinceClear() && !nearCap &&
-                        nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
+                    if (!nearCap && nowMs - noClockBlockedSinceMs < DECODER_NO_CLOCK_HOLD_MS) {
                         break;
                     }
                 } else {
                     noClockBlockedSinceMs = 0;
                     const int64_t headPts = jitterBuf.front()->pts;
-                    if (headPts != AV_NOPTS_VALUE) {
+                    if (clock != AV_NOPTS_VALUE && headPts != AV_NOPTS_VALUE) {
                         const int64_t dueIn = headPts - clock - SyncLatency90k(ap);
                         // Release the head once it is within the wake threshold: strict-due, or half a
                         // frame early to pre-fill an empty display queue (keeps depth at 1 and absorbs
@@ -2183,6 +2192,8 @@ auto cVaapiDecoder::PresentAction() -> void {
     // Never dereference it; surface lifetime is governed by the AVFrame refcount.
     vaapiFrame->vaSurfaceId = static_cast<VASurfaceID>(std::bit_cast<uintptr_t>(vaapiFrame->avFrame->data[3]));
     vaapiFrame->pts = src->pts;
+    // Per frame: Action() leaves still mode right after the drain, before the presenter has shown its output.
+    vaapiFrame->stillPicture = stillPictureMode.load(std::memory_order_acquire);
 
     return vaapiFrame;
 }
@@ -2219,11 +2230,11 @@ auto StampFilterOutputs(std::vector<std::unique_ptr<VaapiFrame>> &outFrames, siz
 }
 
 /// The chain's EOF flush extrapolates the last field's stamp: deinterlace_vaapi keeps prev_pts in an int
-/// (truncates past 2^31, i.e. 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
+/// (truncating past 2^31 ticks, 6.6 h), yadif skips the NOPTS check. A garbage stamp makes the presenter
 /// drop the last picture as stale. Only the flush outputs are repaired: no real jump can occur inside one.
 auto RepairEosFlushPts(std::vector<std::unique_ptr<VaapiFrame>> &frames, size_t firstFlushIndex, int64_t refPts,
                        int64_t frameDur90k) noexcept -> void {
-    constexpr int64_t kMaxStep90k = 10 * 1000 * PTS_TICKS_PER_MS; // 10 s
+    constexpr int64_t kMaxStep90k = int64_t{10} * 1000 * PTS_TICKS_PER_MS; // 10 s
     if (refPts == AV_NOPTS_VALUE) {
         return;
     }
@@ -2309,9 +2320,14 @@ auto cVaapiDecoder::FilterAndAppendDecodedFrame(std::vector<std::unique_ptr<Vaap
             (void)InitFilterGraph(decodedFrame.get(), compactLog);
         }
 
-        if (filterChain.IsBuilt() && filterChain.SendFrame(decodedFrame.get()) >= 0) {
-            ReceiveFilteredFrames(outFrames);
-        } else if (!filterChain.IsBuilt()) {
+        if (filterChain.IsBuilt()) {
+            // A graph that rejected a frame rejects the rest of the tail too: retire it, the next one rebuilds.
+            if (filterChain.SendFrame(decodedFrame.get()) >= 0) {
+                ReceiveFilteredFrames(outFrames);
+            } else {
+                RetireFilterGraph(/*compactRebuild=*/true);
+            }
+        } else {
             // Filter graph failed to build (rare: GPU OOM, driver bug); pass raw frame through unscaled.
             if (auto vaapiFrame = CreateVaapiFrame(decodedFrame.get())) {
                 outFrames.push_back(std::move(vaapiFrame));
@@ -2423,13 +2439,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     }
 }
 
-[[nodiscard]] auto cVaapiDecoder::DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames)
-    -> bool {
-    if (!codecCtx) [[unlikely]] {
-        return false;
-    }
-
-    bool anyFrameDecoded = false;
+auto cVaapiDecoder::DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<VaapiFrame>> &outFrames) -> void {
     bool packetSent = false;
 
     // EAGAIN = VAAPI surface pool full; drain available frames then retry. Normally one iteration.
@@ -2449,7 +2459,7 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
                 // continues it.
                 avcodec_flush_buffers(codecCtx.get());
                 RetireFilterGraph(/*compactRebuild=*/true);
-                return anyFrameDecoded;
+                return;
             }
             packetSent = true; // success or EOF; don't retry
             NoteStarvationTick(pkt);
@@ -2591,8 +2601,9 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
             // from the chain, not codecCtx -- only the chain knows whether a field-rate deinterlacer
             // doubled it. Published even at rateMilliHz == 0: the device reads that as "cannot be
             // matched" and restores the default mode now, instead of leaving the output on the
-            // PREVIOUS stream's mode until the idle watchdog notices seconds later.
-            if (filterRebuilt && streamFormatCallback) {
+            // PREVIOUS stream's mode until the idle watchdog notices seconds later. Not for a graph the
+            // first pull already retired: Reset() cleared its rate, the rebuild publishes the real one.
+            if (filterRebuilt && filterChain.IsBuilt() && streamFormatCallback) {
                 streamFormatCallback(static_cast<uint32_t>(decodedFrame->width),
                                      static_cast<uint32_t>(decodedFrame->height),
                                      filterChain.NaturalOutputRateMilliHz());
@@ -2600,7 +2611,6 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
 
             // Only [prevOutCount, end): earlier receive iterations are already final.
             const size_t newOutCount = outFrames.size() - prevOutCount;
-            anyFrameDecoded = anyFrameDecoded || newOutCount > 0;
             const bool seekingTrick = IsSeekingTrick();
             StampFilterOutputs(outFrames, prevOutCount, sourcePts, seekingTrick,
                                static_cast<int64_t>(outputFrameDurationMs.load(std::memory_order_relaxed)));
@@ -2624,18 +2634,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // PAFF: trigger only on second field (non-key) so the pair is complete before drain.
     if (trickSpeed.load(std::memory_order_acquire) != 0 && isTrickReverse.load(std::memory_order_relaxed) &&
         !(pkt->flags & AV_PKT_FLAG_KEY)) {
-        const size_t preDrainSize = outFrames.size();
         DrainCodecAtEos(outFrames);
-        if (outFrames.size() > preDrainSize) {
-            anyFrameDecoded = true;
-        }
     }
 
     // Do NOT reset the filter graph here: bob is spatial-only (no temporal state), and
     // destroying it invalidates in-flight VPP surfaces (EIO on DRM PRIME export).
     // codecDrainPending is handled in Action() so the drain runs even when no packet was queued.
-
-    return anyFrameDecoded;
 }
 
 [[nodiscard]] auto cVaapiDecoder::InitFilterGraph(AVFrame *firstFrame, bool compactLog) -> bool {
@@ -2704,15 +2708,12 @@ auto cVaapiDecoder::DrainCodecAtEos(std::vector<std::unique_ptr<VaapiFrame>> &ou
     // Manual zoom: resolve the active cycle stop (0 = Off) to an equal per-side crop fraction. The
     // level is a zoom-in factor in tenths-of-% (344 = +34.4% = magnification z=1.344); the per-side
     // crop that yields that magnification once the kept region refills the screen is (1 - 1/z)/2.
-    const int zoomStop = vaapiConfig.zoomActive.load(std::memory_order_relaxed);
-    if (zoomStop >= 1 && zoomStop <= CONFIG_ZOOM_PRESET_COUNT) {
-        const int level = vaapiConfig.zoomLevel[zoomStop - 1].load(std::memory_order_relaxed);
-        if (level > 0) {
-            const double z = 1.0 + (static_cast<double>(level) / 1000.0);
-            const double cropFraction = (1.0 - (1.0 / z)) / 2.0;
-            params.cropH = cropFraction;
-            params.cropV = cropFraction;
-        }
+    if (const int level = vaapiConfig.ZoomLevelOfStop(vaapiConfig.zoomActive.load(std::memory_order_relaxed));
+        level > 0) {
+        const double z = 1.0 + (static_cast<double>(level) / 1000.0);
+        const double cropFraction = (1.0 - (1.0 / z)) / 2.0;
+        params.cropH = cropFraction;
+        params.cropV = cropFraction;
     }
 
     const bool built = filterChain.Build(firstFrame, params);
@@ -3303,7 +3304,7 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     // Normal mode: keep >=1 frame to avoid starving the display.
     const bool silent = catchingUp;
     while ((silent ? !jitterBuf.empty() : jitterBuf.size() > 1) && !stopping.load(std::memory_order_relaxed)) {
-        if (jitterBuf.front()->pts == AV_NOPTS_VALUE) {
+        if (jitterBuf.front()->stillPicture || jitterBuf.front()->pts == AV_NOPTS_VALUE) {
             break;
         }
         const int64_t clock = ap->GetClock();
@@ -3359,18 +3360,14 @@ auto cVaapiDecoder::SkipStaleJitterFrames(cAudioProcessor *ap) -> void {
     const int frameDurMs = outputFrameDurationMs.load(std::memory_order_relaxed);
 
     // --- Trick mode ---
-    if (trickSpeed.load(std::memory_order_acquire) != 0) {
-        // A deferred Play()-out-of-trick whose grace has expired resolves here too (the loop-top call
-        // may not have fired since this frame became due): ResolvePendingTrickExit() runs the full
-        // generation-boundary teardown and leaves trickSpeed==0, so this frame falls through as the
-        // first normal-play re-anchor. Until the grace expires it returns false -- keep pacing trick.
-        if (!ResolvePendingTrickExit()) {
-            return SubmitTrickFrame(std::move(frame));
-        }
+    // A deferred Play()-out-of-trick past its grace resolves here too (the loop-top call may not have run since
+    // this frame became due) and leaves trickSpeed 0, so the frame re-anchors normal play; until then, trick pacing.
+    if (trickSpeed.load(std::memory_order_acquire) != 0 && !ResolvePendingTrickExit()) {
+        return SubmitTrickFrame(std::move(frame));
     }
 
     // Still picture: no audio clock to sync against; sync logic would erroneously drop/delay it.
-    if (stillPictureMode.load(std::memory_order_relaxed)) {
+    if (frame->stillPicture) {
         if (pts != AV_NOPTS_VALUE) {
             PublishLastPts(pts);
         }

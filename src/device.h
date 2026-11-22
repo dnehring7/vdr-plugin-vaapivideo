@@ -11,6 +11,15 @@
 #include "caps.h"
 #include "common.h"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
 // VDR
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
@@ -61,7 +70,7 @@ struct DisplayModeCandidate {
 /// What the stream currently playing wants from the output.
 struct StreamModeRequest {
     uint32_t height{};      ///< Coded frame height (px)
-    uint32_t rateMilliHz{}; ///< VPP *output* rate, i.e. the field rate when the chain deinterlaces --
+    uint32_t rateMilliHz{}; ///< VPP *output* rate: the field rate when the chain deinterlaces --
                             ///< 1080i25 arrives here as 50000, which is why 25i naturally lands on 50 Hz
     uint32_t width{};       ///< Coded frame width (px)
 
@@ -229,7 +238,7 @@ class cVaapiDevice : public cDevice {
     auto RefreshZoom() -> void;            ///< Rebuild VPP for edited crop values without changing the active stop
     auto RefreshVideoFilters()
         -> void; ///< Rebuild VPP for policy-only setup changes (post-processing policies); leaves zoom/rect
-    auto ResetZoom() -> void; ///< Force back to Off; the new stream's graph rebuild picks it up
+    static auto ResetZoom() -> void; ///< Force back to Off; the new stream's graph rebuild picks it up
     [[nodiscard]] static auto ZoomStatusLabel(bool localized = true)
         -> std::string; ///< Active-zoom label (e.g. "Zoom 2: +12.5%"); translated for the OSD, English for SVDRP
     // === Audio passthrough (runtime; setup.conf keeps the startup default) ===
@@ -248,11 +257,11 @@ class cVaapiDevice : public cDevice {
     // ========================================================================
     [[nodiscard]] auto Attach() -> bool; ///< Open DRM/VAAPI hardware and start decoder/display/audio threads; used
                                          ///< for the first attach after a detached startup and to resume after Detach()
-    auto Detach() -> bool;               ///< Stop all threads and release DRM/VAAPI hardware; use Attach() to resume.
-                           ///< Returns true iff VDR's VT was yielded so fbcon owns the text console; false
-                           ///< means the hardware IS released but fbcon did not reclaim the display (user
-                           ///< needs to press `Alt+F<n>`, or add CAP_SYS_TTY_CONFIG to the systemd drop-in --
-                           ///< see README)
+    /// Stop all threads and release DRM/VAAPI hardware; use Attach() to resume. Returns true iff VDR's VT was
+    /// yielded so fbcon owns the text console; false means the hardware IS released but fbcon did not reclaim
+    /// the display (user needs to press `Alt+F<n>`, or add CAP_SYS_TTY_CONFIG to the systemd drop-in -- see
+    /// README).
+    auto Detach() -> bool;
     [[nodiscard]] auto Initialize(std::string_view drmDevicePath, std::string_view audioDevicePath,
                                   std::string_view connectorNameFilter = {}, bool deferred = false)
         -> bool; ///< Latch device arguments and, unless @p deferred is true, immediately open hardware and start
@@ -409,7 +418,7 @@ class cVaapiDevice : public cDevice {
     auto ShowEncryptedScreen()
         -> void; ///< Paint "Channel N - <name> / encrypted" over black when the current channel is encrypted (Ca != 0)
                  ///< and its primary content (video for TV, audio for radio) is not decoding; no-op otherwise.
-    [[nodiscard]] auto CurrentChannelIsEncrypted() const
+    [[nodiscard]] static auto CurrentChannelIsEncrypted()
         -> bool; ///< True iff the current channel carries a CA id; lets the radio path defer encrypted channels to the
                  ///< encrypted watchdog instead of painting a (silent) radio splash over them.
     auto CheckRadioSplash()
@@ -429,21 +438,22 @@ class cVaapiDevice : public cDevice {
     auto ReleaseHardware() -> void;      ///< Close VAAPI device reference and DRM file descriptor
     auto ResetAudioCodecState() -> void; ///< Drop the cached audio codec id and any in-flight 2-of-2 confirmation state
                                          ///< so the next PlayAudio() packet re-runs codec detection
-    auto ApplyDisplayModePolicy(const StreamModeRequest &request, PlaybackSource source, uint64_t nowMs)
+    auto ApplyDisplayModePolicy(StreamModeRequest request, PlaybackSource source, uint64_t nowMs)
         -> void; ///< Run the matcher and stage the winner. Caller holds displayModeMutex and has already
                  ///< cleared the scope/policy/stability gates; this applies only the rate limit.
     auto RestoreDefaultModeLocked(uint64_t nowMs)
         -> void; ///< Hand the output back to defaultMode when mode switching is not in charge of the
                  ///< current source. Caller holds displayModeMutex.
-    auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs)
-        -> void; ///< Start the stability window for @p request. Caller holds displayModeMutex.
+    auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs, uint64_t dueMs)
+        -> void; ///< Arm @p request, due for PollPendingDisplayMode() at @p dueMs (non-zero): the end of its
+                 ///< stability window, or the cooldown boundary of a throttled switch. Caller holds displayModeMutex.
     auto ArmStartTrace(uint64_t epochMs, bool withDisplay)
         -> void; ///< Arm the stream-start trace (SetPlayMode); a no-op unless TraceEnabled(). withDisplay=false for
                  ///< audio-only modes, which never produce a video frame for the display milestone to describe.
     auto DisarmStartTrace() noexcept -> void; ///< Drop pending milestones (pmNone / suspend).
     auto ClearModeCandidateLocked()
         -> void; ///< Disarm the stability window. Caller holds displayModeMutex. Both helpers exist so
-                 ///< modeCandidateDueMs can never drift from modeCandidateSinceMs.
+                 ///< modeCandidateDueMs can never drift from modeCandidate.
     [[nodiscard]] auto SelectDrmConnector()
         -> bool; ///< Scan connectors, pick a display mode, and store crtcId/connectorId
     [[nodiscard]] auto TryAcceptConnector(drmModeConnector *connector, bool allowModeFallback, drmModeRes *resources)
@@ -507,7 +517,7 @@ class cVaapiDevice : public cDevice {
                                        ///< reached from the decode thread, the player thread and the main thread
     StreamModeRequest modeCandidate{}; ///< Format currently accumulating toward the stability gate
     uint64_t modeCandidateSinceMs{};   ///< When modeCandidate was first observed (0 = none pending)
-    /// Lock-free mirror of modeCandidateSinceMs + DEVICE_DISPLAY_MODE_STABLE_MS; 0 = nothing armed.
+    /// When modeCandidate is due (stability window end, or a throttled switch's cooldown boundary); 0 = nothing armed.
     /// PollPendingDisplayMode() runs on every decode-loop iteration, so the (overwhelmingly common) no-candidate case
     /// must not cost a mutex acquisition.
     std::atomic<uint64_t> modeCandidateDueMs{0};

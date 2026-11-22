@@ -16,11 +16,12 @@
 #ifndef VDR_VAAPIVIDEO_OSD_H
 #define VDR_VAAPIVIDEO_OSD_H
 
-#include "common.h"
 #include "display.h"
 
 // C++ Standard Library
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -42,7 +43,7 @@ class cVaapiOsd;
 struct cVaapiOsdProviderState {
     std::vector<cVaapiOsd *> activeOsds; ///< Live OSDs holding DRM resources; guarded by mutex
     cMutex mutex;                        ///< Serializes activeOsds, provider_ writes, and all dumb-buffer pixel
-                                         ///< access (VDR main thread vs. SVDRP grab/detach/provider teardown)
+                                         ///< access (VDR main thread against SVDRP grab/detach/provider teardown)
 };
 
 // ============================================================================
@@ -72,6 +73,12 @@ class cVaapiOsdProvider : public cOsdProvider {
     /// matches, or the geometry is malformed. Lets GrabImage include the OSD in captures.
     auto CompositeOntoRgb24(uint8_t *rgb24, int width, int height, int stride, uint32_t fbId) -> void;
     auto DetachDisplay() noexcept -> void; ///< Null the display ref; Flush() becomes a no-op
+    /// The registered provider, or nullptr before the first Register(). Kept so the device can swap the display
+    /// under it across SVDRP DETA/ATTA without re-registering with VDR (which has no detach hook).
+    [[nodiscard]] static auto Instance() noexcept -> cVaapiOsdProvider * { return instance_; }
+    /// Create the provider for @p display (null while detached); VDR's cOsdProvider ctor installs it, and VDR
+    /// owns it from then on.
+    static auto Register(cVaapiDisplay *display) -> void;
     auto ReleaseAllOsdResources() -> void; ///< Force-free DRM buffers of all live OSDs before drmDropMaster
 
   protected:
@@ -103,6 +110,7 @@ class cVaapiOsdProvider : public cOsdProvider {
                                                     ///< separately (display outlives the provider while attached).
     std::shared_ptr<cVaapiOsdProviderState> state_{std::make_shared<cVaapiOsdProviderState>()};
     ///< Shared with every cVaapiOsd it creates; keeps mutex + list alive past provider destruction
+    static inline cVaapiOsdProvider *instance_ = nullptr; ///< See Instance(); VDR owns the object
 };
 
 // ============================================================================
@@ -161,13 +169,5 @@ class cVaapiOsd : public cOsd {
     uint32_t stride_{}; ///< Row pitch in bytes from DRM_IOCTL_MODE_CREATE_DUMB; may exceed width*4
     uint32_t width_{};  ///< FB width = screen width - Left()
 };
-
-// ============================================================================
-// === GLOBAL STATE ===
-// ============================================================================
-
-/// Singleton provider pointer -- kept here so device.cpp can swap the display under it across
-/// SVDRP DETA/ATTA without re-registering the provider with VDR (which has no detach hook).
-extern cOsdProvider *osdProvider;
 
 #endif // VDR_VAAPIVIDEO_OSD_H
