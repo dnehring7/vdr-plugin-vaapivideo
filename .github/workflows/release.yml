@@ -215,7 +215,7 @@ jobs:
           retention-days: 7
 
   # ================================================================
-  # publish -- sign apt repos, upload to release, deploy Pages
+  # publish -- sign apt repos, upload to release, upload the Pages site
   # ================================================================
   publish:
     name: publish
@@ -226,11 +226,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write   # gh release upload
-      pages: write      # actions/deploy-pages
-      id-token: write   # actions/deploy-pages
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     env:
       VERSION: ${{ needs.rpm.outputs.version }}
       OWNER: ${{ github.repository_owner }}
@@ -366,15 +361,36 @@ jobs:
           gh release upload "${TAG}" --clobber \
             _artifacts/rpm/pkgs/*.rpm _artifacts/deb-*/*.deb
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v6
-        with:
-          enablement: true
-
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
           path: site/
+
+  # ================================================================
+  # pages -- deploy the site publish uploaded
+  # ================================================================
+  # A job of its own, as in GitHub's Pages starter workflows: deploy-pages finds
+  # the site in the run's artifact list, which can lag the upload, and a step
+  # right after it failed the 1.10.1 publish ("No artifacts named
+  # github-pages"). A failed deploy also re-runs alone, without re-signing or
+  # re-uploading anything.
+  pages:
+    name: pages
+    needs: publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      pages: write      # actions/configure-pages, actions/deploy-pages
+      id-token: write   # actions/deploy-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+        with:
+          enablement: true
 
       - name: Deploy to GitHub Pages
         id: deployment
