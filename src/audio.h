@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <span>
 #include <string>
@@ -72,6 +73,13 @@ static_assert(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER < AUDIO_QUEUE_CAPACITY,
 /// parameters across the PES and mediaplayer paths. Kept only for call-site readability in audio.cpp.
 using AudioStreamParams = AudioStreamInfo;
 
+/// IEC61937 carrier: the ALSA geometry the bursts play at in real time, and the muxer's DTS framing.
+struct PassthroughCarrier {
+    unsigned channels{2}; ///< 8 = the high-bitrate (HBR) carrier, which the kernel enables only for a non-audio stream
+    int dtshdRate{0};     ///< Muxer `dtshd_rate` (Hz) sending DTS-HD whole as IEC61937 type IV; 0 = the DTS core alone
+    unsigned rate{0};     ///< ALSA rate (Hz)
+};
+
 // ============================================================================
 // === AUDIO PROCESSOR CLASS ===
 // ============================================================================
@@ -113,23 +121,23 @@ class cAudioProcessor : public cThread {
     [[nodiscard]] auto IsInitialized() const noexcept
         -> bool; ///< True after Initialize() succeeds and before Shutdown()
     [[nodiscard]] auto IsPassthrough() const noexcept
-        -> bool;                                    ///< True when the device is currently in IEC61937 passthrough mode
-    [[nodiscard]] auto IsQueueFull() const -> bool; ///< True when the packet queue has reached AUDIO_QUEUE_CAPACITY
+        -> bool; ///< True when the device is currently in IEC61937 passthrough mode
+    /// True when the queue holds @p limit packets of ~32 ms (AC-3); 38 TrueHD access units count as one.
+    [[nodiscard]] auto IsQueueFull(size_t limit) const -> bool;
     [[nodiscard]] auto GetBufferedMs() const noexcept
         -> int; ///< Unplayed audio already handed to ALSA, in ms (end-of-queued PTS minus the DAC clock).
                 ///< Lock-free and diagnostic-only: 0 whenever the tail or the clock is undefined (pre-roll,
                 ///< DropOutput, freeze), and a concurrent re-anchor can make it momentarily stale.
-    [[nodiscard]] auto GetQueueSize() const -> size_t; ///< Exact packet-queue depth (takes queueMutex)
     [[nodiscard]] auto GetQueueSizeRelaxed() const noexcept -> size_t {
         return approxQueueSize.load(std::memory_order_relaxed);
-    } ///< Lock-free approximate queue depth for the timing-critical present thread. GetQueueSize() is exact but
-      ///< takes queueMutex; this mirror avoids even that short queue lock in hot display / status paths.
+    } ///< Lock-free approximate queue depth for the timing-critical present thread; IsQueueFull() is exact but
+      ///< takes queueMutex, which this mirror keeps out of hot display / status paths.
     [[nodiscard]] auto HasQueuedSinceClear() const noexcept -> bool {
         return queuedSinceClear.load(std::memory_order_relaxed);
     } ///< A clock is on its way. Lock-free for the present thread's no-clock hold, which waits for nothing else.
     [[nodiscard]] auto GetPendingWorkSize() const
         -> size_t; ///< Queue + consumer-held packet + unplayed ALSA tail. The EOS drains need this, not
-                   ///< GetQueueSize(): the queue hits 0 while the last packet is still in flight / queued in ALSA.
+                   ///< the queue depth: the queue hits 0 while the last packet is still in flight / queued in ALSA.
     [[nodiscard]] auto OpenCodec(AVCodecID codecId, int sampleRate, int channels)
         -> bool; ///< Convenience wrapper around SetStreamParams() for simple codec+rate+channels changes
     [[nodiscard]] auto OpenCodecWithInfo(const AudioStreamInfo &info)
@@ -161,13 +169,14 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === THREAD ===
     // ========================================================================
-    auto Action() -> void override; ///< Processing thread: dequeues packets and calls DecodeToPcm() or WrapIec61937()
+    auto Action()
+        -> void override; ///< Processing thread: dequeues packets and calls DecodeToPcm() or WritePassthroughUnit()
 
   private:
     // ========================================================================
     // === INTERNAL METHODS ===
     // ========================================================================
-    [[nodiscard]] auto CanPassthrough(AVCodecID codecId) const
+    [[nodiscard]] auto CanPassthrough(const AudioStreamParams &params) const
         -> bool; ///< True when IEC61937 passthrough should be used; honors PassthroughMode
                  ///< (Auto = ELD-driven, On = any wrappable codec regardless of ELD, Off = never)
     [[nodiscard]] static auto CodecWrappable(AVCodecID codecId)
@@ -206,8 +215,6 @@ class cAudioProcessor : public cThread {
     auto ResetResampler() noexcept -> void;         ///< Frees swrCtx + clears its geometry (single owner of that
                                                     ///< teardown -- a partial reset pairs stale geometry with a null
                                                     ///< context). The next DecodeToPcm() rebuilds it.
-    [[nodiscard]] static auto ComputeAlsaRate(AVCodecID codecId, unsigned streamRate, bool passthrough)
-        -> unsigned; ///< Returns ALSA carrier rate: 4x streamRate for DD+/AC-4/MPEG-H passthrough, 1x otherwise
     [[nodiscard]] auto ChooseOutputChannels(int inChannels) const noexcept
         -> unsigned; ///< PCM output channel count for an input of @p inChannels, per PcmChannelMode + sink caps
                      ///< snapshot. Never upmixes; snaps to a standard HDMI layout (2 / 5.1 / 7.1). Lock-free
@@ -231,15 +238,28 @@ class cAudioProcessor : public cThread {
         -> bool; ///< Decodes one compressed packet and forwards S16LE PCM to WritePcmToAlsa().
                  ///< expectedGeneration is clearGeneration captured at dequeue; mismatch means the
                  ///< packet is from a previous codec era and is dropped to avoid an INVALIDDATA cascade.
-    [[nodiscard]] auto OpenAlsaDevice()
-        -> bool; ///< Opens alsaDeviceName in passthrough or PCM mode; falls back to PCM if passthrough fails
+    /// Opens alsaDeviceName for passthrough when allowed and wanted, else for PCM (stereo if the layout is refused).
+    [[nodiscard]] auto OpenAlsaDevice(bool allowPassthrough = true) -> bool;
     auto OpenDecoder() -> void; ///< Allocates and opens the FFmpeg decoder + parser for streamParams
-    [[nodiscard]] auto OpenSpdifMuxer(AVCodecID codecId, int sampleRate)
-        -> bool; ///< Opens the FFmpeg spdif muxer for IEC61937 burst framing; called on passthrough open
-    auto CloseSpdifMuxer() -> void; ///< Closes the spdif muxer and frees the AVIO buffer
-    [[nodiscard]] auto WrapIec61937(const uint8_t *data, int size)
-        -> std::span<const uint8_t>; ///< Wraps one compressed frame into an IEC61937 burst; result valid until next
-                                     ///< call
+    /// Configures @p handle for @p carrier and opens the spdif muxer for streamParams. False leaves @p handle unusable
+    /// for another geometry: reopen it.
+    [[nodiscard]] auto OpenPassthrough(snd_pcm_t *handle, const PassthroughCarrier &carrier) -> bool;
+    /// Closes @p handle when open and opens alsaDeviceName afresh into it, without ALSA's conversions when @p exact;
+    /// false (logged) leaves it null.
+    [[nodiscard]] auto ReopenPcm(snd_pcm_t *&handle, bool exact) const -> bool;
+    /// Drops and closes @p handle when open and clears the non-audio bit, which HDMI drivers keep past the close.
+    /// Cleared after hw_free: ALSA hooks (the `hdmi:` alias) lock the control until then and restore its old value.
+    auto CloseAlsaHandle(snd_pcm_t *&handle) const -> void;
+    [[nodiscard]] auto OpenSpdifMuxer(AVCodecID codecId, int sampleRate, int dtshdRate)
+        -> bool; ///< Opens the FFmpeg spdif muxer for IEC61937 burst framing. @p dtshdRate > 0 frames DTS whole
+                 ///< as type IV at that rate, 0 its core alone
+    auto CloseSpdifMuxer() -> void;     ///< Closes the spdif muxer and frees the AVIO buffer
+    auto DiscardPartialBurst() -> void; ///< Discontinuity: restarts a TrueHD muxer, whose MAT frame gathers 24 units
+    /// Feeds one access unit to the spdif muxer; false = rejected. A burst it completes is in spdifOutputBuf.
+    [[nodiscard]] auto WrapIec61937(std::span<const uint8_t> accessUnit) -> bool;
+    /// Wraps one access unit and writes the burst it completes, dated from @p pts. Caller holds mutex; @p generation
+    /// gates the write like WritePcmToAlsa().
+    auto WritePassthroughUnit(std::span<const uint8_t> accessUnit, int64_t pts, uint32_t generation) -> void;
     auto ProbeSinkCaps()
         -> void; ///< Reads the HDMI ELD via ALSA control interface and populates sinkCaps; cached per device name
     auto ResolveIec958Control(snd_ctl_t *ctl, int deviceId)
@@ -247,9 +267,12 @@ class cAudioProcessor : public cThread {
                  ///< Called by ProbeSinkCaps() once per device; the naming scheme is driver-specific (see impl).
     auto FillIec958CtlId(snd_ctl_elem_id_t *id) const noexcept
         -> void; ///< Stamps the resolved element id (iface/name/device/index) so read and write agree
-    auto SetIec958NonAudio(bool enable) const
-        -> void; ///< Sets/clears IEC 60958-3 AES0 bit 1 ("non-audio") on the sink's IEC958 control.
-                 ///< Must be set before passthrough writes; cleared on PCM open to prevent noise on the receiver.
+    /// Reads IEC 60958-3 AES0 bit 1 ("non-audio") on the sink's IEC958 control, writing @p enable first when
+    /// given. Returns the bit as the control holds it afterwards, nullopt when no control is resolved or the
+    /// access failed.
+    [[nodiscard]] auto Iec958NonAudio(std::optional<bool> enable) const -> std::optional<bool>;
+    /// Sets the non-audio bit before passthrough writes and clears it on a PCM open (noise on the receiver).
+    auto SetIec958NonAudio(bool enable) const -> void { (void)Iec958NonAudio(enable); }
     [[nodiscard]] auto WritePcmToAlsa(std::span<const uint8_t> data, int64_t startPts90k, unsigned frames,
                                       uint32_t expectedGeneration)
         -> bool; ///< Writes PCM/burst to ALSA and publishes the updated playbackPts under the seqlock.
@@ -271,6 +294,7 @@ class cAudioProcessor : public cThread {
     snd_pcm_t *alsaHandle{nullptr};                     ///< Open PCM device handle; nullptr when closed
     unsigned alsaIec958CtlDevice{0};                ///< Device field of the resolved IEC958 control (0 on iface=MIXER)
     unsigned alsaIec958CtlIndex{UINT_MAX};          ///< "IEC958 Playback Default" control index; UINT_MAX = unresolved
+    bool alsaIec958CtlMatched{false};               ///< The control is this output's, not just the card's only one
     bool alsaIec958CtlMixer{false};                 ///< Resolved control sits on iface=MIXER (HDA) instead of PCM
     std::atomic<bool> alsaPassthroughActive{false}; ///< True in IEC61937 passthrough mode
     std::atomic<unsigned> alsaSampleRate{0};        ///< Negotiated sample rate (Hz)
@@ -291,8 +315,12 @@ class cAudioProcessor : public cThread {
     // ========================================================================
     // === IEC61937 SPDIF MUXER ===
     // ========================================================================
+    int64_t burstPendingFrames{0};         ///< TrueHD: carrier frames accepted by the muxer, not yet emitted (mutex)
+    int64_t burstStartPts{AV_NOPTS_VALUE}; ///< PTS of the first access unit in the burst being filled (mutex)
+    int dtsCorelessUnits{0};               ///< Consecutive DTS-HD units without a core the muxer rejected (mutex)
     AVFormatContext *spdifMuxCtx{nullptr}; ///< FFmpeg spdif output context
-    std::vector<uint8_t> spdifOutputBuf;   ///< IEC61937 burst bytes; valid until next WrapIec61937()
+    bool spdifMuxFed{false};               ///< The muxer took a unit since it was opened: a restart discards it (mutex)
+    std::vector<uint8_t> spdifOutputBuf;   ///< IEC61937 burst bytes; valid until the next WrapIec61937()
 
     // ========================================================================
     // === DECODER ===
@@ -327,6 +355,7 @@ class cAudioProcessor : public cThread {
     std::atomic<bool> packetInFlight{false}; ///< Action() popped a packet but hasn't finished handing it to ALSA.
                                              ///< Closes the EOS-drain false-zero gap between pop and ALSA write.
     std::queue<AVPacket *> packetQueue;      ///< Compressed packets awaiting decode
+    size_t queueLimitScale{1};               ///< Packets per AC-3-sized queue slot: 38 for TrueHD (queueMutex)
     std::atomic<bool> queuedSinceClear{false}; ///< A packet was queued since the last Clear() (queueMutex writes)
 
     // ========================================================================

@@ -1010,6 +1010,8 @@ auto cVaapiMediaSource::PopulateAudioInfo(const AVStream *stream, AudioStreamInf
     // Raw PCM has no in-band layout; a count alone would turn quad into 4.0.
     info.channelMask =
         p->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? av_channel_layout_subset(&p->ch_layout, UINT64_MAX) : 0;
+    // Sizes the passthrough carrier: DTS-HD MA needs the 8-channel one, its core alone fits stereo.
+    info.profile = p->profile;
     CopyExtradata(p, storage, info.extradata, info.extradataSize);
 }
 

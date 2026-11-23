@@ -119,8 +119,8 @@ Three invariants:
    `ResetPlaybackClock()`s. `GetClock()` goes NOPTS briefly (the triggering frame is
    dropped, and the next packet is held until ALSA reopens and swr rebuilds) and
    re-anchors on the next write; the decoder's no-clock hold (1.5 s) covers the gap.
-   The reopen is one-shot per layout change — passthrough is never affected (it is a
-   fixed 2-channel IEC61937 carrier).
+   The reopen is one-shot per layout change — passthrough is never affected (its
+   IEC61937 carrier is fixed by the stream and the sink, never by a decoded layout).
 
    Audio-only replay EOF is a deliberate exception to "keep the clock advancing":
    VDR core ends a replay only when `GetSTC()` reaches the last frame or stalls

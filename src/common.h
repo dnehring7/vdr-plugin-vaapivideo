@@ -59,6 +59,7 @@ extern "C" {
 #pragma GCC diagnostic ignored "-Wvariadic-macros"
 #include <vdr/config.h>
 #pragma GCC diagnostic pop
+#include <vdr/thread.h>
 
 // ============================================================================
 // === VERSION CHECKS ===
@@ -79,7 +80,7 @@ extern "C" {
 /// Shown by "vdr -h" and in VDR's plugin list.
 inline constexpr const char *PLUGIN_DESCRIPTION = trNOOP("Hardware-accelerated video playback with VAAPI");
 inline constexpr const char *PLUGIN_NAME = "vaapivideo"; ///< VDR plugin name; cRemote::CallPlugin arg.
-inline constexpr const char *PLUGIN_VERSION = "1.10.0";  ///< Reported to VDR; "make dist" greps this line.
+inline constexpr const char *PLUGIN_VERSION = "1.10.1";  ///< Reported to VDR; "make dist" greps this line.
 
 /// Translate a label: the plugin catalog first, then VDR's. So "auto" (unmarked) comes from VDR, and a word the
 /// plugin translates itself still falls back to VDR in languages the plugin does not ship.
@@ -191,6 +192,19 @@ struct StreamStartTrace {
         return static_cast<int64_t>(cTimeMs::Now() - epochMs.load(std::memory_order_relaxed));
     }
 };
+
+// ============================================================================
+// === HDMI AUDIO ===
+// ============================================================================
+
+/// Keeps ALSA prepares out of display modesets. While a modeset has the link's audio off, i915 reads the HDA pin
+/// control back as 0, and an HBR prepare (TrueHD, DTS-HD MA) in that window writes it back without output enable:
+/// HDMI audio stays silent until the codec re-initializes, as Intel enables the pin only then. A leaf lock: the
+/// display holds it for a modeset commit, audio for a prepare.
+[[nodiscard]] inline auto HdmiModesetMutex() -> cMutex & {
+    static cMutex mutex;
+    return mutex;
+}
 
 // ============================================================================
 // === DRM/KMS UTILITIES ===

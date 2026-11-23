@@ -79,6 +79,7 @@ struct AudioStreamInfo {
     AVCodecID codecId{AV_CODEC_ID_NONE}; ///< FFmpeg codec identifier
     const uint8_t *extradata{nullptr};   ///< Non-owning; caller owns the buffer lifetime
     int extradataSize{0};                ///< Byte length of @c extradata
+    int profile{AV_PROFILE_UNKNOWN};     ///< Container's codec profile (the DTS-HD flavour); unknown on the PES path
     int sampleRate{0};                   ///< Audio sample rate in Hz
 };
 
@@ -134,9 +135,9 @@ inline constexpr std::array<VideoBackendCap, 11> STREAM_VIDEO_BACKEND_TABLE{{
 /// Dereference with caps.*(result). Returns nullptr if no table row matches.
 [[nodiscard]] auto SelectVideoBackendCap(const VideoStreamInfo &info) noexcept -> bool GpuCaps::*;
 
-/// Codecs this passthrough path can IEC61937-wrap. DTS-HD is intentionally absent:
-/// the ELD probe records it only as a sink capability for accepting DTS core.
-/// Sink availability (ELD check) is separate; use AudioSinkCaps::Supports (caps.h).
+/// Codecs this passthrough path can IEC61937-wrap (AC-4 and MPEG-H once FFmpeg's spdif muxer does). DTS covers
+/// DTS-HD, which FFmpeg tells apart only by profile. Sink availability (ELD check) is separate; use
+/// AudioSinkCaps::Supports (caps.h).
 inline constexpr std::array<AVCodecID, 6> STREAM_AUDIO_PASSTHROUGH_TABLE{{
     AV_CODEC_ID_AC3,
     AV_CODEC_ID_EAC3,
@@ -168,6 +169,7 @@ static_assert(std::ranges::all_of(STREAM_VIDEO_BACKEND_TABLE,
 struct AudioDetection {
     AVCodecID codecId{AV_CODEC_ID_NONE}; ///< Detected codec; AV_CODEC_ID_NONE = nothing corroborated
     bool chained{false};                 ///< True iff two chained frame headers corroborated codecId
+    int sampleRate{48000};               ///< Stream rate: 48 kHz unless a TrueHD major sync names its own
 };
 
 /// Identify an audio codec from ES bytes (AC-3/E-AC-3/AAC/AAC-LATM/DTS/MP2 Layer II/

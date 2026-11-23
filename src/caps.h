@@ -134,7 +134,7 @@ struct AudioSinkCaps {
     bool ac3{};    ///< Dolby Digital (AC-3)
     bool eac3{};   ///< Dolby Digital Plus (E-AC-3)
     bool dts{};    ///< DTS core
-    bool dtshd{};  ///< Sink advertises DTS-HD; used only as proof DTS core is accepted
+    bool dtshd{};  ///< DTS-HD: DTS core passthrough too, and the HD carrier for DTS-HD MA / HRA streams
     bool truehd{}; ///< Dolby TrueHD
     bool ac4{};    ///< AC-4
     bool mpegh{};  ///< MPEG-H 3D Audio

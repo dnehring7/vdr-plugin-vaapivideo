@@ -1036,7 +1036,7 @@ auto cVaapiDevice::Clear() -> void {
 [[nodiscard]] auto cVaapiDevice::Flush(int TimeoutMs) -> bool {
     // Waits only on the decoder packet queue, not the audio queue. Audio drains under its
     // own ALSA backpressure and has not been observed to linger past channel switches.
-    // If that changes, add audioProcessor->GetQueueSize()==0 here.
+    // If that changes, wait for an empty audio queue here too.
     dsyslog("vaapivideo/device: Flush(%d)", TimeoutMs);
 
     if (!decoder) {
@@ -1814,8 +1814,12 @@ auto cVaapiDevice::Play() -> void {
         if (detectedCodec == AV_CODEC_ID_NONE) [[unlikely]] {
             // Reset the candidate so 2-of-2 means two CONSECUTIVE decisive payloads -- else two
             // uncorrelated false positives minutes apart could accumulate into a bogus confirmation.
-            audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
-            audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+            // TrueHD is exempt: its minor units carry no sync, so PES packets between two major syncs
+            // find nothing, and its 32-bit sync is no short alias.
+            if (audioCodecCandidate.load(std::memory_order_relaxed) != AV_CODEC_ID_TRUEHD) {
+                audioCodecCandidate.store(AV_CODEC_ID_NONE, std::memory_order_relaxed);
+                audioCodecCandidateCount.store(0, std::memory_order_relaxed);
+            }
             audioHeldPayload.clear();
             return Length;
         }
@@ -1849,6 +1853,9 @@ auto cVaapiDevice::Play() -> void {
             audioCodecCandidateCount.store(1, std::memory_order_relaxed);
             audioHeldPayload.clear();
         }
+        if (detectedCodec == AV_CODEC_ID_TRUEHD) {
+            audioDetectBuffer.clear(); // a major sync the window found must not vote twice
+        }
 
         if (const int candidateCount = audioCodecCandidateCount.load(std::memory_order_relaxed);
             !chainedFastConfirm && candidateCount < 2) {
@@ -1867,7 +1874,7 @@ auto cVaapiDevice::Play() -> void {
         audioCodecCandidateCount.store(0, std::memory_order_relaxed);
         audioDetectBuffer.clear(); // detection done; the 2 KB window stays allocated for the next stream
 
-        if (!audioProcessor->OpenCodec(detectedCodec, 48000, 2)) [[unlikely]] {
+        if (!audioProcessor->OpenCodec(detectedCodec, detected.sampleRate, 2)) [[unlikely]] {
             esyslog("vaapivideo/device: failed to open audio codec %s", avcodec_get_name(detectedCodec));
             return Length;
         }
@@ -1944,7 +1951,7 @@ auto cVaapiDevice::Play() -> void {
 #endif
 
     // Replay backpressure: cap queue to avoid tail-drops that create PTS gaps. Live: always accept.
-    if (!isLive && audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER) [[unlikely]] {
+    if (!isLive && audioProcessor->IsQueueFull(AUDIO_QUEUE_HIGHWATER)) [[unlikely]] {
         return 0;
     }
 
@@ -2114,7 +2121,7 @@ auto cVaapiDevice::Play() -> void {
     }
     // A decoder still in trick mode is in Play()'s exit grace: wait it out, as PlayVideo() would refuse the data.
     return !decoder->IsQueueFull() && !decoder->IsInTrickMode() &&
-           (!audioProcessor || audioProcessor->GetQueueSize() < AUDIO_QUEUE_HIGHWATER);
+           (!audioProcessor || !audioProcessor->IsQueueFull(AUDIO_QUEUE_HIGHWATER));
 }
 
 [[nodiscard]] auto cVaapiDevice::Poll(cPoller & /*Poller*/, int TimeoutMs) -> bool {
@@ -3238,7 +3245,7 @@ namespace {
     // shared cursor pull video ~1 s ahead too, so the reserve fills toward DECODER_RESERVE_CAPACITY
     // exactly like the live/dvbplayer paths. (This is mediaplayer-only: PlayAudio() keeps the shallow
     // real-time gate.)
-    if (audioProcessor->GetQueueSize() >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER) {
+    if (audioProcessor->IsQueueFull(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER)) {
         return false;
     }
     if (decoder) [[likely]] {
@@ -3326,9 +3333,8 @@ auto cVaapiDevice::FlushForSeek() -> void {
 
 [[nodiscard]] auto cVaapiDevice::IsMediaPlayerBackpressured() const noexcept -> bool {
     const bool videoFull = decoder && decoder->IsQueueFull();
-    const size_t audioDepth = audioProcessor ? audioProcessor->GetQueueSize() : 0;
     // Gates BOTH the audioHighwater pacing and the audioCanReanchor escape below. Without it,
-    // a video-only stream (no audio codec opened) reports audioDepth=0 forever -> audioCanReanchor
+    // a video-only stream (no audio codec opened) reports an empty audio queue forever -> audioCanReanchor
     // would always be true and permanently disable the jitterFull pre-anchor backpressure, letting
     // the decoder freerun-overrun the jitterBuf hard cap during startup.
     const bool audioOpen = audioCodecId.load(std::memory_order_relaxed) != AV_CODEC_ID_NONE;
@@ -3340,7 +3346,8 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // both audio packet depth and the co-buffered video lead, keeping jitterBuf well below the cap.
     // Mediaplayer-only deeper highwater (single-cursor demux: audio depth bounds the video reserve).
     // See AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER -- the shallow shared gate starves heavy interlaced 4K.
-    const bool audioHighwater = audioOpen && audioDepth >= AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER;
+    const bool audioHighwater =
+        audioOpen && audioProcessor && audioProcessor->IsQueueFull(AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER);
     // jitterBuf depth: guards ONLY the pre-anchor window (post-seek / startup) where the audio
     // clock is still NOPTS, so the demuxer's lookahead throttle can't gate delivery and HW decode
     // would overrun the jitterBuf hard cap (dropping ~30 frames per rapid-seek burst).
@@ -3363,7 +3370,7 @@ auto cVaapiDevice::FlushForSeek() -> void {
     // Video-only streams (audioOpen=false) cannot anchor an audio clock, so the escape stays
     // disarmed and jitterFull bounds the decoder's pre-anchor depth.
     const bool clockAnchored = audioProcessor && audioProcessor->GetClock() != AV_NOPTS_VALUE;
-    const bool audioCanReanchor = audioOpen && audioDepth < AUDIO_QUEUE_HIGHWATER_MEDIAPLAYER;
+    const bool audioCanReanchor = audioOpen && !audioHighwater;
     const bool jitterFull = !clockAnchored && !audioCanReanchor && decoder &&
                             decoder->GetDecodedReserveSize() >= DEVICE_MEDIAPLAYER_BACKPRESSURE_FRAMES;
     return videoFull || audioHighwater || jitterFull;

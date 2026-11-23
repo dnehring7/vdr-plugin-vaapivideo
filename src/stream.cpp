@@ -300,9 +300,13 @@ auto DetectAudioCodec(std::span<const uint8_t> data) noexcept -> AudioDetection 
         }
 
         // TrueHD major sync (0xF8726FBA, Dolby TrueHD sec.5.3). Mandatory in the first frame
-        // and recurs periodically, so probing for it on early input is reliable.
-        if (ReadBe32(p + i) == 0xF8726FBA) [[unlikely]] {
-            return Confirmed(AV_CODEC_ID_TRUEHD, Corroboration::SingleFrame);
+        // and recurs periodically, so probing for it on early input is reliable. Its rate code
+        // picks the passthrough carrier: 48 or 44.1 kHz times 1, 2 or 4.
+        if (ReadBe32(p + i) == 0xF8726FBA && i + 4 < size) [[unlikely]] {
+            if (const unsigned rateCode = p[i + 4] >> 4U; (rateCode & 7U) <= 2) {
+                return {.codecId = AV_CODEC_ID_TRUEHD,
+                        .sampleRate = ((rateCode & 8U) != 0 ? 44100 : 48000) << (rateCode & 7U)};
+            }
         }
     }
 

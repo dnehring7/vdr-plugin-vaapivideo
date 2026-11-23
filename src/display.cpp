@@ -1116,6 +1116,16 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     return true;
 }
 
+namespace {
+
+/// drmModeAtomicCommit(); a modeset holds HdmiModesetMutex(), as it switches the link's audio off and on.
+[[nodiscard]] auto CommitAtomic(int fd, drmModeAtomicReq *req, uint32_t flags, void *userData) -> int {
+    const cMutexLock lock((flags & DRM_MODE_ATOMIC_ALLOW_MODESET) != 0 ? &HdmiModesetMutex() : nullptr);
+    return drmModeAtomicCommit(fd, req, flags, userData);
+}
+
+} // namespace
+
 [[nodiscard]] auto cVaapiDisplay::AtomicCommit(AtomicRequest &req, uint32_t flags, bool osdHdrCommit) -> bool {
     if (!req.Handle() || req.Failed()) [[unlikely]] {
         // Incomplete request (alloc failure): reporting success would let PresentBuffer RmFB
@@ -1143,7 +1153,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
     // The serial lets the event name its commit: one the watchdog gave up on can still deliver late.
     const bool wantsEvent = (commitFlags & DRM_MODE_PAGE_FLIP_EVENT) != 0;
     const uintptr_t serial = wantsEvent ? flipSerial + 1 : 0;
-    if (drmModeAtomicCommit(drmFd, req.Handle(), commitFlags, std::bit_cast<void *>(serial)) == 0) {
+    if (CommitAtomic(drmFd, req.Handle(), commitFlags, std::bit_cast<void *>(serial)) == 0) {
         if (wantsEvent) {
             flipSerial = serial;
             flipPendingSinceMs.store(cTimeMs::Now(), std::memory_order_release);
@@ -1170,7 +1180,7 @@ auto cVaapiDisplay::AppendOsdPlane(AtomicRequest &req, const OsdOverlay &osd) co
                         "synchronous commits while the OSD is shown (brief A/V interruption possible)");
                 osdHdrNeedsModeset = true;
             }
-            if (drmModeAtomicCommit(drmFd, req.Handle(), DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) == 0) {
+            if (CommitAtomic(drmFd, req.Handle(), DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) == 0) {
                 return true; // sync path carries no PAGE_FLIP_EVENT -> isFlipPending stays clear
             }
         }

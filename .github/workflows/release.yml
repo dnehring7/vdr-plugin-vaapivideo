@@ -24,7 +24,7 @@ on:
         default: false
 
 permissions:
-  contents: read   # publish overrides to write for action-gh-release
+  contents: read   # publish overrides to write for gh release upload
 
 concurrency:
   group: ${{ github.workflow }}
@@ -32,9 +32,15 @@ concurrency:
 
 env:
   TAG: ${{ inputs.tag || github.event.release.tag_name }}
-  PUBLISH: ${{ github.event_name == 'release' || inputs.publish }}
   PLUGIN: vaapivideo
   FEDORA_REL: '45'
+
+# An explicit bash runs with -o pipefail (the implicit default does not), so a
+# failing curl in "curl | sed >> file" fails the step instead of writing a
+# truncated file. It also replaces sh as the default inside the containers.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # ================================================================
@@ -42,7 +48,10 @@ jobs:
   # ================================================================
   rpm:
     name: rpm (fedora 45)
-    runs-on: ubuntu-latest
+    # Pinned image: ubuntu-latest moved to 26.04 under the workflow, and its
+    # missing apt-utils failed the 1.10.0 publish (runner-images#14748).
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     container: fedora:45
     outputs:
       version: ${{ steps.prep.outputs.version }}
@@ -50,15 +59,16 @@ jobs:
     steps:
       - name: Install build prerequisites
         run: |
-          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_REL}.noarch.rpm
+          dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_REL}.noarch.rpm"
           dnf -y update
           dnf install -y \
-            git gnupg2 rpm-build rpm-sign rpmdevtools createrepo_c dnf-plugins-core
+            git gnupg2 rpm-build rpm-sign rpmdevtools createrepo_c dnf5-plugins
 
       - name: Checkout meta (workflow ref)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: _meta
+          persist-credentials: false
 
       - name: Prepare build
         id: prep
@@ -82,9 +92,10 @@ jobs:
           EOF
 
       - name: Checkout tag source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
+          persist-credentials: false
 
       - name: Patch spec & install build deps
         run: |
@@ -122,6 +133,8 @@ jobs:
           path: |
             repo/
             pkgs/
+          if-no-files-found: error
+          retention-days: 7   # only the publish job (or its re-run) reads it
 
   # ================================================================
   # deb -- build .deb only (matrix: Debian 13 + Ubuntu 26.04 LTS)
@@ -130,7 +143,8 @@ jobs:
   # collates both legs' .debs into per-distro signed apt repos.
   deb:
     name: deb (${{ matrix.distro }} ${{ matrix.version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -157,9 +171,10 @@ jobs:
             libavutil-dev libswresample-dev
 
       - name: Checkout meta (workflow ref)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: _meta
+          persist-credentials: false
 
       - name: Prepare build
         uses: ./_meta/.github/actions/prepare-build
@@ -167,9 +182,10 @@ jobs:
           tag: ${{ env.TAG }}
 
       - name: Checkout tag source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
+          persist-credentials: false
 
       - name: Build .deb
         env:
@@ -195,6 +211,8 @@ jobs:
           # derive it without a second copy of the matrix.
           name: deb-${{ matrix.distro }}-${{ matrix.codename }}
           path: _out/*.deb
+          if-no-files-found: error
+          retention-days: 7
 
   # ================================================================
   # publish -- sign apt repos, upload to release, deploy Pages
@@ -204,9 +222,10 @@ jobs:
     needs: [rpm, deb]
     if: needs.rpm.result == 'success' && needs.deb.result == 'success'
       && (github.event_name == 'release' || inputs.publish)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     permissions:
-      contents: write   # softprops/action-gh-release
+      contents: write   # gh release upload
       pages: write      # actions/deploy-pages
       id-token: write   # actions/deploy-pages
     environment:
@@ -219,6 +238,13 @@ jobs:
       PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
 
     steps:
+      - name: Install repo tools
+        # The 26.04 image has no apt-utils (apt-ftparchive): install what the apt
+        # repo step runs instead of trusting the image.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
+
       - name: Import GPG key
         id: gpg
         uses: crazy-max/ghaction-import-gpg@v7
@@ -239,9 +265,8 @@ jobs:
         env:
           KEYFP: ${{ steps.gpg.outputs.fingerprint }}
         run: |
-          # apt-utils (apt-ftparchive), dpkg-dev (dpkg-scanpackages) and gpg
-          # are pre-installed on ubuntu-latest. The artifact name encodes
-          # both fields: deb-<distro>-<codename>, one .deb each.
+          # The artifact name encodes both fields: deb-<distro>-<codename>,
+          # one .deb each.
           for dir in _artifacts/deb-*; do
             base=$(basename "${dir}")
             tmp=${base#deb-}                # <distro>-<codename>
@@ -331,12 +356,15 @@ jobs:
           HTML
 
       - name: Upload packages to release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.TAG }}
-          files: |
-            _artifacts/rpm/pkgs/*.rpm
-            _artifacts/deb-*/*.deb
+        # The preinstalled gh instead of a third-party action holding contents:
+        # write. --clobber keeps a re-run idempotent; a tag without a release
+        # fails here instead of getting one created behind its back.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${TAG}" --clobber \
+            _artifacts/rpm/pkgs/*.rpm _artifacts/deb-*/*.deb
 
       - name: Configure Pages
         uses: actions/configure-pages@v6

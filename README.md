@@ -19,7 +19,7 @@ the plugin refuses to start without it.
 |-------------|----------------------------------------------------------------------------------------------------|
 | Decode      | MPEG-2, H.264 (incl. High 10), HEVC (incl. Main 10), AV1 Main / Main 10 — hardware (VAAPI) with per-profile software fallback |
 | Filters     | Deinterlace and DAR-preserving scale — hardware (VAAPI VPP) or software (bwdif, swscale); opt-in denoise and sharpen, hardware or software (hqdn3d, unsharp) |
-| Audio       | PCM decode/downmix with sink-driven multichannel output; IEC61937 passthrough (AC-3, E-AC-3, DTS, TrueHD, AC-4, MPEG-H 3D) |
+| Audio       | PCM decode/downmix with sink-driven multichannel output; IEC61937 passthrough (AC-3, E-AC-3, DTS, DTS-HD, TrueHD) |
 | Display     | DRM atomic mode-setting, double-buffered page-flip, BT.709 SDR + BT.2020 HDR10/HLG passthrough, optional runtime resolution / refresh-rate matching |
 | OSD         | True-color hardware overlay on a dedicated DRM plane, alpha-blended over the video plane           |
 | Mediaplayer | Local files (MP4, MKV, TS, WebM, …), http(s)/ftp URLs, m3u/m3u8 playlists, trick play (fast/slow, forward/backward), audio-track switching, text subtitles — see [Mediaplayer](#mediaplayer) |
@@ -234,7 +234,11 @@ conversion). Both expose the real sink and its channel map, so IEC61937
 passthrough and native multichannel PCM both work. Avoid the bare `default`:
 it routes through dmix/PulseAudio, downmixes multichannel to stereo, and
 blocks the channel-map query used to put surround channels on the right
-speakers. Find the device with:
+speakers. TrueHD and DTS-HD Master Audio depend on this choice most: their
+8-channel 192 kHz carrier needs the data unconverted and the output's own
+non-audio bit set, which neither `default` nor the `hdmi:` alias (it rewrites
+the bit) provides. There TrueHD is decoded to PCM and DTS-HD sends its core.
+Find the device with:
 
     aplay -l | grep -E "HDMI|DisplayPort"
     vdr -P 'vaapivideo -a plughw:0,3'
@@ -310,8 +314,8 @@ and forwards a compressed codec as IEC61937 only when the sink advertises
 support for it; everything else is decoded to PCM. If the ELD is unreadable at
 that point (AVR asleep, TV off), the probe repeats on the next codec change, so
 passthrough and multichannel light up as soon as the sink answers — no VDR
-restart needed. `on` forces passthrough for
-every wrappable codec (AC-3, E-AC-3, TrueHD, DTS, AC-4, MPEG-H 3D) and ignores
+restart needed. `on` forces passthrough for every codec FFmpeg's `spdif` muxer
+frames (AC-3, E-AC-3, TrueHD, DTS; AC-4 and MPEG-H 3D once it does) and ignores
 the ELD — for topologies where the probed capabilities are wrong, typically an
 AVR behind a TV whose EDID masks the AVR's real decoders. Make sure the
 downstream device really decodes the codec: ALSA cannot detect a silent decode
@@ -326,7 +330,7 @@ VDR restarts; the setup value stays the startup default. Typical use: `off` for
 TV on the TV speakers, one key press for bitstream when the AVR is switched on.
 
 Passthrough also flips the IEC 60958-3 "non-audio" bit (AES0 bit 1) that tells
-the sink a bitstream, not PCM, is coming, and clears it again on every PCM open
+the sink a bitstream, not PCM, is coming, and clears it again on every close
 (HDMI codecs keep the bit across `snd_pcm_close()`). The control is resolved per
 output at startup — HDA cards expose one `IEC958 Playback Default` per digital
 converter on `iface=MIXER`, indexed in PCM-device order, so `hw:0,3` (the first
@@ -334,12 +338,25 @@ HDMI pin) uses index 0. The log names the element it picked:
 `IEC958 Playback Default on hw:0 -- iface=MIXER device=0 index=0`, and every
 *change* as `IEC958 AES0 0x04 -> 0x06 (non-audio)`. The bit is re-asserted on
 every device open (the kernel's cached value can drift from the link across an
-AVR power-cycle or a hotplug), but a write that changes nothing is not logged:
-no line on a passthrough-to-passthrough channel switch means the sink was
-already armed, not that the bit was skipped. If the log instead reports
+AVR power-cycle or a hotplug); only a write that changes it is logged. So a
+passthrough-to-passthrough reopen logs the bit dropping and returning, and a
+switch that keeps the device open logs nothing. If the log instead reports
 `not resolved`, the card exposes no such control (an ALSA `default`/dmix device
 does not) and the bit is left alone — passthrough still works on sinks that key
-off the IEC61937 preamble alone.
+off the IEC61937 preamble alone. TrueHD and DTS-HD Master Audio are the
+exception: the kernel enables their 8-channel high-bitrate carrier (192 kHz,
+176.4 kHz for the 44.1 kHz family) only for a non-audio stream, else it plays
+as full-scale noise. Without a control resolved for this very output, on a
+device that rewrites the bit (the `hdmi:` alias does) or on one that cannot
+take the carrier unconverted, TrueHD is decoded to PCM and DTS-HD sends its
+core.
+
+DTS-HD from a media file goes out whole only to a sink whose ELD lists
+DTS-HD, in `on` mode too: Master Audio on the same 8-channel carrier as
+TrueHD, High Resolution on a stereo 192 kHz one. Every other sink, a live
+DTS stream (it carries no profile) and an HD carrier the device refuses get
+the DTS core, which every DTS decoder plays. DTS Express and other streams
+without a core are decoded to PCM.
 
 **`PCM channels`** — applies whenever audio is decoded to PCM (no passthrough,
 or a codec without IEC61937 framing such as AAC or MP2):
@@ -445,7 +462,10 @@ The default mode is restored whenever mode switching is no longer in charge of
 what is playing.
 
 A mode change re-trains the HDMI link, so the panel goes black for roughly half
-a second — the same blank a source switch on the TV produces. The OSD re-lays
+a second — the same blank a source switch on the TV produces. HDMI audio pauses
+with it, and the audio output is not reconfigured until the link is back: on
+Intel graphics, a TrueHD or DTS-HD Master Audio stream set up in that pause
+leaves HDMI audio silent until the sound driver re-initializes. The OSD re-lays
 itself out within about a second.
 
 > **Caution:** a **resolution** change resizes the OSD mid-session, a path some
@@ -813,6 +833,7 @@ Passing `data == nullptr` acts as a capability probe — `Service()` returns
 | Picture | Combing on interlaced (AMD/Mesa)     | Weak HW deinterlacer — `Deinterlacing = software: bwdif` (or `w3fdif`) |
 | Audio   | No audio                             | `speaker-test -D hw:0,3 -c 2 -r 48000 -t sine -l 1`        |
 | Audio   | Passthrough not working              | Use `hw:CARD,DEV`; `/proc/asound/card0/eld#0.N` must be non-empty |
+| Audio   | TrueHD plays as PCM, DTS-HD MA as plain DTS | The log names the cause (`… passthrough on 8ch needs the IEC958 …`, `DTS-HD carrier … refused`); use `hw:`/`plughw:CARD,DEV`, not `hdmi:` or `default` |
 | Audio   | Multichannel plays as stereo / wrong speakers | Use a direct `hw:`/`plughw:CARD,DEV`, not `default` |
 | Audio   | Persistent A/V drift                 | Tune `PCM` / `Passthrough audio latency` (see [AVSYNC.md](AVSYNC.md)) |
 | Audio   | Short dropout shortly after a channel switch | ALSA ring ran dry — the log reports `ALSA … recovered -- N xrun(s)`; check `state:`/`avail_max` in `/proc/asound/card0/pcm3p/sub0/status` and see [AVSYNC.md](AVSYNC.md#ring-cushion) |
