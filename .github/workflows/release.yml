@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Dirk Nehring <dnehring@gmx.net>
 #
-# Build & sign RPMs (Fedora) and DEBs (Debian + Ubuntu), attach to the
+# Build & sign RPMs (Fedora) and DEBs (Debian + Ubuntu), attach them to the
 # GitHub Release, and publish DNF / APT repos via GitHub Pages.
 #
 # Prereqs:
@@ -24,7 +24,7 @@ on:
         default: false
 
 permissions:
-  contents: read   # publish overrides to write for gh release upload
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}
@@ -35,72 +35,50 @@ env:
   PLUGIN: vaapivideo
   FEDORA_REL: '45'
 
-# An explicit bash runs with -o pipefail (the implicit default does not), so a
-# failing curl in "curl | sed >> file" fails the step instead of writing a
-# truncated file. It also replaces sh as the default inside the containers.
+# bash, not the containers' sh, and with -o pipefail: a failing curl in
+# "curl | sed >> file" fails the step instead of writing a truncated file.
 defaults:
   run:
     shell: bash
 
 jobs:
-  # ================================================================
-  # rpm -- build + sign RPMs, assemble the dnf repo (Fedora)
-  # ================================================================
   rpm:
     name: rpm (fedora 45)
-    # Pinned image: ubuntu-latest moved to 26.04 under the workflow, and its
-    # missing apt-utils failed the 1.10.0 publish (runner-images#14748).
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     container: fedora:45
-    outputs:
-      version: ${{ steps.prep.outputs.version }}
-
     steps:
       - name: Install build prerequisites
         run: |
           dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_REL}.noarch.rpm"
           dnf -y update
-          dnf install -y \
-            git gnupg2 rpm-build rpm-sign rpmdevtools createrepo_c dnf5-plugins
+          dnf install -y git gnupg2 rpm-build rpm-sign rpmdevtools createrepo_c dnf5-plugins
 
-      - name: Checkout meta (workflow ref)
+      - name: Checkout tag source
         uses: actions/checkout@v7
         with:
-          path: _meta
+          # Fully qualified: a branch named like the tag would win otherwise.
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
 
-      - name: Prepare build
-        id: prep
-        uses: ./_meta/.github/actions/prepare-build
-        with:
-          tag: ${{ env.TAG }}
+      - name: Check version & install build deps
+        run: |
+          # The tarball is the tagged tree as committed, so it must already
+          # carry the tag's version. Patching only the spec labeled the package
+          # with the tag while the plugin reported its own version (v1.3.2).
+          V=${TAG#v}
+          [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && [[ "$(awk '$1 == "Version:" {print $2}' "vdr-${PLUGIN}.spec")" == "${V}" ]] \
+            && grep -qF "PLUGIN_VERSION = \"${V}\";" src/common.h \
+            || { echo "::error::${TAG}, vdr-${PLUGIN}.spec and src/common.h must agree on vX.Y.Z"; exit 1; }
+          echo "V=${V}" >> "${GITHUB_ENV}"
+          dnf builddep -y "vdr-${PLUGIN}.spec"
 
       - name: Import GPG key
         id: gpg
         uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-
-      - name: Configure rpm signing
-        env:
-          KEYFP: ${{ steps.gpg.outputs.fingerprint }}
-        run: |
-          cat > ~/.rpmmacros <<EOF
-          %_gpg_name ${KEYFP}
-          %_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback
-          EOF
-
-      - name: Checkout tag source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-
-      - name: Patch spec & install build deps
-        run: |
-          sed -i "s/^Version:.*/Version:        ${V}/" "vdr-${PLUGIN}.spec"
-          dnf builddep -y "vdr-${PLUGIN}.spec"
 
       - name: Build, sign & assemble repo
         env:
@@ -110,20 +88,19 @@ jobs:
           rpmdev-setuptree
           git archive --format=tar.gz --prefix="vdr-plugin-${PLUGIN}-${V}/" HEAD \
             -o "${HOME}/rpmbuild/SOURCES/vdr-${PLUGIN}-${V}.tar.gz"
-          cp "vdr-${PLUGIN}.spec" "${HOME}/rpmbuild/SPECS/"
-          # debug_package=%{nil} suppresses the auto -debuginfo / -debugsource subpackages.
-          rpmbuild -ba --define 'debug_package %{nil}' "${HOME}/rpmbuild/SPECS/vdr-${PLUGIN}.spec"
-          rpm --addsign "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm
-          # Repo layout matches the URL the .repo file will hand to dnf:
+          # debug_package %{nil}: no -debuginfo / -debugsource subpackages.
+          rpmbuild -ba --define 'debug_package %{nil}' "vdr-${PLUGIN}.spec"
+          rpmsign --addsign --define "_gpg_name ${KEYFP}" \
+            --define '_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback' \
+            "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm
+          # Repo layout matches the baseurl of the .repo file:
           #   <pages>/fedora/<rel>/x86_64/{*.rpm, repodata/}
           REPO_DIR="repo/${FEDORA_REL}/x86_64"
-          mkdir -p "${REPO_DIR}"
+          mkdir -p "${REPO_DIR}" pkgs
           cp "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${REPO_DIR}/"
           createrepo_c "${REPO_DIR}/"
           gpg --batch --yes --pinentry-mode loopback --local-user "${KEYFP}" \
             --detach-sign --armor "${REPO_DIR}/repodata/repomd.xml"
-          # Stage release-only artifacts (binary + source RPMs) outside the repo dir.
-          mkdir -p pkgs
           cp "${HOME}"/rpmbuild/RPMS/x86_64/*.rpm "${HOME}"/rpmbuild/SRPMS/*.rpm pkgs/
 
       - name: Upload artifacts
@@ -134,13 +111,9 @@ jobs:
             repo/
             pkgs/
           if-no-files-found: error
-          retention-days: 7   # only the publish job (or its re-run) reads it
+          retention-days: 7
 
-  # ================================================================
-  # deb -- build .deb only (matrix: Debian 13 + Ubuntu 26.04 LTS)
-  # ================================================================
-  # Pure dpkg-buildpackage; no GPG, no repo metadata. The publish job
-  # collates both legs' .debs into per-distro signed apt repos.
+  # Unsigned .debs only: the publish job builds the signed apt repos.
   deb:
     name: deb (${{ matrix.distro }} ${{ matrix.version }})
     runs-on: ubuntu-26.04
@@ -158,7 +131,6 @@ jobs:
             codename: resolute
             image: ubuntu:26.04
     container: ${{ matrix.image }}
-
     steps:
       - name: Install build prerequisites
         run: |
@@ -170,27 +142,22 @@ jobs:
             libavcodec-dev libavfilter-dev libavformat-dev \
             libavutil-dev libswresample-dev
 
-      - name: Checkout meta (workflow ref)
-        uses: actions/checkout@v7
-        with:
-          path: _meta
-          persist-credentials: false
-
-      - name: Prepare build
-        uses: ./_meta/.github/actions/prepare-build
-        with:
-          tag: ${{ env.TAG }}
-
       - name: Checkout tag source
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
 
       - name: Build .deb
         env:
           CODENAME: ${{ matrix.codename }}
         run: |
+          # As in the rpm job: the changelog below labels the package with the
+          # tag, so the tagged tree must report the same version.
+          V=${TAG#v}
+          [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && grep -qF "PLUGIN_VERSION = \"${V}\";" src/common.h \
+            || { echo "::error::${TAG} and src/common.h must agree on vX.Y.Z"; exit 1; }
           git config --global --add safe.directory '*'
           MAINTAINER=$(git log -1 --format='%an <%ae>' HEAD)
           cat > debian/changelog <<EOF
@@ -207,35 +174,27 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          # Encoding the codename in the artifact name lets the publish job
-          # derive it without a second copy of the matrix.
+          # deb-<distro>-<codename> lets the publish job derive both fields
+          # without a second copy of the matrix.
           name: deb-${{ matrix.distro }}-${{ matrix.codename }}
           path: _out/*.deb
           if-no-files-found: error
           retention-days: 7
 
-  # ================================================================
-  # publish -- sign apt repos, upload to release, upload the Pages site
-  # ================================================================
   publish:
     name: publish
     needs: [rpm, deb]
-    if: needs.rpm.result == 'success' && needs.deb.result == 'success'
-      && (github.event_name == 'release' || inputs.publish)
+    if: github.event_name == 'release' || inputs.publish
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: write   # gh release upload
     env:
-      VERSION: ${{ needs.rpm.outputs.version }}
-      OWNER: ${{ github.repository_owner }}
       PKG: ${{ github.event.repository.name }}
       PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
-
     steps:
       - name: Install repo tools
-        # The 26.04 image has no apt-utils (apt-ftparchive): install what the apt
-        # repo step runs instead of trusting the image.
+        # The 26.04 image has no apt-utils (apt-ftparchive).
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
@@ -260,11 +219,8 @@ jobs:
         env:
           KEYFP: ${{ steps.gpg.outputs.fingerprint }}
         run: |
-          # The artifact name encodes both fields: deb-<distro>-<codename>,
-          # one .deb each.
           for dir in _artifacts/deb-*; do
-            base=$(basename "${dir}")
-            tmp=${base#deb-}                # <distro>-<codename>
+            tmp=${dir##*/deb-}              # <distro>-<codename>
             distro=${tmp%-*}; codename=${tmp##*-}
             REPO_DIR="site/${distro}"
             mkdir -p "${REPO_DIR}"
@@ -289,20 +245,18 @@ jobs:
 
       - name: Generate repo configs and landing page
         run: |
-          # DNF repo file: dnf fetches gpgkey on first install.
+          # dnf fetches gpgkey on first install.
           cat > "site/fedora/${FEDORA_REL}/vdr-${PLUGIN}.repo" <<REPO
           [vdr-${PLUGIN}]
           name=${PKG} packages for Fedora ${FEDORA_REL}
           baseurl=${PAGES_URL}/fedora/${FEDORA_REL}/x86_64/
           enabled=1
           gpgcheck=1
-          gpgkey=https://github.com/${OWNER}.gpg
+          gpgkey=https://github.com/${GITHUB_REPOSITORY_OWNER}.gpg
           repo_gpgcheck=1
           REPO
-          # DEB822 sources with inline Signed-By: the trust anchor travels
-          # with the file. Each armored line is space-prefixed; blank lines
-          # become " ." per the DEB822 spec. Distro list is derived from the
-          # artifact directory names (same source as the repo-signing step).
+          # DEB822 sources with an inline Signed-By, so the trust anchor travels
+          # with the file: armored lines are space-prefixed, blank ones " .".
           for dir in _artifacts/deb-*; do
             d=${dir##*/deb-}; d=${d%-*}
             cat > "site/${d}/vdr-${PLUGIN}.sources" <<SOURCES
@@ -312,7 +266,7 @@ jobs:
           Architectures: amd64
           Signed-By:
           SOURCES
-            curl -fsSL "https://github.com/${OWNER}.gpg" \
+            curl -fsSL "https://github.com/${GITHUB_REPOSITORY_OWNER}.gpg" \
               | sed -e 's/^$/./' -e 's/^/ /' \
               >> "site/${d}/vdr-${PLUGIN}.sources"
             printf '\n' >> "site/${d}/vdr-${PLUGIN}.sources"
@@ -322,7 +276,7 @@ jobs:
           <html lang="en">
           <head><meta charset="utf-8"><title>${PKG} packages</title></head>
           <body>
-          <h1>${PKG} ${VERSION}</h1>
+          <h1>${PKG} ${TAG#v}</h1>
 
           <h2>Fedora ${FEDORA_REL} (x86_64)</h2>
           <pre>
@@ -351,9 +305,8 @@ jobs:
           HTML
 
       - name: Upload packages to release
-        # The preinstalled gh instead of a third-party action holding contents:
-        # write. --clobber keeps a re-run idempotent; a tag without a release
-        # fails here instead of getting one created behind its back.
+        # --clobber keeps a re-run idempotent; a tag without a release fails
+        # here instead of getting one created behind its back.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -366,26 +319,20 @@ jobs:
         with:
           path: site/
 
-  # ================================================================
-  # pages -- deploy the site publish uploaded
-  # ================================================================
-  # A job of its own, as in GitHub's Pages starter workflows: deploy-pages finds
-  # the site in the run's artifact list, which can lag the upload, and a step
-  # right after it failed the 1.10.1 publish ("No artifacts named
-  # github-pages"). A failed deploy also re-runs alone, without re-signing or
-  # re-uploading anything.
+  # A job of its own: deploy-pages finds the site in the run's artifact list,
+  # which can lag the upload (the 1.10.1 publish failed with "No artifacts
+  # named github-pages"), and a failed deploy re-runs alone.
   pages:
     name: pages
     needs: publish
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
-      pages: write      # actions/configure-pages, actions/deploy-pages
-      id-token: write   # actions/deploy-pages
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Configure Pages
         uses: actions/configure-pages@v6
