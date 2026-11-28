@@ -681,6 +681,27 @@ the Dolby vendor block. The Dolby line shows the vendor block's layout version
 signaling and cannot be detected.
 
 
+## 3D
+
+A mediaplayer file that declares side-by-side or top/bottom 3D (Matroska
+`StereoMode`, MP4 `st3d`) gets the HDMI 3D variant of its output mode, whether
+mode matching is on or off. The TV then switches by itself, and Stop returns to
+2D. Nothing is guessed from the file name or the picture; a 3D TV's own
+detection does that.
+
+- **Which displays.** The kernel offers 3D variants only on a native HDMI port
+  to a sink that announces 3D, and only for the timings HDMI 1.4 defines. TVs
+  typically take top/bottom at 1080p50/60 but side-by-side only at 1080p24.
+  DisplayPort and LSPCON links offer none. Without a variant the file plays as
+  encoded.
+- **Picture.** The frame stays packed. A full-resolution pair (side-by-side
+  2.5:1 or wider, top/bottom narrower than 1.5:1) is scaled to fit the screen.
+  The OSD is not drawn per eye.
+- **Not supported:** MV-HEVC plays its base view in 2D. FFmpeg decodes the
+  second view only in software and outputs it as a separate frame. H.264 MVC
+  has no FFmpeg decoder.
+
+
 ## SVDRP commands
 
 | Command                        | Description                                                |

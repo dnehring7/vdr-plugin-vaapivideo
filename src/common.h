@@ -235,10 +235,25 @@ struct StreamStartTrace {
     return static_cast<uint32_t>((num + (den / 2)) / den); // round to nearest
 }
 
-/// Two modes are "the same output" iff size and exact rate agree; drmModeModeInfo also carries
+/// Two modes are "the same output" iff size, exact rate and 3D layout agree; drmModeModeInfo also carries
 /// timing detail that is irrelevant to whether a modeset is worth its HDMI relink.
 [[nodiscard]] inline auto SameOutputMode(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
-    return a.hdisplay == b.hdisplay && a.vdisplay == b.vdisplay && ModeRefreshMilliHz(a) == ModeRefreshMilliHz(b);
+    return a.hdisplay == b.hdisplay && a.vdisplay == b.vdisplay && ModeRefreshMilliHz(a) == ModeRefreshMilliHz(b) &&
+           (a.flags & DRM_MODE_FLAG_3D_MASK) == (b.flags & DRM_MODE_FLAG_3D_MASK);
+}
+
+/// Log suffix naming a DRM_MODE_FLAG_3D_* layout; empty for 2D.
+[[nodiscard]] inline auto Stereo3dTag(uint32_t flags) noexcept -> const char * {
+    switch (flags & DRM_MODE_FLAG_3D_MASK) {
+        case 0:
+            return "";
+        case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
+            return " (3D side-by-side)";
+        case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
+            return " (3D top/bottom)";
+        default:
+            return " (3D)";
+    }
 }
 
 /// An exact width:height ratio. Rational rather than a double so the VPP fit can cross-multiply in

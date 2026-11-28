@@ -23,6 +23,9 @@
 #include <utility>
 #include <vector>
 
+// DRM/KMS
+#include <libdrm/drm_mode.h>
+
 // FFmpeg
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -312,8 +315,15 @@ auto cVideoFilterChain::Build(AVFrame *firstFrame, const BuildParams &params) ->
     // where this collapses to the source DAR exactly.
     const uint64_t parNum = params.outputParNum > 0 ? params.outputParNum : 1;
     const uint64_t parDen = params.outputParDen > 0 ? params.outputParDen : 1;
-    const uint64_t fitNum = static_cast<uint64_t>(croppedW) * static_cast<uint64_t>(sarNum) * parDen;
-    const uint64_t fitDen = static_cast<uint64_t>(croppedH) * static_cast<uint64_t>(sarDen) * parNum;
+    uint64_t fitNum = static_cast<uint64_t>(croppedW) * static_cast<uint64_t>(sarNum) * parDen;
+    uint64_t fitDen = static_cast<uint64_t>(croppedH) * static_cast<uint64_t>(sarDen) * parNum;
+    // 3D mode: the TV stretches each half to the screen. Side by side from 2.5:1, or top/bottom under 1.5:1, packs
+    // full-resolution eyes: fit one eye, half the frame's aspect on the packed axis.
+    if (params.stereo3d == DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF && fitNum * 2 >= fitDen * 5) {
+        fitDen *= 2;
+    } else if (params.stereo3d == DRM_MODE_FLAG_3D_TOP_AND_BOTTOM && fitNum * 2 < fitDen * 3) {
+        fitNum *= 2;
+    }
 
     uint32_t filterWidth = dstWidth;
     uint32_t filterHeight = dstHeight;

@@ -67,6 +67,9 @@
 #include <utility>
 #include <vector>
 
+// DRM/KMS
+#include <libdrm/drm_mode.h>
+
 // FFmpeg
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -2685,6 +2688,8 @@ auto cVaapiDecoder::DecodeOnePacket(AVPacket *pkt, std::vector<std::unique_ptr<V
     // the first frame decodes, so the first chain already paces for it instead of carrying fps=50 through
     // the modeset and dropping every other frame on the new mode until the rebuild.
     params.outputRefreshMilliHz = display->GetTargetRefreshMilliHz();
+    // The active mode, not the request: 3D geometry only once the TV gets the 3D signal (each modeset rebuilds).
+    params.stereo3d = display->GetActiveMode().flags & DRM_MODE_FLAG_3D_MASK;
     params.hdrPassthrough = hdrPassthrough;
     params.hdrInfo = hdrInfo;
     params.deinterlaceMode = vaapiContext->caps.deinterlaceMode;

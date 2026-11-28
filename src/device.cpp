@@ -2821,7 +2821,8 @@ auto cVaapiDevice::ApplyDisplayModePolicy(StreamModeRequest request, PlaybackSou
     if (match.index < 0) {
         return;
     }
-    const auto &winner = connectorModes.at(modeCandidates.at(static_cast<size_t>(match.index)).index);
+    const drmModeModeInfo winner =
+        StereoTwinLocked(connectorModes.at(modeCandidates.at(static_cast<size_t>(match.index)).index));
     // Against the latest request, not the programmed mode: one in flight is already on its way, and one the
     // driver rejected would be rejected again -- each retry a blanking commit.
     if (SameOutputMode(winner, display->GetRequestedMode())) {
@@ -2847,8 +2848,10 @@ auto cVaapiDevice::RestoreDefaultModeLocked(uint64_t nowMs) -> void {
     if (defaultMode.hdisplay == 0) {
         return;
     }
+    // 3D switches the TV even with matching off, as a Blu-ray player does.
+    const drmModeModeInfo target = StereoTwinLocked(defaultMode);
     // The latest request, not the programmed mode: a stop inside an in-flight switch must still undo it.
-    if (SameOutputMode(defaultMode, display->GetRequestedMode())) {
+    if (SameOutputMode(target, display->GetRequestedMode())) {
         return; // the overwhelmingly common case: nothing ever moved the mode
     }
     // No rate limit here, unlike ApplyDisplayModePolicy: this path is edge-driven with nothing left
@@ -2856,7 +2859,7 @@ auto cVaapiDevice::RestoreDefaultModeLocked(uint64_t nowMs) -> void {
     // another source's mode. Returning to the default is idempotent and cannot oscillate.
     isyslog("vaapivideo/device: restoring default display mode %ux%u@%.3fHz", defaultMode.hdisplay,
             defaultMode.vdisplay, static_cast<double>(ModeRefreshMilliHz(defaultMode)) / 1000.0);
-    display->RequestDisplayMode(defaultMode);
+    display->RequestDisplayMode(target);
     lastModeChangeMs = nowMs;
 }
 
@@ -3024,6 +3027,7 @@ auto cVaapiDevice::ReevaluateDisplayMode() -> void {
 }
 
 auto cVaapiDevice::ResetDisplayModeToDefault() -> void {
+    mediaStereo3d.store(0, std::memory_order_relaxed); // playback over: the default mode is 2D
     if (!HardwareReady() || !display) {
         return;
     }
@@ -3125,6 +3129,7 @@ namespace {
     liveMode.store(false, std::memory_order_relaxed);
     decoder->SetLiveMode(false);
     ResetZoom(); // Each opened file/URL starts unzoomed; the codec-open below rebuilds the graph.
+    mediaStereo3d.store(video.stereo3d, std::memory_order_relaxed);
 
     // Skip the audio 2-of-2 codec-detection dance: the demuxer reported authoritative codec IDs.
     firstAuReleasePending.store(false, std::memory_order_relaxed); // pre-framed AUs never go through the parser
@@ -3163,8 +3168,8 @@ namespace {
     // HandleAudioTrackChange reset must stand down for this session.
     mediaPlayerAudioActive.store(true, std::memory_order_release);
 
-    isyslog("vaapivideo/device: mediaplayer open -- video=%s audio=%s", avcodec_get_name(video.codecId),
-            audioOpened ? avcodec_get_name(audio.codecId) : "none");
+    isyslog("vaapivideo/device: mediaplayer open -- video=%s%s audio=%s", avcodec_get_name(video.codecId),
+            Stereo3dTag(video.stereo3d), audioOpened ? avcodec_get_name(audio.codecId) : "none");
     return true;
 }
 
@@ -3952,14 +3957,26 @@ namespace {
 /// Timing identity, stricter than SameOutputMode(): a CEA and a DMT 1080p60 look alike but are
 /// different rasters. All programmed fields -- equal totals can still split into a different
 /// porch/sync -- but not type/name/vrefresh, which are metadata or derived.
-[[nodiscard]] auto SameRaster(const drmModeModeInfo &a, const drmModeModeInfo &b) noexcept -> bool {
+[[nodiscard]] auto SameRaster(const drmModeModeInfo &a, const drmModeModeInfo &b, uint32_t ignoredFlags = 0) noexcept
+    -> bool {
     return a.clock == b.clock && a.hdisplay == b.hdisplay && a.hsync_start == b.hsync_start &&
            a.hsync_end == b.hsync_end && a.htotal == b.htotal && a.hskew == b.hskew && a.vdisplay == b.vdisplay &&
            a.vsync_start == b.vsync_start && a.vsync_end == b.vsync_end && a.vtotal == b.vtotal && a.vscan == b.vscan &&
-           a.flags == b.flags;
+           (a.flags & ~ignoredFlags) == (b.flags & ~ignoredFlags);
 }
 
 } // namespace
+
+[[nodiscard]] auto cVaapiDevice::StereoTwinLocked(const drmModeModeInfo &mode) const -> drmModeModeInfo {
+    // Twins exist only where the link can signal 3D (native HDMI to a 3D sink). The kernel builds them from the CEA
+    // VIC, so their picture aspect may differ from that of an EDID detailed timing of the same raster.
+    const uint32_t wanted = mediaStereo3d.load(std::memory_order_relaxed);
+    const auto twin = std::ranges::find_if(connectorModes, [&](const drmModeModeInfo &m) noexcept -> bool {
+        return wanted != 0 && (m.flags & DRM_MODE_FLAG_3D_MASK) == wanted &&
+               SameRaster(m, mode, DRM_MODE_FLAG_3D_MASK | DRM_MODE_FLAG_PIC_AR_MASK);
+    });
+    return twin != connectorModes.end() ? *twin : mode;
+}
 
 [[nodiscard]] auto BuildModeCandidates(std::span<const drmModeModeInfo> modes, const drmModeModeInfo &defaultMode)
     -> std::vector<DisplayModeCandidate> {
@@ -3983,7 +4000,8 @@ namespace {
         }
         // Interlaced output is unusable here: the VPP always emits progressive frames and the
         // scanout path has no field interleaving, so an interlaced mode would show half the lines.
-        if ((mode.flags & DRM_MODE_FLAG_INTERLACE) != 0) {
+        // A 3D twin (DRM_CLIENT_CAP_STEREO_3D) is never a 2D candidate; StereoTwinLocked() picks it.
+        if ((mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_3D_MASK)) != 0) {
             continue;
         }
         const uint32_t rateMilliHz = ModeRefreshMilliHz(mode);
@@ -4113,7 +4131,8 @@ namespace {
     uint32_t bestErrorPpm = 0;
     for (int modeIdx = 0; modeIdx < connector->count_modes; ++modeIdx) {
         const auto &mode = connector->modes[modeIdx];
-        if (mode.hdisplay != targetWidth || mode.vdisplay != targetHeight) {
+        if (mode.hdisplay != targetWidth || mode.vdisplay != targetHeight ||
+            (mode.flags & DRM_MODE_FLAG_3D_MASK) != 0) {
             continue;
         }
         const uint32_t errorPpm = RateErrorPpm(ModeRefreshMilliHz(mode), targetRate * 1000U);
@@ -4219,6 +4238,8 @@ namespace {
     // explicitly keeps the dependency visible. Best-effort: a refusal just falls back to pixel
     // ratios.
     (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_ASPECT_RATIO, 1);
+    // Adds a 3D twin of each timing the link can signal 3D on; programming one sends the HDMI 3D infoframe.
+    (void)drmSetClientCap(drmFd, DRM_CLIENT_CAP_STEREO_3D, 1);
 
     std::unique_ptr<drmModeRes, FreeDrmResources> resources{drmModeGetResources(drmFd)};
     if (!resources) [[unlikely]] {

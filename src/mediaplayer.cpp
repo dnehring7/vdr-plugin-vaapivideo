@@ -68,6 +68,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// DRM/KMS
+#include <libdrm/drm_mode.h>
+
 // FFmpeg
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -90,6 +93,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/rational.h>
+#include <libavutil/stereo3d.h>
 }
 #pragma GCC diagnostic pop
 
@@ -895,6 +899,18 @@ auto cVaapiMediaSource::PopulateStreamInfo() -> void {
             sd != nullptr && sd->size >= sizeof(AVContentLightMetadata)) {
             videoInfo.hasContentLight = true;
             std::memcpy(&videoInfo.contentLight, sd->data, sizeof(videoInfo.contentLight));
+        }
+        // 3D only as the file declares it (Matroska StereoMode, MP4 st3d); the TV's own detection handles the rest.
+        if (const AVPacketSideData *sd =
+                av_packet_side_data_get(p->coded_side_data, p->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
+            sd != nullptr && sd->size >= sizeof(AVStereo3D)) {
+            AVStereo3D s3d{};
+            std::memcpy(&s3d, sd->data, sizeof(s3d));
+            if (s3d.type == AV_STEREO3D_SIDEBYSIDE) {
+                videoInfo.stereo3d = DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF;
+            } else if (s3d.type == AV_STEREO3D_TOPBOTTOM) {
+                videoInfo.stereo3d = DRM_MODE_FLAG_3D_TOP_AND_BOTTOM;
+            }
         }
         // Dolby Vision: VAAPI has no DV path, so only the HEVC base layer decodes (RPU + enhancement
         // layer dropped). A BL compatibility id of 1 (HDR10) / 4 (HLG) renders correctly; 0/2 (e.g.

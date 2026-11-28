@@ -69,6 +69,7 @@ struct VideoStreamInfo {
     bool hasContentLight{false};                   ///< contentLight is valid
     AVMasteringDisplayMetadata masteringDisplay{}; ///< Display primaries + luminance
     AVContentLightMetadata contentLight{};         ///< MaxCLL / MaxFALL
+    uint32_t stereo3d{0};                          ///< DRM_MODE_FLAG_3D_* layout the container declares; 0 = 2D
 };
 
 /// Audio elementary stream descriptor. Field order is preserved from the former

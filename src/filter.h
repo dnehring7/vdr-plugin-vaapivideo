@@ -149,6 +149,7 @@ class cVideoFilterChain {
         // --- Manual zoom (symmetric crop before scale) ---
         double cropH{0.0}; ///< Per-side horizontal crop fraction (decoder derives it from the zoom-in factor); 0 = none
         double cropV{0.0}; ///< Per-side vertical crop fraction (decoder derives it from the zoom-in factor); 0 = none
+        uint32_t stereo3d{0}; ///< DRM_MODE_FLAG_3D_* layout of the active mode; 0 = 2D
 
         // --- Playback mode flags ---
         bool trickMode{false};    ///< Trick speed: use minimal chain + bob deint (no priming delay)

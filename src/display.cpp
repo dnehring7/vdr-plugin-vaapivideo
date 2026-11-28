@@ -1490,8 +1490,8 @@ auto cVaapiDisplay::ChangeDisplayMode() -> void {
         // geometry when it does.
         geometryChanged.store(true, std::memory_order_release);
         modeGeneration.fetch_add(1, std::memory_order_acq_rel);
-        isyslog("vaapivideo/display: mode changed to %ux%u@%.3fHz", GetOutputWidth(), GetOutputHeight(),
-                static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0);
+        isyslog("vaapivideo/display: mode changed to %ux%u@%.3fHz%s", GetOutputWidth(), GetOutputHeight(),
+                static_cast<double>(GetOutputRefreshMilliHz()) / 1000.0, Stereo3dTag(wanted.flags));
     } else {
         // An atomic commit is all-or-nothing: the old mode is still programmed AND the old OSD fb
         // still attached, so lastCommittedOsdFbId must keep describing it. The next commit

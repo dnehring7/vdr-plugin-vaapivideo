@@ -444,6 +444,8 @@ class cVaapiDevice : public cDevice {
     auto RestoreDefaultModeLocked(uint64_t nowMs)
         -> void; ///< Hand the output back to defaultMode when mode switching is not in charge of the
                  ///< current source. Caller holds displayModeMutex.
+    [[nodiscard]] auto StereoTwinLocked(const drmModeModeInfo &mode) const
+        -> drmModeModeInfo; ///< @p mode's 3D twin for mediaStereo3d if the connector has one, else @p mode
     auto ArmModeCandidateLocked(const StreamModeRequest &request, uint64_t nowMs, uint64_t dueMs)
         -> void; ///< Arm @p request, due for PollPendingDisplayMode() at @p dueMs (non-zero): the end of its
                  ///< stability window, or the cooldown boundary of a throttled switch. Caller holds displayModeMutex.
@@ -527,7 +529,8 @@ class cVaapiDevice : public cDevice {
     std::atomic<uint64_t> modeIdleRestoreDueMs{0};
     uint64_t lastModeChangeMs{};     ///< Wall clock of the last applied change; enforces the minimum interval
     StreamModeRequest lastRequest{}; ///< Most recently published format; replayed by ReevaluateDisplayMode()
-    PlaybackSource lastRequestSource{PlaybackSource::LiveTv};     ///< Source that published lastRequest
+    PlaybackSource lastRequestSource{PlaybackSource::LiveTv}; ///< Source that published lastRequest
+    std::atomic<uint32_t> mediaStereo3d{0}; ///< 3D layout the open mediaplayer file declares (DRM_MODE_FLAG_3D_*)
     std::atomic<AVCodecID> audioCodecCandidate{AV_CODEC_ID_NONE}; ///< Pending 2-of-2 audio codec confirm
     std::atomic<int> audioCodecCandidateCount{0};                 ///< Confirmation count for audioCodecCandidate
     std::vector<uint8_t> audioDetectBuffer; ///< AAC-LATM fallback window for DetectAudioCodec() (see
