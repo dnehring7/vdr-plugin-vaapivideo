@@ -584,6 +584,11 @@ auto cVaapiDisplay::RequestDisplayMode(const drmModeModeInfo &mode) -> void {
             esyslog("vaapivideo/display: grab failed: mode change in progress");
             return nullptr;
         }
+        // The frames still flow while the video window is off-screen, but none of them is on screen.
+        if (videoPlaneDetached.load(std::memory_order_acquire)) [[unlikely]] {
+            esyslog("vaapivideo/display: grab failed: video window off-screen");
+            return nullptr;
+        }
         // pendingBuffer holds the last committed frame; it is on screen once its flip has landed
         // (and is re-presented while no new frame comes). displayedBuffer is the one before it, so
         // grabbing it showed the previous picture -- for a still, the black frame ahead of it.
@@ -2327,7 +2332,30 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     return {x, y, w, h};
 }
 
+[[nodiscard]] auto cVaapiDisplay::IsVideoRectOffScreen(const cRect &rect) const -> bool {
+    const int outW = static_cast<int>(GetOutputWidth());
+    const int outH = static_cast<int>(GetOutputHeight());
+    if (rect.IsEmpty() || outW < 2 || outH < 2) {
+        return false;
+    }
+    return !rect.Intersects(cRect(0, 0, outW, outH));
+}
+
 [[nodiscard]] auto cVaapiDisplay::SetVideoRect(const cRect &rect) -> bool {
+    // A window with nothing on screen hides the video. Clamping it would leave a 2x2 sliver at the edge, and
+    // the rects keep the last visible window so coming back costs no VPP rebuild either.
+    if (IsVideoRectOffScreen(rect)) {
+        bool wasHidden = false;
+        {
+            const cMutexLock lock(&videoRectMutex);
+            wasHidden = std::exchange(videoHidden, true);
+        }
+        if (!wasHidden) {
+            dsyslog("vaapivideo/display: video window (%d,%d %dx%d) off-screen -- video plane detached", rect.X(),
+                    rect.Y(), rect.Width(), rect.Height());
+        }
+        return false;
+    }
     const cRect normalized = NormalizeVideoRect(rect);
     if (normalized.IsEmpty()) [[unlikely]] {
         return false;
@@ -2336,10 +2364,15 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     // of the new size arrives. Old-sized jitterBuf frames keep painting at the old rect during the
     // VPP rebuild, so no underrun and no crop.
     bool dimsChanged = false;
+    bool wasHidden = false;
     {
         const cMutexLock lock(&videoRectMutex);
         dimsChanged = normalized.Width() != targetVideoRect.Width() || normalized.Height() != targetVideoRect.Height();
         targetVideoRect = normalized;
+        wasHidden = std::exchange(videoHidden, false);
+    }
+    if (wasHidden) {
+        dsyslog("vaapivideo/display: video window back on screen");
     }
     return dimsChanged;
 }
@@ -2356,8 +2389,10 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     cRect vr;
     cRect promoteRect;
     bool promoteVideoRect = false;
+    bool hidden = false;
     {
         const cMutexLock lock(&videoRectMutex);
+        hidden = videoHidden;
         const auto fitTarget = FitVideoToRect(fb.width, fb.height, targetVideoRect);
         if (fitTarget.width == fb.width && fitTarget.height == fb.height) {
             vr = targetVideoRect;
@@ -2395,8 +2430,19 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
     const uint32_t planeH = placement.height;
 
     AtomicRequest req;
-    req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
-    req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
+    if (hidden) [[unlikely]] {
+        // Off-screen window: the commit still runs every frame -- its flip event paces this loop, and the OSD
+        // and HDR state ride along -- but with the video plane detached. A detached plane names no CRTC, so
+        // ACTIVE=1 pulls it in for the event (see CommitOsdOnly).
+        if (!videoPlaneDetached.load(std::memory_order_relaxed)) {
+            req.AddProperty(videoPlaneId, videoProps.fbId, 0);
+            req.AddProperty(videoPlaneId, videoProps.crtcId, 0);
+        }
+        req.AddProperty(crtcId, modesetProps.crtcActive, 1);
+    } else {
+        req.AddProperty(videoPlaneId, videoProps.crtcId, crtcId);
+        req.AddProperty(videoPlaneId, videoProps.fbId, fb.fbId);
+    }
 
     // HDR connector signaling: must precede the plane color-space write so the kernel sees one
     // coherent HDR picture per commit. Snapshot for rollback on commit failure.
@@ -2423,31 +2469,33 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
                                              : videoProps.colorEncodingBt709;
     const uint64_t stagedSrcW = static_cast<uint64_t>(planeW) << 16;
     const uint64_t stagedSrcH = static_cast<uint64_t>(planeH) << 16;
-    if (videoProps.colorEncodingValid && stagedColorEncoding != lastVideoColorEncoding) {
-        req.AddProperty(videoPlaneId, videoProps.colorEncoding, stagedColorEncoding);
-    }
-    if (videoProps.colorRangeValid && videoProps.colorRangeLimited != lastVideoColorRange) {
-        req.AddProperty(videoPlaneId, videoProps.colorRange, videoProps.colorRangeLimited);
-    }
-    // SRC_X/Y are always 0 (no source crop); bundled with the SRC_W/H write so they're emitted
-    // once on the first commit and again only when the source rect actually changes.
-    if (stagedSrcW != lastVideoSrcW || stagedSrcH != lastVideoSrcH) {
-        req.AddProperty(videoPlaneId, videoProps.srcX, 0);
-        req.AddProperty(videoPlaneId, videoProps.srcY, 0);
-        req.AddProperty(videoPlaneId, videoProps.srcW, stagedSrcW);
-        req.AddProperty(videoPlaneId, videoProps.srcH, stagedSrcH);
-    }
-    if (destX != lastVideoCrtcX) {
-        req.AddProperty(videoPlaneId, videoProps.crtcX, destX);
-    }
-    if (destY != lastVideoCrtcY) {
-        req.AddProperty(videoPlaneId, videoProps.crtcY, destY);
-    }
-    if (planeW != lastVideoCrtcW) {
-        req.AddProperty(videoPlaneId, videoProps.crtcW, planeW);
-    }
-    if (planeH != lastVideoCrtcH) {
-        req.AddProperty(videoPlaneId, videoProps.crtcH, planeH);
+    if (!hidden) [[likely]] {
+        if (videoProps.colorEncodingValid && stagedColorEncoding != lastVideoColorEncoding) {
+            req.AddProperty(videoPlaneId, videoProps.colorEncoding, stagedColorEncoding);
+        }
+        if (videoProps.colorRangeValid && videoProps.colorRangeLimited != lastVideoColorRange) {
+            req.AddProperty(videoPlaneId, videoProps.colorRange, videoProps.colorRangeLimited);
+        }
+        // SRC_X/Y are always 0 (no source crop); bundled with the SRC_W/H write so they're emitted
+        // once on the first commit and again only when the source rect actually changes.
+        if (stagedSrcW != lastVideoSrcW || stagedSrcH != lastVideoSrcH) {
+            req.AddProperty(videoPlaneId, videoProps.srcX, 0);
+            req.AddProperty(videoPlaneId, videoProps.srcY, 0);
+            req.AddProperty(videoPlaneId, videoProps.srcW, stagedSrcW);
+            req.AddProperty(videoPlaneId, videoProps.srcH, stagedSrcH);
+        }
+        if (destX != lastVideoCrtcX) {
+            req.AddProperty(videoPlaneId, videoProps.crtcX, destX);
+        }
+        if (destY != lastVideoCrtcY) {
+            req.AddProperty(videoPlaneId, videoProps.crtcY, destY);
+        }
+        if (planeW != lastVideoCrtcW) {
+            req.AddProperty(videoPlaneId, videoProps.crtcW, planeW);
+        }
+        if (planeH != lastVideoCrtcH) {
+            req.AddProperty(videoPlaneId, videoProps.crtcH, planeH);
+        }
     }
 
     // Bundle the OSD plane into the same atomic commit -- separate commits let one plane lag a
@@ -2498,14 +2546,23 @@ auto cVaapiDisplay::OnPageFlipEvent([[maybe_unused]] int fd, [[maybe_unused]] un
             const cMutexLock lock(&videoRectMutex);
             videoRect = promoteRect;
         }
-        lastVideoColorEncoding = stagedColorEncoding;
-        lastVideoColorRange = videoProps.colorRangeLimited;
-        lastVideoSrcW = stagedSrcW;
-        lastVideoSrcH = stagedSrcH;
-        lastVideoCrtcX = destX;
-        lastVideoCrtcY = destY;
-        lastVideoCrtcW = planeW;
-        lastVideoCrtcH = planeH;
+        if (hidden) [[unlikely]] {
+            // Re-attaching must write the whole plane state again.
+            constexpr uint64_t kCacheSentinel = ~uint64_t{0};
+            lastVideoColorEncoding = lastVideoColorRange = kCacheSentinel;
+            lastVideoSrcW = lastVideoSrcH = kCacheSentinel;
+            lastVideoCrtcX = lastVideoCrtcY = lastVideoCrtcW = lastVideoCrtcH = kCacheSentinel;
+        } else {
+            lastVideoColorEncoding = stagedColorEncoding;
+            lastVideoColorRange = videoProps.colorRangeLimited;
+            lastVideoSrcW = stagedSrcW;
+            lastVideoSrcH = stagedSrcH;
+            lastVideoCrtcX = destX;
+            lastVideoCrtcY = destY;
+            lastVideoCrtcW = planeW;
+            lastVideoCrtcH = planeH;
+        }
+        videoPlaneDetached.store(hidden, std::memory_order_release);
         if (osdCommitted) {
             // osdDirty clears only on a landed commit -- a failed one (e.g. EBUSY) must keep
             // the OSD update queued -- and only for the generation this commit actually staged:

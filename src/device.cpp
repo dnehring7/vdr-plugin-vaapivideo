@@ -893,7 +893,12 @@ cVaapiDevice::~cVaapiDevice() noexcept {
 }
 
 [[nodiscard]] auto cVaapiDevice::CanScaleVideo(const cRect &rect, int /*alignment*/) -> cRect {
-    return HardwareReady() && display ? display->NormalizeVideoRect(rect) : cRect::Null;
+    if (!HardwareReady() || !display) [[unlikely]] {
+        return cRect::Null;
+    }
+    // An off-screen window is honoured as asked (ScaleVideo hides the video). cRect::Null would make a skin
+    // fall back to full-screen video.
+    return display->IsVideoRectOffScreen(rect) ? rect : display->NormalizeVideoRect(rect);
 }
 
 namespace {

@@ -210,6 +210,9 @@ class cVaapiDisplay : public cThread {
     /// Thread-safe snapshot of the rect the next VPP build should target (differs from videoRect
     /// only between a ScaleVideo() call and the first fb of the new size).
     [[nodiscard]] auto GetTargetVideoRect() const -> cRect;
+    /// True when @p rect lies entirely outside the output: nothing of the video would show, so SetVideoRect()
+    /// detaches the plane instead of clamping the window to a 2-px sliver. An empty rect means full-screen.
+    [[nodiscard]] auto IsVideoRectOffScreen(const cRect &rect) const -> bool;
     /// Rect SetVideoRect() will store: full-screen for empty, otherwise clipped + 2-px aligned.
     [[nodiscard]] auto NormalizeVideoRect(const cRect &rect) const -> cRect;
     /// Set up planes, cache DRM property IDs, program the initial display mode, start the thread.
@@ -543,7 +546,12 @@ class cVaapiDisplay : public cThread {
     /// so old frames keep painting during a rebuild.
     cRect videoRect{0, 0, static_cast<int>(CONFIG_DISPLAY_WIDTH_DEFAULT),
                     static_cast<int>(CONFIG_DISPLAY_HEIGHT_DEFAULT)};
-    mutable cMutex videoRectMutex; ///< Guards targetVideoRect and videoRect.
+    /// The requested window lies entirely off-screen: the video plane stays detached until one shows again. Both
+    /// rects keep the last visible window, so hiding needs no VPP rebuild.
+    bool videoHidden{false};
+    mutable cMutex videoRectMutex; ///< Guards targetVideoRect, videoRect and videoHidden.
+    /// videoHidden as the last landed commit applied it: no video on screen, so GRAB has no frame to return.
+    std::atomic<bool> videoPlaneDetached{false};
 
     // Last-committed plane property caches. Sentinel ~0 forces a write on the first commit after
     // Initialize; cache advances only on commit success so failed commits retry next frame.
